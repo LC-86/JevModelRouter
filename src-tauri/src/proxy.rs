@@ -795,7 +795,7 @@ mod tests {
         let store = Arc::new(ConfigStore::load(directory.path().join("autojev.db")).unwrap());
         let reserved=TcpListener::bind("127.0.0.1:0").await.unwrap();let port=reserved.local_addr().unwrap().port();drop(reserved);
         store.update(|config| config.port = port).unwrap();
-        let handle = start(store).await.unwrap();
+        let handle = start(store.clone()).await.unwrap();
         tokio::time::sleep(Duration::from_millis(40)).await;
         let response: Value = reqwest::get(format!("http://127.0.0.1:{port}/health"))
             .await
@@ -805,7 +805,10 @@ mod tests {
             .unwrap();
         assert_eq!(response["status"], "ok");
         let catalog:Value=reqwest::get(format!("http://127.0.0.1:{port}/v1/models")).await.unwrap().json().await.unwrap();
-        assert_eq!(catalog["object"],"list");assert!(catalog["data"].as_array().unwrap().iter().all(|v|v["id"].as_str().unwrap().starts_with("autojev/")));
+        assert_eq!(catalog["object"],"list");
+        // Public IDs are <provider>/<model> for models and autojev/<route> for routes; each must resolve back.
+        let config=store.read();let ids=catalog["data"].as_array().unwrap();assert!(!ids.is_empty());
+        assert!(ids.iter().all(|v|crate::router::normalize_requested_model(&config,v["id"].as_str()).unwrap().is_some_and(|m|m.starts_with("autojev/"))));
         handle.stop().await;
         assert!(TcpListener::bind(("127.0.0.1",port)).await.is_ok());
     }
@@ -879,14 +882,15 @@ mod route_forward_tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-autojev-agent", HeaderValue::from_static("hermes"));
         headers.insert("x-autojev-session-id", HeaderValue::from_static("same-session"));
-        for model in ["first", "second", "not-selected"] {
-            let body = json!({"model":model,"messages":[{"role":"user","content":"hello"}]});
+        let provider = store.read().models[0].provider_id.clone();
+        for (public, upstream) in [(format!("{provider}/first"), "first"), (format!("{provider}/second"), "second"), ("not-selected".into(), "")] {
+            let body = json!({"model":public,"messages":[{"role":"user","content":"hello"}]});
             let response = forward(context.clone(), headers.clone(), body, "/v1/chat/completions", "chat/completions").await;
-            if model == "not-selected" {assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);}
+            if upstream.is_empty() {assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);}
             else {
                 assert_eq!(response.status(), StatusCode::OK);
                 let bytes = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
-                assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap()["model"], model);
+                assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap()["model"], upstream);
             }
         }
         upstream.abort();
@@ -1031,7 +1035,9 @@ mod protocol_forward_tests {
         let store = Arc::new(ConfigStore::load(dir.path().join("errors.db")).unwrap());
         store.update(|config| { config.models.truncate(1); config.providers[0].base_url = format!("http://127.0.0.1:{port}"); }).unwrap();
         store.write_secret("provider:openrouter", "test-only-key").unwrap();
-        let reply = forward(ProxyContext { store, client: Client::new(), sessions: Default::default(), health: Default::default() }, HeaderMap::new(), request(Protocol::Messages, false), "/v1/messages", "messages").await;
+        let mut body = request(Protocol::Messages, false);
+        body["model"] = "auto".into();
+        let reply = forward(ProxyContext { store, client: Client::new(), sessions: Default::default(), health: Default::default() }, HeaderMap::new(), body, "/v1/messages", "messages").await;
         assert_eq!(reply.status(), StatusCode::TOO_MANY_REQUESTS);
         let body: Value = serde_json::from_slice(&axum::body::to_bytes(reply.into_body(), 1024).await.unwrap()).unwrap();
         assert_eq!(body["type"], "error");
