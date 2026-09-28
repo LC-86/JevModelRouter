@@ -23,7 +23,6 @@ assert.equal(JSON.parse(readFileSync('src-tauri/capabilities/default.json', 'utf
 const publicKey = Buffer.from(config.plugins.updater.pubkey, 'base64').toString('utf8');
 assert.match(publicKey, /^untrusted comment: minisign public key:/, 'Invalid updater public key');
 assert.ok(config.plugins.updater.endpoints.every(url => url.startsWith('https://')));
-if (process.env.RELEASE_REPOSITORY) {
-  assert.deepEqual(config.plugins.updater.endpoints, [`https://github.com/${process.env.RELEASE_REPOSITORY}/releases/latest/download/latest.json`], 'Updater endpoint and release destination differ');
-}
+// The feed is written by scripts/publish-release.sh (publish-cdn.yml).
+assert.deepEqual(config.plugins.updater.endpoints, ['https://cdn.autojev.ai/latest.json'], 'Updater endpoint must be the CDN feed');
 console.log(`Release configuration OK: v${pkg.version}`);

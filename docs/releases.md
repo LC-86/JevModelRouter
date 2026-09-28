@@ -5,7 +5,7 @@
 正式版使用 Tauri updater，从以下公开地址读取版本清单：
 
 ```text
-https://github.com/thinkany-ai/autojev/releases/latest/download/latest.json
+https://cdn.autojev.ai/latest.json
 ```
 
 客户端启动后检查一次，此后每四小时检查；也可在「设置 → 关于」手动检查。
@@ -53,17 +53,12 @@ pnpm release:mac --target aarch64-apple-darwin
 这些资料可复用 Termany 的本地原件或已有组织级 Secrets，并授权给本仓库。GitHub 不允许读取另一个仓库中 Secret 的明文；不能用 `gh secret list` 复制密钥值。
 可通过 `gh secret list --repo thinkany-ai/autojev` 核对名称，但名称存在不证明凭据有效。本次本地准备未验证远端 Secrets。
 
-### 下载地址必须公开
+### CDN 发布
 
-GitHub Releases 更新地址需要无需登录即可访问。本次准备未验证远端仓库可见性。
-如果源代码仓库保持私有，可使用同组织的公开发布仓库：
-
-1. 配置 Actions 变量 `RELEASE_REPO` 为公开发布仓库名称。
-2. 配置 `RELEASE_TOKEN`，授予发布仓库 Contents 读写权限。
-3. 修改 `tauri.conf.json` 的 updater endpoint，指向该仓库的 `latest.json`。
-4. 如发布仓库默认分支不是 `main`，配置 `RELEASE_BRANCH`。
-
-工作流会核对下载仓库公开性与 endpoint 一致性，不把 GitHub Token 打包到客户端。
+`cdn.autojev.ai` 绑定 Cloudflare R2 存储桶 `autojev`，流程与 Termany 的 `cdn.termany.sh` 相同。
+发布 Release（草稿转正式）后，`publish-cdn.yml` 下载该版本的全部安装包，由 `scripts/publish-release.sh`
+上传到 R2 并重写 `latest.json`（签名内联在清单中）。该工作流需要 Secrets `CLOUDFLARE_API_TOKEN`（R2 编辑权限）与
+`CLOUDFLARE_ACCOUNT_ID`。也可在本地 `wrangler login` 后运行 `bash scripts/publish-release.sh <文件...>`。
 
 ## 发布版本
 
@@ -71,8 +66,9 @@ GitHub Releases 更新地址需要无需登录即可访问。本次准备未验�
 2. 执行 `pnpm release:check`、`pnpm test`、`pnpm build` 和 `cargo test --locked --manifest-path src-tauri/Cargo.toml --lib`。
 3. 提交并推送代码；检查 CI 通过后，推送匹配的版本标签，例如 `v0.1.0`。
 
-标签工作流构建 macOS ARM64 / x64、Windows x64、Linux x64 安装包与签名更新包。各平台依次合并更新清单，避免并发覆盖。
-全部构建成功且 `latest.json` 包含四个平台后才将草稿发布为 latest；构建失败保留草稿。手动触发只上传测试产物。
+4. 标签工作流构建 macOS ARM64 / x64、Windows x64、Linux x64 安装包与签名更新包，并挂到草稿 Release。
+5. 检查草稿无误后发布它，`publish-cdn.yml` 随即把产物推到 `cdn.autojev.ai` 并更新 `latest.json`，客户端即可检测到新版本。
+手动触发构建工作流只上传测试产物。
 
 Windows 安装程序当前未使用 Authenticode 签名；所有平台的 Tauri 更新包仍使用更新签名。
 首次发布后，使用两个不同版本的签名安装包测试真实升级，包括下载失败、签名失败、重试和重启。单元测试不能替代真实升级验证。

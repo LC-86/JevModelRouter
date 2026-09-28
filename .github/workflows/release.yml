@@ -1,58 +1,80 @@
 name: Build and release
 
+# One matrix job per shipping platform; every job attaches its installer to
+# the SAME draft release v<version> (tauri-action creates it if missing, then
+# uploads — the standard tauri matrix pattern). Publishing the draft fires
+# publish-cdn.yml, which pushes all assets to R2 (cdn.autojev.ai) and rewrites
+# the updater feed latest.json.
+#
+# Assets produced (names drive publish-release.sh's platform mapping — keep stable):
+#   macos-arm64  → AutoJev_X.Y.Z_aarch64.dmg + AutoJev_aarch64.app.tar.gz(.sig)
+#   macos-x64    → AutoJev_X.Y.Z_x64.dmg     + AutoJev_x64.app.tar.gz(.sig)
+#   windows-x64  → AutoJev_X.Y.Z_x64-setup.exe(.sig)       (NSIS, unsigned)
+#   linux-x64    → AutoJev_X.Y.Z_amd64.AppImage(.sig)/.deb (unsigned)
+#
+# To ship: bump the version, then `git tag v<version> && git push origin v<version>`,
+# wait for the build, and publish the draft release.
+
 on:
   push:
     tags: ['v*']
   workflow_dispatch:
+    inputs:
+      platform:
+        description: Platform to build (manual test artifact only)
+        required: true
+        default: macos-arm64
+        type: choice
+        options:
+          - macos-arm64
+          - macos-x64
+          - windows-x64
+          - linux-x64
+          - all
 
-permissions:
-  contents: read
-
-concurrency:
-  group: release-${{ github.ref }}
-  cancel-in-progress: false
+env:
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: short
 
 jobs:
-  validate:
+  select-matrix:
     runs-on: ubuntu-22.04
+    outputs:
+      matrix: ${{ steps.select.outputs.matrix }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
       - run: node scripts/check-release.mjs
+      - name: Select build matrix
+        id: select
+        shell: bash
         env:
-          RELEASE_REPOSITORY: ${{ github.repository_owner }}/${{ vars.RELEASE_REPO || github.event.repository.name }}
-      - name: Require public downloads for the desktop updater
-        if: github.event_name == 'push'
-        env:
-          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
-          RELEASE_REPOSITORY: ${{ github.repository_owner }}/${{ vars.RELEASE_REPO || github.event.repository.name }}
+          REQUESTED_PLATFORM: ${{ inputs.platform || 'all' }}
         run: |
-          test "$(gh api "repos/$RELEASE_REPOSITORY" --jq '.private')" = "false" || {
-            echo 'The updater needs a public release repository. Configure the release destination before tagging.' >&2
-            exit 1
-          }
+          mac_arm='{"platform":"macos-arm64","runner":"macos-latest"}'
+          mac_x64='{"platform":"macos-x64","runner":"macos-15-intel"}'
+          win='{"platform":"windows-x64","runner":"windows-latest"}'
+          linux='{"platform":"linux-x64","runner":"ubuntu-22.04"}'
+          case "$REQUESTED_PLATFORM" in
+            macos-arm64) include="$mac_arm" ;;
+            macos-x64)   include="$mac_x64" ;;
+            windows-x64) include="$win" ;;
+            linux-x64)   include="$linux" ;;
+            all)         include="$mac_arm,$mac_x64,$win,$linux" ;;
+            *) echo "Unsupported platform: $REQUESTED_PLATFORM" >&2; exit 1 ;;
+          esac
+          echo "matrix={\"include\":[$include]}" >> "$GITHUB_OUTPUT"
 
   build:
-    needs: validate
-    permissions:
-      contents: write
+    needs: select-matrix
     strategy:
       fail-fast: false
-      # tauri-action merges latest.json; serialize uploads to avoid lost platforms.
-      max-parallel: 1
-      matrix:
-        include:
-          - runner: macos-latest
-            platform: macos-arm64
-          - runner: macos-15-intel
-            platform: macos-x64
-          - runner: windows-latest
-            platform: windows-x64
-          - runner: ubuntu-22.04
-            platform: linux-x64
+      matrix: ${{ fromJSON(needs.select-matrix.outputs.matrix) }}
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -65,17 +87,45 @@ jobs:
         with:
           workspaces: src-tauri -> target
           key: ${{ matrix.platform }}
-      - name: Install Linux build dependencies
+      - name: Install Tauri system deps (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf
       - run: pnpm install --frozen-lockfile
       - run: pnpm test
-      - name: Build signed app and updater artifacts
+
+      - name: Build, bundle & attach to the draft release
+        if: github.event_name == 'push'
         uses: tauri-apps/tauri-action@v0
         env:
-          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Apple signing/notarization vars are only read on macOS runners
+          # (same Developer ID credentials as Termany).
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # Self-update artifacts are signed with the Tauri updater key (shared
+          # with Termany, no password) — without it `tauri build` fails.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
+        with:
+          tauriScript: pnpm tauri
+          args: -- --locked
+          tagName: v__VERSION__
+          releaseName: AutoJev v__VERSION__
+          releaseBody: 'macOS: download the .dmg for your chip (aarch64 = Apple Silicon, x64 = Intel). Windows: download the x64 NSIS setup .exe. Linux: AppImage or .deb.'
+          releaseDraft: true
+          prerelease: false
+          # latest.json is served from cdn.autojev.ai by publish-cdn.yml.
+          includeUpdaterJson: false
+
+      - name: Build manual test artifact
+        if: github.event_name == 'workflow_dispatch'
+        env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
@@ -83,51 +133,17 @@ jobs:
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        with:
-          tauriScript: pnpm tauri
-          args: -- --locked
-          # Empty tag for workflow_dispatch builds binaries without a release.
-          tagName: ${{ github.event_name == 'push' && github.ref_name || '' }}
-          repo: ${{ vars.RELEASE_REPO || github.event.repository.name }}
-          owner: ${{ github.repository_owner }}
-          releaseCommitish: ${{ vars.RELEASE_REPO && (vars.RELEASE_BRANCH || 'main') || github.sha }}
-          releaseName: AutoJev v__VERSION__
-          releaseBody: 'Download the installer for your platform. macOS: aarch64 for Apple Silicon, x64 for Intel. Windows installers are not Authenticode signed.'
-          releaseDraft: true
-          prerelease: false
-          includeUpdaterJson: true
-      - name: Upload manual build artifacts
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
+        run: pnpm tauri build -- --locked
+
+      - name: Upload manual test artifact
         if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
-          name: AutoJev-${{ matrix.platform }}
+          name: AutoJev-${{ matrix.platform }}-${{ github.sha }}
           if-no-files-found: error
           path: |
-            src-tauri/target/release/bundle/**/*.dmg
-            src-tauri/target/release/bundle/**/*.app.tar.gz*
-            src-tauri/target/release/bundle/**/*.exe*
-            src-tauri/target/release/bundle/**/*.AppImage*
-            src-tauri/target/release/bundle/**/*.deb
-
-  publish:
-    if: github.event_name == 'push'
-    needs: build
-    runs-on: ubuntu-22.04
-    permissions:
-      contents: write
-    env:
-      GH_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
-      RELEASE_REPOSITORY: ${{ github.repository_owner }}/${{ vars.RELEASE_REPO || github.event.repository.name }}
-      RELEASE_TAG: ${{ github.ref_name }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-      - name: Verify updater manifest before publishing
-        run: |
-          gh release download "$RELEASE_TAG" --repo "$RELEASE_REPOSITORY" --pattern latest.json --dir "$RUNNER_TEMP"
-          node scripts/check-updater-manifest.mjs "$RUNNER_TEMP/latest.json" "$RELEASE_TAG" "$RELEASE_REPOSITORY"
-      - name: Publish complete release
-        run: gh release edit "$RELEASE_TAG" --repo "$RELEASE_REPOSITORY" --draft=false --latest
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/bundle/dmg/*.dmg
+            src-tauri/target/release/bundle/appimage/*.AppImage
+            src-tauri/target/release/bundle/deb/*.deb
