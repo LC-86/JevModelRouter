@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 64 64" role="img" aria-labelledby="title desc">
+  <title id="title">AutoJev</title>
+  <desc id="desc">An angular A crossed by a decision route and two routing nodes.</desc>
+  <rect x="2" y="2" width="60" height="60" rx="14" fill="#151611"/>
+  <path d="M13 50 29 13l17 37" fill="none" stroke="#f26122" stroke-width="7" stroke-linejoin="bevel"/>
+  <path d="M20 37h20" fill="none" stroke="#e9eadf" stroke-width="5"/>
+  <path d="M29 13v12c0 7 5 12 12 12h11" fill="none" stroke="#78c8b4" stroke-width="4" stroke-linecap="square" stroke-linejoin="round"/>
+  <circle cx="29" cy="25" r="4" fill="#151611" stroke="#78c8b4" stroke-width="3"/>
+  <circle cx="52" cy="37" r="4" fill="#f26122"/>
+</svg>

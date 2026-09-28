@@ -1,0 +1,33 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "AutoJev Dev",
+  "identifier": "ai.autojev.client.dev",
+  "app": {
+    "windows": [
+      {
+        "title": "",
+        "width": 1260,
+        "height": 800,
+        "minWidth": 960,
+        "minHeight": 640,
+        "resizable": true,
+        "fullscreen": false,
+        "center": true,
+        "decorations": false,
+        "transparent": true,
+        "shadow": true
+      }
+    ],
+    "macOSPrivateApi": true
+  },
+  "bundle": {
+    "createUpdaterArtifacts": false,
+    "icon": [
+      "icons-dev/32x32.png",
+      "icons-dev/128x128.png",
+      "icons-dev/128x128@2x.png",
+      "icons-dev/icon.icns",
+      "icons-dev/icon.ico"
+    ]
+  }
+}

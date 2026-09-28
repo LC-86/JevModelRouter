@@ -1,0 +1,66 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "AutoJev",
+  "version": "0.1.0",
+  "identifier": "ai.autojev.client",
+  "build": {
+    "beforeDevCommand": "pnpm dev:web",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "pnpm build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "",
+        "width": 1260,
+        "height": 800,
+        "minWidth": 960,
+        "minHeight": 640,
+        "resizable": true,
+        "fullscreen": false,
+        "center": true,
+        "decorations": false,
+        "transparent": true,
+        "shadow": true
+      }
+    ],
+    "security": {
+      "csp": null
+    },
+    "macOSPrivateApi": true
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "category": "DeveloperTool",
+    "publisher": "ThinkAny, LLC",
+    "homepage": "https://autojev.ai",
+    "copyright": "Copyright 2026 ThinkAny, LLC",
+    "license": "AGPL-3.0-only",
+    "licenseFile": "../LICENSE",
+    "resources": {
+      "../LICENSE": "LICENSE",
+      "../NOTICE": "NOTICE",
+      "../TRADEMARKS.md": "TRADEMARKS.md"
+    },
+    "shortDescription": "A local model router for AI agents",
+    "longDescription": "AutoJev gives AI agents one local endpoint and routes each request by capability, complexity, context and cost.",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "createUpdaterArtifacts": true
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/thinkany-ai/autojev/releases/latest/download/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDEzNEEzMThGQjBFOUFBMTQKUldRVXF1bXdqekZLRTRDV3NsMlZ2aWIraFllbW5KWExyWmlBcmgwaE1kMFl2clgyaDYxN2lhZXIK"
+    }
+  }
+}

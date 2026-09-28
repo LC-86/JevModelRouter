@@ -1,0 +1,133 @@
+name: Build and release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: node scripts/check-release.mjs
+        env:
+          RELEASE_REPOSITORY: ${{ github.repository_owner }}/${{ vars.RELEASE_REPO || github.event.repository.name }}
+      - name: Require public downloads for the desktop updater
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          RELEASE_REPOSITORY: ${{ github.repository_owner }}/${{ vars.RELEASE_REPO || github.event.repository.name }}
+        run: |
+          test "$(gh api "repos/$RELEASE_REPOSITORY" --jq '.private')" = "false" || {
+            echo 'The updater needs a public release repository. Configure the release destination before tagging.' >&2
+            exit 1
+          }
+
+  build:
+    needs: validate
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      # tauri-action merges latest.json; serialize uploads to avoid lost platforms.
+      max-parallel: 1
+      matrix:
+        include:
+          - runner: macos-latest
+            platform: macos-arm64
+          - runner: macos-15-intel
+            platform: macos-x64
+          - runner: windows-latest
+            platform: windows-x64
+          - runner: ubuntu-22.04
+            platform: linux-x64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: ${{ matrix.platform }}
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test
+      - name: Build signed app and updater artifacts
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tauriScript: pnpm tauri
+          args: -- --locked
+          # Empty tag for workflow_dispatch builds binaries without a release.
+          tagName: ${{ github.event_name == 'push' && github.ref_name || '' }}
+          repo: ${{ vars.RELEASE_REPO || github.event.repository.name }}
+          owner: ${{ github.repository_owner }}
+          releaseCommitish: ${{ vars.RELEASE_REPO && (vars.RELEASE_BRANCH || 'main') || github.sha }}
+          releaseName: AutoJev v__VERSION__
+          releaseBody: 'Download the installer for your platform. macOS: aarch64 for Apple Silicon, x64 for Intel. Windows installers are not Authenticode signed.'
+          releaseDraft: true
+          prerelease: false
+          includeUpdaterJson: true
+      - name: Upload manual build artifacts
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: AutoJev-${{ matrix.platform }}
+          if-no-files-found: error
+          path: |
+            src-tauri/target/release/bundle/**/*.dmg
+            src-tauri/target/release/bundle/**/*.app.tar.gz*
+            src-tauri/target/release/bundle/**/*.exe*
+            src-tauri/target/release/bundle/**/*.AppImage*
+            src-tauri/target/release/bundle/**/*.deb
+
+  publish:
+    if: github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+      RELEASE_REPOSITORY: ${{ github.repository_owner }}/${{ vars.RELEASE_REPO || github.event.repository.name }}
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Verify updater manifest before publishing
+        run: |
+          gh release download "$RELEASE_TAG" --repo "$RELEASE_REPOSITORY" --pattern latest.json --dir "$RUNNER_TEMP"
+          node scripts/check-updater-manifest.mjs "$RUNNER_TEMP/latest.json" "$RELEASE_TAG" "$RELEASE_REPOSITORY"
+      - name: Publish complete release
+        run: gh release edit "$RELEASE_TAG" --repo "$RELEASE_REPOSITORY" --draft=false --latest

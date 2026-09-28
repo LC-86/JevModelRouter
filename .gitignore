@@ -1,0 +1,55 @@
+# Dependencies and frontend output
+node_modules/
+dist/
+.vite/
+coverage/
+*.tsbuildinfo
+
+# Rust / Tauri generated output (keep Cargo.lock)
+target/
+src-tauri/gen/schemas/
+artifacts/
+*.dmg
+*.app/
+*.app.tar.gz
+*.app.tar.gz.sig
+*.AppImage
+*.AppImage.sig
+*.msi
+*.nsis.zip
+
+# Local app data, agent backups and logs
+.autojev/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.autojev.bak
+*.autojev-owner.json
+*.log
+logs/
+tmp/
+temp/
+playwright-report/
+test-results/
+
+# Local environment and signing credentials
+.env
+.env.*
+!.env.example
+*.key
+*.p12
+*.pfx
+*.pem
+*.mobileprovision
+*.provisionprofile
+.secrets/
+
+# Editor / OS files
+.DS_Store
+Thumbs.db
+.idea/
+*.swp
+*.swo
+*~
