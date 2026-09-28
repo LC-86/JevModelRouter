@@ -487,7 +487,7 @@
   "Jev endpoint": "Jev 接口地址",
   "Jev credentials are shared. Leave blank to keep the stored key. Decision settings apply only to this route.": "Jev 密钥共用，留空保留已保存的密钥。以上决策设置仅对当前路由生效。",
   "Calls the Jev model to choose among candidates. Configure Jev access here; if unavailable, local selection is used.": "调用 Jev 模型从候选中做决策。请在此配置 Jev 接入；未配置或调用失败时回退到本地选择。",
-  "Debug": "调试",
+  "Debug": "调试台",
   "Preview model selection or send a real request through AutoJev.": "预览模型选择，或通过 AutoJev 发送真实请求。",
   "Test prompt": "测试提示词",
   "Preview constraints": "预览条件",
@@ -721,7 +721,6 @@
   "Configured agents": "已配置智能体",
   "Requests today": "今日请求",
   "Tokens today": "今日 Token",
-  "Suppliers": "供应商",
   "{count} models connected": "已接入 {count} 个模型",
   "Add local agent": "添加本地智能体",
   "Choose image": "选择图片",
@@ -792,5 +791,8 @@
   "Update configurations for connected agents only. Disconnected agents remain disconnected.": "仅更新已连接智能体的配置；已断开的智能体保持断开。",
   "Updating {done}/{total}": "正在更新 {done}/{total}",
   "Update complete: {success} succeeded, {failed} failed": "更新完成：成功 {success} 个，失败 {failed} 个",
-  "Agent disconnected; configuration update skipped.": "智能体已断开，已跳过配置更新。"
+  "Agent disconnected; configuration update skipped.": "智能体已断开，已跳过配置更新。",
+  "Logs": "请求日志",
+  "Usage": "用量统计",
+  "Route every request to the right model.": "为每次请求选择合适的模型。"
 }

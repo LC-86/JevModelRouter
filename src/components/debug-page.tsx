@@ -130,7 +130,7 @@ export function DebugPage({ snapshot }: { snapshot: DashboardSnapshot }) {
     finally { reading.current = false; setReadingImages(false); }
   };
   return <div className="debug-console">
-    <div className="page-intro"><div><h2>{t('Debug console')}</h2><p>{t('Send real requests through AutoJev to test models and routes.')}</p></div></div>
+    <div className="page-intro"><div><h2>{t('Debug')}</h2><p>{t('Send real requests through AutoJev to test models and routes.')}</p></div></div>
     <div className="debug-mode-tabs" role="tablist" aria-label={t('Debug mode')}>
       <button role="tab" id="debug-chat-tab" aria-controls="debug-chat-panel" aria-selected={mode === 'chat'} disabled={busy} onClick={() => setMode('chat')}>{t('Conversation mode')}</button>
       <button role="tab" id="debug-curl-tab" aria-controls="debug-curl-panel" aria-selected={mode === 'curl'} disabled={busy} onClick={() => {

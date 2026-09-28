@@ -213,11 +213,11 @@ export default function App() {
     { id: 'overview', label: t("Overview"), icon: CircleGauge },
     { id: 'providers', label: t("Providers"), icon: Server },
     { id: 'models', label: t("Models"), icon: Cpu },
-    { id: 'router', label: t("Router"), icon: GitBranch },
+    { id: 'router', label: t("Routes"), icon: GitBranch },
     { id: 'agents', label: t("Agents"), icon: Bot },
-    { id: 'debug', label: t("Debug console"), icon: Play },
-    { id: 'activity', label: t("Request logs"), icon: Activity },
-    { id: 'usage', label: t("Token usage"), icon: ChartNoAxesCombined },
+    { id: 'debug', label: t("Debug"), icon: Play },
+    { id: 'activity', label: t("Logs"), icon: Activity },
+    { id: 'usage', label: t("Usage"), icon: ChartNoAxesCombined },
   ];
 
   return (
@@ -410,9 +410,10 @@ function Overview({ snapshot, go }: { snapshot: DashboardSnapshot; go: (page: Pa
   const running = snapshot.proxy.running && !snapshot.proxy.paused;
 
   return <div className="router-home">
-    <PageIntro title={t('Model router')} body={t('One endpoint. Route every request to the right model.')} action={
+    <section className="overview-intro">
+      <p>{t('Route every request to the right model.')}</p>
       <button className="button ghost" onClick={() => go('agents')}><Bot size={16} />{t('Connect an agent')}</button>
-    } />
+    </section>
 
     <section className="router-map" aria-label={t('Routing topology')}>
       <div className="router-map-bar"><span><Network size={14} /><code>127.0.0.1:{snapshot.proxy.port}</code></span><span className="status-line"><i className={cx('status-dot', running && 'online')} />{t(snapshot.proxy.paused ? 'Gateway paused' : running ? 'Proxy online' : 'Proxy stopped')}</span></div>
@@ -441,7 +442,7 @@ function Overview({ snapshot, go }: { snapshot: DashboardSnapshot; go: (page: Pa
 
     <section className="router-home-summary" aria-label={t('Overview')}>
       {([
-        { page: 'providers', label: 'Suppliers', count: snapshot.providers.length, icon: Server },
+        { page: 'providers', label: 'Providers', count: snapshot.providers.length, icon: Server },
         { page: 'models', label: 'Models', count: snapshot.models.length, icon: Cpu },
         { page: 'router', label: 'Routes', count: snapshot.routes.length, icon: GitBranch },
         { page: 'agents', label: 'Agents', count: snapshot.agents.filter((agent) => agent.installed || agent.custom).length, icon: Bot },

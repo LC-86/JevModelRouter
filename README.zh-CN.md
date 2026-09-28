@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/autojev-mark.svg" width="96" height="96" alt="AutoJev">
+  <img src="public/brand/app-icon.png" width="96" height="96" alt="AutoJev">
 </p>
 <h1 align="center">AutoJev</h1>
 <p align="center"><a href="README.md">English</a> · 简体中文</p>
@@ -38,6 +38,48 @@ Codex / Claude Code / Hermes / 其他兼容客户端
                        │
           OpenRouter / DeepSeek / 自定义服务商
 ```
+
+## 界面与工作流程
+
+从添加服务商、模型测速、配置路由到接入智能体，再到查看请求日志与用量，在同一个应用内完成。
+
+### 集中管理服务商
+
+添加 OpenRouter、DeepSeek 或兼容的 API 接口，也可从 CC Switch 和 Termany 导入已有服务商。支持测试、启用和禁用服务商，配置保存在本地。
+
+![服务商管理：接口地址、启用状态与本地保存的密钥](docs/assets/autojev-providers.webp)
+
+### 先测速，再配置模型路由
+
+通过内置测速比较首响应延迟和输出速度。为模型配置输入与输出价格，并记录图片输入支持和上下文窗口信息。
+
+![模型管理：测速结果、输入输出价格与上下文窗口](docs/assets/autojev-models.webp)
+
+### 创建可复用的路由
+
+将候选模型组织成 `fast`、`quality`、`cheap` 等路由，通过 `autojev/<路由 ID>` 调用。支持智能选择、负载均衡、会话粘性、故障转移与冷却。
+
+![路由管理：速度、质量、费用优先与负载均衡](docs/assets/autojev-routes.webp)
+
+### 接入你的智能体
+
+集中查看已检测的智能体、配置文件路径和连接状态。为每个智能体选择模型或路由，批量更新已连接智能体的配置，并在断开时恢复备份。
+
+![智能体管理：配置路径、已选模型与路由、连接状态](docs/assets/autojev-agents.webp)
+
+### 在调试台验证请求
+
+使用对话模式或 cURL 模式测试模型和路由，切换 API 协议，查看实际选中的模型、耗时、Token 用量、预估费用与原始 JSON 响应。
+
+![调试台：通过路由发送对话并查看响应详情](docs/assets/autojev-debug.webp)
+
+### 查看请求日志与用量
+
+按时间、智能体、服务商和状态筛选请求，排查路由结果与失败原因。通过用量页查看 Token 总量、缓存用量、预估费用及每日趋势。
+
+![请求日志：路由信息、Token、费用、延迟与状态](docs/assets/autojev-logs.webp)
+
+![用量统计：Token 总量、预估费用与每日趋势](docs/assets/autojev-usage.webp)
 
 ## 快速开始
 

@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/autojev-mark.svg" width="96" height="96" alt="AutoJev">
+  <img src="public/brand/app-icon.png" width="96" height="96" alt="AutoJev">
 </p>
 <h1 align="center">AutoJev</h1>
 <p align="center">English · <a href="README.zh-CN.md">简体中文</a></p>
@@ -39,14 +39,56 @@ Codex / Claude Code / Hermes / Other compatible clients
             OpenRouter / DeepSeek / Custom providers
 ```
 
+## Inside AutoJev
+
+Add providers, measure models, build routes, connect agents, then inspect requests and usage.
+
+### Manage providers in one place
+
+Add OpenRouter, DeepSeek, or compatible API endpoints, or import existing providers from CC Switch and Termany. Test, enable, or disable each provider while keeping its configuration saved locally.
+
+![Providers with API endpoints, enabled status, and locally saved keys](docs/assets/autojev-providers.webp)
+
+### Measure models before routing
+
+Compare first-response latency and output speed with built-in speed tests. Configure input and output pricing, and keep image support and context-window information alongside each model.
+
+![Models with speed measurements, pricing, and context windows](docs/assets/autojev-models.webp)
+
+### Create reusable routes
+
+Group candidate models into routes such as `fast`, `quality`, or `cheap`, exposed as `autojev/<route ID>`. Choose intelligent selection or load balancing, with session affinity, failover, and cooldowns.
+
+![Routes configured for speed, quality, cost, and load balancing](docs/assets/autojev-routes.webp)
+
+### Connect your agents
+
+See detected agents, configuration paths, and connection status in one view. Select models or routes per agent, batch-update connected agents, and restore backed-up configurations when disconnecting.
+
+![Agents with configuration paths, selected models and routes, and connection status](docs/assets/autojev-agents.webp)
+
+### Test requests in the debug console
+
+Try models and routes in conversation or cURL mode. Switch API protocols and inspect the selected model, timing, token usage, estimated cost, and raw JSON response.
+
+![Debug console showing a routed conversation and response details](docs/assets/autojev-debug.webp)
+
+### Inspect logs and usage
+
+Filter request logs by time, agent, provider, and status to investigate routing and failures. Review token totals, cache usage, estimated costs, and daily usage across agents and models.
+
+![Request logs with routing details, tokens, cost, latency, and status](docs/assets/autojev-logs.webp)
+
+![Usage totals and daily token chart](docs/assets/autojev-usage.webp)
+
 ## Quick start
 
 1. Download an installer for your system from [Releases](https://github.com/thinkany-ai/autojev/releases).
 2. Add your API endpoint and key under **Providers**.
 3. Add models with their upstream API type, model ID, and pricing.
-4. Configure candidate models and scheduling preferences under **Router**. For intelligent selection, configure Jev in **Settings → Gateway & routing → Decision model**.
+4. Configure candidate models and scheduling preferences under **Routes**. For intelligent selection, configure Jev in **Settings → Gateway & routing → Decision model**.
 5. Select models or routes under **Agents** and connect an agent, or configure your client manually.
-6. Try a request in the **Debug console**. Use **Request logs** to see which provider and model handled it.
+6. Try a request in the **Debug**. Use **Logs** to see which provider and model handled it.
 
 Release builds listen on `127.0.0.1:9527`; development builds use `127.0.0.1:9526`. Route model IDs use the format `autojev/<route ID>`.
 

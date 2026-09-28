@@ -56,7 +56,7 @@ export function TrafficPage({ mode }: { mode: 'logs' | 'usage' }) {
   const providers = [...new Set([...rows.map(r => r.provider_name), ...(provider ? [provider] : [])])].filter(Boolean).sort();
   const statusLabel = (s: string) => t(s === 'success' ? 'Success' : s === 'cancelled' ? 'Cancelled' : 'Failed');
   return <div className="stack lg traffic-page">
-    <div className="page-intro"><div><h2>{t(mode === 'logs' ? 'Request logs' : 'Token usage')}</h2><p>{t(mode === 'logs' ? 'Requests from agents through AutoJev. Metadata stays on this device.' : 'Actual upstream usage, across your agents and models.')}</p></div>
+    <div className="page-intro"><div><h2>{t(mode === 'logs' ? 'Logs' : 'Usage')}</h2><p>{t(mode === 'logs' ? 'Requests from agents through AutoJev. Metadata stays on this device.' : 'Actual upstream usage, across your agents and models.')}</p></div>
       <button className="button ghost" disabled={loading} onClick={() => void load()}><RefreshCw size={15} className={loading ? 'import-spinner' : ''}/>{t('Refresh')}</button></div>
     <div className="traffic-filters">
       <Select aria-label={t('Date range')} value={String(days)} onChange={e => setDays(Number(e.target.value))} searchable={false}>{[1, 7, 30, 90].map(n => <option key={n} value={String(n)}>{n === 1 ? t('Today') : t('Last {count} days', { count: n })}</option>)}</Select>
