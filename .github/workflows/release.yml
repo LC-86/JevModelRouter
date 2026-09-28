@@ -32,6 +32,9 @@ on:
           - linux-x64
           - all
 
+permissions:
+  contents: write
+
 env:
   CARGO_INCREMENTAL: 0
   RUST_BACKTRACE: short
@@ -73,8 +76,6 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.select-matrix.outputs.matrix) }}
     runs-on: ${{ matrix.runner }}
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
