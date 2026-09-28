@@ -57,7 +57,7 @@ pnpm release:mac --target aarch64-apple-darwin
 
 `cdn.autojev.ai` 绑定 Cloudflare R2 存储桶 `autojev`，流程与 Termany 的 `cdn.termany.sh` 相同。
 发布 Release（草稿转正式）后，`publish-cdn.yml` 下载该版本的全部安装包，由 `scripts/publish-release.sh`
-上传到 R2 并重写 `latest.json`（签名内联在清单中）。该工作流需要 Secrets `CLOUDFLARE_API_TOKEN`（R2 编辑权限）与
+上传到 R2 并重写 `latest.json`（签名内联在清单中）。该工作流需要 Secrets `R2_ACCESS_KEY_ID`、`R2_SECRET_ACCESS_KEY`（R2 S3 凭证）与
 `CLOUDFLARE_ACCOUNT_ID`。也可在本地 `wrangler login` 后运行 `bash scripts/publish-release.sh <文件...>`。
 
 ## 发布版本

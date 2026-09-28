@@ -17,8 +17,8 @@
 # CI's unversioned mac names (AutoJev_aarch64.app.tar.gz / AutoJev_x64.app.tar.gz)
 # are accepted and renamed to the versioned form on upload.
 #
-# Requires wrangler auth (interactive login locally; CLOUDFLARE_API_TOKEN +
-# CLOUDFLARE_ACCOUNT_ID in CI).
+# Uploads through R2's S3 API when R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY and
+# CLOUDFLARE_ACCOUNT_ID are set (CI); otherwise through wrangler (local login).
 set -euo pipefail
 
 R2_BUCKET="autojev"
@@ -47,7 +47,13 @@ done
 [ -n "$VERSION" ] || { echo "error: no recognizable installer among inputs" >&2; exit 1; }
 
 put() {
-  npx --yes wrangler r2 object put "$R2_BUCKET/$1" --file="$2" --content-type="$3" --remote
+  if [ -n "${R2_ACCESS_KEY_ID:-}" ]; then
+    AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID" AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY" AWS_DEFAULT_REGION=auto \
+      aws s3 cp "$2" "s3://$R2_BUCKET/$1" --content-type "$3" --only-show-errors \
+      --endpoint-url "https://$CLOUDFLARE_ACCOUNT_ID.r2.cloudflarestorage.com"
+  else
+    npx --yes wrangler r2 object put "$R2_BUCKET/$1" --file="$2" --content-type="$3" --remote
+  fi
 }
 
 for f in "${FILES[@]}"; do
