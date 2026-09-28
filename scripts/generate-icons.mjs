@@ -4,6 +4,15 @@ import { createRequire } from 'node:module';
 
 const logo = readFileSync('public/logo.svg', 'utf8');
 const symbol = logo.slice(logo.indexOf('<defs>'), logo.lastIndexOf('</svg>'));
+// Menu bar icons use only the logo silhouette; macOS supplies the tint.
+const trayDirectory = 'src-tauri/icons-tray';
+mkdirSync(trayDirectory, { recursive: true });
+const traySvg = `<svg xmlns="http://www.w3.org/2000/svg" width="44" height="44" viewBox="4 7 56 56">${symbol.replaceAll('#D45A2A', '#000000')}</svg>\n`;
+writeFileSync(`${trayDirectory}/icon.svg`, traySvg);
+const trayResult = spawnSync(process.execPath, [createRequire(import.meta.url).resolve('@tauri-apps/cli/tauri.js'), 'icon', `${trayDirectory}/icon.svg`, '--output', trayDirectory, '--png', '44'], { stdio: 'inherit' });
+if (trayResult.status !== 0) process.exit(trayResult.status ?? 1);
+if (process.argv.includes('--tray-only')) process.exit(0);
+
 // Keep the original AutoJev paths, colour and arrow cutout. Desktop icons have
 // the same inset rounded-square silhouette and DEV badge convention as Termany.
 for (const dev of [false, true]) {

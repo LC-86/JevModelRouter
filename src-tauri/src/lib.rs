@@ -801,6 +801,11 @@ pub fn run() {
             let quit=tauri::menu::MenuItem::with_id(app,"safe-quit","Quit AutoJev (restore agents)",true,None::<&str>)?;
             let menu=tauri::menu::Menu::with_items(app,&[&show,&quit])?;
             let mut tray=tauri::tray::TrayIconBuilder::new().tooltip("AutoJev").menu(&menu).on_menu_event(|app,event|match event.id.as_ref(){"show"=>show_main(app),"safe-quit"=>request_safe_exit(app.clone()),_=>{}});
+            #[cfg(target_os = "macos")]
+            {
+                tray = tray.icon(tauri::include_image!("icons-tray/44x44.png")).icon_as_template(true);
+            }
+            #[cfg(not(target_os = "macos"))]
             if let Some(icon)=app.default_window_icon(){tray=tray.icon(icon.clone());}
             tray.build(app)?;
             Ok(())
