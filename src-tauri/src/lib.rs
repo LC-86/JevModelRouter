@@ -63,12 +63,12 @@ struct DashboardSnapshot {
 }
 
 async fn snapshot(state: &AppState) -> DashboardSnapshot {
-    let mut config = state.store.read();
+    let (mut config, decision_key) = state.store.read_with_decision_key();
     for provider in &mut config.providers {
         provider.has_api_key = provider.kind == ProviderKind::Ollama
             || state.store.read_secret(&format!("provider:{}", provider.id)).is_some();
     }
-    config.policy.has_autojev_key = state.store.read_secret("autojev-cloud").is_some();
+    config.policy.has_autojev_key = decision_key.is_some();
     let running = state.proxy.lock().await.as_ref().is_some_and(|p|p.running());
     let paused = state.proxy.lock().await.as_ref().is_some_and(|p| p.running() && p.paused());
     let detected = detected_agents_with_selection(&config);
@@ -309,6 +309,13 @@ fn validate_jev_policy(policy:&RoutingPolicy)->Result<(),String>{
     Ok(())
 }
 
+fn require_new_key_after_provider_change(saved: &RoutingPolicy, draft: &RoutingPolicy, key: Option<&str>) -> anyhow::Result<()> {
+    if saved.decision_provider != draft.decision_provider && key.is_none() {
+        return Err(anyhow!("Enter a new decision API key after changing provider"));
+    }
+    Ok(())
+}
+
 fn save_decision_policy(store: &ConfigStore, mut policy: RoutingPolicy, api_key: Option<&str>) -> Result<(), String> {
     validate_jev_policy(&policy)?;
     policy.jev_model = policy.jev_model.trim().to_owned();
@@ -316,9 +323,7 @@ fn save_decision_policy(store: &ConfigStore, mut policy: RoutingPolicy, api_key:
     let key = api_key.map(str::trim).filter(|value| !value.is_empty());
     store.update_checked(
         |config| {
-            if config.policy.decision_provider != policy.decision_provider && key.is_none() {
-                return Err(anyhow!("Enter a new decision API key after changing provider"));
-            }
+            require_new_key_after_provider_change(&config.policy, &policy, key)?;
             config.policy = policy;
             Ok(())
         },
@@ -328,12 +333,9 @@ fn save_decision_policy(store: &ConfigStore, mut policy: RoutingPolicy, api_key:
 
 async fn probe_decision_settings(store: &ConfigStore, policy: RoutingPolicy, api_key: Option<&str>) -> Result<String, String> {
     validate_jev_policy(&policy)?;
-    let mut config = store.read();
+    let (mut config, stored) = store.read_with_decision_key();
     let supplied = api_key.map(str::trim).filter(|value| !value.is_empty());
-    if config.policy.decision_provider != policy.decision_provider && supplied.is_none() {
-        return Err("Enter a new decision API key after changing provider".into());
-    }
-    let stored = if supplied.is_none() { store.read_secret("autojev-cloud") } else { None };
+    require_new_key_after_provider_change(&config.policy, &policy, supplied).map_err(|error| error.to_string())?;
     let key = supplied.or(stored.as_deref()).ok_or("Enter a Jev access key")?;
     config.policy = policy;
     let client = config.gateway.client().map_err(|error| error.to_string())?;
@@ -420,13 +422,13 @@ async fn preview_route(
     input: router::RoutePreviewInput,
 ) -> Result<router::RouteDecision, String> {
     let client = Client::new();
-    let mut config = state.store.read();
+    let (mut config, decision_key) = state.store.read_with_decision_key();
     config.install_id = format!("preview:{}", config.install_id);
     if cost::is_cost_route(&config, &input) {
         let store=state.store.clone();
         config.cost_history=tauri::async_runtime::spawn_blocking(move || store.recent_cost_logs().unwrap_or_default()).await.unwrap_or_default();
     }
-    router::decide(&config, &input, &client, state.store.read_secret("autojev-cloud").as_deref())
+    router::decide(&config, &input, &client, decision_key.as_deref())
         .await
         .map(|route| route.decision)
         .map_err(|error| error.to_string())

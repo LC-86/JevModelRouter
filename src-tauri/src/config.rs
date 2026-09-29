@@ -320,6 +320,13 @@ impl ConfigStore {
         self.value.read().expect("config lock poisoned").clone()
     }
 
+    pub fn read_with_decision_key(&self) -> (AppConfig, Option<String>) {
+        // A provider switch holds the write lock through the config/key transaction.
+        let config = self.value.read().expect("config lock poisoned");
+        let key = self.read_secret("autojev-cloud");
+        (config.clone(), key)
+    }
+
     pub fn update<T>(&self, change: impl FnOnce(&mut AppConfig) -> T) -> Result<T> {
         let mut current = self.value.write().expect("config lock poisoned");
         let mut next = current.clone();
@@ -421,6 +428,36 @@ mod storage_tests {
         assert_eq!(restored.decision_provider, DecisionProvider::Openrouter);
         old["decision_provider"] = serde_json::json!("unknown");
         assert!(serde_json::from_value::<RoutingPolicy>(old).is_err());
+    }
+
+    #[test]
+    fn concurrent_provider_changes_never_pair_a_config_with_the_other_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(ConfigStore::load(dir.path().join("decision.db")).unwrap());
+        store.write_secret("autojev-cloud", "openrouter-key").unwrap();
+        let writing = store.clone();
+        let writer = std::thread::spawn(move || {
+            for _ in 0..100 {
+                for (provider, key) in [
+                    (DecisionProvider::Zenmux, "zenmux-key"),
+                    (DecisionProvider::Openrouter, "openrouter-key"),
+                ] {
+                    writing.update_checked(
+                        |config| { config.policy.decision_provider = provider; Ok(()) },
+                        Some(("autojev-cloud", "autojev-cloud", Some(key))),
+                    ).unwrap();
+                }
+            }
+        });
+        for _ in 0..200 {
+            let (config, key) = store.read_with_decision_key();
+            let expected = match config.policy.decision_provider {
+                DecisionProvider::Openrouter => "openrouter-key",
+                DecisionProvider::Zenmux => "zenmux-key",
+            };
+            assert_eq!(key.as_deref(), Some(expected));
+        }
+        writer.join().unwrap();
     }
 
     #[test]

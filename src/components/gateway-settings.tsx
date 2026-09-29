@@ -52,13 +52,13 @@ export function GatewaySettingsPanel({ snapshot, onChange }: { snapshot: Dashboa
     {tab === 'speed' && <SpeedTestSettings/>}
     {tab === 'jev' && <>
     <form className="settings-group stack decision-model-form" onChange={() => { setError(''); setMessage(''); }} onSubmit={e => { e.preventDefault(); void act(async () => { const result = await savePolicy(policy, key || undefined); setKey(''); return result; }); }}>
-      <div className="form-field"><label htmlFor="decision-provider">{t('Provider')}</label><Select id="decision-provider" aria-label={t('Provider')} searchable={false} disabled={busy} value={policy.decision_provider} onChange={e => {
+      <div className="form-field"><label htmlFor="decision-provider">{t('Decision provider')}</label><Select id="decision-provider" aria-label={t('Decision provider')} searchable={false} disabled={busy} value={policy.decision_provider} onChange={e => {
         const selected = e.target.value as DecisionProvider;
         if (selected === policy.decision_provider) return;
         setPolicy({ ...policy, decision_provider: selected, ...decisionDefaults[selected] });
         setKey('');
       }}><option value="openrouter">OpenRouter</option><option value="zenmux">ZenMux</option></Select></div>
-      <label className="form-field">{t('Provider API key')}<input autoCapitalize="none" autoCorrect="off" spellCheck={false} disabled={busy} type="password" autoComplete="off" value={key} placeholder={snapshot.policy.has_autojev_key && !needsNewKey ? t('Credential stored') : 'sk-…'} onChange={e => setKey(e.target.value)} /></label>
+      <label className="form-field">{t('Decision key')}<input autoCapitalize="none" autoCorrect="off" spellCheck={false} disabled={busy} type="password" autoComplete="off" value={key} placeholder={snapshot.policy.has_autojev_key && !needsNewKey ? t('Credential stored') : 'sk-…'} onChange={e => setKey(e.target.value)} /></label>
       <p className="settings-description">{t(needsNewKey ? 'Enter a new decision API key after changing provider' : 'Leave blank to keep the stored key.')}</p>
       <label className="form-field">{t('Decision model ID')}<input autoComplete="off" autoCapitalize="none" autoCorrect="off" spellCheck={false} disabled={busy} required value={policy.jev_model ?? ''} placeholder={decisionDefaults[policy.decision_provider].jev_model} onChange={e => setPolicy({ ...policy, jev_model: e.target.value })}/></label>
       <p className="settings-description">{t('Used to select candidate models; only routing metadata is sent, not conversation content.')}</p>

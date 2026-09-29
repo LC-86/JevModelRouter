@@ -12,7 +12,7 @@ try {
   await page.getByRole('button', { name: '网关与路由', exact: true }).click();
   const provider = page.locator('#decision-provider');
   const model = page.getByLabel('决策模型 ID');
-  const key = page.getByLabel('供应商 API 密钥');
+  const key = page.getByLabel('决策密钥');
   assert.match(await provider.innerText(), /OpenRouter/);
   await provider.click();
   await page.getByRole('option', { name: 'ZenMux' }).click();
