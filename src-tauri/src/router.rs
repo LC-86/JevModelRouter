@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::config::{
-    AppConfig, Model, ModelTier, Provider, ProviderKind, RoutingMode,
+    AppConfig, DecisionProvider, Model, ModelTier, Provider, ProviderKind, RoutingMode,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -692,12 +692,13 @@ fn jev_request_body(
         "constraints": ["Choose exactly one eligible candidate", "Do not expand agent authority"],
         "stakes": if complexity.score > 0.68 { "high" } else if complexity.score > 0.4 { "medium" } else { "low" }
     });
-    let decisions_api = reqwest::Url::parse(&config.policy.jev_endpoint)
-        .map(|url| url.path().trim_end_matches('/') == "/api/alpha/decisions")
-        .unwrap_or(false);
+    let decisions_api = config.policy.decision_provider == DecisionProvider::Zenmux
+        || reqwest::Url::parse(&config.policy.jev_endpoint)
+            .map(|url| url.path().trim_end_matches('/') == "/api/alpha/decisions" || url.path().contains("systemone"))
+            .unwrap_or(false);
     let body = if decisions_api {
         if config.policy.jev_model.trim().is_empty() {
-            return Err(anyhow!("OpenRouter Decisions requires a model ID"));
+            return Err(anyhow!("Choice decision requires a model ID"));
         }
         // Reuse the same metadata for criteria so the two API formats cannot drift.
         let criteria: serde_json::Map<String, Value> = candidates.iter().map(|candidate| {
@@ -746,7 +747,7 @@ async fn ask_jev(
     let response = if decisions_api {
         let answer = &response["answers"]["route"];
         if answer["type"] != "choice" {
-            return Err(anyhow!("Invalid OpenRouter Decisions response: missing route choice"));
+            return Err(anyhow!("Invalid Choice response: missing route choice"));
         }
         answer.clone()
     } else if !config.policy.jev_model.trim().is_empty() {
@@ -1217,6 +1218,39 @@ mod jev_service_tests {
             server.abort();
         }
     }
+    #[tokio::test]
+    async fn zenmux_probe_sends_choice_metadata_and_returns_selected_model() {
+        for (provider, path) in [
+            (DecisionProvider::Zenmux, "/api/v1/systemone"),
+            (DecisionProvider::Zenmux, "/custom-decision-path"),
+            (DecisionProvider::Openrouter, "/api/v1/systemone"),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let mut config = AppConfig::default();
+            let chosen = config.models[1].id.clone();
+            let selected_name = config.models[1].name.clone();
+            let server = tokio::spawn(async move {
+                axum::serve(listener, Router::new().route(path, post(move |headers: axum::http::HeaderMap, Json(body): Json<Value>| {
+                    let chosen = chosen.clone();
+                    async move {
+                        assert_eq!(headers["authorization"], "Bearer fixture-key");
+                        assert_eq!(body["model"], "typesafe/jev-1.13");
+                        assert_eq!(body["questions"]["route"]["type"], "choice");
+                        assert!(body["state"]["candidates"].is_array());
+                        assert!(body.get("messages").is_none());
+                        Json(json!({"answers":{"route":{"type":"choice","choice":chosen,"confidence":0.9}}}))
+                    }
+                }))).await.unwrap();
+            });
+            config.policy.decision_provider = provider;
+            config.policy.jev_endpoint = format!("http://127.0.0.1:{port}{path}");
+            config.policy.jev_model = "typesafe/jev-1.13".into();
+            assert_eq!(probe_jev(&config, &Client::new(), "fixture-key").await.unwrap(), selected_name);
+            server.abort();
+        }
+    }
+
     #[tokio::test]
     async fn decisions_probe_rejects_errors_and_malformed_answers() {
         for (status, response) in [

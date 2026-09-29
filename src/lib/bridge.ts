@@ -20,6 +20,7 @@ const MOCK: DashboardSnapshot = {
     prefer_local: false,
     use_jev_when_ambiguous: true,
     jev_endpoint: 'https://openrouter.ai/api/alpha/decisions',
+    decision_provider: 'openrouter',
     jev_model: '~typesafe/jev-latest',
     has_autojev_key: false,
     savings_baseline_model_id: 'claude-sonnet-4',
@@ -187,7 +188,9 @@ export async function deleteModel(id: string): Promise<DashboardSnapshot> {
 
 export async function savePolicy(policy: RoutingPolicy, autojevKey?: string): Promise<DashboardSnapshot> {
   if (!isTauri()) {
-    MOCK.policy = { ...policy, has_autojev_key: Boolean(autojevKey) || policy.has_autojev_key };
+    const sameProvider = policy.decision_provider === MOCK.policy.decision_provider;
+    if (!sameProvider && !autojevKey?.trim()) throw new Error('Enter a new decision API key after changing provider');
+    MOCK.policy = { ...policy, has_autojev_key: Boolean(autojevKey?.trim()) || (sameProvider && MOCK.policy.has_autojev_key) };
     return structuredClone(MOCK);
   }
   return invoke('save_policy', { policy, autojevKey: autojevKey || null });

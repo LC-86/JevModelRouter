@@ -265,7 +265,7 @@ async fn forward_attempt(context: ProxyContext, headers: HeaderMap, body: Value,
     if let Some(binding) = headers.get("x-autojev-binding").and_then(|v| v.to_str().ok()) {
         input.requested_model = Some(format!("autojev/{binding}"));
     }
-    let mut config = context.store.read();
+    let (mut config, decision_key) = context.store.read_with_decision_key();
     crate::traffic::resolve_requested_model(&mut capture.lock().unwrap().log, &config, input.requested_model.as_deref().unwrap_or(""));
     let session_config = serde_json::to_string(&(&config.routes, &config.models, &config.providers, &config.policy)).unwrap_or_default();
     config.models.retain(|m| !tried.contains(&m.id) && context.health.available(&m.id));
@@ -347,7 +347,7 @@ async fn forward_attempt(context: ProxyContext, headers: HeaderMap, body: Value,
             route.decision.reason = "Kept the model selected for this agent session.".into();
             route
         }
-        None => match decide(&config, &input, &context.client, context.store.read_secret("autojev-cloud").as_deref()).await {
+        None => match decide(&config, &input, &context.client, decision_key.as_deref()).await {
             Ok(route) => {
                 if let Some(id) = session_id {
                     let mut sessions = context.sessions.lock().await;

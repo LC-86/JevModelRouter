@@ -87,12 +87,22 @@ pub struct RoutingPolicy {
     pub use_jev_when_ambiguous: bool,
     pub jev_endpoint: String,
     #[serde(default)]
+    pub decision_provider: DecisionProvider,
+    #[serde(default)]
     pub jev_model: String,
     #[serde(default)]
     pub decision_preference: String,
     #[serde(default)]
     pub has_autojev_key: bool,
     pub savings_baseline_model_id: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionProvider {
+    #[default]
+    Openrouter,
+    Zenmux,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -235,6 +245,7 @@ impl Default for AppConfig {
                 prefer_local: false,
                 use_jev_when_ambiguous: true,
                 jev_model: "~typesafe/jev-latest".into(),
+                decision_provider: DecisionProvider::Openrouter,
                 decision_preference: "balanced".into(),
                 jev_endpoint: "https://openrouter.ai/api/alpha/decisions".into(),
                 has_autojev_key: false,
@@ -307,6 +318,13 @@ impl ConfigStore {
 
     pub fn read(&self) -> AppConfig {
         self.value.read().expect("config lock poisoned").clone()
+    }
+
+    pub fn read_with_decision_key(&self) -> (AppConfig, Option<String>) {
+        // A provider switch holds the write lock through the config/key transaction.
+        let config = self.value.read().expect("config lock poisoned");
+        let key = self.read_secret("autojev-cloud");
+        (config.clone(), key)
     }
 
     pub fn update<T>(&self, change: impl FnOnce(&mut AppConfig) -> T) -> Result<T> {
@@ -401,6 +419,46 @@ impl ConfigStore {
 #[cfg(test)]
 mod storage_tests {
     use super::*;
+
+    #[test]
+    fn legacy_decision_provider_defaults_to_openrouter_and_unknown_values_fail() {
+        let mut old = serde_json::to_value(AppConfig::default().policy).unwrap();
+        old.as_object_mut().unwrap().remove("decision_provider");
+        let restored: RoutingPolicy = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(restored.decision_provider, DecisionProvider::Openrouter);
+        old["decision_provider"] = serde_json::json!("unknown");
+        assert!(serde_json::from_value::<RoutingPolicy>(old).is_err());
+    }
+
+    #[test]
+    fn concurrent_provider_changes_never_pair_a_config_with_the_other_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(ConfigStore::load(dir.path().join("decision.db")).unwrap());
+        store.write_secret("autojev-cloud", "openrouter-key").unwrap();
+        let writing = store.clone();
+        let writer = std::thread::spawn(move || {
+            for _ in 0..100 {
+                for (provider, key) in [
+                    (DecisionProvider::Zenmux, "zenmux-key"),
+                    (DecisionProvider::Openrouter, "openrouter-key"),
+                ] {
+                    writing.update_checked(
+                        |config| { config.policy.decision_provider = provider; Ok(()) },
+                        Some(("autojev-cloud", "autojev-cloud", Some(key))),
+                    ).unwrap();
+                }
+            }
+        });
+        for _ in 0..200 {
+            let (config, key) = store.read_with_decision_key();
+            let expected = match config.policy.decision_provider {
+                DecisionProvider::Openrouter => "openrouter-key",
+                DecisionProvider::Zenmux => "zenmux-key",
+            };
+            assert_eq!(key.as_deref(), Some(expected));
+        }
+        writer.join().unwrap();
+    }
 
     #[test]
     fn initializes_database_and_persists_updates() {
