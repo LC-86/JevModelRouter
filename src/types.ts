@@ -1,6 +1,7 @@
 export type ProviderKind = 'openrouter' | 'ollama' | 'openai_compatible';
 export type ModelTier = 'fast' | 'balanced' | 'strong';
 export type RoutingMode = 'observe' | 'assist' | 'auto';
+export type DecisionProvider = 'openrouter' | 'zenmux';
 
 export interface Provider {
   preset?: string;
@@ -39,6 +40,7 @@ export interface RoutingPolicy {
   prefer_local: boolean;
   use_jev_when_ambiguous: boolean;
   jev_endpoint: string;
+  decision_provider: DecisionProvider;
   jev_model?: string;
   decision_preference?: 'balanced' | 'cost' | 'quality' | 'speed';
   has_autojev_key: boolean;

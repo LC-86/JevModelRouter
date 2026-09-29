@@ -308,31 +308,53 @@ fn validate_jev_policy(policy:&RoutingPolicy)->Result<(),String>{
     if !(url.scheme()=="https" || (url.scheme()=="http" && matches!(url.host_str(),Some("127.0.0.1"|"localhost"|"[::1]")))) || !url.username().is_empty() || url.password().is_some() {return Err("Jev endpoint must use HTTPS or loopback HTTP without embedded credentials".into());}
     Ok(())
 }
+
+fn save_decision_policy(store: &ConfigStore, mut policy: RoutingPolicy, api_key: Option<&str>) -> Result<(), String> {
+    validate_jev_policy(&policy)?;
+    policy.jev_model = policy.jev_model.trim().to_owned();
+    policy.has_autojev_key = false;
+    let key = api_key.map(str::trim).filter(|value| !value.is_empty());
+    store.update_checked(
+        |config| {
+            if config.policy.decision_provider != policy.decision_provider && key.is_none() {
+                return Err(anyhow!("Enter a new decision API key after changing provider"));
+            }
+            config.policy = policy;
+            Ok(())
+        },
+        Some(("autojev-cloud", "autojev-cloud", key)),
+    ).map_err(|error| error.to_string())
+}
+
+async fn probe_decision_settings(store: &ConfigStore, policy: RoutingPolicy, api_key: Option<&str>) -> Result<String, String> {
+    validate_jev_policy(&policy)?;
+    let mut config = store.read();
+    let supplied = api_key.map(str::trim).filter(|value| !value.is_empty());
+    if config.policy.decision_provider != policy.decision_provider && supplied.is_none() {
+        return Err("Enter a new decision API key after changing provider".into());
+    }
+    let stored = if supplied.is_none() { store.read_secret("autojev-cloud") } else { None };
+    let key = supplied.or(stored.as_deref()).ok_or("Enter a Jev access key")?;
+    config.policy = policy;
+    let client = config.gateway.client().map_err(|error| error.to_string())?;
+    router::probe_jev(&config, &client, key).await.map_err(|error| {
+        if error.to_string().contains("Add an enabled model") { error.to_string() }
+        else { "Jev test failed: check the endpoint, model ID, credentials and returned candidate ID".into() }
+    })
+}
+
 #[tauri::command]
 async fn test_jev_settings(state:State<'_,AppState>,policy:RoutingPolicy,api_key:Option<String>)->Result<String,String>{
-    validate_jev_policy(&policy)?;
-    let key=api_key.filter(|s|!s.trim().is_empty()).or_else(||state.store.read_secret("autojev-cloud")).ok_or("Enter a Jev access key")?;
-    let mut config=state.store.read();config.policy=policy;
-    let client=config.gateway.client().map_err(|e|e.to_string())?;
-    router::probe_jev(&config,&client,key.trim()).await.map_err(|_|"Jev test failed: check the endpoint, model ID, credentials and returned candidate ID".into())
+    probe_decision_settings(&state.store, policy, api_key.as_deref()).await
 }
 
 #[tauri::command]
 async fn save_policy(
     state: State<'_, AppState>,
-    mut policy: RoutingPolicy,
+    policy: RoutingPolicy,
     autojev_key: Option<String>,
 ) -> Result<DashboardSnapshot, String> {
-    validate_jev_policy(&policy)?;
-    policy.jev_model=policy.jev_model.trim().to_owned();
-    policy.has_autojev_key = false;
-    if let Some(key) = autojev_key.filter(|value| !value.trim().is_empty()) {
-        state.store.write_secret("autojev-cloud", key.trim()).map_err(|error| error.to_string())?;
-    }
-    state
-        .store
-        .update(|config| config.policy = policy)
-        .map_err(|error| error.to_string())?;
+    save_decision_policy(&state.store, policy, autojev_key.as_deref())?;
     Ok(snapshot(&state).await)
 }
 
@@ -854,6 +876,110 @@ pub fn run() {
             tauri::RunEvent::Reopen{..}=>show_main(app),
             _=>{}
         }});
+}
+
+#[cfg(test)]
+mod decision_policy_tests {
+    use super::*;
+    use config::DecisionProvider;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use axum::{Router, routing::post, Json};
+
+    #[test]
+    fn changing_decision_provider_requires_a_new_key_and_keeps_saved_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("decision.db");
+        let store = ConfigStore::load(path.clone()).unwrap();
+        store.write_secret("autojev-cloud", "old-fixture-key").unwrap();
+        let mut draft = store.read().policy;
+        draft.decision_provider = DecisionProvider::Zenmux;
+        draft.jev_endpoint = "https://zenmux.ai/api/v1/systemone".into();
+        draft.jev_model = "typesafe/jev-1.13".into();
+        assert!(save_decision_policy(&store, draft, None).is_err());
+        let reopened = ConfigStore::load(path).unwrap();
+        assert_eq!(reopened.read().policy.decision_provider, DecisionProvider::Openrouter);
+        assert_eq!(reopened.read_secret("autojev-cloud").as_deref(), Some("old-fixture-key"));
+    }
+
+    #[test]
+    fn zenmux_save_roundtrips_and_keeps_key_on_same_provider_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("decision.db");
+        let store = ConfigStore::load(path.clone()).unwrap();
+        store.write_secret("autojev-cloud", "old-fixture-key").unwrap();
+        let mut draft = store.read().policy;
+        draft.decision_provider = DecisionProvider::Zenmux;
+        draft.jev_endpoint = "https://zenmux.ai/api/v1/systemone".into();
+        draft.jev_model = "typesafe/jev-1.13".into();
+        save_decision_policy(&store, draft, Some("new-fixture-key")).unwrap();
+        let reopened = ConfigStore::load(path.clone()).unwrap();
+        let mut saved = reopened.read().policy;
+        assert_eq!(saved.decision_provider, DecisionProvider::Zenmux);
+        assert_eq!(saved.jev_endpoint, "https://zenmux.ai/api/v1/systemone");
+        assert_eq!(saved.jev_model, "typesafe/jev-1.13");
+        assert_eq!(reopened.read_secret("autojev-cloud").as_deref(), Some("new-fixture-key"));
+        saved.jev_model = "typesafe/jev-custom".into();
+        save_decision_policy(&reopened, saved, None).unwrap();
+        let again = ConfigStore::load(path).unwrap();
+        assert_eq!(again.read().policy.jev_model, "typesafe/jev-custom");
+        assert_eq!(again.read_secret("autojev-cloud").as_deref(), Some("new-fixture-key"));
+    }
+
+    #[test]
+    fn failed_decision_save_rolls_back_new_key_and_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("decision.db");
+        let store = ConfigStore::load(path.clone()).unwrap();
+        store.write_secret("autojev-cloud", "old-fixture-key").unwrap();
+        let mut draft = store.read().policy;
+        draft.decision_provider = DecisionProvider::Zenmux;
+        draft.jev_endpoint = "https://zenmux.ai/api/v1/systemone".into();
+        draft.jev_model = "typesafe/jev-1.13".into();
+        rusqlite::Connection::open(&path).unwrap().execute_batch("DROP TABLE app_meta;").unwrap();
+        assert!(save_decision_policy(&store, draft, Some("new-fixture-key")).is_err());
+        assert_eq!(store.read().policy.decision_provider, DecisionProvider::Openrouter);
+        assert_eq!(store.read_secret("autojev-cloud").as_deref(), Some("old-fixture-key"));
+    }
+
+    #[tokio::test]
+    async fn draft_test_never_sends_the_saved_key_to_a_new_decision_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ConfigStore::load(dir.path().join("decision.db")).unwrap();
+        store.write_secret("autojev-cloud", "old-fixture-key").unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let selected = store.read().models[0].clone();
+        let selected_id = selected.id.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/api/v1/systemone", post(move |headers: axum::http::HeaderMap, Json(body): Json<serde_json::Value>| {
+                let seen = seen.clone();
+                let selected_id = selected_id.clone();
+                async move {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(headers["authorization"], "Bearer new-fixture-key");
+                    assert_eq!(body["model"], "typesafe/jev-1.13");
+                    Json(serde_json::json!({"answers":{"route":{"type":"choice","choice":selected_id,"confidence":0.9}}}))
+                }
+            }))).await.unwrap();
+        });
+        let mut draft = store.read().policy;
+        draft.decision_provider = DecisionProvider::Zenmux;
+        draft.jev_endpoint = format!("http://127.0.0.1:{port}/api/v1/systemone");
+        draft.jev_model = "typesafe/jev-1.13".into();
+        assert!(probe_decision_settings(&store, draft.clone(), None).await.unwrap_err().contains("new decision API key"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(probe_decision_settings(&store, draft.clone(), Some("new-fixture-key")).await.unwrap(), selected.name);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        save_decision_policy(&store, draft.clone(), Some("new-fixture-key")).unwrap();
+        assert_eq!(probe_decision_settings(&store, draft.clone(), None).await.unwrap(), selected.name);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        store.update(|config| config.models.iter_mut().for_each(|model| model.enabled = false)).unwrap();
+        assert!(probe_decision_settings(&store, draft, None).await.unwrap_err().contains("Add an enabled model"));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        server.abort();
+    }
 }
 
 #[cfg(test)]

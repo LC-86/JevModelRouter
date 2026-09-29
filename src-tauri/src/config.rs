@@ -87,12 +87,22 @@ pub struct RoutingPolicy {
     pub use_jev_when_ambiguous: bool,
     pub jev_endpoint: String,
     #[serde(default)]
+    pub decision_provider: DecisionProvider,
+    #[serde(default)]
     pub jev_model: String,
     #[serde(default)]
     pub decision_preference: String,
     #[serde(default)]
     pub has_autojev_key: bool,
     pub savings_baseline_model_id: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionProvider {
+    #[default]
+    Openrouter,
+    Zenmux,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -235,6 +245,7 @@ impl Default for AppConfig {
                 prefer_local: false,
                 use_jev_when_ambiguous: true,
                 jev_model: "~typesafe/jev-latest".into(),
+                decision_provider: DecisionProvider::Openrouter,
                 decision_preference: "balanced".into(),
                 jev_endpoint: "https://openrouter.ai/api/alpha/decisions".into(),
                 has_autojev_key: false,
@@ -401,6 +412,16 @@ impl ConfigStore {
 #[cfg(test)]
 mod storage_tests {
     use super::*;
+
+    #[test]
+    fn legacy_decision_provider_defaults_to_openrouter_and_unknown_values_fail() {
+        let mut old = serde_json::to_value(AppConfig::default().policy).unwrap();
+        old.as_object_mut().unwrap().remove("decision_provider");
+        let restored: RoutingPolicy = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(restored.decision_provider, DecisionProvider::Openrouter);
+        old["decision_provider"] = serde_json::json!("unknown");
+        assert!(serde_json::from_value::<RoutingPolicy>(old).is_err());
+    }
 
     #[test]
     fn initializes_database_and_persists_updates() {

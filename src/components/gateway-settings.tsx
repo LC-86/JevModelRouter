@@ -1,22 +1,24 @@
 import { CircleCheck, CircleAlert, LoaderCircle, Play } from 'lucide-react';
 import { SpeedTestSettings } from './model-speed-tests';
 import { useState } from 'react';
-import type { DashboardSnapshot, GatewaySettings } from '../types';
+import type { DashboardSnapshot, DecisionProvider, GatewaySettings } from '../types';
 import { gatewayDefaults, saveGatewaySettings, savePolicy, testJevSettings } from '../lib/bridge';
 import { usePreferences } from '../lib/preferences-context';
 import { Select } from './select';
+
+const decisionDefaults: Record<DecisionProvider, { jev_endpoint: string; jev_model: string }> = {
+  openrouter: { jev_endpoint: 'https://openrouter.ai/api/alpha/decisions', jev_model: '~typesafe/jev-latest' },
+  zenmux: { jev_endpoint: 'https://zenmux.ai/api/v1/systemone', jev_model: 'typesafe/jev-1.13' },
+};
 
 export function GatewaySettingsPanel({ snapshot, onChange }: { snapshot: DashboardSnapshot; onChange: (s: DashboardSnapshot) => void }) {
   const { t } = usePreferences();
   const [gateway, setGateway] = useState(snapshot.gateway ?? gatewayDefaults);
   const [tab, setTab] = useState('jev');
   const tabs = [['jev', 'Decision model'], ['gateway', 'Gateway settings'], ['speed', 'Model speed tests']] as const;
-  const [policy, setPolicy] = useState({ ...snapshot.policy,
-    jev_endpoint: 'https://openrouter.ai/api/alpha/decisions',
-    jev_model: snapshot.policy.jev_endpoint === 'https://openrouter.ai/api/alpha/decisions' && snapshot.policy.jev_model
-      ? snapshot.policy.jev_model : '~typesafe/jev-latest',
-  });
+  const [policy, setPolicy] = useState(snapshot.policy);
   const [key, setKey] = useState('');
+  const needsNewKey = policy.decision_provider !== snapshot.policy.decision_provider && !key.trim();
   const [busy, setBusy] = useState(false);
   const [testing, setTesting] = useState(false);
   const [message, setMessage] = useState('');
@@ -50,14 +52,19 @@ export function GatewaySettingsPanel({ snapshot, onChange }: { snapshot: Dashboa
     {tab === 'speed' && <SpeedTestSettings/>}
     {tab === 'jev' && <>
     <form className="settings-group stack decision-model-form" onChange={() => { setError(''); setMessage(''); }} onSubmit={e => { e.preventDefault(); void act(async () => { const result = await savePolicy(policy, key || undefined); setKey(''); return result; }); }}>
-      <div className="form-field"><label htmlFor="decision-provider">{t('Provider')}</label><Select id="decision-provider" aria-label={t('Provider')} searchable={false} disabled={busy} value="openrouter" onChange={() => {}}><option value="openrouter">OpenRouter</option></Select></div>
-      <label className="form-field">{t('Provider API key')}<input autoCapitalize="none" autoCorrect="off" spellCheck={false} disabled={busy} type="password" autoComplete="off" value={key} placeholder={snapshot.policy.has_autojev_key ? t('Credential stored') : 'sk-or-…'} onChange={e => setKey(e.target.value)} /></label>
-      <p className="settings-description">{t('Leave blank to keep the stored key.')}</p>
-      <label className="form-field">{t('Decision model ID')}<input autoComplete="off" autoCapitalize="none" autoCorrect="off" spellCheck={false} disabled={busy} required value={policy.jev_model} placeholder="~typesafe/jev-latest" onChange={e => setPolicy({ ...policy, jev_model: e.target.value })}/></label>
-      <p className="settings-description">{t('Defaults to OpenRouter Jev. Used to select candidate models; only routing metadata is sent, not conversation content.')}</p>
-      <div className="provider-dialog-actions"><button type="button" className="button ghost" disabled={busy || !policy.jev_model.trim()} onClick={async () => {
+      <div className="form-field"><label htmlFor="decision-provider">{t('Provider')}</label><Select id="decision-provider" aria-label={t('Provider')} searchable={false} disabled={busy} value={policy.decision_provider} onChange={e => {
+        const selected = e.target.value as DecisionProvider;
+        if (selected === policy.decision_provider) return;
+        setPolicy({ ...policy, decision_provider: selected, ...decisionDefaults[selected] });
+        setKey('');
+      }}><option value="openrouter">OpenRouter</option><option value="zenmux">ZenMux</option></Select></div>
+      <label className="form-field">{t('Provider API key')}<input autoCapitalize="none" autoCorrect="off" spellCheck={false} disabled={busy} type="password" autoComplete="off" value={key} placeholder={snapshot.policy.has_autojev_key && !needsNewKey ? t('Credential stored') : 'sk-…'} onChange={e => setKey(e.target.value)} /></label>
+      <p className="settings-description">{t(needsNewKey ? 'Enter a new decision API key after changing provider' : 'Leave blank to keep the stored key.')}</p>
+      <label className="form-field">{t('Decision model ID')}<input autoComplete="off" autoCapitalize="none" autoCorrect="off" spellCheck={false} disabled={busy} required value={policy.jev_model ?? ''} placeholder={decisionDefaults[policy.decision_provider].jev_model} onChange={e => setPolicy({ ...policy, jev_model: e.target.value })}/></label>
+      <p className="settings-description">{t('Used to select candidate models; only routing metadata is sent, not conversation content.')}</p>
+      <div className="provider-dialog-actions"><button type="button" className="button ghost" disabled={busy || !policy.jev_model?.trim() || needsNewKey} onClick={async () => {
         setBusy(true);setTesting(true);setError('');setMessage('');try{const model=await testJevSettings(policy,key);setMessage(t('Decision model test passed. Selected: {model}',{model}));}catch(e){setError(t(String(e instanceof Error ? e.message : e)));}finally{setBusy(false);setTesting(false);}
-      }}>{testing ? <LoaderCircle size={15} className="import-spinner"/> : <Play size={15}/>} {t(testing ? 'Testing…' : 'Test')}</button><button className="button primary" disabled={busy}>{t('Save decision model')}</button></div>
+      }}>{testing ? <LoaderCircle size={15} className="import-spinner"/> : <Play size={15}/>} {t(testing ? 'Testing…' : 'Test')}</button><button className="button primary" disabled={busy || needsNewKey}>{t('Save decision model')}</button></div>
     </form>
     </>}
     {tab === 'gateway' && <form className="settings-group gateway-form" onSubmit={e => { e.preventDefault(); void act(() => saveGatewaySettings(gateway)); }}>
