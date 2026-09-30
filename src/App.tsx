@@ -298,7 +298,7 @@ export default function App() {
                 } catch (error) { setToast(String(error), true); }
               }}
               testStates={providerTests}
-onAuth={(provider) => setAuthTarget(provider)}
+              onAuth={(provider) => setAuthTarget(provider)}
               onSnapshot={setSnapshot}
               onNotify={setToast}
               onRefreshSubscription={async (provider) => {
@@ -590,7 +590,7 @@ function ProvidersPage({ snapshot, onAdd, onEdit, onDelete, onTest, onImport, on
             {providers.map((provider) => {
               const subscription = isSubscriptionProvider(provider);
               const view = subscription ? subscriptionView(snapshot, provider.id) : undefined;
-const auth = subscription ? subscriptionAuthView(snapshot, provider.id) : undefined;
+              const auth = subscription ? subscriptionAuthView(snapshot, provider.id) : undefined;
               const available = subscriptionActions(view?.state ?? 'not_connected');
               const busyAction = subscriptionBusy[provider.id];
               const login = view?.login ?? null;

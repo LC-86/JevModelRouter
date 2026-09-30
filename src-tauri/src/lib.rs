@@ -88,7 +88,7 @@ async fn snapshot(state: &AppState) -> DashboardSnapshot {
     let port = state.proxy.lock().await.as_ref().map_or(config.port, |p| p.port);
     let paused = state.proxy.lock().await.as_ref().is_some_and(|p| p.running() && p.paused());
     let detected = detected_agents_with_selection(&config);
-let helper = state.store.subscription.helper_status();
+    let helper = state.store.subscription.helper_status();
     // 只有适配器真正支持的订阅行才能带上 helper 版本与授权目录，其余行如实不可用。
     let supported: Vec<String> = config
         .providers
@@ -557,7 +557,7 @@ async fn delete_provider(
     state: State<'_, AppState>,
     id: String,
 ) -> Result<DashboardSnapshot, String> {
-// 删除前释放两套订阅资源：#13 的适配器/内存会话（Codex 等）与本票的 Grok 授权生命周期。
+    // 删除前释放两套订阅资源：#13 的适配器/内存会话（Codex 等）与本票的 Grok 授权生命周期。
     // 任一失败都中止删除，provider 与连接都保留；非该 kind 的调用按各自实现是空操作。
     subscription::dispose(&state.store, &id, &state.sessions).await?;
     if managed_by_grok_auth(&state.store.read(), &id) {
