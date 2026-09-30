@@ -192,6 +192,106 @@ async fn gateway_ephemeral_port_preserves_protocols_and_persistence() {
 }
 
 #[tokio::test]
+async fn gateway_denies_subscription_generation_without_reaching_any_upstream() {
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let counted = calls.clone();
+    let upstream = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new().fallback(post(move || {
+                let counted = counted.clone();
+                async move {
+                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Json(serde_json::json!({"choices":[{"message":{"role":"assistant","content":"ok"}}]})).into_response()
+                }
+            })),
+        )
+        .await
+        .unwrap();
+    });
+    let temp = tempfile::tempdir().unwrap();
+    let store = Arc::new(ConfigStore::load(temp.path().join("subscription.db")).unwrap());
+    store
+        .update(|c| {
+            c.port = 0;
+            c.models.truncate(1);
+            c.models[0].model_id = "fixture-model".into();
+            c.providers[0].base_url = format!("http://{address}");
+            c.policy.use_jev_when_ambiguous = false;
+            c.gateway.proxy_mode = "direct".into();
+            // 订阅服务商与它的模型：身份、凭据与 API 服务商分开。
+            let mut provider = c.providers[0].clone();
+            provider.id = "codex".into();
+            provider.name = "Codex".into();
+            provider.kind = crate::config::ProviderKind::CodexSubscription;
+            provider.base_url = String::new();
+            provider.test_model = String::new();
+            c.providers.push(provider.clone());
+            let mut model = c.models[0].clone();
+            model.id = "codex-subscription-model".into();
+            model.provider_id = provider.id.clone();
+            model.model_id = "codex-fixture-model".into();
+            c.models.push(model);
+            crate::subscription::sync_provider(c, &provider.id, &provider.kind);
+        })
+        .unwrap();
+    store.write_secret("provider:openrouter", "fixture-key").unwrap();
+    let gateway = crate::proxy::start(store.clone()).await.unwrap();
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let url = format!("http://127.0.0.1:{}/v1/chat/completions", gateway.port);
+    let body = |model: &str| {
+        serde_json::json!({"model": model, "messages": [{"role": "user", "content": "fictional"}]})
+    };
+
+    // 未连接的订阅目标：网关、Debug 与测试入口共用的准入在派发前拒绝。
+    for source in [Protocol::Chat, Protocol::Responses, Protocol::Messages] {
+        let reply = client
+            .post(format!("http://127.0.0.1:{}{}", gateway.port, source.path()))
+            .json(&body("autojev/model/codex-subscription-model"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(reply.status(), 428, "{source:?}");
+        assert_eq!(reply.headers()["x-autojev-subscription-denial"], "not_connected");
+        assert_eq!(reply.headers()["x-should-retry"], "false");
+        assert!(reply.text().await.unwrap().contains("not_connected"));
+    }
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0, "denied subscription work must never reach an upstream");
+
+    // 停用该服务商后拒绝原因随之改变，仍然零派发。
+    store.update(|c| c.providers.iter_mut().find(|p| p.id == "codex").unwrap().enabled = false).unwrap();
+    let reply = client.post(&url).json(&body("autojev/model/codex-subscription-model")).send().await.unwrap();
+    assert_eq!(reply.status(), 403);
+    assert!(reply.text().await.unwrap().contains("provider_disabled"));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    // 已连接但没有任何只读证据：按缺失证据拒绝，不是放行也不是笼统失败。
+    store
+        .update(|c| {
+            c.providers.iter_mut().find(|p| p.id == "codex").unwrap().enabled = true;
+            let connection = c.subscriptions.get_mut("codex").unwrap();
+            connection.state = crate::subscription::ConnectionState::Connected;
+            connection.identity = Some("fixture@example.invalid".into());
+        })
+        .unwrap();
+    let reply = client.post(&url).json(&body("autojev/model/codex-subscription-model")).send().await.unwrap();
+    assert_eq!(reply.status(), 428);
+    assert!(reply.text().await.unwrap().contains("evidence_missing"));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    // 自动选路不会选中被拒绝的订阅模型，API 目标仍然照常工作。
+    let reply = client.post(&url).json(&body("autojev/auto")).send().await.unwrap();
+    assert_eq!(reply.status(), 200);
+    assert_eq!(reply.headers()["x-autojev-model"], "fixture-model");
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    gateway.stop().await;
+    upstream.abort();
+}
+
+#[tokio::test]
 async fn isolated_gateway_rejects_remote_targets_and_never_follows_redirects() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();

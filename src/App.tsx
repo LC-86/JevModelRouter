@@ -58,6 +58,10 @@ import { SearchSelect } from './components/search-select';
 import { BrandMark } from './components/brand-mark';
 import { rangeStart, summarize } from './lib/traffic';
 import {
+  capabilityLabel, connectionStateLabel, connectionStateTone, denialLabel, identityLabel, isSubscriptionKind,
+  isSubscriptionProvider, modelCapability, protocolKey, quotaLabel, subscriptionReason, subscriptionView,
+} from './lib/subscription';
+import {
   connectAgent,
   deleteModel,
   deleteProvider,
@@ -69,6 +73,7 @@ import {
   getGatewayHealth,
   resetGatewayHealth,
   importProviders,
+  refreshSubscription,
   restoreAgent,
   saveModel,
   saveProvider,
@@ -282,6 +287,12 @@ export default function App() {
                 } catch (error) { setToast(String(error), true); }
               }}
               testStates={providerTests}
+              onRefreshSubscription={async (provider) => {
+                try {
+                  setSnapshot(await refreshSubscription(provider.id));
+                  setToast(t('Read-only status refreshed'));
+                } catch (error) { setToast(String(error instanceof Error ? error.message : error), true); }
+              }}
               onTest={async (id) => {
                 setProviderTests((previous) => ({ ...previous, [id]: 'testing' }));
                 try {
@@ -494,14 +505,21 @@ function ProviderImport({ onImport }: { onImport: (source: 'ccswitch' | 'termany
   </div>;
 }
 
-function ProvidersPage({ snapshot, onAdd, onEdit, onDelete, onTest, onImport, testStates, onToggle }: { onToggle: (provider: Provider) => Promise<void>; testStates: Record<string, ProviderTestStatus>; onImport: (source: 'ccswitch' | 'termany') => Promise<void>; snapshot: DashboardSnapshot; onAdd: () => void; onEdit: (p: Provider) => void; onDelete: (id: string) => void; onTest: (id: string) => void }) {
+function ProvidersPage({ snapshot, onAdd, onEdit, onDelete, onTest, onImport, onRefreshSubscription, testStates, onToggle }: { onToggle: (provider: Provider) => Promise<void>; onRefreshSubscription: (provider: Provider) => Promise<void>; testStates: Record<string, ProviderTestStatus>; onImport: (source: 'ccswitch' | 'termany') => Promise<void>; snapshot: DashboardSnapshot; onAdd: () => void; onEdit: (p: Provider) => void; onDelete: (id: string) => void; onTest: (id: string) => void }) {
   const { t } = usePreferences();
   const [toggling, setToggling] = useState<Record<string, boolean>>({});
+  const [refreshing, setRefreshing] = useState<Record<string, boolean>>({});
   const toggle = async (provider: Provider) => {
     if (toggling[provider.id]) return;
     setToggling((previous) => ({ ...previous, [provider.id]: true }));
     try { await onToggle(provider); }
     finally { setToggling((previous) => ({ ...previous, [provider.id]: false })); }
+  };
+  const refresh = async (provider: Provider) => {
+    if (refreshing[provider.id]) return;
+    setRefreshing((previous) => ({ ...previous, [provider.id]: true }));
+    try { await onRefreshSubscription(provider); }
+    finally { setRefreshing((previous) => ({ ...previous, [provider.id]: false })); }
   };
   const providers = sortProviders(snapshot.providers, testStates);
   return (
@@ -509,17 +527,21 @@ function ProvidersPage({ snapshot, onAdd, onEdit, onDelete, onTest, onImport, te
       <PageIntro title={t("Providers")} body={t("Keys are stored in the local database.")} action={<div className="provider-actions"><ProviderImport onImport={onImport} /><button className="button primary" onClick={onAdd}><Plus size={16} /> {t("Add provider")}</button></div>} />
       <div className="table-panel provider-table-panel">
         <table className="provider-table">
-          <thead><tr><th>{t('Provider')}</th><th>{t('Base URL')}</th><th>{t('Enabled status')}</th><th>{t('API key')}</th><th className="provider-actions-heading">{t('Actions')}</th></tr></thead>
+          <thead><tr><th>{t('Provider')}</th><th>{t('Base URL')}</th><th>{t('Enabled status')}</th><th>{t('Subscription')}</th><th>{t('API key')}</th><th className="provider-actions-heading">{t('Actions')}</th></tr></thead>
           <tbody>
-            {providers.map((provider) => (
+            {providers.map((provider) => {
+              const subscription = isSubscriptionProvider(provider);
+              const view = subscription ? subscriptionView(snapshot, provider.id) : undefined;
+              return (
               <tr key={provider.id}>
                 <td><div className="provider-table-name"><span className="provider-table-icon"><ProviderLogo id={providerPreset(provider)} /></span><div><strong>{provider.name}</strong><small>{provider.id}</small></div></div></td>
-                <td><code className="provider-table-url" title={provider.base_url}>{provider.base_url}</code></td>
+                <td>{subscription ? <span className="provider-subscription-identity" title={t('Subscription identity')}><ShieldCheck size={14} aria-hidden="true" />{identityLabel(view, t)}</span> : <code className="provider-table-url" title={provider.base_url}>{provider.base_url}</code>}</td>
                 <td><div className="provider-enabled-cell"><button type="button" role="switch" aria-checked={provider.enabled} aria-label={t('Enable {provider}', { provider: provider.name })} disabled={toggling[provider.id]} className={cx('switch', provider.enabled && 'on')} onClick={() => void toggle(provider)}><span /></button><span>{t(provider.enabled ? 'ENABLED' : 'DISABLED')}</span></div></td>
-                <td><span className="provider-table-key"><KeyRound size={14} />{provider.kind === 'ollama' ? t('No API key required') : provider.has_api_key ? t('API key saved locally') : t('API key required')}</span></td>
-                <td><div className="row-actions"><button className="icon-action" disabled={testStates[provider.id] === 'testing'} title={t(testStates[provider.id] === 'testing' ? 'Testing…' : 'Test')} aria-label={t(testStates[provider.id] === 'testing' ? 'Testing…' : 'Test')} onClick={() => onTest(provider.id)}>{testStates[provider.id] === 'testing' ? <LoaderCircle size={15} className="import-spinner" /> : <Play size={15} />}</button><button className="icon-action" onClick={() => onEdit(provider)} title={t('Configure')} aria-label={t('Configure')}><Settings2 size={15} /></button><button className="icon-action danger" onClick={() => onDelete(provider.id)} title={t('Delete')} aria-label={t('Delete')}><Trash2 size={15} /></button></div></td>
+                <td>{subscription ? <div className="provider-subscription-status"><span className={cx('provider-connection', connectionStateTone(view?.state ?? 'not_connected'))}><Plug size={14} aria-hidden="true" />{connectionStateLabel(view?.state ?? 'not_connected', t)}</span><span className="provider-subscription-detail">{view && view.models.length > 0 ? t('{count} discovered models', { count: view.models.length }) : t('No discovered models yet')}</span>{subscriptionReason(view, t) && <span className="provider-subscription-reason" role="status" title={subscriptionReason(view, t)}>{denialLabel(view?.denial, t) || quotaLabel(view?.quota.state ?? 'unknown', t)}</span>}</div> : <span className="provider-table-key">{t('Not a subscription provider')}</span>}</td>
+                <td><span className="provider-table-key"><KeyRound size={14} />{subscription ? t('No API key is used for subscription providers.') : provider.kind === 'ollama' ? t('No API key required') : provider.has_api_key ? t('API key saved locally') : t('API key required')}</span></td>
+                <td><div className="row-actions">{subscription && <button className="icon-action" disabled={refreshing[provider.id]} title={t('Refresh read-only status')} aria-label={t('Refresh read-only status')} onClick={() => void refresh(provider)}>{refreshing[provider.id] ? <LoaderCircle size={15} className="import-spinner" /> : <RefreshCw size={15} />}</button>}{!subscription && <button className="icon-action" disabled={testStates[provider.id] === 'testing'} title={t(testStates[provider.id] === 'testing' ? 'Testing…' : 'Test')} aria-label={t(testStates[provider.id] === 'testing' ? 'Testing…' : 'Test')} onClick={() => onTest(provider.id)}>{testStates[provider.id] === 'testing' ? <LoaderCircle size={15} className="import-spinner" /> : <Play size={15} />}</button>}<button className="icon-action" onClick={() => onEdit(provider)} title={t('Configure')} aria-label={t('Configure')}><Settings2 size={15} /></button><button className="icon-action danger" onClick={() => onDelete(provider.id)} title={t('Delete')} aria-label={t('Delete')}><Trash2 size={15} /></button></div></td>
               </tr>
-            ))}
+            ); })}
           </tbody>
         </table>
         {snapshot.providers.length === 0 && <EmptyState icon={<Server />} title={t('No providers yet')} body={t('Add a provider or import from CC Switch or Termany.')} />}
@@ -593,7 +615,7 @@ function ModelsPage({ snapshot, onAdd, onEdit, onDelete, onChange, onNotify }: {
     if (!provider) return;
     setTests(previous => ({ ...previous, [model.id]: 'testing' }));
     try {
-      await testProviderDraft({ ...provider, api_type: model.api_type || provider.api_type, test_model: model.model_id });
+      await testProviderDraft({ ...provider, api_type: isSubscriptionProvider(provider) ? '' : model.api_type || provider.api_type, test_model: model.model_id });
       setTests(previous => ({ ...previous, [model.id]: 'success' }));
       onNotify(t('Test request succeeded.'));
     } catch (error) {
@@ -612,6 +634,8 @@ function ModelsPage({ snapshot, onAdd, onEdit, onDelete, onChange, onNotify }: {
         {snapshot.models.map((model) => {
           const provider = snapshot.providers.find(p => p.id === model.provider_id);
           const modelHealth = health.find(h => h.model_id === model.id && h.state !== 'healthy');
+          const subscription = isSubscriptionProvider(provider) ? subscriptionView(snapshot, model.provider_id) : undefined;
+          const capability = subscription ? modelCapability(subscription, model.model_id, protocolKey(model.api_type || provider?.api_type || 'chat_completions')) : undefined;
           return (
           <tr key={model.id} className={speedTests.selected.includes(model.id) ? 'is-selected' : undefined}>
             <td className="model-speed-check"><label className="model-selection"><input autoComplete="off" autoCapitalize="none" type="checkbox" aria-label={t("Select model for speed test") + ": " + model.provider_id + "/" + model.model_id} disabled={!testable.some(m => m.id === model.id)} checked={speedTests.selected.includes(model.id)} onChange={() => speedTests.toggle(model.id)}/></label></td>
@@ -619,7 +643,7 @@ function ModelsPage({ snapshot, onAdd, onEdit, onDelete, onChange, onNotify }: {
             <td><div className="provider-enabled-cell"><button type="button" role="switch" aria-checked={model.enabled} aria-label={t('Enable {provider}', { provider: model.name })} disabled={toggling[model.id]} className={cx('switch', model.enabled && 'on')} onClick={() => void toggle(model)}><span/></button><span>{t(model.enabled ? 'ENABLED' : 'DISABLED')}</span></div>{modelHealth && <div className="model-health-status" title={modelHealth.last_status ? `HTTP ${modelHealth.last_status}` : t('Connection failed')}><span>{t(modelHealth.state === 'cooldown' ? 'Cooling down' : modelHealth.state === 'probing' ? 'Checking recovery' : 'Awaiting recovery')}{modelHealth.retry_after_seconds > 0 ? ` · ${modelHealth.retry_after_seconds}s` : ''}</span><button type="button" className="icon-action" title={t('Clear cooldown')} aria-label={t('Clear cooldown') + ': ' + (model.name || model.model_id)} disabled={clearingCooldown[model.id]} onClick={() => void clearCooldown(model.id)}><RefreshCw size={13} className={clearingCooldown[model.id] ? 'import-spinner' : ''}/></button></div>}</td>
             <td><SpeedCell result={speedTests.view?.models[model.id]} running={speedTests.view?.job.running === true && speedTests.view.job.current_models.includes(model.id)}/></td>
             <td><code className="provider-table-url">{(model.input_price_known ?? model.input_cost_per_million > 0) ? `$${model.input_cost_per_million}` : t('Unknown')} / {(model.output_price_known ?? model.output_cost_per_million > 0) ? `$${model.output_cost_per_million}` : t('Unknown')}</code></td>
-            <td><div className="model-info-cell"><span className={model.supports_vision ? 'model-image-supported' : 'model-image-unsupported'} role="img" aria-label={t(model.supports_vision ? 'Supports image input' : 'Image input not marked as supported')} title={t(model.supports_vision ? 'Supports image input' : 'Image input not marked as supported')}>{model.supports_vision ? <ImageIcon size={16} aria-hidden="true"/> : <ImageOff size={16} aria-hidden="true"/>}</span><span title={t('Context length (tokens)') + ': ' + (model.context_window > 0 ? model.context_window.toLocaleString() : t('Unknown'))}>{model.context_window > 0 ? new Intl.NumberFormat('en', { notation: 'compact', maximumFractionDigits: 2 }).format(model.context_window) : '—'}</span></div></td>
+            <td><div className="model-info-cell"><span className={model.supports_vision ? 'model-image-supported' : 'model-image-unsupported'} role="img" aria-label={t(model.supports_vision ? 'Supports image input' : 'Image input not marked as supported')} title={t(model.supports_vision ? 'Supports image input' : 'Image input not marked as supported')}>{model.supports_vision ? <ImageIcon size={16} aria-hidden="true"/> : <ImageOff size={16} aria-hidden="true"/>}</span><span title={t('Context length (tokens)') + ': ' + (model.context_window > 0 ? model.context_window.toLocaleString() : t('Unknown'))}>{model.context_window > 0 ? new Intl.NumberFormat('en', { notation: 'compact', maximumFractionDigits: 2 }).format(model.context_window) : '—'}</span>{capability && <span className={cx('model-capability-badge', capability)} title={t('Generation stays denied for subscription models until every condition is verified.')}>{capabilityLabel(capability, t)}</span>}</div></td>
             <td><div className="row-actions"><button className="icon-action" disabled={!provider || tests[model.id] === 'testing'} title={t('Test')} aria-label={t('Test')} onClick={() => void test(model)}>{tests[model.id] === 'testing' ? <LoaderCircle size={15} className="import-spinner"/> : <Play size={15}/>}</button><button className="icon-action" title={t("Configure")} aria-label={t("Configure")} onClick={() => onEdit(model)}><Settings2 size={15} /></button><button className="icon-action danger" title={t("Delete")} aria-label={t("Delete")} onClick={() => onDelete(model.id)}><Trash2 size={15} /></button></div></td>
           </tr>
         ); })}
@@ -779,11 +803,15 @@ const PROVIDER_PRESETS = [
   { id: 'ollama', name: 'Ollama', kind: 'ollama', url: 'http://127.0.0.1:11434' },
   { id: 'custom-openai', name: 'OpenAI Compatible', kind: 'openai_compatible', url: '' },
   { id: 'custom-anthropic', name: 'Anthropic Compatible', kind: 'openai_compatible', url: '' },
+  { id: 'codex-subscription', name: 'Codex subscription', kind: 'codex_subscription', url: '' },
+  { id: 'grok-subscription', name: 'Grok subscription', kind: 'grok_subscription', url: '' },
 ] as const;
 
 function providerPreset(provider: Provider) {
   const preset = PROVIDER_PRESETS.find((p) => p.id === provider.preset);
   if (preset) return preset.id;
+  if (provider.kind === 'codex_subscription') return 'codex-subscription';
+  if (provider.kind === 'grok_subscription') return 'grok-subscription';
   let host = '';
   try { host = new URL(provider.base_url).hostname; } catch { /* Use protocol fallback. */ }
   if (host === 'api.deepseek.com') return 'deepseek';
@@ -794,7 +822,7 @@ function providerPreset(provider: Provider) {
 }
 
 function ProviderLogo({ id }: { id: string }) {
-  if (id.startsWith('custom-')) return <Server size={18} aria-hidden="true" />;
+  if (id.startsWith('custom-') || id.endsWith('-subscription')) return <Server size={18} aria-hidden="true" />;
   return <img alt="" className={cx('provider-logo', ['openai', 'ollama'].includes(id) && 'monochrome-logo')} src={`/icons/providers/${id}${['deepseek', 'anthropic', 'openrouter'].includes(id) ? '-color' : ''}.svg`} />;
 }
 
@@ -805,7 +833,10 @@ function normalizeApiType(value?: string) {
 function ProviderDialog({ initial, onClose, onSave, onTestStatus }: { onTestStatus: (status: ProviderTestStatus) => void; initial: Provider; onClose: () => void; onSave: (p: Provider, key?: string, addTestModel?: boolean) => Promise<void> }) {
   const { t } = usePreferences();
   const edit = Boolean(initial.id);
-  const inferred = PROVIDER_PRESETS.find((p) => p.id === initial.preset)?.id || PROVIDER_PRESETS.find((p) => p.url && initial.base_url.startsWith(p.url))?.id || (initial.api_type === 'messages' ? 'custom-anthropic' : 'custom-openai');
+  const inferred = PROVIDER_PRESETS.find((p) => p.id === initial.preset)?.id
+    || (initial.kind === 'codex_subscription' ? 'codex-subscription' : initial.kind === 'grok_subscription' ? 'grok-subscription' : undefined)
+    || PROVIDER_PRESETS.find((p) => p.url && initial.base_url.startsWith(p.url))?.id
+    || (initial.api_type === 'messages' ? 'custom-anthropic' : 'custom-openai');
   const [provider, setProvider] = useState(() => ({ ...initial, id: initial.id || crypto.randomUUID(), name: initial.name || (inferred.startsWith('custom-') ? 'Custom' : PROVIDER_PRESETS.find((p) => p.id === inferred)?.name) || '', preset: inferred, api_type: normalizeApiType(initial.api_type), test_model: initial.test_model || '' }));
   const [identifier, setIdentifier] = useState(initial.id || (inferred.startsWith('custom-') ? 'custom' : inferred));
   const [apiKey, setApiKey] = useState('');
@@ -816,17 +847,27 @@ function ProviderDialog({ initial, onClose, onSave, onTestStatus }: { onTestStat
   const [testedFingerprint, setTestedFingerprint] = useState('');
   const fingerprint = () => JSON.stringify([provider.base_url.trim(), provider.api_type, provider.kind, provider.test_model.trim(), apiKey]);
   const form = useRef<HTMLFormElement>(null);
+  const subscription = isSubscriptionKind(provider.kind);
   const changePreset = (id: string) => {
     const preset = PROVIDER_PRESETS.find((p) => p.id === id)!;
-    setProvider({ ...provider, preset: preset.id, kind: preset.kind, base_url: preset.url, name: id.startsWith('custom-') ? 'Custom' : preset.name, api_type: id === 'custom-anthropic' ? 'messages' : 'chat_completions', test_model: '' });
+    const kind = preset.kind as Provider['kind'];
+    const subscriptionPreset = isSubscriptionKind(kind);
+    setProvider({ ...provider, preset: preset.id, kind, base_url: preset.url, name: id.startsWith('custom-') ? 'Custom' : preset.name, api_type: subscriptionPreset ? '' : id === 'custom-anthropic' ? 'messages' : 'chat_completions', test_model: '' });
     if (!edit) setIdentifier(id.startsWith('custom-') ? 'custom' : id);
+    // 订阅条目没有密钥字段：切到订阅时丢弃已输入的密钥，避免隐藏字段的残留值随保存提交。
+    if (subscriptionPreset) { setApiKey(''); setShowKey(false); }
     setTestResult('');
   };
-  const draft = () => ({ ...provider, id: identifier.trim(), name: provider.name.trim() || identifier.trim() });
+  const draft = (): Provider => {
+    const next = { ...provider, id: identifier.trim(), name: provider.name.trim() || identifier.trim() };
+    // 订阅服务商没有 base URL、API 类型与测试模型：身份由官方辅助进程承载。
+    return isSubscriptionKind(next.kind) ? { ...next, base_url: '', api_type: '', test_model: '' } : next;
+  };
   const submit = async (event: FormEvent) => {
     event.preventDefault(); if (testing) return;
     setTesting(true); setTestResult('');
-    try { await onSave(draft(), apiKey || undefined, !edit && testedFingerprint === fingerprint()); }
+    const next = draft();
+    try { await onSave(next, isSubscriptionKind(next.kind) ? undefined : apiKey || undefined, !edit && testedFingerprint === fingerprint()); }
     catch (error) { setTestFailed(true); setTestResult(t(String(error instanceof Error ? error.message : error))); }
     finally { setTesting(false); }
   };
@@ -847,23 +888,24 @@ function ProviderDialog({ initial, onClose, onSave, onTestStatus }: { onTestStat
   const endpoint = `${base}/${provider.api_type === 'messages' ? 'messages' : provider.api_type === 'responses' ? 'responses' : 'chat/completions'}`;
   return <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && !testing && onClose()}>
     <div className="dialog provider-dialog" role="dialog" aria-modal="true" aria-labelledby="provider-dialog-title">
-      <div className="provider-dialog-header"><div><h2 id="provider-dialog-title">{t(edit ? 'Edit provider' : 'Create provider')}</h2><p>{t(edit ? 'Update provider configuration.' : 'Add a new upstream API provider.')}</p></div><button type="button" className="icon-action" disabled={testing} onClick={onClose} aria-label={t('Close')}><X size={20} /></button></div>
+      <div className="provider-dialog-header"><div><h2 id="provider-dialog-title">{t(edit ? 'Edit provider' : 'Create provider')}</h2><p>{t(subscription ? 'Add a subscription provider to connect a Codex or Grok account.' : edit ? 'Update provider configuration.' : 'Add a new upstream API provider.')}</p></div><button type="button" className="icon-action" disabled={testing} onClick={onClose} aria-label={t('Close')}><X size={20} /></button></div>
       <form autoComplete="off" ref={form} onSubmit={submit} className="provider-dialog-form">
         <fieldset disabled={testing}>
           <div className="field-pair">
             <div className="form-field"><span>{t('Provider type')}</span><SearchSelect value={provider.preset} disabled={testing} label={t('Provider type')} placeholder={t('Search providers…')} empty={t('No providers found')} onChange={changePreset} options={[...PROVIDER_PRESETS.filter((p) => !p.id.startsWith('custom-')).sort((a, b) => a.name.localeCompare(b.name, 'en')), ...PROVIDER_PRESETS.filter((p) => p.id.startsWith('custom-'))].map((p) => ({ value: p.id, label: t(p.name), icon: <ProviderLogo id={p.id} />, group: p.id.startsWith('custom-') ? t('Custom') : t('Recommended'), keywords: `${p.name} ${p.id} ${p.url}` }))} /></div>
-            <label className="form-field"><span>{t('API type')}</span><Select searchable={false} value={provider.api_type} onChange={(e) => { setProvider({ ...provider, api_type: e.target.value }); setTestResult(''); }}><option value="chat_completions">OpenAI Chat Completions</option><option value="responses">OpenAI Responses</option><option value="messages">Anthropic Messages</option></Select></label>
+            {!subscription && <label className="form-field"><span>{t('API type')}</span><Select searchable={false} value={provider.api_type} onChange={(e) => { setProvider({ ...provider, api_type: e.target.value }); setTestResult(''); }}><option value="chat_completions">OpenAI Chat Completions</option><option value="responses">OpenAI Responses</option><option value="messages">Anthropic Messages</option></Select></label>}
           </div>
           <div className="field-pair">
             <label className="form-field"><span>{t('Provider name')}</span><input autoComplete="off" autoCapitalize="none" autoCorrect="off" spellCheck={false} required pattern="[a-zA-Z0-9_-]+" value={identifier} onChange={(e) => setIdentifier(e.target.value)} /></label>
             <label className="form-field"><span>{t('Display name')} <small>{t('(optional)')}</small></span><input autoComplete="off" autoCapitalize="none" autoCorrect="off" spellCheck={false} value={provider.name} placeholder={identifier} onChange={(e) => setProvider({ ...provider, name: e.target.value })} /></label>
           </div>
-          <label className="form-field"><span>{t('Base URL')}</span><input autoComplete="off" autoCapitalize="none" autoCorrect="off" spellCheck={false} required type="url" value={provider.base_url} placeholder="https://api.example.com/v1" onChange={(e) => setProvider({ ...provider, base_url: e.target.value })} /></label>
-          <label className="form-field"><span>{t('API key')}</span><div className="secret-input"><input autoComplete="off" autoCapitalize="none" autoCorrect="off" spellCheck={false} value={apiKey} type={showKey ? 'text' : 'password'} placeholder={provider.has_api_key ? t('Leave blank to keep the stored credential.') : provider.kind === 'ollama' ? t('No API key required') : 'sk-…'} onChange={(e) => setApiKey(e.target.value)} /><button type="button" aria-label={t('API key')} onClick={() => setShowKey(!showKey)}>{showKey ? <EyeOff size={16} /> : <Eye size={16} />}</button></div></label>
-          <div className="form-field"><label htmlFor="provider-test-model">{t('Test model')}</label><div className="provider-test-fields"><input autoComplete="off" autoCapitalize="none" autoCorrect="off" spellCheck={false} id="provider-test-model" value={provider.test_model} placeholder={t('Enter a model ID')} onChange={(e) => setProvider({ ...provider, test_model: e.target.value })} /><Select searchable={false} aria-label={t('Test type')} value="text" onChange={() => {}}><option value="text">{t('Text generation')}</option></Select></div><p className="provider-test-help">{t('Send a minimal text request using the selected API format to verify the URL and credential. Upstream usage charges may apply.')}</p><p className="provider-test-endpoint">{t('Test endpoint')}: <code>{endpoint}</code></p></div>
+          {!subscription && <label className="form-field"><span>{t('Base URL')}</span><input autoComplete="off" autoCapitalize="none" autoCorrect="off" spellCheck={false} required type="url" value={provider.base_url} placeholder="https://api.example.com/v1" onChange={(e) => setProvider({ ...provider, base_url: e.target.value })} /></label>}
+          {!subscription && <label className="form-field"><span>{t('API key')}</span><div className="secret-input"><input autoComplete="off" autoCapitalize="none" autoCorrect="off" spellCheck={false} value={apiKey} type={showKey ? 'text' : 'password'} placeholder={provider.has_api_key ? t('Leave blank to keep the stored credential.') : provider.kind === 'ollama' ? t('No API key required') : 'sk-…'} onChange={(e) => setApiKey(e.target.value)} /><button type="button" aria-label={t('API key')} onClick={() => setShowKey(!showKey)}>{showKey ? <EyeOff size={16} /> : <Eye size={16} />}</button></div></label>}
+          {subscription && <div className="form-field subscription-provider-note"><ShieldCheck size={16} aria-hidden="true" /><p className="provider-test-help">{t('Subscription providers keep authorization in the official helper managed by this app. Generation stays denied until identity, capability and quota are verified.')}</p></div>}
+          {!subscription && <div className="form-field"><label htmlFor="provider-test-model">{t('Test model')}</label><div className="provider-test-fields"><input autoComplete="off" autoCapitalize="none" autoCorrect="off" spellCheck={false} id="provider-test-model" value={provider.test_model} placeholder={t('Enter a model ID')} onChange={(e) => setProvider({ ...provider, test_model: e.target.value })} /><Select searchable={false} aria-label={t('Test type')} value="text" onChange={() => {}}><option value="text">{t('Text generation')}</option></Select></div><p className="provider-test-help">{t('Send a minimal text request using the selected API format to verify the URL and credential. Upstream usage charges may apply.')}</p><p className="provider-test-endpoint">{t('Test endpoint')}: <code>{endpoint}</code></p></div>}
         </fieldset>
         {testResult && <p className={cx('provider-test-result', testFailed && 'error')} role="status">{testResult}</p>}
-        <div className="provider-dialog-actions"><button type="button" className="button ghost" disabled={testing} onClick={() => void test()}>{testing ? <LoaderCircle size={16} className="import-spinner" /> : <Play size={16} />}{t(testing ? 'Testing…' : 'Test')}</button><button className="button primary" type="submit" disabled={testing}>{t('Save provider')}</button></div>
+        <div className="provider-dialog-actions">{!subscription && <button type="button" className="button ghost" disabled={testing} onClick={() => void test()}>{testing ? <LoaderCircle size={16} className="import-spinner" /> : <Play size={16} />}{t(testing ? 'Testing…' : 'Test')}</button>}<button className="button primary" type="submit" disabled={testing}>{t('Save provider')}</button></div>
       </form>
     </div>
   </div>;
@@ -893,7 +935,7 @@ function ModelDialog({ initial, providers, onClose, onSave, onTestStatus }: { on
     if (testing || !form.current?.reportValidity() || !provider) return;
     setTesting(true); setResult(''); setFailed(false); onTestStatus(provider.id, 'testing');
     try {
-      await testProviderDraft({ ...provider, api_type: model.api_type, test_model: model.model_id.trim() });
+      await testProviderDraft({ ...provider, api_type: isSubscriptionProvider(provider) ? '' : model.api_type, test_model: model.model_id.trim() });
       setResult(t('Test request succeeded.')); onTestStatus(provider.id, 'success');
     } catch (error) { setFailed(true); setResult(providerTestError(error, t)); onTestStatus(provider.id, 'error'); }
     finally { setTesting(false); }

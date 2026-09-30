@@ -292,6 +292,19 @@ async fn forward_attempt(context: ProxyContext, headers: HeaderMap, body: Value,
         Ok(model) => model,
         Err(error) => return error_response(StatusCode::UNPROCESSABLE_ENTITY, &error.to_string()),
     };
+    // 固定目标（原 ID 直调）先给出订阅准入的精确原因，而不是被候选过滤成笼统错误。
+    if let Some(pinned) = input.requested_model.as_deref().and_then(|id| id.strip_prefix("autojev/model/")).map(str::to_owned) {
+        let stored = context.store.read();
+        if let Some(model) = stored.models.iter().find(|model| model.id == pinned) {
+            if let Some(provider) = stored.providers.iter().find(|provider| provider.id == model.provider_id) {
+                if let Ok(protocol) = Protocol::parse(endpoint) {
+                    if let Err(denial) = crate::subscription::admit_model(&stored, model, provider, protocol) {
+                        return subscription_denial(denial, protocol);
+                    }
+                }
+            }
+        }
+    }
     capture.lock().unwrap().routing_rule(&config, input.requested_model.as_deref().unwrap_or(""));
     let requested=input.requested_model.as_deref().unwrap_or("").strip_prefix("autojev/").unwrap_or("");
     let unavailable = if let Some(id)=requested.strip_prefix("model/") {context.store.read().models.iter().any(|m|m.id==id) && !config.models.iter().any(|m|m.id==id)} else {config.routes.iter().find(|r|r.id==requested && r.enabled).is_some_and(|r|!config.models.iter().any(|m|r.includes_model(&m.id)))};
@@ -303,6 +316,15 @@ async fn forward_attempt(context: ProxyContext, headers: HeaderMap, body: Value,
         Err(error) => return error_response(StatusCode::UNPROCESSABLE_ENTITY,&error.to_string()),
     };
     let binding=input.requested_model.as_deref().unwrap_or("").strip_prefix("autojev/");
+    // 被订阅准入拒绝的模型不参与候选与重试，但仍保留固定直调路径以返回具体原因。
+    let pinned = binding.and_then(|id| id.strip_prefix("model/")).map(str::to_owned);
+    let denied: std::collections::HashSet<String> = config.models.iter()
+        .filter(|model| Some(&model.id) != pinned.as_ref())
+        .filter(|model| config.providers.iter().find(|provider| provider.id == model.provider_id)
+            .is_some_and(|_provider| !crate::subscription::generation_ready(&config, model, source)))
+        .map(|model| model.id.clone())
+        .collect();
+    config.models.retain(|model| !denied.contains(&model.id));
     let mut conversion_error=None;
     config.models.retain(|model| {
         let in_scope=match binding {
@@ -369,6 +391,11 @@ async fn forward_attempt(context: ProxyContext, headers: HeaderMap, body: Value,
         },
     };
 
+    // 订阅模型与固定直调共用同一准入：未连接、未验证能力或缺额度依据时真实上游零派发。
+    if let Err(denial) = crate::subscription::admit_model(&config, &resolved.model, &resolved.provider, source) {
+        return subscription_denial(denial, source);
+    }
+
     *lease = context.health.acquire(&resolved.model.id);
     if lease.is_none() {return error_response(StatusCode::SERVICE_UNAVAILABLE, "Candidate is being probed by another request. Retry shortly.");}
     tried.insert(resolved.model.id.clone());
@@ -396,7 +423,7 @@ async fn forward_attempt(context: ProxyContext, headers: HeaderMap, body: Value,
     if target == Protocol::Messages {
         request = request.header("anthropic-version", "2023-06-01");
     }
-    if resolved.provider.kind != ProviderKind::Ollama {
+    if resolved.provider.kind != ProviderKind::Ollama && !crate::subscription::is_subscription_provider(&resolved.provider) {
         let account = format!("provider:{}", resolved.provider.id);
         let Some(key) = context.store.read_secret(&account) else {
             return (StatusCode::PRECONDITION_REQUIRED, Json(source.error(&format!(
@@ -670,6 +697,7 @@ fn still_eligible(
         && route.model.enabled
         && config.models.iter().any(|m| m.id == route.model.id && m.enabled && (!input.requires_vision || m.supports_vision))
         && crate::router::protocol_matches(&route.model, &route.provider, &input.endpoint)
+        && Protocol::parse(&input.endpoint).is_ok_and(|protocol| crate::subscription::generation_ready(config, &route.model, protocol))
         && config
             .providers
             .iter()
@@ -683,6 +711,17 @@ pub(crate) fn endpoint_url(base_url: &str, path: &str) -> String {
     } else {
         format!("{base}{path}")
     }
+}
+
+/// 订阅准入被拒绝：按客户端协议返回稳定 code、原因与恢复动作，并明确标注是否可重试。
+fn subscription_denial(denial: crate::subscription::Denial, protocol: Protocol) -> Response {
+    let status = StatusCode::from_u16(denial.status()).unwrap_or(StatusCode::FORBIDDEN);
+    let mut response = (status, Json(denial.body(protocol))).into_response();
+    let headers = response.headers_mut();
+    // 订阅拒绝只能靠用户动作恢复（连接、刷新、核实能力），客户端重试不会改变结果。
+    headers.insert("x-should-retry", HeaderValue::from_static("false"));
+    headers.insert("x-autojev-subscription-denial", HeaderValue::from_str(&denial.code).unwrap_or_else(|_| HeaderValue::from_static("denied")));
+    response
 }
 
 fn error_response(status: StatusCode, message: &str) -> Response {

@@ -18,6 +18,7 @@ mod provider_import;
 mod provider_test;
 mod router;
 mod dispatch;
+mod subscription;
 mod runtime;
 #[cfg(feature = "isolation-check")]
 mod isolation_check;
@@ -60,6 +61,8 @@ struct DashboardSnapshot {
     agent_catalogs: std::collections::HashMap<String, Vec<agent_catalog::Entry>>,
     providers: Vec<Provider>,
     models: Vec<Model>,
+    /// 订阅服务商的连接、只读证据与当前拒绝原因。API 服务商不出现在这里。
+    subscriptions: Vec<subscription::SubscriptionView>,
     routes: Vec<config::RouteRule>,
     policy: RoutingPolicy,
     proxy: ProxyStatus,
@@ -71,14 +74,16 @@ struct DashboardSnapshot {
 async fn snapshot(state: &AppState) -> DashboardSnapshot {
     let (mut config, decision_key) = state.store.read_with_decision_key();
     for provider in &mut config.providers {
-        provider.has_api_key = provider.kind == ProviderKind::Ollama
-            || state.store.read_secret(&format!("provider:{}", provider.id)).is_some();
+        provider.has_api_key = (provider.kind == ProviderKind::Ollama
+            || state.store.read_secret(&format!("provider:{}", provider.id)).is_some())
+            && !subscription::is_subscription_provider(provider);
     }
     config.policy.has_autojev_key = decision_key.is_some();
     let running = state.proxy.lock().await.as_ref().is_some_and(|p|p.running());
     let port = state.proxy.lock().await.as_ref().map_or(config.port, |p| p.port);
     let paused = state.proxy.lock().await.as_ref().is_some_and(|p| p.running() && p.paused());
     let detected = detected_agents_with_selection(&config);
+    let subscriptions = subscription::views(&config, state.store.subscription.available());
     DashboardSnapshot {
         recovery_notice: lifecycle::notice(config.port),
         gateway: config.gateway.clone(),
@@ -86,6 +91,7 @@ async fn snapshot(state: &AppState) -> DashboardSnapshot {
         agent_catalogs: config.agent_catalogs.clone(),
         providers: config.providers,
         models: config.models,
+        subscriptions,
         routes: config.routes,
         policy: config.policy,
         proxy: ProxyStatus {
@@ -154,6 +160,13 @@ async fn get_snapshot(state: State<'_, AppState>) -> Result<DashboardSnapshot, S
     Ok(snapshot(&state).await)
 }
 
+/// 只读刷新订阅连接。生成被拒绝或网关暂停时仍需可用，且不产生任何生成请求。
+#[tauri::command]
+async fn refresh_subscription(state: State<'_, AppState>, provider_id: String) -> Result<DashboardSnapshot, String> {
+    subscription::refresh(&state.store, &provider_id).await?;
+    Ok(snapshot(&state).await)
+}
+
 #[tauri::command]
 async fn save_provider(
     state: State<'_, AppState>,
@@ -165,6 +178,9 @@ async fn save_provider(
 ) -> Result<DashboardSnapshot, String> {
     provider.id = provider.id.trim().to_owned();
     validate_provider(&provider).map_err(|error| error.to_string())?;
+    if subscription::is_subscription_provider(&provider) && api_key.as_deref().is_some_and(|key| !key.trim().is_empty()) {
+        return Err("Subscription providers keep their authorization in the provider helper, not as an API key".into());
+    }
     provider.has_api_key = false;
     let old_id = original_id.as_deref().unwrap_or(&provider.id).to_owned();
     let old_account = format!("provider:{old_id}");
@@ -180,6 +196,8 @@ fn apply_provider_edit(config: &mut AppConfig, provider: Provider, original_id: 
     if (creating || old_id != provider.id) && config.providers.iter().any(|p|p.id==provider.id) { return Err(anyhow!("Provider ID already exists")); }
     for model in &mut config.models { if model.provider_id==old_id { model.provider_id=provider.id.clone(); } }
     if add_test_model { add_provider_test_model(config, &provider); }
+    subscription::rename_provider(config, &old_id, &provider.id);
+    subscription::sync_provider(config, &provider.id, &provider.kind);
     if let Some(existing)=config.providers.iter_mut().find(|p|p.id==old_id) { *existing=provider; } else { config.providers.push(provider); }
     Ok(())
 }
@@ -235,6 +253,7 @@ async fn delete_provider(
         .update(|config| {
             config.providers.retain(|provider| provider.id != id);
             config.models.retain(|model| model.provider_id != id);
+            subscription::forget_provider(config, &id);
         })
         .map_err(|error| error.to_string())?;
     state.store.delete_secret(&format!("provider:{id}")).map_err(|error| error.to_string())?;
@@ -691,6 +710,15 @@ async fn restore_agent(
 async fn test_provider_draft(state: State<'_, AppState>, provider: Provider, api_key: Option<String>) -> Result<String, String> {
     validate_provider(&provider).map_err(|e| e.to_string())?;
     if provider.test_model.trim().is_empty() { return Err("Enter a test model".into()); }
+    // 订阅服务商的测试入口共用订阅准入，且不经过 API Key 与 base_url 路径。
+    if subscription::is_subscription_provider(&provider) {
+        // 订阅条目不带 API 类型，测试按首版唯一的客户端协议语义走 Chat Completions 准入。
+        let config = state.store.read();
+        return Err(match subscription::admit_target(&config, &provider, provider.test_model.trim(), protocol::Protocol::Chat) {
+            Err(denial) => denial.summary(),
+            Ok(()) => "Subscription generation requires the native helper, which this build does not provide.".into(),
+        });
+    }
     let key = api_key.filter(|k| !k.trim().is_empty()).or_else(|| {
         state.store.read().providers.iter().find(|p| p.id == provider.id)
             .and_then(|_| state.store.read_secret(&format!("provider:{}", provider.id)))
@@ -742,6 +770,15 @@ fn validate_provider(provider: &Provider) -> anyhow::Result<()> {
         return Err(anyhow!(
             "Provider ID may contain only letters, numbers, hyphens and underscores"
         ));
+    }
+    // 订阅服务商由官方辅助进程承载身份，没有 base_url 与 API key 可填。
+    if subscription::is_subscription_provider(provider) {
+        if !provider.base_url.trim().is_empty() || !provider.api_type.trim().is_empty() {
+            return Err(anyhow!(
+                "Subscription providers cannot carry an API base URL or API type"
+            ));
+        }
+        return Ok(());
     }
     if !(provider.base_url.starts_with("https://")
         || provider.base_url.starts_with("http://127.0.0.1")
@@ -885,6 +922,7 @@ pub fn run() {
             }
             let handler: fn(tauri::ipc::Invoke<tauri::Wry>) -> bool = tauri::generate_handler![
             get_snapshot,
+            refresh_subscription,
             get_model_performance,
             start_model_speed_tests,
             cancel_model_speed_tests,
@@ -1104,5 +1142,74 @@ mod identifier_edit_tests {
         assert_eq!(config.agent_catalogs["agent"][0].binding,"new");
         assert_eq!(config.agent_catalogs["agent"][0].id,"autojev/old");
         assert!(apply_route_edit(&mut config,renamed,None,true).is_err());
+    }
+}
+
+#[cfg(test)]
+mod subscription_provider_tests {
+    use super::*;
+
+    fn subscription(id: &str, kind: ProviderKind) -> Provider {
+        Provider {
+            preset: String::new(), api_type: String::new(), test_model: String::new(),
+            id: id.into(), name: id.into(), kind, base_url: String::new(), enabled: true, has_api_key: false,
+        }
+    }
+
+    #[test]
+    fn subscription_providers_carry_no_api_identity() {
+        let codex = subscription("codex", ProviderKind::CodexSubscription);
+        validate_provider(&codex).unwrap();
+        let mut with_url = codex.clone();
+        with_url.base_url = "https://example.invalid".into();
+        assert!(validate_provider(&with_url).is_err());
+        let mut with_type = codex.clone();
+        with_type.api_type = "responses".into();
+        assert!(validate_provider(&with_type).is_err());
+        // API 服务商的既有校验不变：仍然要求 HTTPS 或回环 base URL。
+        let mut api = codex.clone();
+        api.kind = ProviderKind::OpenaiCompatible;
+        assert!(validate_provider(&api).is_err());
+        api.base_url = "https://api.example.invalid/v1".into();
+        validate_provider(&api).unwrap();
+        assert!(validate_provider(&AppConfig::default().providers[0]).is_ok());
+    }
+
+    #[test]
+    fn one_active_connection_per_subscription_provider() {
+        let mut config = AppConfig::default();
+        let codex = subscription("codex", ProviderKind::CodexSubscription);
+        apply_provider_edit(&mut config, codex.clone(), None, true, false).unwrap();
+        let grok = subscription("grok", ProviderKind::GrokSubscription);
+        apply_provider_edit(&mut config, grok, None, true, false).unwrap();
+        assert_eq!(config.subscriptions.len(), 2);
+        assert_eq!(config.subscriptions["codex"].generation, 1);
+        assert_eq!(config.subscriptions["grok"].generation, 1);
+
+        // 标识重命名保留世代与已核实身份，不新建第二个连接。
+        config.subscriptions.get_mut("codex").unwrap().identity = Some("fixture@example.invalid".into());
+        let mut renamed = codex;
+        renamed.id = "codex-work".into();
+        apply_provider_edit(&mut config, renamed, Some("codex"), false, false).unwrap();
+        assert!(!config.subscriptions.contains_key("codex"));
+        assert_eq!(config.subscriptions["codex-work"].identity.as_deref(), Some("fixture@example.invalid"));
+        assert_eq!(config.subscriptions["codex-work"].generation, 1);
+        assert!(config.subscriptions.contains_key("grok"));
+
+        // 改成 API 服务商即放弃订阅身份，另一家不受影响。
+        let mut converted = config.providers.iter().find(|p| p.id == "codex-work").unwrap().clone();
+        converted.kind = ProviderKind::OpenaiCompatible;
+        converted.base_url = "https://api.example.invalid/v1".into();
+        apply_provider_edit(&mut config, converted, Some("codex-work"), false, false).unwrap();
+        assert!(!config.subscriptions.contains_key("codex-work"));
+        assert!(config.subscriptions.contains_key("grok"));
+    }
+
+    #[test]
+    fn api_providers_never_gain_a_subscription_connection() {
+        let mut config = AppConfig::default();
+        let api = config.providers[0].clone();
+        apply_provider_edit(&mut config, api, None, false, false).unwrap();
+        assert!(config.subscriptions.is_empty());
     }
 }

@@ -14,6 +14,7 @@ const isTauri = () => '__TAURI_INTERNALS__' in window;
 const MOCK: DashboardSnapshot = {
   routes: [],
   install_id: 'preview',
+  subscriptions: [],
   proxy: { running: true, port: 9526, base_url: 'http://127.0.0.1:9526' },
   policy: {
     mode: 'auto',
@@ -295,6 +296,12 @@ export async function importProviders(source: ImportSource): Promise<{ snapshot:
 export async function testProviderDraft(provider: Provider, apiKey?: string): Promise<string> {
   if (!isTauri()) throw new Error('Open the desktop app to test provider connections.');
   return invoke('test_provider_draft', { provider, apiKey: apiKey || null });
+}
+
+/** 只读刷新订阅连接：生成被拒绝或网关暂停时仍然可用，且不派发任何生成请求。 */
+export async function refreshSubscription(providerId: string): Promise<DashboardSnapshot> {
+  if (!isTauri()) throw new Error('Open the desktop app to refresh a subscription connection.');
+  return invoke('refresh_subscription', { providerId });
 }
 
 

@@ -1,4 +1,4 @@
-export type ProviderKind = 'openrouter' | 'ollama' | 'openai_compatible';
+export type ProviderKind = 'openrouter' | 'ollama' | 'openai_compatible' | 'codex_subscription' | 'grok_subscription';
 export type ModelTier = 'fast' | 'balanced' | 'strong';
 export type RoutingMode = 'observe' | 'assist' | 'auto';
 export type DecisionProvider = 'openrouter' | 'zenmux';
@@ -54,6 +54,31 @@ export interface ProxyStatus {
   base_url: string;
 }
 
+export type SubscriptionConnectionState = 'not_connected' | 'authorization_pending' | 'connected' | 'expired';
+export type SubscriptionCapabilityStatus = 'unverified' | 'verified' | 'unsupported';
+export type SubscriptionEvidenceState = 'unknown' | 'available' | 'stale' | 'failed' | 'unsupported';
+
+export interface SubscriptionModel { model_id: string; name?: string | null; eligible: boolean }
+export interface SubscriptionCapability { model_id: string; protocol: string; status: SubscriptionCapabilityStatus }
+export interface SubscriptionQuota { state: SubscriptionEvidenceState; source?: string | null; observed_at?: string | null }
+/** 准入拒绝：稳定 code、类别、原因与恢复动作。 */
+export interface SubscriptionDenial { code: string; family: string; message: string; recovery: string }
+/** 一家订阅服务商的实际状态、只读证据与当前拒绝原因。 */
+export interface SubscriptionView {
+  provider_id: string;
+  label: string;
+  generation: number;
+  state: SubscriptionConnectionState;
+  identity?: string | null;
+  helper_version?: string | null;
+  account_path?: string | null;
+  models: SubscriptionModel[];
+  capabilities: SubscriptionCapability[];
+  quota: SubscriptionQuota;
+  denial?: SubscriptionDenial | null;
+  adapter_available: boolean;
+}
+
 export interface AgentInjection { template: string; path: string; api: string }
 
 export interface AgentStatus {
@@ -107,6 +132,8 @@ export interface DashboardSnapshot {
   routes: RouteRule[];
   providers: Provider[];
   models: Model[];
+  /** 订阅服务商的连接与证据；API 服务商不出现在这里。 */
+  subscriptions: SubscriptionView[];
   policy: RoutingPolicy;
   proxy: ProxyStatus;
   agents: AgentStatus[];

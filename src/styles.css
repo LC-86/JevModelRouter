@@ -349,6 +349,19 @@ input, select, textarea { width: 100%; border: 1px solid var(--line-light); back
 .provider-enabled-cell .switch:disabled { opacity: .5; cursor: wait; }
 .provider-connection.success { color: var(--green); }
 .provider-connection.error { color: var(--red); }
+.provider-connection.warning { color: var(--yellow); }
+
+.provider-subscription-identity { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.provider-subscription-status { display: flex; flex-direction: column; gap: 4px; max-width: 320px; }
+.provider-subscription-detail { color: var(--muted); font-size: 11px; }
+.provider-subscription-reason { color: var(--muted); font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
+.subscription-provider-note { display: flex; align-items: flex-start; gap: 8px; color: var(--muted); }
+.subscription-provider-note svg { flex-shrink: 0; margin-top: 2px; }
+.subscription-provider-note .provider-test-help { margin: 0; }
+.model-capability-badge { padding: 1px 6px; border-radius: 999px; border: 1px solid currentColor; font-size: 10px; white-space: nowrap; }
+.model-capability-badge.unverified { color: var(--muted); }
+.model-capability-badge.verified { color: var(--green); }
+.model-capability-badge.unsupported { color: var(--red); }
 
 .provider-delete-dialog { width: min(420px, 92vw); padding: 24px; }
 .provider-delete-dialog h2 { margin: 0 0 12px; font-size: 19px; }
