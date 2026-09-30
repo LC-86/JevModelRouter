@@ -270,6 +270,8 @@ pub struct ConfigStore {
     pub subscription: std::sync::Arc<dyn crate::subscription::SubscriptionAdapter>,
     path: PathBuf,
     value: RwLock<AppConfig>,
+    /// 进程内、按服务商递增的刷新序号；不持久化、不跨异步读取持锁。
+    subscription_refreshes: std::sync::Mutex<std::collections::HashMap<String, u64>>,
 }
 
 impl ConfigStore {
@@ -335,7 +337,7 @@ impl ConfigStore {
                 rusqlite::params![log.id, log.created_at, serde_json::to_string(&log)?])?;
         }
         transaction.commit()?;
-        Ok(Self { path, value: RwLock::new(value), dispatcher, subscription })
+        Ok(Self { path, value: RwLock::new(value), dispatcher, subscription, subscription_refreshes: Default::default() })
     }
 
     fn connect(path: &PathBuf) -> Result<Connection> {
@@ -353,6 +355,29 @@ impl ConfigStore {
         let config = self.value.read().expect("config lock poisoned");
         let key = self.read_secret("autojev-cloud");
         (config.clone(), key)
+    }
+
+    pub(crate) fn begin_subscription_refresh(&self, provider_id: &str) -> Result<u64, String> {
+        let mut requests = self.subscription_refreshes.lock().expect("refresh lock poisoned");
+        let request = requests.entry(provider_id.to_owned()).or_default();
+        *request = request.checked_add(1).ok_or("The refresh request sequence was exhausted")?;
+        Ok(*request)
+    }
+
+    pub(crate) fn update_subscription_refresh<T>(
+        &self,
+        provider_id: &str,
+        request: u64,
+        change: impl FnOnce(&mut AppConfig) -> Result<T, String>,
+    ) -> Result<T, String> {
+        // 登记与提交共享此短同步锁：原子配置校验/写回期间不能登记新序号。没有 await。
+        let requests = self.subscription_refreshes.lock().expect("refresh lock poisoned");
+        self.update(|config| {
+            if requests.get(provider_id) != Some(&request) {
+                return Err("The connection changed while refreshing; a newer refresh started and the read-only result was discarded".into());
+            }
+            change(config)
+        }).map_err(|error| error.to_string())?
     }
 
     pub fn update<T>(&self, change: impl FnOnce(&mut AppConfig) -> T) -> Result<T> {

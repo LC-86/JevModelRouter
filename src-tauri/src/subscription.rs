@@ -1252,6 +1252,7 @@ fn had_verified_catalog(previous: Option<&Evidence>) -> bool {
 /// 身份不完整或状态读取失败：立即阻止准入，保留同账号同世代的历史并标陈旧/失败，
 /// 不发起本次目录与额度读取。明确未登录：推进世代并清空身份与所有证据。
 pub async fn refresh(store: &ConfigStore, provider_id: &str) -> Result<Connection, String> {
+    let request = store.begin_subscription_refresh(provider_id)?;
     let provider = require_subscription_provider(store, provider_id)?;
     // 不支持的订阅类型不得借用其它服务商的辅助进程读取证据（#12「两家互不冒用」）。
     require_supported(store, &provider, "read-only status")?;
@@ -1269,7 +1270,7 @@ pub async fn refresh(store: &ConfigStore, provider_id: &str) -> Result<Connectio
     // 必须先落盘当前失效状态，不能由“保留历史”的身份守卫忽略 helper 的明确退出。
     if status.identity_incomplete || status.state != ConnectionState::Connected || read_identity.is_none() {
         let incomplete = status.identity_incomplete || (status.state == ConnectionState::Connected && read_identity.is_none());
-        let result = store.update(|config| -> Result<Connection, String> {
+        let result = store.update_subscription_refresh(provider_id, request, |config| -> Result<Connection, String> {
             if !config.providers.iter().any(|provider| provider.id == provider_id && is_subscription_provider(provider)) {
                 return Err("The subscription provider was removed while refreshing".into());
             }
@@ -1294,7 +1295,7 @@ pub async fn refresh(store: &ConfigStore, provider_id: &str) -> Result<Connectio
                 connection.evidence = None;
             }
             Ok(connection.clone())
-        }).map_err(|error| error.to_string())??;
+        })?;
         return if incomplete {
             Err(status_error.unwrap_or_else(|| "The Codex helper could not confirm which account the data belongs to; connection suspended and history retained".into()))
         } else {
@@ -1307,7 +1308,7 @@ pub async fn refresh(store: &ConfigStore, provider_id: &str) -> Result<Connectio
     // 2) 目录与额度独立读取：任一失败都不影响另一项写回。
     let catalog_read = store.subscription.models(provider_id, generation).await;
     let quota_read = store.subscription.quota(provider_id, generation).await;
-    store.update(|config| -> Result<Connection, String> {
+    store.update_subscription_refresh(provider_id, request, |config| -> Result<Connection, String> {
         // 服务商可能在读取期间被删除或换号：迟到的只读结果不得复活或污染连接。
         if !config.providers.iter().any(|provider| provider.id == provider_id && is_subscription_provider(provider)) {
             return Err("The subscription provider was removed while refreshing".into());
@@ -1359,7 +1360,6 @@ pub async fn refresh(store: &ConfigStore, provider_id: &str) -> Result<Connectio
         });
         Ok(connection.clone())
     })
-    .map_err(|error| error.to_string())?
 }
 
 /// 界面视图：每家订阅服务商的实际状态、只读证据与当前拒绝原因。
@@ -1672,6 +1672,7 @@ mod refresh_tests {
         status: Mutex<ConnectionStatus>,
         models: Mutex<Vec<DiscoveredModel>>,
         catalog_missing: Mutex<Vec<String>>,
+        catalog_time: Mutex<String>,
         quota: Mutex<QuotaEvidence>,
         reads: Mutex<Vec<u64>>,
         /// 目录与额度读取的调用次数：用来证明「无法确认身份时本次刷新根本不发起这两项读取」。
@@ -1685,6 +1686,9 @@ mod refresh_tests {
         pause_models: AtomicBool,
         models_started: tokio::sync::Notify,
         resume_models: tokio::sync::Notify,
+        pause_status: AtomicBool,
+        status_started: tokio::sync::Notify,
+        resume_status: tokio::sync::Notify,
     }
 
     /// 替身写回的固定读取时间：失败后必须原样保留，不能被刷新成「现在」。
@@ -1705,6 +1709,7 @@ mod refresh_tests {
                 // 真实 CodexAdapter 一律发现即 false（见 codex_helper 的目录单测）。
                 models: Mutex::new(vec![DiscoveredModel { model_id: "fixture-model".into(), name: None, eligible: true }]),
                 catalog_missing: Mutex::new(Vec::new()),
+                catalog_time: Mutex::new(STUB_CATALOG_OBSERVED_AT.into()),
                 quota: Mutex::new(QuotaEvidence {
                     state: EvidenceState::Available,
                     source: Some("fixture:account/rateLimits/read".into()),
@@ -1735,6 +1740,9 @@ mod refresh_tests {
                 pause_models: AtomicBool::new(false),
                 models_started: tokio::sync::Notify::new(),
                 resume_models: tokio::sync::Notify::new(),
+                pause_status: AtomicBool::new(false),
+                status_started: tokio::sync::Notify::new(),
+                resume_status: tokio::sync::Notify::new(),
             })
         }
     }
@@ -1752,9 +1760,6 @@ mod refresh_tests {
         fn status<'a>(&'a self, provider_id: &'a str, generation: u64) -> BoxFuture<'a, Result<ConnectionStatus>> {
             Box::pin(async move {
                 self.reads.lock().unwrap().push(generation);
-                if self.fail_status.load(Ordering::SeqCst) {
-                    bail!("fixture helper status read failed");
-                }
                 if self.switch_during_read.load(Ordering::SeqCst) {
                     if let Some(store) = self.store.lock().unwrap().clone() {
                         store.update(|config| {
@@ -1764,26 +1769,36 @@ mod refresh_tests {
                         })?;
                     }
                 }
-                Ok(self.status.lock().unwrap().clone())
+                let result = if self.fail_status.load(Ordering::SeqCst) {
+                    Err(anyhow::anyhow!("fixture helper status read failed"))
+                } else {
+                    Ok(self.status.lock().unwrap().clone())
+                };
+                if self.pause_status.swap(false, Ordering::SeqCst) {
+                    self.status_started.notify_one();
+                    self.resume_status.notified().await;
+                }
+                result
             })
         }
 
         fn models<'a>(&'a self, _provider_id: &'a str, _generation: u64) -> BoxFuture<'a, Result<CatalogRead>> {
             Box::pin(async move {
                 self.catalog_reads.fetch_add(1, Ordering::SeqCst);
+                if self.fail_models.load(Ordering::SeqCst) {
+                    bail!("fixture catalog read failed");
+                }
+                let read = CatalogRead {
+                    models: self.models.lock().unwrap().clone(),
+                    source: Some("fixture:model/list".into()),
+                    observed_at: Some(self.catalog_time.lock().unwrap().clone()),
+                    missing_fields: self.catalog_missing.lock().unwrap().clone(),
+                };
                 if self.pause_models.swap(false, Ordering::SeqCst) {
                     self.models_started.notify_one();
                     self.resume_models.notified().await;
                 }
-                if self.fail_models.load(Ordering::SeqCst) {
-                    bail!("fixture catalog read failed");
-                }
-                Ok(CatalogRead {
-                    models: self.models.lock().unwrap().clone(),
-                    source: Some("fixture:model/list".into()),
-                    observed_at: Some(STUB_CATALOG_OBSERVED_AT.into()),
-                    missing_fields: self.catalog_missing.lock().unwrap().clone(),
-                })
+                Ok(read)
             })
         }
 
@@ -2083,6 +2098,100 @@ mod refresh_tests {
         let connection = stored(&store);
         assert_eq!(connection.generation, 2);
         assert!(connection.evidence.is_none());
+    }
+
+    async fn invalid_refresh_cannot_clobber_newer_recovery(mode: &str) {
+        let adapter = StubAdapter::new();
+        let (store, _directory) = fixture_store(adapter.clone());
+        refresh(&store, "codex").await.unwrap();
+        {
+            let mut status = adapter.status.lock().unwrap();
+            status.state = ConnectionState::NotConnected;
+            status.identity = None;
+            status.identity_incomplete = mode == "incomplete";
+        }
+        adapter.fail_status.store(mode == "rpc-failed", Ordering::SeqCst);
+        adapter.pause_status.store(true, Ordering::SeqCst);
+        let old_store = store.clone();
+        let old = tokio::spawn(async move { refresh(&old_store, "codex").await });
+        adapter.status_started.notified().await;
+        // Old result is fixed before the barrier; newer request writes fresh evidence for the same A.
+        {
+            let mut status = adapter.status.lock().unwrap();
+            status.state = ConnectionState::Connected;
+            status.identity = Some("fixture@example.invalid".into());
+            status.identity_incomplete = false;
+        }
+        adapter.fail_status.store(false, Ordering::SeqCst);
+        adapter.models.lock().unwrap()[0].model_id = "recovered-model".into();
+        *adapter.catalog_time.lock().unwrap() = "2026-09-30T05:00:00Z".into();
+        {
+            let mut quota = adapter.quota.lock().unwrap();
+            quota.observed_at = Some("2026-09-30T05:01:00Z".into());
+            quota.buckets[0].windows[0].used_percent = Some(73.0);
+        }
+        let recovered = refresh(&store, "codex").await.unwrap();
+        adapter.resume_status.notify_one();
+        let old_result = old.await.unwrap();
+        assert_eq!(stored(&store), recovered, "stale {mode} must preserve the newer connection and all evidence");
+        assert!(old_result.is_err(), "a superseded request must be discarded");
+        let evidence = recovered.current_evidence().unwrap();
+        assert_eq!(evidence.models[0].model_id, "recovered-model");
+        assert_eq!(evidence.catalog.observed_at.as_deref(), Some("2026-09-30T05:00:00Z"));
+        assert_eq!(evidence.quota.observed_at.as_deref(), Some("2026-09-30T05:01:00Z"));
+    }
+
+    #[tokio::test]
+    async fn stale_incomplete_refresh_cannot_clobber_newer_recovery() {
+        invalid_refresh_cannot_clobber_newer_recovery("incomplete").await;
+    }
+
+    #[tokio::test]
+    async fn stale_failed_rpc_refresh_cannot_clobber_newer_recovery() {
+        invalid_refresh_cannot_clobber_newer_recovery("rpc-failed").await;
+    }
+
+    #[tokio::test]
+    async fn stale_signed_out_refresh_cannot_clobber_newer_recovery() {
+        invalid_refresh_cannot_clobber_newer_recovery("signed-out").await;
+    }
+
+    #[tokio::test]
+    async fn stale_success_refresh_cannot_clobber_newer_success() {
+        let adapter = StubAdapter::new();
+        let (store, _directory) = fixture_store(adapter.clone());
+        refresh(&store, "codex").await.unwrap();
+        adapter.pause_models.store(true, Ordering::SeqCst);
+        let old_store = store.clone();
+        let old = tokio::spawn(async move { refresh(&old_store, "codex").await });
+        adapter.models_started.notified().await;
+        adapter.models.lock().unwrap()[0].model_id = "new-model".into();
+        *adapter.catalog_time.lock().unwrap() = "2026-09-30T05:00:00Z".into();
+        let newer = refresh(&store, "codex").await.unwrap();
+        adapter.resume_models.notify_one();
+        assert!(old.await.unwrap().is_err());
+        assert_eq!(stored(&store), newer);
+    }
+
+    #[tokio::test]
+    async fn refresh_order_is_independent_for_different_providers() {
+        let adapter = StubAdapter::new();
+        let (store, _directory) = fixture_store(adapter.clone());
+        store.update(|config| {
+            let mut second = config.providers.iter().find(|p| p.id == "codex").unwrap().clone();
+            second.id = "codex-second".into();
+            config.providers.push(second);
+            sync_provider(config, "codex-second", &ProviderKind::CodexSubscription);
+        }).unwrap();
+        adapter.pause_status.store(true, Ordering::SeqCst);
+        let first_store = store.clone();
+        let first = tokio::spawn(async move { refresh(&first_store, "codex").await });
+        adapter.status_started.notified().await;
+        // The second provider finishes while the first read is paused, without superseding it.
+        let second = refresh(&store, "codex-second").await.unwrap();
+        adapter.resume_status.notify_one();
+        assert!(first.await.unwrap().unwrap().current_evidence().is_some());
+        assert_eq!(store.read().subscriptions["codex-second"], second);
     }
 
     #[tokio::test]
