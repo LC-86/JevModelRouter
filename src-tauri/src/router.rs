@@ -326,10 +326,13 @@ async fn decide_global(
 }
 
 fn eligible_models(config: &AppConfig, input: &RoutePreviewInput) -> Vec<(Model, Provider)> {
+    let protocol = crate::protocol::Protocol::parse(&input.endpoint).ok();
     config
         .models
         .iter()
         .filter(|model| model.enabled && (!input.requires_vision || model.supports_vision))
+        // 订阅准入：未连接、未验证能力或缺额度依据的订阅模型不进入候选。
+        .filter(|model| protocol.is_some_and(|protocol| crate::subscription::generation_ready(config, model, protocol)))
         .filter_map(|model| {
             config
                 .providers
@@ -360,6 +363,17 @@ fn no_eligible_model_error(config: &AppConfig, input: &RoutePreviewInput) -> any
     }).collect();
     if active.is_empty() {
         return anyhow!("No enabled model with an enabled provider. Add or enable a model in AutoJev → Models.");
+    }
+    // 候选可能只剩下被订阅准入拒绝的模型：直接给出连接、能力或额度上的具体原因。
+    if let Some(denial) = active.iter().find_map(|(model, provider)| {
+        if !crate::subscription::is_subscription_provider(provider) {
+            return None;
+        }
+        crate::protocol::Protocol::parse(&input.endpoint)
+            .ok()
+            .and_then(|protocol| crate::subscription::admit_model(config, model, provider, protocol).err())
+    }) {
+        return anyhow!("{} {}", denial.message, denial.recovery);
     }
     let compatible: Vec<_> = active.iter().filter(|(m, p)| protocol_matches(m, p, &input.endpoint)).collect();
     if compatible.is_empty() {

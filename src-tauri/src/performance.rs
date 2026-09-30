@@ -323,8 +323,8 @@ impl Runner {
                         let result = probe(&store, &id).await;
                         let mut job = runner.job.lock().unwrap();
                         job.completed += 1;
-                        if result.is_err() {
-                            job.error = Some("Some speed tests failed. Check model availability and credentials.".into());
+                        if let Err(error) = result {
+                            job.error = Some(format!("Some speed tests failed: {error}"));
                         }
                     }
                     let mut job = runner.job.lock().unwrap();
@@ -346,6 +346,19 @@ impl Runner {
     }
 }
 use futures_util::FutureExt;
+/// 被订阅准入拒绝的探测记录：与真实探测同形，但没有上游请求，状态码保持未设置。
+fn denied_probe_log(model: &crate::config::Model, provider: &crate::config::Provider, protocol: Protocol, reason: &str) -> crate::traffic::RequestLog {
+    let capture = Capture::new(protocol.path().trim_start_matches("/v1/"), &serde_json::json!({}), &axum::http::HeaderMap::new());
+    {
+        let mut c = capture.lock().unwrap();
+        c.measure(model, provider, 32);
+        c.log.status = "error".into();
+        c.log.error = reason.to_owned();
+    }
+    let log = capture.lock().unwrap().finish(true);
+    log
+}
+
 async fn probe(store: &ConfigStore, id: &str) -> Result<()> {
     let config = store.read();
     let model = config
@@ -359,6 +372,13 @@ async fn probe(store: &ConfigStore, id: &str) -> Result<()> {
         .find(|p| p.id == model.provider_id && p.enabled)
         .ok_or_else(|| anyhow::anyhow!("Provider unavailable"))?;
     let protocol = Protocol::upstream(model, provider)?;
+    // 模型测试与手动测速和网关共用订阅准入；被拒绝时先记录原因，再向上游派发零请求。
+    if let Err(denial) = crate::subscription::admit_model(&config, model, provider, protocol) {
+        let reason = denial.summary();
+        let log = denied_probe_log(model, provider, protocol, &reason);
+        record_log(store, &log, true)?;
+        return Err(anyhow::anyhow!(reason));
+    }
     let prompt = "Count from 1 to 40, separated by spaces. Do not explain.";
     let body = match protocol {
         Protocol::Responses => {
@@ -398,7 +418,7 @@ async fn probe(store: &ConfigStore, id: &str) -> Result<()> {
         if protocol == Protocol::Messages {
             request = request.header("anthropic-version", "2023-06-01");
         }
-        if provider.kind != ProviderKind::Ollama {
+        if provider.kind != ProviderKind::Ollama && !crate::subscription::is_subscription_provider(provider) {
             let key = store
                 .read_secret(&format!("provider:{}", provider.id))
                 .ok_or_else(|| anyhow::anyhow!("Missing API key"))?;
@@ -443,6 +463,26 @@ async fn probe(store: &ConfigStore, id: &str) -> Result<()> {
     );
     Ok(())
 }
+/// 自动测速的到期模型。订阅模型永不参加：应用不在后台主动消耗订阅额度。
+pub fn due_models(config: &AppConfig, now: i64) -> Vec<String> {
+    let age = (config.performance_settings.interval_minutes.clamp(5, 120) * 60 * 1000) as i64;
+    config
+        .models
+        .iter()
+        .filter(|m| m.enabled)
+        .filter_map(|m| {
+            let p = config.providers.iter().find(|p| p.id == m.provider_id && p.enabled)?;
+            if crate::subscription::is_subscription_provider(p) {
+                return None;
+            }
+            let s = summary(config, m, p, None, now);
+            s.last_test_at
+                .is_none_or(|at| now - at >= age)
+                .then(|| m.id.clone())
+        })
+        .collect()
+}
+
 pub async fn schedule(store: Arc<ConfigStore>, runner: Arc<Runner>) {
     loop {
         tokio::time::sleep(Duration::from_secs(60)).await;
@@ -450,23 +490,7 @@ pub async fn schedule(store: Arc<ConfigStore>, runner: Arc<Runner>) {
         if !config.performance_settings.enabled {
             continue;
         }
-        let now = chrono::Utc::now().timestamp_millis();
-        let age = (config.performance_settings.interval_minutes.clamp(5, 120) * 60 * 1000) as i64;
-        let ids = config
-            .models
-            .iter()
-            .filter(|m| m.enabled)
-            .filter_map(|m| {
-                let p = config
-                    .providers
-                    .iter()
-                    .find(|p| p.id == m.provider_id && p.enabled)?;
-                let s = summary(&config, m, p, None, now);
-                s.last_test_at
-                    .is_none_or(|at| now - at >= age)
-                    .then(|| m.id.clone())
-            })
-            .collect::<Vec<_>>();
+        let ids = due_models(&config, chrono::Utc::now().timestamp_millis());
         if !ids.is_empty() {
             let _ = runner.start(store.clone(), ids);
         }
@@ -843,5 +867,62 @@ mod tests {
             3
         );
         assert!(!calls.iter().any(|id| id == "unselected"));
+    }
+
+    #[test]
+    fn automatic_speed_tests_never_pick_subscription_models() {
+        let mut config = AppConfig::default();
+        // 一家订阅服务商与它的模型：即使 enabled 也不进入自动测速。
+        let mut provider = config.providers[0].clone();
+        provider.id = "codex".into();
+        provider.name = "Codex".into();
+        provider.kind = crate::config::ProviderKind::CodexSubscription;
+        provider.base_url = String::new();
+        config.providers.push(provider.clone());
+        let mut model = config.models[0].clone();
+        model.id = "codex-subscription-model".into();
+        model.provider_id = provider.id.clone();
+        config.models.push(model);
+        crate::subscription::sync_provider(&mut config, &provider.id, &provider.kind);
+
+        let due = due_models(&config, chrono::Utc::now().timestamp_millis());
+        assert!(!due.contains(&"codex-subscription-model".to_owned()));
+        assert!(due.iter().any(|id| id == &config.models[0].id));
+        // 手动测速仍可指定该模型，只是会先被订阅准入拒绝。
+        assert!(config.models.iter().any(|m| m.id == "codex-subscription-model" && m.enabled));
+    }
+
+    #[tokio::test]
+    async fn probe_denies_subscription_models_and_records_the_reason() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(ConfigStore::load(directory.path().join("probe.db")).unwrap());
+        store
+            .update(|config| {
+                let mut provider = config.providers[0].clone();
+                provider.id = "grok".into();
+                provider.name = "Grok".into();
+                provider.kind = crate::config::ProviderKind::GrokSubscription;
+                provider.base_url = String::new();
+                config.providers.push(provider.clone());
+                let mut model = config.models[0].clone();
+                model.id = "grok-subscription-model".into();
+                model.provider_id = provider.id.clone();
+                model.model_id = "fixture-model".into();
+                config.models.push(model);
+                crate::subscription::sync_provider(config, &provider.id, &provider.kind);
+            })
+            .unwrap();
+        let error = probe(&store, "grok-subscription-model").await.unwrap_err().to_string();
+        assert!(error.contains("not connected"), "{error}");
+        assert!(error.contains("Connect the account"), "{error}");
+        // 拒绝发生在构造任何上游请求之前，并留下一条失败样本供界面展示。
+        let samples = store.read().performance_samples.get("grok-subscription-model").cloned().unwrap_or_default();
+        assert_eq!(samples.len(), 1);
+        assert!(!samples[0].success);
+        assert!(samples[0].probe);
+        assert_eq!(samples[0].first_content_ms, None);
+        // 从未派发：没有请求日志，且服务商没有任何 API 凭据可用。
+        assert!(store.request_logs("").unwrap().is_empty());
+        assert!(store.read_secret("provider:grok").is_none());
     }
 }

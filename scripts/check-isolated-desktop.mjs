@@ -63,6 +63,8 @@ try {
   assert.ok(requests.some(r => r.headers['user-agent'] === 'AutoJev/ProviderTest' && r.body.messages[0].content === 'Say OK'));
   assert.equal(requests.filter(r => r.headers['user-agent'] === 'AutoJev/ModelTest').length, 3);
   assert.equal(requests.filter(r => r.headers['user-agent'] === 'AutoJev/Debug').length, 3);
+  // 订阅目标被拒绝时真实上游必须零派发：替身从未收到该订阅模型的任何生成请求。
+  assert.equal(requests.filter(r => r.body?.model === 'codex-fixture-model').length, 0, 'Denied subscription generation must never reach an upstream');
   assert.ok(requests.filter(r => !r.path.startsWith('/redirect/')).every(r => r.body.model === 'fixture-model' && r.headers.authorization === 'Bearer fixture-key'));
   await writeFile(join(root, 'requests.json'), JSON.stringify(requests, null, 2));
   console.log(`Native desktop acceptance passed. Fictional evidence: ${root}`);

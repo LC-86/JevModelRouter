@@ -33,6 +33,9 @@ pub enum ProviderKind {
     Openrouter,
     Ollama,
     OpenaiCompatible,
+    /// 订阅身份：由本应用管理的官方辅助进程承载授权，不与 API 凭据混用。
+    CodexSubscription,
+    GrokSubscription,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -165,6 +168,9 @@ pub struct AppConfig {
     pub custom_agents: Vec<crate::agents::CustomAgent>,
     #[serde(default)]
     pub routes: Vec<RouteRule>,
+    /// 订阅服务商的活动连接，按服务商标识索引：每家一个，证据绑定连接世代。
+    #[serde(default)]
+    pub subscriptions: std::collections::HashMap<String, crate::subscription::Connection>,
     pub install_id: String,
     pub port: u16,
     pub providers: Vec<Provider>,
@@ -186,6 +192,7 @@ impl Default for AppConfig {
             agent_auto_connect: Default::default(),
             custom_agents: Vec::new(),
             routes: Vec::new(),
+            subscriptions: Default::default(),
             install_id: Uuid::new_v4().to_string(),
             port: DEFAULT_PORT,
             providers: vec![
@@ -258,18 +265,31 @@ impl Default for AppConfig {
 
 pub struct ConfigStore {
     pub dispatcher: std::sync::Arc<dyn crate::dispatch::Dispatcher>,
+    /// 订阅适配边界。生产构造只注入 [`crate::subscription::UnavailableAdapter`]。
+    pub subscription: std::sync::Arc<dyn crate::subscription::SubscriptionAdapter>,
     path: PathBuf,
     value: RwLock<AppConfig>,
 }
 
 impl ConfigStore {
     pub fn load(path: PathBuf) -> Result<Self> {
-        Self::load_with_dispatcher(path, std::sync::Arc::new(crate::dispatch::ApiDispatcher {
-            loopback_only: crate::runtime::isolated(),
-        }))
+        Self::load_with_dispatcher(
+            path,
+            std::sync::Arc::new(crate::dispatch::ApiDispatcher {
+                loopback_only: crate::runtime::isolated(),
+            }),
+        )
     }
 
     pub fn load_with_dispatcher(path: PathBuf, dispatcher: std::sync::Arc<dyn crate::dispatch::Dispatcher>) -> Result<Self> {
+        Self::load_with_adapters(path, dispatcher, std::sync::Arc::new(crate::subscription::UnavailableAdapter))
+    }
+
+    pub fn load_with_adapters(
+        path: PathBuf,
+        dispatcher: std::sync::Arc<dyn crate::dispatch::Dispatcher>,
+        subscription: std::sync::Arc<dyn crate::subscription::SubscriptionAdapter>,
+    ) -> Result<Self> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).context("create AutoJev data directory")?;
             #[cfg(unix)] {
@@ -314,7 +334,7 @@ impl ConfigStore {
                 rusqlite::params![log.id, log.created_at, serde_json::to_string(&log)?])?;
         }
         transaction.commit()?;
-        Ok(Self { path, value: RwLock::new(value), dispatcher })
+        Ok(Self { path, value: RwLock::new(value), dispatcher, subscription })
     }
 
     fn connect(path: &PathBuf) -> Result<Connection> {
@@ -426,6 +446,39 @@ impl ConfigStore {
 #[cfg(test)]
 mod storage_tests {
     use super::*;
+
+    #[test]
+    fn a_config_without_subscriptions_loads_and_keeps_api_identity_unchanged() {
+        let mut legacy = serde_json::to_value(AppConfig::default()).unwrap();
+        legacy.as_object_mut().unwrap().remove("subscriptions");
+        let restored: AppConfig = serde_json::from_value(legacy).unwrap();
+        assert!(restored.subscriptions.is_empty());
+        assert_eq!(restored.providers.len(), 2);
+        assert_eq!(restored.providers[0].kind, ProviderKind::Openrouter);
+        assert_eq!(restored.models[0].provider_id, "openrouter");
+        assert!(restored.models[0].enabled);
+
+        // 订阅服务商与连接可以往返保存，API 服务商不受影响。
+        let mut saved = AppConfig::default();
+        let mut provider = saved.providers[0].clone();
+        provider.id = "codex".into();
+        provider.name = "Codex".into();
+        provider.kind = ProviderKind::CodexSubscription;
+        provider.base_url = String::new();
+        saved.providers.push(provider.clone());
+        crate::subscription::sync_provider(&mut saved, &provider.id, &provider.kind);
+        let round_trip: AppConfig = serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+        assert_eq!(round_trip.subscriptions.len(), 1);
+        assert_eq!(round_trip.subscriptions["codex"].generation, 1);
+        assert_eq!(round_trip.subscriptions["codex"].state, crate::subscription::ConnectionState::NotConnected);
+        assert_eq!(round_trip.providers[0].kind, ProviderKind::Openrouter);
+        assert_eq!(round_trip.models.len(), saved.models.len());
+
+        // 未知的服务商类型仍然整库拒绝，不会被静默降级成 API 服务商。
+        let mut unknown = serde_json::to_value(AppConfig::default()).unwrap();
+        unknown["providers"][0]["kind"] = serde_json::json!("some_future_subscription");
+        assert!(serde_json::from_value::<AppConfig>(unknown).is_err());
+    }
 
     #[test]
     fn legacy_decision_provider_defaults_to_openrouter_and_unknown_values_fail() {

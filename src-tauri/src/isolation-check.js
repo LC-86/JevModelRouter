@@ -39,10 +39,12 @@
       await rejected('test_provider_draft', { provider: { ...provider, base_url: 'https://example.invalid' }, apiKey: 'fixture-key' }, 'Connection failed');
       await rejected('test_provider_draft', { provider: { ...provider, base_url: 'http://127.0.0.1:11434' }, apiKey: 'fixture-key' }, 'Connection failed');
       await rejected('test_provider_draft', { provider: { ...provider, base_url: `${provider.base_url}/redirect` }, apiKey: 'fixture-key' }, '302');
-      await rejected('save_provider', { provider: { ...provider, kind: 'codex_subscription' } }, 'unknown variant');
+      await rejected('save_provider', { provider: { ...provider, kind: 'codex_subscription' } }, 'cannot carry an API base URL');
+      await rejected('save_provider', { provider: { ...provider, kind: 'some_future_subscription' } }, 'unknown variant');
+      await rejected('save_provider', { provider: { ...provider, kind: 'codex_subscription', base_url: '', api_type: '', test_model: '' }, apiKey: 'fixture-key' }, 'not as an API key');
       await rejected('launch_agent', { id: 'codex' }, 'disabled in isolated');
       await rejected('save_custom_agent', { agent: { id: 'custom-outside', name: 'Fixture', command: 'grok', config_path: '/outside-isolation/config.toml', args: [] } }, 'inside the isolation');
-      passed('remote and daily loopback targets, redirects, unknown subscription kinds and external Agent actions rejected');
+      passed('remote and daily loopback targets, redirects, invalid subscription entries and external Agent actions rejected');
       await invoke('save_provider', { provider, apiKey: 'fixture-key' });
       const model = { ...snapshot.models[0], model_id: 'fixture-model', api_type: 'chat_completions', name: 'Fixture model' };
       await invoke('save_model', { model });
@@ -71,6 +73,28 @@
       const view = await wait(async () => { const v = await invoke('get_model_performance'); return !v.job.running && v.job.completed === 3 && v; });
       check(!view.job.error && view.models[model.id].samples >= 3, 'Manual speed tests must succeed');
       passed('manual speed test from model UI');
+      // 订阅服务商：从服务商面板添加保存，行内显示真实连接状态；未验证生成一律拒绝且真实上游零派发。
+      await nav(1);
+      await click('.provider-actions .button.primary');
+      await click('.provider-dialog .search-select-trigger');
+      (await wait(() => [...document.querySelectorAll('.provider-dialog [role="option"]')].find(option => /Codex subscription|Codex 订阅/.test(option.textContent)))).click();
+      setValue(await wait(() => document.querySelector('.provider-dialog input[pattern="[a-zA-Z0-9_-]+"]')), 'codex-subscription');
+      await click('.provider-dialog-actions button[type="submit"]');
+      await wait(() => !document.querySelector('.provider-dialog'));
+      const subscriptionRow = await wait(() => [...document.querySelectorAll('tbody tr')].find(row => row.textContent.includes('codex-subscription')));
+      check(/Not connected|未连接/.test(subscriptionRow.textContent), `Provider row must show the real connection state: ${subscriptionRow.textContent}`);
+      const subscription = (await invoke('get_snapshot')).subscriptions.find(s => s.provider_id === 'codex-subscription');
+      check(subscription && subscription.state === 'not_connected' && subscription.generation === 1, `Subscription connection must start unconnected: ${JSON.stringify(subscription)}`);
+      check(subscription.adapter_available === false, 'Production must not install a subscription stub');
+      check(subscription.denial && subscription.denial.code === 'not_connected', 'Unconnected subscription must stay denied');
+      passed('subscription provider added from the provider panel with its real state');
+      await invoke('save_model', { model: { ...model, id: 'codex-subscription-model', provider_id: 'codex-subscription', model_id: 'codex-fixture-model', name: 'Codex fixture' } });
+      await rejected('test_provider_draft', { provider: { ...provider, id: 'codex-subscription', name: 'Codex subscription', kind: 'codex_subscription', base_url: '', api_type: '', test_model: 'codex-fixture-model' } }, 'not connected');
+      await rejected('refresh_subscription', { providerId: 'codex-subscription' }, 'No subscription helper');
+      await invoke('start_model_speed_tests', { ids: ['codex-subscription-model'] });
+      const denied = await wait(async () => { const v = await invoke('get_model_performance'); return !v.job.running && v.job.completed === 3 && v; });
+      check(/not connected/i.test(denied.job.error || ''), `Subscription speed test must report the reason: ${denied.job.error}`);
+      passed('subscription generation denied without upstream work');
       await nav(5);
       for (const option of ['OpenAI Chat Completions', 'OpenAI Responses', 'Anthropic Messages']) {
         await click('.debug-settings .select-control button');
