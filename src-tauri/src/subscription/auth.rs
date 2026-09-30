@@ -845,7 +845,7 @@ pub async fn logout(store: &ConfigStore, provider_id: &str) -> Result<AuthView, 
     }
     let generation = connection.generation;
     let auth = store.auth.clone();
-    auth.logout(provider_id, generation).await.map_err(|error| helper::redact(&error))?;
+    // 先写配置（世代守卫）：失败时直接返回错误，磁盘凭据与专用 home 一个都不动。
     let next_generation = store
         .update(|config| -> u64 {
             let connection = config.subscriptions.entry(provider_id.to_owned()).or_default();
@@ -860,6 +860,8 @@ pub async fn logout(store: &ConfigStore, provider_id: &str) -> Result<AuthView, 
             connection.generation
         })
         .map_err(|error| helper::redact(&error.to_string()))?;
+    // 配置已落地为未连接，之后才做不可逆的本地清理：清理失败如实报错，绝不回退成已连接。
+    auth.logout(provider_id, generation).await.map_err(|error| helper::redact(&error))?;
     Ok(auth.view(provider_id, next_generation))
 }
 
@@ -923,9 +925,11 @@ mod lifecycle_tests {
         shutdown_calls: Mutex<u32>,
         /// 供竞态用例把 store 接进来，在某个调用内部推进世代。
         store: Mutex<Option<Arc<ConfigStore>>>,
+        /// 竞态推进世代时使用的 provider id（由用例设置）。
+        race_provider: Mutex<Option<String>>,
         bump_generation_on_begin: AtomicBool,
         bump_generation_on_cancel: AtomicBool,
-        bump_generation_on_logout: AtomicBool,
+        bump_generation_on_isolated: AtomicBool,
         /// cancel 变成 no-op 时模拟“会话已终结/attempt 不匹配”的竞态。
         cancel_is_noop: AtomicBool,
         /// dispose/rename 的记录与脚本化失败。
@@ -954,9 +958,10 @@ mod lifecycle_tests {
                 shutdown_pids: vec![4242],
                 shutdown_calls: Mutex::new(0),
                 store: Mutex::new(None),
+                race_provider: Mutex::new(None),
                 bump_generation_on_begin: AtomicBool::new(false),
                 bump_generation_on_cancel: AtomicBool::new(false),
-                bump_generation_on_logout: AtomicBool::new(false),
+                bump_generation_on_isolated: AtomicBool::new(false),
                 cancel_is_noop: AtomicBool::new(false),
                 dispose_calls: Mutex::new(Vec::new()),
                 rename_calls: Mutex::new(Vec::new()),
@@ -996,6 +1001,14 @@ mod lifecycle_tests {
         }
 
         fn isolated(&self) -> bool {
+            // 生命周期在 store.read() 之后、store.update 之前调用本方法：此处推进世代
+            // 正好模拟「读配置与写配置之间被别的写入抢先」的竞态。
+            if self.bump_generation_on_isolated.load(Ordering::SeqCst) {
+                let provider_id = self.race_provider.lock().unwrap().clone();
+                if let Some(provider_id) = provider_id {
+                    self.bump_generation(&provider_id);
+                }
+            }
             self.isolated.load(Ordering::SeqCst)
         }
 
@@ -1117,9 +1130,6 @@ mod lifecycle_tests {
         fn logout<'a>(&'a self, provider_id: &'a str, _generation: u64) -> BoxFuture<'a, Result<LogoutEvidence, String>> {
             Box::pin(async move {
                 self.sessions.lock().unwrap().remove(provider_id);
-                if self.bump_generation_on_logout.load(Ordering::SeqCst) {
-                    self.bump_generation(provider_id);
-                }
                 let evidence = self.logout_evidence.lock().unwrap().clone();
                 self.logouts.lock().unwrap().insert(provider_id.to_owned(), evidence.clone());
                 Ok(evidence)
@@ -1261,6 +1271,41 @@ mod lifecycle_tests {
     /// 造一个“已核实到可派发程度”的旧账号连接，供退出与换号用例使用。
     fn connect_old_account(store: &ConfigStore) {
         connect_provider_account(store, "grok", "old@example.invalid");
+    }
+
+    /// 真实 GrokCliAuth 的生命周期装置：专用 home 根就是临时目录，不拉起任何进程。
+    fn grok_cli_fixture_store(directory: &tempfile::TempDir) -> (Arc<ConfigStore>, Arc<GrokCliAuth>) {
+        let auth = Arc::new(GrokCliAuth::with_test_helper(
+            directory.path().to_path_buf(),
+            directory.path().join("unused-fixture-helper"),
+        ));
+        let store = Arc::new(
+            ConfigStore::load_with_adapters_and_auth(
+                directory.path().join("autojev.db"),
+                Arc::new(crate::dispatch::ApiDispatcher { loopback_only: true }),
+                Arc::new(UnavailableAdapter),
+                auth.clone(),
+            )
+            .unwrap(),
+        );
+        store
+            .update(|config| {
+                let provider = Provider {
+                    preset: String::new(),
+                    api_type: String::new(),
+                    test_model: String::new(),
+                    id: "grok".into(),
+                    name: "Grok".into(),
+                    kind: ProviderKind::GrokSubscription,
+                    base_url: String::new(),
+                    enabled: true,
+                    has_api_key: false,
+                };
+                config.providers.push(provider.clone());
+                sync_provider(config, &provider.id, &provider.kind);
+            })
+            .unwrap();
+        (store, auth)
     }
 
     fn configuration_ids(config: &AppConfig) -> (Vec<String>, Vec<String>, Vec<String>) {
@@ -1438,6 +1483,58 @@ mod lifecycle_tests {
         assert_eq!(view.logout.remote, RemoteRevokeState::NotAttempted);
         assert_ne!(view.logout.remote, RemoteRevokeState::Verified);
         assert_eq!(configuration_ids(&store.read()), before, "provider/model/route 配置必须保留");
+    }
+
+    /// B4：退出必须先写配置（世代 +1、未连接、身份/证据清空），成功后才做不可逆的本地清理。
+    #[tokio::test]
+    async fn logout_clears_the_helper_home_only_after_the_config_write_succeeds() {
+        let directory = tempfile::tempdir().unwrap();
+        let (store, _auth) = grok_cli_fixture_store(&directory);
+        connect_old_account(&store);
+        let home = helper::helper_home(&ProviderKind::GrokSubscription, "grok", directory.path()).unwrap();
+        helper::prepare_home(&home).unwrap();
+        std::fs::write(home.join("session"), "fixture credential").unwrap();
+
+        let view = logout(&store, "grok").await.unwrap();
+        assert_eq!(view.generation, 2);
+        assert_eq!(view.logout.local, LocalLogoutState::Cleared);
+        assert_eq!(view.logout.remote, RemoteRevokeState::NotAttempted);
+        let connection = stored_connection(&store);
+        assert_eq!(connection.generation, 2, "世代必须 +1");
+        assert_eq!(connection.state, ConnectionState::NotConnected);
+        assert!(connection.identity.is_none() && connection.evidence.is_none());
+        assert!(home.is_dir() && std::fs::read_dir(&home).unwrap().count() == 0, "配置写成功后 home 必须被清空");
+        assert!(!home.join("session").exists());
+    }
+
+    /// B4：配置写失败时任何凭据都不得销毁（旧实现会先删 home 再写库，留下已连接但无凭据的配置）。
+    #[tokio::test]
+    async fn logout_keeps_the_helper_home_when_the_config_write_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let (store, auth) = grok_cli_fixture_store(&directory);
+        connect_old_account(&store);
+        let home = helper::helper_home(&ProviderKind::GrokSubscription, "grok", directory.path()).unwrap();
+        helper::prepare_home(&home).unwrap();
+        std::fs::write(home.join("session"), "fixture credential").unwrap();
+
+        // 让配置写入必然失败（内存态不变），与 config 模块既有用例同一手法。
+        rusqlite::Connection::open(directory.path().join("autojev.db"))
+            .unwrap()
+            .execute_batch("DROP TABLE app_meta;")
+            .unwrap();
+
+        let error = logout(&store, "grok").await.unwrap_err();
+        assert!(!error.is_empty());
+        let connection = stored_connection(&store);
+        assert_eq!(connection.generation, 1, "写配置失败不得推进世代");
+        assert_eq!(connection.state, ConnectionState::Connected);
+        assert_eq!(connection.identity.as_deref(), Some("old@example.invalid"));
+        assert!(connection.evidence.is_some());
+        assert!(home.join("session").is_file(), "写配置失败时不得清理专用 home");
+        assert!(
+            !matches!(auth.view("grok", 1).logout.local, LocalLogoutState::Cleared),
+            "未执行的清理不得被写成证据"
+        );
     }
 
     #[tokio::test]
@@ -1759,7 +1856,8 @@ mod lifecycle_tests {
         let auth = StubAuth::new();
         let (store, _directory) = fixture_store(auth.clone());
         connect_old_account(&store);
-        auth.bump_generation_on_logout.store(true, Ordering::SeqCst);
+        *auth.race_provider.lock().unwrap() = Some("grok".to_owned());
+        auth.bump_generation_on_isolated.store(true, Ordering::SeqCst);
         let view = logout(&store, "grok").await.unwrap();
         assert_eq!(view.generation, 2);
         let after = stored_connection(&store);

@@ -267,6 +267,12 @@ fn managed_by_grok_auth(config: &AppConfig, provider_id: &str) -> bool {
         .is_some_and(|existing| existing.kind == ProviderKind::GrokSubscription)
 }
 
+/// 这次编辑是否需要本票的 Grok 授权处置：旧 provider 是 Grok（改名/换 kind/转 API），
+/// 或新 provider 是 Grok（其它订阅 → Grok 转换；旧身份必须作废，不能沿用）。
+fn needs_grok_auth_change(config: &AppConfig, old_id: &str, new_kind: &ProviderKind) -> bool {
+    managed_by_grok_auth(config, old_id) || *new_kind == ProviderKind::GrokSubscription
+}
+
 #[tauri::command]
 async fn save_provider(
     state: State<'_, AppState>,
@@ -292,7 +298,9 @@ async fn save_provider(
     // 两者都按 kind 生效，互不干扰。
     prepare_subscription_change(&state.store, &state.sessions, &provider, original_id.as_deref(), creating).await?;
     // 本票的 Grok 授权资源先于配置迁移：重命名会搬 home，跨 kind 变更会作废旧授权。
-    let transition = if managed_by_grok_auth(&state.store.read(), &old_id) {
+    // 旧 id 是 Grok 与「新 provider 是 Grok」都要走这里：Codex→Grok 若不处置，
+    // 旧 Codex 的已核实身份会被 sync_provider 当成新的已核实 Grok 账号保留下来。
+    let transition = if needs_grok_auth_change(&state.store.read(), &old_id, &provider.kind) {
         prepare_provider_auth_change(&state.store.read(), &*state.store.auth, &provider, original_id.as_deref())?
     } else {
         AuthTransition::None
@@ -363,6 +371,10 @@ fn provider_auth_failure_notice(transition: AuthTransition) -> Option<&'static s
         AuthTransition::Disposed { reset_connection: false } => Some(
             "subscription authorization was already cleared, but saving the API provider change failed; the saved provider keeps its subscription type and still shows connected while its credentials are gone until the user signs in again or deletes it",
         ),
+        // 改名失败同样已经 dispose 了旧授权（不可逆）：配置写失败时也必须告警，不能静默。
+        AuthTransition::RenameFailed => Some(
+            "subscription authorization was already cleared after the identifier change failed, but saving the provider change also failed; the saved provider keeps its previous identifier and still shows connected while its credentials are gone until the user signs in again or deletes it",
+        ),
         _ => None,
     }
 }
@@ -399,6 +411,12 @@ fn prepare_provider_auth_change(
         // 只会把凭据留在无人清理的旧 kind 路径里。因此一律作废旧授权。
         auth.dispose(old_id)
             .map_err(|error| format!("Could not remove the subscription authorization for {old_id}: {error}"))?;
+        // 旧是其它订阅（Codex 等）、新是本票管理的 Grok 且改了标识：新 id 名下可能残留旧 Grok home，
+        // 新 id 不得继承一个来路不明的授权目录，一并清掉（同 id 时上面这次 dispose 已经覆盖）。
+        if provider.kind == ProviderKind::GrokSubscription && old_id != provider.id {
+            auth.dispose(&provider.id)
+                .map_err(|error| format!("Could not remove the subscription authorization for {}: {error}", provider.id))?;
+        }
         return Ok(AuthTransition::Disposed { reset_connection: true });
     }
     if old_id == provider.id {
@@ -1891,11 +1909,12 @@ mod provider_authorization_tests {
     }
 
     #[test]
-    fn provider_auth_failure_notice_covers_only_irreversible_disposals() {
+    fn provider_auth_failure_notice_covers_every_irreversible_cleanup() {
         assert!(provider_auth_failure_notice(AuthTransition::Disposed { reset_connection: true }).is_some());
         assert!(provider_auth_failure_notice(AuthTransition::Disposed { reset_connection: false }).is_some());
+        // RenameFailed 也是不可逆的 dispose（旧授权已清），配置写失败必须一并告警。
+        assert!(provider_auth_failure_notice(AuthTransition::RenameFailed).is_some());
         assert!(provider_auth_failure_notice(AuthTransition::Renamed).is_none());
-        assert!(provider_auth_failure_notice(AuthTransition::RenameFailed).is_none());
         assert!(provider_auth_failure_notice(AuthTransition::None).is_none());
         assert!(needs_connection_reset(AuthTransition::RenameFailed));
         assert!(needs_connection_reset(AuthTransition::Disposed { reset_connection: true }));
@@ -1967,6 +1986,85 @@ mod provider_authorization_tests {
         assert!(!moved_grok_home.exists(), "不得把 Grok home 搬到新 id 下");
         let codex_home = crate::subscription::helper::helper_home(&ProviderKind::CodexSubscription, "codex", directory.path()).unwrap();
         assert!(!codex_home.exists(), "Codex 路径本来就不该有 Grok 资源");
+    }
+
+    /// 把已连接的订阅装置换成另一个 kind/id（保留旧身份），用来验证「其它订阅 → Grok」。
+    fn other_subscription_config(id: &str, kind: ProviderKind) -> AppConfig {
+        let mut config = subscription_config();
+        let provider = {
+            let provider = config.providers.iter_mut().find(|provider| provider.id == "grok").unwrap();
+            provider.id = id.into();
+            provider.name = id.into();
+            provider.kind = kind.clone();
+            provider.clone()
+        };
+        subscription::sync_provider(&mut config, &provider.id, &provider.kind);
+        let mut connection = config.subscriptions.remove("grok").unwrap();
+        connection.identity = Some("codex@example.invalid".into());
+        config.subscriptions.insert(id.into(), connection);
+        config
+    }
+
+    #[test]
+    fn the_grok_auth_change_gate_covers_both_directions() {
+        let codex = other_subscription_config("codex", ProviderKind::CodexSubscription);
+        assert!(needs_grok_auth_change(&codex, "codex", &ProviderKind::GrokSubscription), "Codex→Grok 必须走本票处置");
+        assert!(!needs_grok_auth_change(&codex, "codex", &ProviderKind::CodexSubscription), "Codex→Codex 交给 #13 的适配器");
+        let grok = subscription_config();
+        assert!(needs_grok_auth_change(&grok, "grok", &ProviderKind::CodexSubscription), "Grok→Codex 必须走本票处置");
+        assert!(needs_grok_auth_change(&grok, "grok", &ProviderKind::GrokSubscription));
+        assert!(!needs_grok_auth_change(&grok, "missing", &ProviderKind::CodexSubscription), "全新 Codex provider 无需处置");
+    }
+
+    #[test]
+    fn a_codex_to_grok_conversion_disposes_the_old_identity_and_resets_the_connection() {
+        let config = other_subscription_config("codex", ProviderKind::CodexSubscription);
+        let mut target = config.providers.iter().find(|provider| provider.id == "codex").unwrap().clone();
+        target.kind = ProviderKind::GrokSubscription;
+        let auth = RecordingAuth::new();
+        let transition = prepare_provider_auth_change(&config, &auth, &target, Some("codex")).unwrap();
+        assert_eq!(transition, AuthTransition::Disposed { reset_connection: true });
+        assert_eq!(*auth.dispose_calls.lock().unwrap(), vec!["codex".to_owned()], "旧 Codex 授权必须被作废");
+        assert!(auth.rename_calls.lock().unwrap().is_empty());
+
+        // 与 save_provider 闭包一致：先 apply_provider_edit（sync_provider 会保留旧连接），再按 transition 重置。
+        let mut config = config;
+        apply_provider_edit(&mut config, target, Some("codex"), false, false).unwrap();
+        if needs_connection_reset(transition) {
+            reset_connection_after_authorization_loss(&mut config, "codex");
+        }
+        let connection = config.subscriptions.get("codex").unwrap();
+        assert_eq!(connection.generation, 2, "世代必须 +1");
+        assert_eq!(connection.state, subscription::ConnectionState::NotConnected);
+        assert!(connection.identity.is_none(), "旧 Codex 身份不得被当成新的已核实 Grok 账号");
+        assert!(connection.evidence.is_none());
+    }
+
+    #[test]
+    fn a_renamed_codex_to_grok_conversion_disposes_both_identifiers_and_resets_the_new_connection() {
+        let config = other_subscription_config("codex", ProviderKind::CodexSubscription);
+        let mut target = config.providers.iter().find(|provider| provider.id == "codex").unwrap().clone();
+        target.id = "codex-work".into();
+        target.kind = ProviderKind::GrokSubscription;
+        let auth = RecordingAuth::new();
+        let transition = prepare_provider_auth_change(&config, &auth, &target, Some("codex")).unwrap();
+        assert_eq!(transition, AuthTransition::Disposed { reset_connection: true });
+        assert_eq!(
+            *auth.dispose_calls.lock().unwrap(),
+            vec!["codex".to_owned(), "codex-work".to_owned()],
+            "旧 id 与新 id 两侧的 Grok 资源都必须清掉"
+        );
+
+        let mut config = config;
+        apply_provider_edit(&mut config, target, Some("codex"), false, false).unwrap();
+        if needs_connection_reset(transition) {
+            reset_connection_after_authorization_loss(&mut config, "codex-work");
+        }
+        assert!(!config.subscriptions.contains_key("codex"), "旧标识的连接必须迁走");
+        let connection = config.subscriptions.get("codex-work").unwrap();
+        assert_eq!(connection.generation, 2, "世代必须 +1");
+        assert_eq!(connection.state, subscription::ConnectionState::NotConnected);
+        assert!(connection.identity.is_none() && connection.evidence.is_none());
     }
 
     #[test]

@@ -173,19 +173,29 @@
       passed('a restarted desktop reconciles the orphaned pending sign-in and can sign in again');
     }
     if (mode === 'grok') {
-      // #12 边界：Grok 登录未实现，必须得到明确错误，且不拉起 Codex 替身、不改动任何连接。
+      // Grok 由本票的授权对话框承载（订阅行按 kind 分派后，Grok 行不再有 #13 的动作按钮）：
+      // 入口在 Grok 行内，拒绝原因只出现在该行的对话框里，行内不再显示错误文本。
       const grok = await wait(async () => (await grokView()) || null, 'grok view');
       const codexBefore = await subscriptionView();
       check(grok.state === 'not_connected', `Grok rehearsal needs an unconnected Grok row: ${grok.state}`);
       check(grok.helper?.available !== true && !grok.helper?.version && !grok.helper?.auth_home, `The Grok row must report an unavailable helper: ${JSON.stringify(grok.helper)}`);
       const grokText = await waitStatusFor(grokProviderId, text => text.includes('helper=Unknown') && text.includes('auth_home=Unknown'));
       record('grokStart', { state: grok.state, generation: grok.generation, login: grok.login, helper: grok.helper ?? null, status: grokText, codexBefore: { state: codexBefore.state, generation: codexBefore.generation, identity: codexBefore.identity ?? null } });
-      await click(`[data-testid="sub-login-${grokProviderId}"]`);
-      const rowError = await wait(() => {
+      const grokEntry = await wait(() => {
         const row = [...document.querySelectorAll('tbody tr')].find(item => item.textContent.includes(grokProviderId));
-        const text = row?.textContent || '';
-        return /not implemented|unsupported|not supported/i.test(text) ? text : null;
-      }, 'grok sign-in error in row');
+        return row?.querySelector('.subscription-auth-entry:not([disabled])') ?? null;
+      }, 'grok subscription sign-in entry');
+      grokEntry.click();
+      const grokDialog = () => {
+        const dialog = document.querySelector('.subscription-auth-dialog');
+        return dialog && dialog.textContent.includes(grokProviderId) ? dialog : null;
+      };
+      await wait(grokDialog, 'grok subscription auth dialog');
+      await click('.subscription-auth-dialog .subscription-auth-begin');
+      const rowError = await wait(() => {
+        const text = grokDialog()?.querySelector('.subscription-auth-error')?.textContent?.trim();
+        return text && /not implemented|unsupported|not supported/i.test(text) ? text : null;
+      }, 'grok sign-in error in dialog');
       const directError = await invoke('begin_subscription_login', { providerId: grokProviderId }).then(() => { throw new Error('Grok sign-in must be rejected'); }, error => String(error));
       check(/grok/i.test(directError) && /not implemented|unsupported|not supported/i.test(directError), `Grok sign-in must fail with a clear message: ${directError}`);
       const grokAfter = await wait(async () => (await grokView()) || null, 'grok view after rejection');
@@ -196,6 +206,8 @@
       record('grokRejected', { rowError: rowError.slice(-500), directError, after: { state: grokAfter.state, generation: grokAfter.generation, login: grokAfter.login }, codex: { state: codexAfter.state, generation: codexAfter.generation } });
       passed('an unsupported Grok sign-in is rejected with a clear error and changes nothing');
       passed('the Codex row is unaffected by the rejected Grok sign-in');
+      await click('.subscription-auth-dialog .subscription-auth-footer button.primary');
+      await wait(() => !grokDialog(), 'grok subscription auth dialog closed');
     }
   };
   try {
@@ -328,7 +340,7 @@
       check(grokAfterLogout.auth.phase === 'idle', `Rejected Grok sign-out must not start a sign-in: ${grokAfterLogout.auth.phase}`);
       passed('grok subscription authorization rejected by isolation, not by helper detection');
       // 界面侧：登录入口必须显示诚实失败原因，不得渲染凭据，也不得伪造远端撤销。
-      // 两套 UI 并存：入口与对话框都必须锁定到 Grok 行自己的那一个（Codex 行也有同款入口）。
+      // 订阅行按 kind 分派后 Grok 行只渲染本票入口：仍要锁定 Grok 行自己的入口与含 grok-subscription 的对话框。
       await nav(1);
       const grokEntry = await wait(() => {
         const row = [...document.querySelectorAll('tbody tr')].find(item => item.textContent.includes(grokProviderId));
