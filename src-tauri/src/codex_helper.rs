@@ -2062,6 +2062,7 @@ while IFS= read -r line; do
           exit 0
         else
           printf '{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"%s","turnId":"%s","itemId":"fixture-item","delta":"fixture"}}\n' "$thread_id" "$turn_id"
+          if [ "$scenario" = hold ]; then printf 'started\n' > "$queue.event-consumption-started"; fi
         fi
         if [ "$scenario" = slow-success ]; then sleep 0.25; fi
         if [ "$scenario" = hold ]; then sleep 5; fi
@@ -3202,21 +3203,42 @@ done
         let log = home.path().join("response-timeout-helper.log");
         std::fs::write(format!("{}.generation", log.to_string_lossy()), "hold").unwrap();
         let adapter = Arc::new(CodexAdapter::with_launch(home.path().to_path_buf(), fixture_launch(home.path(), &log)));
+        // Warm the controlled helper outside the request timeout. The regression under test is
+        // consuming a started turn's events, not process startup or thread creation.
+        adapter.status("codex-fixture", 0).await.unwrap();
         let store = admitted_gateway_store(home.path().join("gateway.db").as_path(), adapter, "http://127.0.0.1:9");
-        store.update(|config| config.gateway.response_timeout_seconds = 1).unwrap();
+        store.update(|config| config.gateway.response_timeout_seconds = 2).unwrap();
 
-        let started = tokio::time::Instant::now();
-        let response = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
+        let store_for_request = store.clone();
+        let request = tokio::spawn(async move {
             crate::proxy::forward_test_request(
-                store,
+                store_for_request,
                 gateway_text_request(Protocol::Responses, "autojev/model/codex-fixture-binding", false),
                 gateway_endpoint(Protocol::Responses),
-            ),
-        ).await.expect("the non-streaming turn must not wait beyond response_timeout_seconds");
+            ).await
+        });
+        let event_started = format!("{}.event-consumption-started", log.to_string_lossy());
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while !std::path::Path::new(&event_started).exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }).await.expect("the fixture must start the turn and emit partial output before timing out");
+        assert!(
+            !request.is_finished(),
+            "the gateway request must still be consuming the started turn after the fixture emits its first chunk"
+        );
+
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), request)
+            .await.expect("the event-consumption timeout must bound the non-streaming request")
+            .expect("the gateway request task must not panic");
         assert_eq!(response.status(), axum::http::StatusCode::GATEWAY_TIMEOUT);
-        assert!(started.elapsed() < std::time::Duration::from_secs(3));
-        let _ = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        let error: Value = serde_json::from_slice(&body).expect("the timeout response must be JSON");
+        assert_eq!(
+            error.pointer("/error/message").and_then(Value::as_str),
+            Some("Codex generation exceeded the gateway response timeout."),
+            "this must be the event-consumption timeout, not a timeout starting the helper turn"
+        );
 
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
             loop {
@@ -3225,6 +3247,8 @@ done
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
         }).await.expect("timing out the HTTP request must cancel its helper turn");
+        let calls = std::fs::read_to_string(format!("{}.calls", log.to_string_lossy())).unwrap();
+        assert!(calls.lines().any(|method| method == "turn/start"), "the event timeout must happen after turn/start");
     }
 
     #[tokio::test]
