@@ -39,6 +39,7 @@ impl Dispatcher for ApiDispatcher {
 }
 
 // Also guards decision and local Debug traffic in an isolated desktop process.
+// Deadlines must be on RequestBuilder: client defaults do not survive isolated rebuilds.
 pub async fn send_http(
     request: reqwest::RequestBuilder,
     loopback_only: bool,

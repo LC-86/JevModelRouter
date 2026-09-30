@@ -25,8 +25,9 @@ pub async fn debug_curl(state: State<'_, AppState>, id: String, endpoint: String
     let _ = on_progress.send(json!({"started":true}));
     let operation = async {
         let start = std::time::Instant::now();
-        let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).timeout(std::time::Duration::from_secs(90)).build().map_err(|e|e.to_string())?;
-        let mut request = client.post(format!("http://127.0.0.1:{}/v1/{endpoint}", state.store.read().port));
+        let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().map_err(|e|e.to_string())?;
+        let mut request = client.post(format!("http://127.0.0.1:{}/v1/{endpoint}", state.store.read().port))
+            .timeout(std::time::Duration::from_secs(90));
         for (name, value) in headers {
             if matches!(name.to_ascii_lowercase().as_str(), "host" | "content-length" | "transfer-encoding" | "connection") { return Err(format!("Unsupported header: {name}")); }
             request = request.header(name, value);

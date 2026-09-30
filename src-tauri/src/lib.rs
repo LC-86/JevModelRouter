@@ -460,8 +460,9 @@ async fn debug_request(state: State<'_, AppState>, target: String, endpoint: Str
         }
     }
     let start = std::time::Instant::now();
-    let mut response = dispatch::send_http(Client::builder().timeout(std::time::Duration::from_secs(90)).build().map_err(|e|e.to_string())?
+    let mut response = dispatch::send_http(Client::builder().build().map_err(|e|e.to_string())?
         .post(format!("http://127.0.0.1:{}/v1/{endpoint}", state.store.read().port))
+        .timeout(std::time::Duration::from_secs(90))
         .header("x-autojev-session-id", session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()))
         .header("user-agent", "AutoJev/Debug")
         .header("anthropic-version", "2023-06-01").json(&body), runtime::isolated()).await.map_err(|_| "Debug request failed or timed out".to_string())?;

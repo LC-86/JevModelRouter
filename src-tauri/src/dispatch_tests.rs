@@ -10,6 +10,76 @@ use axum::{http::HeaderMap, response::IntoResponse, routing::post, Json, Router}
 use std::sync::Arc;
 
 #[tokio::test]
+async fn isolated_dispatch_preserves_deadlines_for_headers_and_body() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let upstream = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new()
+                .route(
+                    "/headers",
+                    post(|| async {
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        "late headers"
+                    }),
+                )
+                .route(
+                    "/body",
+                    post(|| async {
+                        let stream = futures_util::stream::once(async {
+                            Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"first chunk"))
+                        });
+                        let stalled =
+                            futures_util::StreamExt::chain(stream, futures_util::stream::pending());
+                        axum::body::Body::from_stream(stalled)
+                    }),
+                ),
+        )
+        .await
+        .unwrap();
+    });
+    let temp = tempfile::tempdir().unwrap();
+    let store = ConfigStore::load_with_dispatcher(
+        temp.path().join("deadline.db"),
+        Arc::new(crate::dispatch::ApiDispatcher {
+            loopback_only: true,
+        }),
+    )
+    .unwrap();
+    let config = store.read();
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    for path in ["headers", "body"] {
+        let request = client
+            .post(format!("http://{address}/{path}"))
+            .timeout(std::time::Duration::from_millis(100));
+        let operation = async {
+            let response = store
+                .dispatcher
+                .send(
+                    crate::dispatch::Target {
+                        provider: &config.providers[0],
+                        model_id: "fixture-model",
+                        protocol: Protocol::Chat,
+                    },
+                    request,
+                )
+                .await?;
+            response.bytes().await.map_err(anyhow::Error::from)
+        };
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), operation)
+            .await
+            .expect("The isolated request must expire without process termination");
+        let error = result.unwrap_err();
+        assert!(
+            error.downcast_ref::<reqwest::Error>().unwrap().is_timeout(),
+            "{path}: {error}"
+        );
+    }
+    upstream.abort();
+}
+
+#[tokio::test]
 async fn gateway_ephemeral_port_preserves_protocols_and_persistence() {
     for target in [Protocol::Chat, Protocol::Responses, Protocol::Messages] {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
