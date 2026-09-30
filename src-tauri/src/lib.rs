@@ -1010,10 +1010,9 @@ async fn connect_agent(
     }
     // 路由候选与上面的连接校验使用同一套判断（作用域 + 选择 + 停用 + 服务商启用 + 协议兼容），
     // 避免「连接成功、实际请求没有候选」。直调绑定 model/<标识> 不要求 selected：取消选择只影响
-    // 列表与自动候选，只有停用才禁止调用（保留原 ID 直调语义）。
+    // 列表与自动候选，只有停用才禁止调用（保留原 ID 直调语义），但协议兼容仍必须满足。
     let has_candidate = if let Some(model_id) = route_id.strip_prefix("model/") {
-        config.models.iter().any(|m| m.id == model_id && m.enabled
-            && config.providers.iter().any(|p| p.id == m.provider_id && p.enabled))
+        router::direct_binding_ready(&config, model_id)
     } else {
         let route = config.routes.iter().find(|r| r.id == route_id).ok_or("Route is unavailable")?;
         router::route_has_candidate(&config, route)

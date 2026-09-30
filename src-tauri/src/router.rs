@@ -117,6 +117,23 @@ pub(crate) fn route_has_candidate(config: &AppConfig, rule: &crate::config::Rout
     config.models.iter().any(|model| route_candidate(config, rule, model))
 }
 
+/// 直调绑定（`model/<标识>`）的可连接判定：未停用、服务商启用、协议兼容。
+///
+/// 与 [`route_candidate`] 的唯一区别是**不要求 `selected`**：取消选择只影响自动候选与列表，
+/// 按原模型标识直调仍然有效（US 36）。协议兼容必须一并检查，否则会绑定一个永远无法派发的模型，
+/// 出现「连接成功、每个请求都失败」。
+pub(crate) fn direct_binding_ready(config: &AppConfig, model_id: &str) -> bool {
+    config.models.iter().any(|model| {
+        model.id == model_id
+            && model.enabled
+            && config.providers.iter().any(|provider| {
+                provider.id == model.provider_id
+                    && provider.enabled
+                    && crate::protocol::Protocol::upstream(model, provider).is_ok()
+            })
+    })
+}
+
 /// 显式固定直调的目标：`autojev/model/<标识>`、`model/<标识>`、`<provider>/<model_id>` 或内部标识。
 /// 这些路径不因取消选择被拒；只有自动候选集合要求 `selected`。
 fn pinned_model<'a>(config: &'a AppConfig, input: &RoutePreviewInput) -> Option<&'a Model> {
@@ -1017,6 +1034,27 @@ mod rule_tests {
         config.models[0].enabled = false;
         assert!(validate_available_rule(&config, &config.routes[0]).is_err());
         assert!(!route_has_candidate(&config, &config.routes[0]));
+    }
+
+    /// 直调绑定（`model/<标识>`）：取消选择不影响，但停用、服务商停用与协议不兼容都必须拒绝，
+    /// 免得绑定一个永远无法派发的模型（连接成功、每个请求都失败）。
+    #[test]
+    fn direct_bindings_keep_protocol_and_disable_checks_without_requiring_selection() {
+        let mut config = AppConfig::default();
+        let id = config.models[0].id.clone();
+        assert!(direct_binding_ready(&config, &id));
+        config.models[0].selected = false;
+        assert!(direct_binding_ready(&config, &id), "取消选择不得阻断原 ID 直调");
+        config.models[0].enabled = false;
+        assert!(!direct_binding_ready(&config, &id), "停用必须禁止直调");
+        config.models[0].enabled = true;
+        config.providers[0].enabled = false;
+        assert!(!direct_binding_ready(&config, &id), "服务商停用必须禁止直调");
+        config.providers[0].enabled = true;
+        config.models[0].api_type = "grpc".into();
+        assert!(!direct_binding_ready(&config, &id), "无法识别的上游协议不得绑定");
+        config.models[0].api_type = String::new();
+        assert!(!direct_binding_ready(&config, "not-a-model"));
     }
 
     #[test]
