@@ -1,6 +1,7 @@
 import type {
   DashboardSnapshot, Provider, ProviderKind, SubscriptionCapabilityStatus,
-  SubscriptionConnectionState, SubscriptionDenial, SubscriptionEvidenceState, SubscriptionView,
+  SubscriptionConnectionState, SubscriptionDenial, SubscriptionEvidenceState,
+  SubscriptionLocalClearing, SubscriptionLoginStage, SubscriptionRemoteRevocation, SubscriptionView,
 } from '../types';
 import type { Translate } from './preferences-context';
 
@@ -90,4 +91,86 @@ export function denialLabel(denial: SubscriptionDenial | null | undefined, t: Tr
 export function identityLabel(view: SubscriptionView | undefined, t: Translate): string {
   const identity = view?.identity?.trim();
   return identity && identity.length > 0 ? identity : t('Unknown');
+}
+
+/** 缺失或空白的只读证据一律显示 `Unknown`，不用界面文案猜测。 */
+export function knownOrUnknown(value: string | null | undefined): string {
+  const text = value?.trim();
+  return text && text.length > 0 ? text : 'Unknown';
+}
+
+/** 官方辅助进程版本；缺失显示 `Unknown`。 */
+export function helperVersionLabel(view: SubscriptionView | undefined): string {
+  return knownOrUnknown(view?.helper?.version ?? view?.helper_version);
+}
+
+/** 专用授权目录（辅助进程的 CODEX_HOME）；缺失显示 `Unknown`。 */
+export function authHomeLabel(view: SubscriptionView | undefined): string {
+  return knownOrUnknown(view?.helper?.auth_home ?? view?.account_path);
+}
+
+export function loginStageLabel(stage: SubscriptionLoginStage, t: Translate): string {
+  return t({
+    idle: 'Sign-in idle',
+    pending: 'Waiting for authorization',
+    completed: 'Sign-in completed',
+    failed: 'Sign-in failed',
+    cancelled: 'Sign-in cancelled',
+  }[stage]);
+}
+
+export function loginStageTone(stage: SubscriptionLoginStage): 'success' | 'warning' | 'error' {
+  if (stage === 'completed') return 'success';
+  if (stage === 'failed') return 'error';
+  return 'warning';
+}
+
+/** 本地凭据清除结果；与远端撤销严格分开，不互相代替。 */
+export function localLogoutLabel(local: SubscriptionLocalClearing, t: Translate): string {
+  return t({ cleared: 'Local credentials cleared', retained: 'Local credentials retained' }[local]);
+}
+
+/** 远端撤销结果；失败、不支持与未知都不得显示成已撤销。 */
+export function remoteRevocationLabel(remote: SubscriptionRemoteRevocation, t: Translate): string {
+  return t({
+    revoked: 'Remote authorization revoked',
+    failed: 'Remote revocation failed',
+    unsupported: 'Remote revocation unsupported',
+    unknown: 'Remote revocation unknown',
+  }[remote]);
+}
+
+/**
+ * 订阅行固定状态文本：连接状态、世代、已核实身份、辅助进程版本与授权目录；
+ * 有退出记录时追加本地清除与远端撤销结果。机器可读 token 与本地化文案同时保留。
+ */
+export function subscriptionStatusText(view: SubscriptionView | undefined, t: Translate): string {
+  const state = view?.state ?? 'not_connected';
+  const parts = [
+    `state=${state}`,
+    `(${connectionStateLabel(state, t)})`,
+    `generation=${view?.generation ?? 0}`,
+    `identity=${knownOrUnknown(view?.identity)}`,
+    `helper=${helperVersionLabel(view)}`,
+    `auth_home=${authHomeLabel(view)}`,
+  ];
+  if (view?.login) {
+    parts.push(`login=${view.login.stage}`);
+    // 挂起时必须能看到授权链接或 user code；两者都放进固定 selector 的文本里。
+    if (view.login.stage === 'pending') {
+      if (view.login.authorization_url?.trim()) parts.push(`authorization_url=${view.login.authorization_url.trim()}`);
+      if (view.login.user_code?.trim()) parts.push(`user_code=${view.login.user_code.trim()}`);
+    }
+  }
+  if (view?.logout) parts.push(`local=${view.logout.local}`, `remote=${view.logout.remote}`);
+  return parts.join(' ');
+}
+
+/** 界面准入：真实生成保持后端默认拒绝，这里只决定登录/退出按钮可用性。 */
+export function subscriptionActions(state: SubscriptionConnectionState): { canLogin: boolean; canCancel: boolean; canLogout: boolean } {
+  return {
+    canLogin: state === 'not_connected' || state === 'expired',
+    canCancel: state === 'authorization_pending',
+    canLogout: state === 'connected',
+  };
 }

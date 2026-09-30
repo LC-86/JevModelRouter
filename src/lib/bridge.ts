@@ -304,6 +304,30 @@ export async function refreshSubscription(providerId: string): Promise<Dashboard
   return invoke('refresh_subscription', { providerId });
 }
 
+/** 开始订阅登录：立即返回 pending，完成结果由前端轮询 get_snapshot 观察。 */
+export async function beginSubscriptionLogin(providerId: string): Promise<DashboardSnapshot> {
+  if (!isTauri()) throw new Error('Open the desktop app to sign in to a subscription.');
+  return invoke('begin_subscription_login', { providerId });
+}
+
+/** 取消挂起的订阅登录；迟到结果按世代丢弃。 */
+export async function cancelSubscriptionLogin(providerId: string): Promise<DashboardSnapshot> {
+  if (!isTauri()) throw new Error('Open the desktop app to cancel a subscription sign-in.');
+  return invoke('cancel_subscription_login', { providerId });
+}
+
+/** 退出订阅：本地清除与远端撤销结果分别返回。 */
+export async function logoutSubscription(providerId: string): Promise<DashboardSnapshot> {
+  if (!isTauri()) throw new Error('Open the desktop app to sign out of a subscription.');
+  return invoke('logout_subscription', { providerId });
+}
+
+/** 换号等价于退出加登录；失败时不恢复旧账号。 */
+export async function switchSubscriptionAccount(providerId: string): Promise<DashboardSnapshot> {
+  if (!isTauri()) throw new Error('Open the desktop app to switch a subscription account.');
+  return invoke('switch_subscription_account', { providerId });
+}
+
 
 export async function saveRoute(route: RouteRule, creating = false, apiKey?: string, originalId?: string): Promise<DashboardSnapshot> {
   if (isTauri()) return invoke('save_route', { route, creating, apiKey, originalId });

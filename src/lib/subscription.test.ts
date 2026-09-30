@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import { translate } from './preferences-context';
 import {
-  capabilityLabel, connectionStateLabel, connectionStateTone, denialLabel, identityLabel, isSubscriptionProvider,
-  modelCapability, protocolKey, quotaLabel, subscriptionReason, subscriptionView,
+  authHomeLabel, capabilityLabel, connectionStateLabel, connectionStateTone, denialLabel, helperVersionLabel,
+  identityLabel, isSubscriptionProvider, knownOrUnknown, localLogoutLabel, loginStageLabel, loginStageTone,
+  modelCapability, protocolKey, quotaLabel, remoteRevocationLabel, subscriptionActions, subscriptionReason,
+  subscriptionStatusText, subscriptionView,
 } from './subscription';
 import type { DashboardSnapshot, SubscriptionView } from '../types';
 
@@ -68,5 +70,99 @@ describe('subscription views', () => {
     expect(denialLabel({ code: 'future_reason', family: 'quota', message: '', recovery: '' }, t)).toBe('future_reason');
     expect(subscriptionView(snapshot, 'codex')?.generation).toBe(1);
     expect(subscriptionView(snapshot, 'grok')).toBeUndefined();
+  });
+});
+
+describe('subscription login and logout lifecycle', () => {
+  it('maps login stages to labels and tones', () => {
+    expect(loginStageLabel('idle', t)).toBe('未开始登录');
+    expect(loginStageLabel('pending', t)).toBe('等待授权');
+    expect(loginStageLabel('completed', t)).toBe('登录已完成');
+    expect(loginStageLabel('failed', t)).toBe('登录失败');
+    expect(loginStageLabel('cancelled', t)).toBe('登录已取消');
+    expect(loginStageTone('completed')).toBe('success');
+    expect(loginStageTone('failed')).toBe('error');
+    expect(loginStageTone('pending')).toBe('warning');
+  });
+
+  it('keeps local clearing and remote revocation apart', () => {
+    expect(localLogoutLabel('cleared', t)).toBe('本地凭据已清除');
+    expect(localLogoutLabel('retained', t)).toBe('本地凭据仍保留');
+    expect(remoteRevocationLabel('revoked', t)).toBe('远端授权已撤销');
+    expect(remoteRevocationLabel('failed', t)).toBe('远端撤销失败');
+    expect(remoteRevocationLabel('unsupported', t)).toBe('远端撤销不受支持');
+    expect(remoteRevocationLabel('unknown', t)).toBe('远端撤销结果未知');
+  });
+
+  it('shows Unknown for every missing piece of evidence', () => {
+    expect(knownOrUnknown(null)).toBe('Unknown');
+    expect(knownOrUnknown('   ')).toBe('Unknown');
+    expect(knownOrUnknown(' fixture ')).toBe('fixture');
+    expect(helperVersionLabel(view())).toBe('Unknown');
+    expect(authHomeLabel(view())).toBe('Unknown');
+  });
+
+  it('falls back to the retained helper fields when the new helper view is absent', () => {
+    const legacy = view({ helper_version: '0.4.0', account_path: '/home/fixture/.autojev/helpers/codex/codex' });
+    expect(helperVersionLabel(legacy)).toBe('0.4.0');
+    expect(authHomeLabel(legacy)).toBe('/home/fixture/.autojev/helpers/codex/codex');
+  });
+
+  it('renders state, generation, identity, helper and auth home in the fixed status text', () => {
+    const text = subscriptionStatusText(view({ generation: 7 }), t);
+    expect(text).toContain('state=not_connected');
+    expect(text).toContain('未连接');
+    expect(text).toContain('generation=7');
+    expect(text).toContain('identity=Unknown');
+    expect(text).toContain('helper=Unknown');
+    expect(text).toContain('auth_home=Unknown');
+
+    const connected = subscriptionStatusText(view({
+      generation: 12,
+      state: 'connected',
+      identity: 'fixture@example.invalid',
+      helper: { available: true, version: '0.4.0', auth_home: '/home/fixture/.autojev/helpers/codex/codex' },
+    }), t);
+    expect(connected).toContain('state=connected');
+    expect(connected).toContain('已连接');
+    expect(connected).toContain('generation=12');
+    expect(connected).toContain('identity=fixture@example.invalid');
+    expect(connected).toContain('helper=0.4.0');
+    expect(connected).toContain('auth_home=/home/fixture/.autojev/helpers/codex/codex');
+    expect(connected).not.toContain('local=');
+  });
+
+  it('adds the login stage and the separate logout outcomes to the status text', () => {
+    const pending = subscriptionStatusText(view({
+      state: 'authorization_pending',
+      generation: 3,
+      login: { stage: 'pending', authorization_url: 'https://example.invalid/auth', user_code: 'ABCD-1234', attempt: 1, generation: 3 },
+    }), t);
+    expect(pending).toContain('login=pending');
+    expect(pending).toContain('generation=3');
+    // 挂起时授权链接与 user code 通过固定 selector 的文本可见。
+    expect(pending).toContain('authorization_url=https://example.invalid/auth');
+    expect(pending).toContain('user_code=ABCD-1234');
+    expect(subscriptionStatusText(view({ login: { stage: 'completed', attempt: 1, generation: 3 } }), t)).not.toContain('authorization_url=');
+
+    const loggedOut = subscriptionStatusText(view({
+      generation: 4,
+      logout: { local: 'cleared', remote: 'revoked', observed_at: '2026-09-30T00:00:00Z' },
+    }), t);
+    expect(loggedOut).toContain('local=cleared');
+    expect(loggedOut).toContain('remote=revoked');
+    // 远端失败或未知不得被折叠成已撤销。
+    expect(subscriptionStatusText(view({ logout: { local: 'retained', remote: 'failed' } }), t)).toContain('remote=failed');
+    expect(subscriptionStatusText(view({ logout: { local: 'retained', remote: 'unknown' } }), t)).toContain('remote=unknown');
+    // 没有快照时不编造连接状态。
+    expect(subscriptionStatusText(undefined, t)).toContain('state=not_connected');
+    expect(subscriptionStatusText(undefined, t)).toContain('generation=0');
+  });
+
+  it('derives button availability from the connection state only', () => {
+    expect(subscriptionActions('not_connected')).toEqual({ canLogin: true, canCancel: false, canLogout: false });
+    expect(subscriptionActions('authorization_pending')).toEqual({ canLogin: false, canCancel: true, canLogout: false });
+    expect(subscriptionActions('connected')).toEqual({ canLogin: false, canCancel: false, canLogout: true });
+    expect(subscriptionActions('expired')).toEqual({ canLogin: true, canCancel: false, canLogout: false });
   });
 });

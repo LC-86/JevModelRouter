@@ -4,10 +4,10 @@
   window.__ISOLATION_CHECK_RUNNING__ = true;
   const invoke = window.__TAURI_INTERNALS__.invoke;
   const check = (ok, message) => { if (!ok) throw new Error(message); };
-  const wait = async fn => {
+  const wait = async (fn, label) => {
     const until = Date.now() + 15000;
     while (Date.now() < until) { const value = await fn(); if (value) return value; await new Promise(r => setTimeout(r, 50)); }
-    throw new Error('Desktop condition timed out');
+    throw new Error(`Desktop condition timed out${label ? `: ${label}` : ''}`);
   };
   const click = async selector => (await wait(() => { const e = document.querySelector(selector); return e && !e.disabled && e; })).click();
   const nav = async index => { (await wait(() => document.querySelectorAll('nav .nav-item')[index])).click(); };
@@ -21,8 +21,138 @@
     try { await invoke(command, args); throw new Error('Unexpected success'); }
     catch (error) { check(String(error).includes(text), `${command}: ${error}`); }
   };
+  const providerId = 'codex-subscription';
+  const statusSelector = `[data-testid="sub-status-${providerId}"]`;
+  const statusText = () => document.querySelector(statusSelector)?.textContent || '';
+  const rowText = () => document.querySelector('tbody')?.textContent || '';
+  // 界面按自己的轮询渲染：读取状态文本前必须等它反映后端快照，不能只读一次。
+  const waitStatus = predicate => wait(() => { const text = statusText(); return predicate(text) ? text : null; }, 'row status');
+  const subscriptionView = async () => (await invoke('get_snapshot')).subscriptions.find(item => item.provider_id === providerId);
+  const clearedQuota = quota => !quota || ['unknown', 'unsupported'].includes(quota.state) === true;
+  // Issue #13 登录/退出/换号闭环：每次桌面运行只排练一个场景，替身场景队列与之对应。
+  const loginLifecycle = async mode => {
+    const details = { mode, observations: [] };
+    report.details = details;
+    const record = (label, value) => details.observations.push({ label, value });
+    await nav(1);
+    await wait(() => [...document.querySelectorAll('tbody tr')].find(item => item.textContent.includes(providerId)), 'subscription row');
+    const started = await wait(async () => (await subscriptionView()) || null, 'subscription view');
+    record('start', { state: started.state, generation: started.generation, identity: started.identity ?? null });
+    const startLogin = async () => {
+      await click(`[data-testid="sub-login-${providerId}"]`);
+      return wait(async () => { const item = await subscriptionView(); return item?.login?.stage === 'pending' ? item : null; }, 'pending login');
+    };
+    if (mode === 'success') {
+      check(started.state !== 'connected', `Success rehearsal needs a disconnected subscription: ${started.state}`);
+      const pending = await startLogin();
+      const pendingText = await waitStatus(text => text.includes('login=pending'));
+      const advertised = [pending.login.authorization_url, pending.login.user_code].filter(Boolean);
+      check(advertised.length > 0, `Pending login must advertise a link or code: ${JSON.stringify(pending.login)}`);
+      if (pending.login.authorization_url) {
+        const link = await wait(() => document.querySelector('.provider-subscription-auth-link')?.getAttribute('href') ?? null, 'authorization link');
+        check(link === pending.login.authorization_url, `Authorization link must be on screen: ${link} vs ${pending.login.authorization_url}`);
+      }
+      if (pending.login.user_code) await wait(() => rowText().includes(pending.login.user_code) ? true : null, 'user code on screen');
+      record('pending', { generation: pending.generation, login: pending.login, status: pendingText });
+      passed('sign-in start reaches pending and shows the authorization link or code');
+      const completed = await wait(async () => { const item = await subscriptionView(); return item?.login?.stage === 'completed' ? item : null; }, 'completed login');
+      check(Boolean(completed.identity), `Completed login must verify an identity: ${JSON.stringify(completed.login)}`);
+      const completedText = await waitStatus(text => text.includes(`identity=${completed.identity}`));
+      check(completedText.includes(`generation=${completed.generation}`), `Status must show generation=${completed.generation}: ${completedText}`);
+      check(completedText.includes(`helper=${completed.helper?.version || 'Unknown'}`), `Status must show the helper version: ${completedText}`);
+      check(completedText.includes(`auth_home=${completed.helper?.auth_home || 'Unknown'}`), `Status must show the helper auth home: ${completedText}`);
+      const home = completed.helper?.auth_home || '';
+      check(home.startsWith(`${window.__ISOLATION_CHECK__.root}/`), `Helper home must live under the isolation root ${window.__ISOLATION_CHECK__.root}: ${home}`);
+      check(completed.generation === pending.generation, `A completed login must keep its own generation: ${pending.generation} -> ${completed.generation}`);
+      record('pendingToCompleted', { from: pending.login.stage, to: completed.login.stage });
+      record('completed', { generation: completed.generation, identity: completed.identity, home, login: completed.login, status: completedText });
+      passed('verified identity, generation, helper version and isolated auth home in the row');
+      // 登录成功不得放行真实生成：订阅模型仍被准入拒绝，替身也不会收到生成请求。
+      const samplesBefore = ((await invoke('get_model_performance')).models['codex-subscription-model']?.samples) ?? 0;
+      await invoke('start_model_speed_tests', { ids: ['codex-subscription-model'] });
+      const denied = await wait(async () => {
+        const v = await invoke('get_model_performance');
+        return !v.job.running && (v.models['codex-subscription-model']?.samples ?? 0) > samplesBefore ? v : null;
+      }, 'denied speed test');
+      check(Boolean(denied.job.error), `Subscription generation must stay denied after sign-in: ${JSON.stringify(denied.job)}`);
+      record('deniedAfterLogin', { error: denied.job.error });
+      passed('real generation stays denied after a successful sign-in');
+      // 换号 = 退出 + 重新登录：世代递增，旧身份立刻消失，新登录仍绑定新世代。
+      await click(`[data-testid="sub-switch-${providerId}"]`);
+      const switched = await wait(async () => { const item = await subscriptionView(); return item?.login?.stage === 'pending' ? item : null; }, 'switched pending login');
+      check(!switched.identity, `Switching accounts must clear the previous identity immediately: ${switched.identity}`);
+      check(switched.generation > completed.generation, `Switching accounts must advance the generation: ${completed.generation} -> ${switched.generation}`);
+      const switchedText = await waitStatus(text => text.includes('identity=Unknown') && text.includes(`generation=${switched.generation}`));
+      check(!switchedText.includes(completed.identity), `Switching accounts must not keep showing the previous identity: ${switchedText}`);
+      record('switch', { from: { generation: completed.generation, identity: completed.identity }, to: { generation: switched.generation, state: switched.state, identity: switched.identity ?? null, login: switched.login }, status: switchedText });
+      passed('switching accounts advances the generation and drops the previous identity');
+      const reconnected = await wait(async () => { const item = await subscriptionView(); return item?.login?.stage === 'completed' && item.identity ? item : null; }, 'second sign-in');
+      check(reconnected.generation === switched.generation, `The switched sign-in must stay on its new generation: ${switched.generation} -> ${reconnected.generation}`);
+      check(reconnected.identity === completed.identity, `The switched sign-in must verify the same stand-in account: ${reconnected.identity}`);
+      const reconnectedText = await waitStatus(text => text.includes(`identity=${reconnected.identity}`) && text.includes('login=completed'));
+      record('reconnected', { generation: reconnected.generation, identity: reconnected.identity, login: reconnected.login, status: reconnectedText });
+      passed('the switched account signs in again on the new generation');
+      await click(`[data-testid="sub-logout-${providerId}"]`);
+      const after = await wait(async () => { const item = await subscriptionView(); return item?.logout && !item.identity ? item : null; }, 'logout outcome');
+      check(after.generation > reconnected.generation, `Sign-out must advance the generation: ${reconnected.generation} -> ${after.generation}`);
+      check(!after.identity, `Sign-out must clear the verified identity: ${after.identity}`);
+      check((after.models || []).length === 0, `Sign-out must clear the discovered catalog: ${(after.models || []).length}`);
+      check((after.capabilities || []).length === 0, `Sign-out must clear verified capabilities: ${(after.capabilities || []).length}`);
+      check(clearedQuota(after.quota), `Sign-out must clear the quota evidence: ${JSON.stringify(after.quota)}`);
+      const afterText = await waitStatus(text => /local=(cleared|retained)/.test(text) && /remote=(revoked|failed|unsupported|unknown)/.test(text));
+      check(/local=(cleared|retained)/.test(afterText), `Status must report the local clearing result: ${afterText}`);
+      check(/remote=(revoked|failed|unsupported|unknown)/.test(afterText), `Status must report the remote revocation result: ${afterText}`);
+      const kept = await invoke('get_snapshot');
+      check(kept.providers.some(item => item.id === providerId && item.kind === 'codex_subscription'), 'Sign-out must keep the subscription provider configuration');
+      check(kept.models.some(item => item.id === 'codex-subscription-model' && item.provider_id === providerId), 'Sign-out must keep the subscription model configuration');
+      record('afterLogout', { generation: after.generation, state: after.state, identity: after.identity ?? null, logout: after.logout, quota: after.quota, status: afterText });
+      passed('sign-out advances the generation, clears caches and keeps provider/model configuration');
+    }
+    if (mode === 'late') {
+      check(started.state !== 'connected', `Late rehearsal needs a disconnected subscription: ${started.state}`);
+      // 先开始一次登录，再取消它；替身只会在收到 cancel 之后补发一个迟到的成功结果。
+      const pending = await startLogin();
+      await click(`[data-testid="sub-cancel-${providerId}"]`);
+      const settled = await wait(async () => { const item = await subscriptionView(); return item?.login && item.login.stage !== 'pending' ? item : null; }, 'cancelled login');
+      const cancelledText = await waitStatus(text => !text.includes('login=pending'));
+      record('cancelled', { stage: settled.login.stage, state: settled.state, generation: settled.generation, identity: settled.identity ?? null, status: cancelledText });
+      await new Promise(r => setTimeout(r, 900));
+      const afterLate = await subscriptionView();
+      check(afterLate.login.stage !== 'completed', `A late completion must not complete the cancelled login: ${afterLate.login.stage}`);
+      check(!afterLate.identity, `A late completion must not revive an identity: ${afterLate.identity}`);
+      check(afterLate.generation >= pending.generation, `A late completion must not roll the generation back: ${pending.generation} -> ${afterLate.generation}`);
+      const lateText = await waitStatus(text => text.includes('identity=Unknown') && !text.includes('login=completed'));
+      record('lateCompletion', { stage: afterLate.login.stage, generation: afterLate.generation, identity: afterLate.identity ?? null, status: lateText, pendingGeneration: pending.generation });
+      passed('a late completion is discarded: no revived identity and no generation rollback');
+      // 这里不再发起新的挂起登录：取消后状态回到未连接，替身进程仍然存活，
+      // 由外层在桌面退出后断言它被回收。
+      const settledState = (await subscriptionView()).state;
+      check(settledState === 'not_connected', `Cancelling must settle back to not_connected: ${settledState}`);
+    }
+    if (mode === 'failed') {
+      check(started.state !== 'connected', `Failed rehearsal needs a disconnected subscription: ${started.state}`);
+      const pending = await startLogin();
+      const failed = await wait(async () => { const item = await subscriptionView(); return item?.login?.stage === 'failed' ? item : null; }, 'failed login');
+      check(Boolean(failed.login.error), `A failed login must report an error: ${JSON.stringify(failed.login)}`);
+      check(!failed.identity, `A failed login must not verify an identity: ${failed.identity}`);
+      check(failed.generation >= pending.generation, `A failed login must not roll the generation back: ${pending.generation} -> ${failed.generation}`);
+      const failedText = await waitStatus(text => text.includes('login=failed'));
+      const failedRow = await wait(() => rowText().includes(failed.login.error) ? rowText() : null, 'failure reason in row');
+      const snapshot = await invoke('get_snapshot');
+      const view = snapshot.subscriptions.find(item => item.provider_id === providerId);
+      check(view.login.stage === 'failed', `The backend snapshot must report the failure: ${JSON.stringify(view.login)}`);
+      record('failed', { stage: failed.login.stage, error: failed.login.error, generation: failed.generation, status: failedText, row: failedRow.slice(-600), snapshot: JSON.stringify(view) });
+      passed('a failed sign-in is reported in the row and the backend snapshot');
+    }
+  };
   try {
     await wait(() => document.querySelector('.app-shell'));
+    if (window.__ISOLATION_CHECK__.loginMode) {
+      try { await loginLifecycle(window.__ISOLATION_CHECK__.loginMode); report.ok = true; }
+      catch (error) { report.error = String(error); report.screen = document.body.innerText.slice(-5000); }
+      await invoke('isolation_check_report', { report });
+      return;
+    }
     let snapshot = await invoke('get_snapshot');
     check(!snapshot.proxy.running && snapshot.proxy.port === 0, 'Isolation must not autostart');
     check(!(await invoke('get_model_performance')).settings.enabled, 'Automatic speed tests must be off');
@@ -85,12 +215,17 @@
       check(/Not connected|未连接/.test(subscriptionRow.textContent), `Provider row must show the real connection state: ${subscriptionRow.textContent}`);
       const subscription = (await invoke('get_snapshot')).subscriptions.find(s => s.provider_id === 'codex-subscription');
       check(subscription && subscription.state === 'not_connected' && subscription.generation === 1, `Subscription connection must start unconnected: ${JSON.stringify(subscription)}`);
-      check(subscription.adapter_available === false, 'Production must not install a subscription stub');
+      check(subscription.adapter_available === true, 'The isolation build must install the real Codex helper adapter (no production stub)');
       check(subscription.denial && subscription.denial.code === 'not_connected', 'Unconnected subscription must stay denied');
       passed('subscription provider added from the provider panel with its real state');
       await invoke('save_model', { model: { ...model, id: 'codex-subscription-model', provider_id: 'codex-subscription', model_id: 'codex-fixture-model', name: 'Codex fixture' } });
       await rejected('test_provider_draft', { provider: { ...provider, id: 'codex-subscription', name: 'Codex subscription', kind: 'codex_subscription', base_url: '', api_type: '', test_model: 'codex-fixture-model' } }, 'not connected');
-      await rejected('refresh_subscription', { providerId: 'codex-subscription' }, 'No subscription helper');
+      // 只读刷新不得把未连接伪装成已连接；替身的目录/额度读取尚未实现时必须如实报错。
+      const refreshError = await invoke('refresh_subscription', { providerId: 'codex-subscription' }).then(() => null, error => String(error));
+      const afterRefresh = (await invoke('get_snapshot')).subscriptions.find(s => s.provider_id === 'codex-subscription');
+      check(afterRefresh.state !== 'connected', `Read-only refresh must not fake a connection: ${afterRefresh.state} (${refreshError})`);
+      check(afterRefresh.denial && afterRefresh.denial.code === 'not_connected', `Unconnected subscription must stay denied: ${JSON.stringify(afterRefresh.denial)}`);
+      check(afterRefresh.identity == null, `Read-only refresh must not invent an identity: ${afterRefresh.identity}`);
       await invoke('start_model_speed_tests', { ids: ['codex-subscription-model'] });
       const denied = await wait(async () => { const v = await invoke('get_model_performance'); return !v.job.running && v.job.completed === 3 && v; });
       check(/not connected/i.test(denied.job.error || ''), `Subscription speed test must report the reason: ${denied.job.error}`);
@@ -111,6 +246,7 @@
       await invoke('connect_agent', { id: 'codex', routeId: `model/${model.id}` });
       await invoke('save_performance_settings', { settings: { version: 1, enabled: true, interval_minutes: 5 } });
       passed('temporary Agent connect and restore');
+      await loginLifecycle('success');
     }
     report.ok = true;
   } catch (error) { report.error = String(error); report.screen = document.body.innerText.slice(-5000); }

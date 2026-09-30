@@ -19,6 +19,7 @@ mod provider_test;
 mod router;
 mod dispatch;
 mod subscription;
+mod codex_helper;
 mod runtime;
 #[cfg(feature = "isolation-check")]
 mod isolation_check;
@@ -43,6 +44,8 @@ struct AppState {
     performance: Arc<performance::Runner>,
     store: Arc<ConfigStore>,
     proxy: Arc<Mutex<Option<ProxyHandle>>>,
+    /// 登录会话内存态：挂起链接、user code、错误与最近一次退出都不落盘。
+    sessions: Arc<Mutex<subscription::SessionState>>,
 }
 
 #[derive(Serialize)]
@@ -83,7 +86,12 @@ async fn snapshot(state: &AppState) -> DashboardSnapshot {
     let port = state.proxy.lock().await.as_ref().map_or(config.port, |p| p.port);
     let paused = state.proxy.lock().await.as_ref().is_some_and(|p| p.running() && p.paused());
     let detected = detected_agents_with_selection(&config);
-    let subscriptions = subscription::views(&config, state.store.subscription.available());
+    let helper = state.store.subscription.helper_status();
+    let subscriptions = {
+        let mut sessions = state.sessions.lock().await;
+        sessions.helper = helper.clone();
+        subscription::views(&config, state.store.subscription.available(), &sessions)
+    };
     DashboardSnapshot {
         recovery_notice: lifecycle::notice(config.port),
         gateway: config.gateway.clone(),
@@ -161,9 +169,52 @@ async fn get_snapshot(state: State<'_, AppState>) -> Result<DashboardSnapshot, S
 }
 
 /// 只读刷新订阅连接。生成被拒绝或网关暂停时仍需可用，且不产生任何生成请求。
+/// 挂起登录期间不改写连接，避免把 pending 伪装成已连接或让旧身份复活。
 #[tauri::command]
 async fn refresh_subscription(state: State<'_, AppState>, provider_id: String) -> Result<DashboardSnapshot, String> {
     subscription::refresh(&state.store, &provider_id).await?;
+    Ok(snapshot(&state).await)
+}
+
+/// 后台等待 account/login/completed 并写入内存态；世代或尝试已变时结果整体丢弃。
+fn spawn_login_waiter(
+    store: Arc<ConfigStore>,
+    sessions: Arc<Mutex<subscription::SessionState>>,
+    provider_id: String,
+) {
+    tauri::async_runtime::spawn(async move {
+        if let Err(error) = subscription::await_login(store, provider_id, sessions).await {
+            eprintln!("AutoJev subscription login: {error}");
+        }
+    });
+}
+
+/// 发起登录：立即返回 pending，授权链接只存在于内存态，由 `get_snapshot` 轮询观察。
+#[tauri::command]
+async fn begin_subscription_login(state: State<'_, AppState>, provider_id: String) -> Result<DashboardSnapshot, String> {
+    subscription::begin_login(&state.store, &provider_id, &state.sessions).await?;
+    spawn_login_waiter(state.store.clone(), state.sessions.clone(), provider_id);
+    Ok(snapshot(&state).await)
+}
+
+#[tauri::command]
+async fn cancel_subscription_login(state: State<'_, AppState>, provider_id: String) -> Result<DashboardSnapshot, String> {
+    subscription::cancel_login(&state.store, &provider_id, &state.sessions).await?;
+    Ok(snapshot(&state).await)
+}
+
+/// 退出：世代递增、身份/额度/目录/能力缓存清空；服务商、模型与路由配置保留。
+#[tauri::command]
+async fn logout_subscription(state: State<'_, AppState>, provider_id: String) -> Result<DashboardSnapshot, String> {
+    subscription::logout(&state.store, &provider_id, &state.sessions).await?;
+    Ok(snapshot(&state).await)
+}
+
+/// 换号 = 退出 + 重新登录；换号失败不会恢复旧账号。
+#[tauri::command]
+async fn switch_subscription_account(state: State<'_, AppState>, provider_id: String) -> Result<DashboardSnapshot, String> {
+    subscription::switch_account(&state.store, &provider_id, &state.sessions).await?;
+    spawn_login_waiter(state.store.clone(), state.sessions.clone(), provider_id);
     Ok(snapshot(&state).await)
 }
 
@@ -868,7 +919,14 @@ pub fn run() {
             }
             let root = crate::runtime::home_dir().context("find home directory")?.join(".autojev");
             let database = if app.config().identifier.ends_with(".dev") { "autojev-dev.db" } else { "autojev.db" };
-            let store = Arc::new(ConfigStore::load(root.join(database))?);
+            // #13：真实官方 Codex 辅助进程适配器只在这里注入一次（代码内固定，无任何运行时替身开关）。
+            // 生产默认构造仍是 UnavailableAdapter；注入点就在 ConfigStore 构造处。
+            let mut store = ConfigStore::load(root.join(database))?;
+            store.subscription = Arc::new(codex_helper::CodexAdapter::new());
+            let store = Arc::new(store);
+            // 挂起登录只存在于内存：上次进程退出时留下的 authorization_pending 无法继续，
+            // 启动时归位成未连接，否则界面只允许取消、而取消又无会话可 settle。
+            subscription::reconcile_orphaned_pending(&store).map_err(|error| anyhow!(error))?;
             let port = if runtime::isolated() { 0 } else if app.config().identifier.ends_with(".dev") { config::DEV_PORT } else { config::DEFAULT_PORT };
             app.manage(lifecycle::lock(port)?);
             if !runtime::isolated() { lifecycle::spawn_watchdog(port)?; }
@@ -878,6 +936,7 @@ pub fn run() {
                 performance: Arc::new(performance::Runner::default()),
                 store: store.clone(),
                 proxy: Arc::new(Mutex::new(None)),
+                sessions: Arc::new(Mutex::new(subscription::SessionState::default())),
             };
             if runtime::isolated() {
                 store.update(|c| c.performance_settings.enabled = false)?;
@@ -923,6 +982,10 @@ pub fn run() {
             let handler: fn(tauri::ipc::Invoke<tauri::Wry>) -> bool = tauri::generate_handler![
             get_snapshot,
             refresh_subscription,
+            begin_subscription_login,
+            cancel_subscription_login,
+            logout_subscription,
+            switch_subscription_account,
             get_model_performance,
             start_model_speed_tests,
             cancel_model_speed_tests,
