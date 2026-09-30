@@ -172,6 +172,20 @@ describe('subscription login and logout lifecycle', () => {
     expect(subscriptionStatusText(undefined, t)).toContain('generation=0');
   });
 
+  it('shows quota admission reasons without changing the connection denial axis', () => {
+    const connected = view({
+      state: 'connected',
+      denial: null,
+      admission_denial: {
+        code: 'extra_usage_permission_unknown', family: 'quota',
+        message: 'No evidence extra credits are prohibited.', recovery: 'Refresh read-only evidence.',
+      },
+    });
+    expect(connectionStateLabel(connected.state, t)).toBe('已连接');
+    expect(subscriptionReason(connected, t)).toBe('No evidence extra credits are prohibited. Refresh read-only evidence.');
+    expect(denialLabel(connected.admission_denial, t)).toBe('尚未核实上游是否禁止额外 credits');
+  });
+
   it('derives button availability from the connection state only', () => {
     expect(subscriptionActions('not_connected')).toEqual({ canLogin: true, canCancel: false, canLogout: false });
     expect(subscriptionActions('authorization_pending')).toEqual({ canLogin: false, canCancel: true, canLogout: false });

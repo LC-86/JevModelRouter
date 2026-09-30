@@ -378,7 +378,8 @@ export function protocolKey(endpoint: string): string {
 /** 完整原因文本（后端英文原文），用作提示与日志详情。 */
 export function subscriptionReason(view: SubscriptionView | undefined, t: Translate): string {
   if (!view) return '';
-  if (view.denial) return `${view.denial.message} ${view.denial.recovery}`;
+  const denial = view.denial ?? view.admission_denial;
+  if (denial) return `${denial.message} ${denial.recovery}`;
   if ((view.quota?.state ?? 'unknown') !== 'available') return quotaLabel(view.quota?.state ?? 'unknown', t);
   return '';
 }

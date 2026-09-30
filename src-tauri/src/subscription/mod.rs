@@ -575,6 +575,11 @@ fn quota_admission_denial(provider: &Provider, state: EvidenceState) -> Option<D
     Some(quota_denial(provider, code, rejected_state))
 }
 
+fn admission_denial(provider: &Provider, quota: &QuotaEvidence) -> Option<Denial> {
+    quota_admission_denial(provider, admission_quota_state(quota))
+        .or_else(|| extra_usage_denial(provider, extra_usage_permission(quota)))
+}
+
 fn evaluate(
     config: &AppConfig,
     provider: &Provider,
@@ -608,10 +613,7 @@ fn evaluate(
         }
         _ => return Err(capability_denial(provider, model_id, protocol, "capability_unverified", "not verified yet")),
     }
-    if let Some(denial) = quota_admission_denial(provider, admission_quota_state(&evidence.quota)) {
-        return Err(denial);
-    }
-    extra_usage_denial(provider, extra_usage_permission(&evidence.quota)).map_or(Ok(()), Err)
+    admission_denial(provider, &evidence.quota).map_or(Ok(()), Err)
 }
 
 /// 网关、Debug、服务商测试、模型测试与手动测速共用的准入；API 服务商保持原行为。
@@ -659,23 +661,30 @@ pub fn catalog_listed(config: &AppConfig, model: &Model) -> bool {
     crate::subscription_catalog::eligibility(config, &provider.id, &model.model_id).is_eligible()
 }
 
-/// 服务商行的拒绝原因：连接/证据、额度与额外用量许可统一展示。
+/// 连接级拒绝原因，供界面在服务商行上直接显示。
 pub fn connection_denial(config: &AppConfig, provider: &Provider) -> Option<Denial> {
+    if !is_subscription_provider(provider) {
+        return None;
+    }
+    connection_check(config, provider)
+        .and_then(|connection| evidence_check(provider, connection).map(|_| ()))
+        .err()
+}
+
+/// 当前已连接服务商的额度与额外用量准入原因；与连接级 `denial` 分开表达。
+fn provider_admission_denial(config: &AppConfig, provider: &Provider) -> Option<Denial> {
     if !is_subscription_provider(provider) {
         return None;
     }
     let connection = match connection_check(config, provider) {
         Ok(connection) => connection,
-        Err(denial) => return Some(denial),
+        Err(_) => return None,
     };
     let evidence = match evidence_check(provider, connection) {
         Ok(evidence) => evidence,
-        Err(denial) => return Some(denial),
+        Err(_) => return None,
     };
-    if let Some(denial) = quota_admission_denial(provider, admission_quota_state(&evidence.quota)) {
-        return Some(denial);
-    }
-    extra_usage_denial(provider, extra_usage_permission(&evidence.quota))
+    admission_denial(provider, &evidence.quota)
 }
 
 /// 一次生成交接：绑定服务商、连接世代、模型与协议。适配器只负责外部辅助进程，
@@ -1676,7 +1685,10 @@ pub struct SubscriptionView {
     /// 订阅目录行：按服务商取全部已建档模型，逐行给出当前账号与世代下的资格。
     /// 与只读证据字段 `catalog`（`CatalogEvidence`）分开：这里是用户配置与账号资格的投影。
     pub catalog_entries: Vec<SubscriptionCatalogView>,
+    /// 连接/证据级拒绝原因；额度准入原因见 `admission_denial`。
     pub denial: Option<Denial>,
+    /// 当前额度或额外用量不满足派发条件时的原因。
+    pub admission_denial: Option<Denial>,
     pub adapter_available: bool,
     /// 登录会话（内存态）：阶段、挂起链接、尝试序号与绑定世代。
     pub login: SubscriptionLoginView,
@@ -1737,6 +1749,7 @@ pub fn views(config: &AppConfig, adapter_available: bool, sessions: &SessionStat
                 quota: evidence.map(|evidence| evidence.quota.clone()).unwrap_or_default(),
                 catalog_entries: catalog,
                 denial: connection_denial(config, provider),
+                admission_denial: provider_admission_denial(config, provider),
                 adapter_available: available,
                 login: SubscriptionLoginView {
                     stage: session.map(|session| session.stage).unwrap_or_default(),
@@ -2033,17 +2046,20 @@ mod admission_tests {
             "extra_usage_permission_unknown",
             "a positive credits balance does not prove extra usage is prohibited"
         );
-        assert_eq!(connection_denial(&config, &provider).unwrap().code, "extra_usage_permission_unknown");
+        assert!(connection_denial(&config, &provider).is_none());
+        assert_eq!(provider_admission_denial(&config, &provider).unwrap().code, "extra_usage_permission_unknown");
 
         config.subscriptions.get_mut(FIXTURE_PROVIDER).unwrap().evidence.as_mut().unwrap().quota.buckets[0]
             .credits.as_mut().unwrap().permission = QuotaPermission::Allowed;
         assert_eq!(admit_model(&config, &model, &provider, Protocol::Chat).unwrap_err().code, "extra_usage_allowed");
-        assert_eq!(connection_denial(&config, &provider).unwrap().code, "extra_usage_allowed");
+        assert!(connection_denial(&config, &provider).is_none());
+        assert_eq!(provider_admission_denial(&config, &provider).unwrap().code, "extra_usage_allowed");
 
         config.subscriptions.get_mut(FIXTURE_PROVIDER).unwrap().evidence.as_mut().unwrap().quota.buckets[0]
             .credits.as_mut().unwrap().permission = QuotaPermission::Denied;
         assert!(admit_model(&config, &model, &provider, Protocol::Chat).is_ok());
         assert!(connection_denial(&config, &provider).is_none());
+        assert!(provider_admission_denial(&config, &provider).is_none());
 
         let mut secondary = QuotaBucket::default();
         secondary.limit_id = "secondary".into();
@@ -2624,8 +2640,9 @@ mod refresh_tests {
         assert_eq!(view.catalog.state, EvidenceState::Available);
         assert_eq!(view.quota.buckets.len(), 1);
         // 服务商行暴露额外用量许可未知；缺能力仍会挡在模型级生成准入上。
+        assert!(view.denial.is_none(), "the connection-level denial remains empty once connection/evidence checks pass");
         assert_eq!(
-            view.denial.as_ref().map(|denial| denial.code.as_str()),
+            view.admission_denial.as_ref().map(|denial| denial.code.as_str()),
             Some("extra_usage_permission_unknown")
         );
         let json = serde_json::to_value(&view).unwrap();
@@ -4009,6 +4026,8 @@ mod lifecycle_tests {
         assert_eq!(json["helper"]["available"], false);
         assert_eq!(json["adapter_available"], false);
         assert_eq!(json["state"], "not_connected");
+        assert!(json["denial"].is_object());
+        assert!(json["admission_denial"].is_null());
         // 目录投影字段名冻结：前端与 lib.rs 快照都按 `catalog_entries` 取；
         // 同名的 `catalog` 是 #15 的只读目录证据（对象），两者不能混用。
         assert!(json["catalog_entries"].is_array());
