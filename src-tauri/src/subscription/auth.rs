@@ -682,7 +682,7 @@ pub async fn begin(store: &ConfigStore, provider_id: &str) -> Result<AuthView, S
         ));
     }
     if store.auth.isolated() {
-        return Err(refusal(CODE_HELPER_ISOLATED, "authorization helpers are disabled in isolated validation"));
+        return Err(refusal(CODE_HELPER_ISOLATED, format!("{} authorization is unsupported in isolated validation", provider.name)));
     }
     if !store.auth.available() {
         return Err(refusal(
@@ -834,7 +834,7 @@ pub async fn logout(store: &ConfigStore, provider_id: &str) -> Result<AuthView, 
     require_subscription(&provider)?;
     require_grok(&provider)?;
     if store.auth.isolated() {
-        return Err(refusal(CODE_HELPER_ISOLATED, "authorization helpers are disabled in isolated validation"));
+        return Err(refusal(CODE_HELPER_ISOLATED, format!("{} authorization is unsupported in isolated validation", provider.name)));
     }
     let connection = connection_of(&config, provider_id);
     if connection.state != ConnectionState::Connected {

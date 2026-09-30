@@ -58,6 +58,34 @@ export type SubscriptionConnectionState = 'not_connected' | 'authorization_pendi
 export type SubscriptionCapabilityStatus = 'unverified' | 'verified' | 'unsupported';
 export type SubscriptionEvidenceState = 'unknown' | 'available' | 'stale' | 'failed' | 'unsupported';
 
+export type SubscriptionLoginStage = 'idle' | 'pending' | 'completed' | 'failed' | 'cancelled';
+export type SubscriptionLocalClearing = 'cleared' | 'retained';
+export type SubscriptionRemoteRevocation = 'revoked' | 'failed' | 'unsupported' | 'unknown';
+
+/** 挂起登录的内存视图；绑定世代，不写进配置文件。 */
+export interface SubscriptionLoginView {
+  stage: SubscriptionLoginStage;
+  authorization_url?: string | null;
+  user_code?: string | null;
+  attempt: number;
+  generation: number;
+  error?: string | null;
+}
+
+/** 上一次退出的实际结果：本地清除与远端撤销分开记录，不互相代替。 */
+export interface SubscriptionLogoutView {
+  local: SubscriptionLocalClearing;
+  remote: SubscriptionRemoteRevocation;
+  observed_at?: string | null;
+}
+
+/** 官方辅助进程的可用性、版本与专用授权目录。 */
+export interface SubscriptionHelperView {
+  available: boolean;
+  version?: string | null;
+  auth_home?: string | null;
+}
+
 export interface SubscriptionModel { model_id: string; name?: string | null; eligible: boolean }
 export interface SubscriptionCapability { model_id: string; protocol: string; status: SubscriptionCapabilityStatus }
 export interface SubscriptionQuota { state: SubscriptionEvidenceState; source?: string | null; observed_at?: string | null }
@@ -77,6 +105,9 @@ export interface SubscriptionView {
   quota: SubscriptionQuota;
   denial?: SubscriptionDenial | null;
   adapter_available: boolean;
+  login?: SubscriptionLoginView | null;
+  logout?: SubscriptionLogoutView | null;
+  helper?: SubscriptionHelperView | null;
 }
 
 export type SubscriptionAuthPhase = 'idle' | 'pending' | 'succeeded' | 'failed' | 'cancelled';

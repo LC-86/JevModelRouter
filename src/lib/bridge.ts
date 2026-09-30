@@ -305,35 +305,34 @@ export async function refreshSubscription(providerId: string): Promise<Dashboard
   return invoke('refresh_subscription', { providerId });
 }
 
-const DESKTOP_AUTH_ERROR = 'Open the desktop app to manage subscription authorization.';
-
-/** 开始一次订阅登录尝试；返回完整快照，界面直接替换即可。 */
+/** 开始订阅登录：立即返回 pending，完成结果由前端轮询 get_snapshot 观察。 */
 export async function beginSubscriptionLogin(providerId: string): Promise<DashboardSnapshot> {
-  if (!isTauri()) throw new Error(DESKTOP_AUTH_ERROR);
+  if (!isTauri()) throw new Error('Open the desktop app to sign in to a subscription.');
   return invoke('begin_subscription_login', { providerId });
 }
 
-/** 读取当前尝试的进度；迟到结果由后端判定为 Superseded，不写入任何状态。 */
-export async function pollSubscriptionLogin(providerId: string): Promise<DashboardSnapshot> {
-  if (!isTauri()) throw new Error(DESKTOP_AUTH_ERROR);
-  return invoke('poll_subscription_login', { providerId });
-}
-
+/** 取消挂起的订阅登录；迟到结果按世代丢弃。 */
 export async function cancelSubscriptionLogin(providerId: string): Promise<DashboardSnapshot> {
-  if (!isTauri()) throw new Error(DESKTOP_AUTH_ERROR);
+  if (!isTauri()) throw new Error('Open the desktop app to cancel a subscription sign-in.');
   return invoke('cancel_subscription_login', { providerId });
 }
 
-/** 退出登录：本地清除与远端撤销的结论分开返回，前端不得互相推断。 */
+/** 退出订阅：本地清除与远端撤销结果分别返回。 */
 export async function logoutSubscription(providerId: string): Promise<DashboardSnapshot> {
-  if (!isTauri()) throw new Error(DESKTOP_AUTH_ERROR);
+  if (!isTauri()) throw new Error('Open the desktop app to sign out of a subscription.');
   return invoke('logout_subscription', { providerId });
 }
 
-/** 更换账号：先退出（新世代）再登录，失败时不恢复旧账号。 */
+/** 换号等价于退出加登录；失败时不恢复旧账号。 */
 export async function switchSubscriptionAccount(providerId: string): Promise<DashboardSnapshot> {
-  if (!isTauri()) throw new Error(DESKTOP_AUTH_ERROR);
+  if (!isTauri()) throw new Error('Open the desktop app to switch a subscription account.');
   return invoke('switch_subscription_account', { providerId });
+}
+
+/** 读取当前登录尝试的进度；迟到结果由后端判定为 Superseded，不写入任何状态。 */
+export async function pollSubscriptionLogin(providerId: string): Promise<DashboardSnapshot> {
+  if (!isTauri()) throw new Error('Open the desktop app to manage subscription authorization.');
+  return invoke('poll_subscription_login', { providerId });
 }
 
 

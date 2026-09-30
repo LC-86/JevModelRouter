@@ -1,8 +1,9 @@
 //! 订阅服务商边界：每家一个活动连接、证据绑定连接世代，以及所有生成入口共用的 fail-closed 准入。
 //!
-//! 本模块不依赖 Tauri 或 HTTP 框架，连接、证据、准入与只读刷新都能直接单测。生产默认没有任何
-//! 可用适配器（[`UnavailableAdapter`]），因此未验证的订阅生成一律拒绝；替身只能由测试构造，
-//! 配置与界面都没有把它换成替身的开关。
+//! 本模块不依赖 Tauri 或 HTTP 框架，连接、证据、准入与只读刷新都能直接单测。适配器只在构造
+//! `ConfigStore` 时注入：默认构造（含测试）装的是不提供任何辅助进程的 [`UnavailableAdapter`]，
+//! 生产在 `lib.rs` 唯一的 ConfigStore 构造处注入官方 Codex 适配器。两者都由代码固定，配置、环境
+//! 与界面都没有把它换成替身的开关；未验证的订阅生成一律拒绝。
 
 pub mod auth;
 pub mod helper;
@@ -10,6 +11,7 @@ pub mod helper;
 use anyhow::{bail, Result};
 use futures_util::future::BoxFuture;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 use crate::{
     config::{AppConfig, ConfigStore, Model, Provider, ProviderKind},
@@ -432,27 +434,601 @@ pub enum GenerationEvent {
 pub type GenerationStream<'a> =
     std::pin::Pin<Box<dyn futures_util::Stream<Item = GenerationEvent> + Send + 'a>>;
 
+/// 登录启动结果：登录 ID 与（可选的）授权链接或设备码。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct LoginStart {
+    pub login_id: String,
+    pub authorization_url: Option<String>,
+    pub user_code: Option<String>,
+}
+
+/// 一次登录尝试的终态。身份来自完成通知，并再次用只读读数核实。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LoginResult {
+    Completed { identity: String },
+    /// 辅助进程显式报告取消；编排同样接受这个终态（替身与验收会驱动它）。
+    #[allow(dead_code)]
+    Cancelled,
+    Failed(String),
+}
+
+/// 远端撤销结果；本地清理与远端撤销分开记录。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemoteRevocation {
+    Revoked,
+    Failed,
+    Unsupported,
+}
+
+/// 一次退出的结果：本地是否已清、远端撤销到了哪一步。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogoutOutcome {
+    pub local_cleared: bool,
+    pub remote: RemoteRevocation,
+}
+
+/// 辅助进程自述状态。生产里解析不到官方 `codex` 时 `available:false`，不 panic。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct HelperStatus {
+    pub available: bool,
+    pub version: Option<String>,
+    pub auth_home: Option<String>,
+}
+
+/// 登录阶段。挂起的 URL、user code 与错误只存在于内存态，不写进配置文件。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoginStage {
+    #[default]
+    Idle,
+    Pending,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+/// 本地清理结果的展示值。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogoutLocal {
+    Cleared,
+    Retained,
+}
+
+/// 远端撤销的展示值；`unknown` 表示这次没能观察到远端结果。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogoutRemote {
+    Revoked,
+    Failed,
+    Unsupported,
+    Unknown,
+}
+
+/// 登录会话的展示视图；挂起链接、user code 与错误只出现在这里，不写进配置文件。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SubscriptionLoginView {
+    pub stage: LoginStage,
+    pub authorization_url: Option<String>,
+    pub user_code: Option<String>,
+    pub attempt: u32,
+    pub generation: u64,
+    pub error: Option<String>,
+}
+
+/// 退出的展示视图：本地清理与远端撤销分别记录。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SubscriptionLogoutView {
+    pub local: LogoutLocal,
+    pub remote: LogoutRemote,
+    pub observed_at: Option<String>,
+}
+
+/// 辅助进程的展示视图。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SubscriptionHelperView {
+    pub available: bool,
+    pub version: Option<String>,
+    pub auth_home: Option<String>,
+}
+
+/// 一次退出的记录；`remote: None` 即展示为 `unknown`。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogoutRecord {
+    pub local_cleared: bool,
+    pub remote: Option<RemoteRevocation>,
+    pub observed_at: Option<String>,
+}
+
+impl LogoutRecord {
+    fn view(&self) -> SubscriptionLogoutView {
+        SubscriptionLogoutView {
+            local: if self.local_cleared { LogoutLocal::Cleared } else { LogoutLocal::Retained },
+            remote: match self.remote {
+                Some(RemoteRevocation::Revoked) => LogoutRemote::Revoked,
+                Some(RemoteRevocation::Failed) => LogoutRemote::Failed,
+                Some(RemoteRevocation::Unsupported) => LogoutRemote::Unsupported,
+                None => LogoutRemote::Unknown,
+            },
+            observed_at: self.observed_at.clone(),
+        }
+    }
+}
+
+/// 一家服务商的内存登录会话：世代与尝试序号决定迟到结果是否还能落盘。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SubscriptionSession {
+    pub stage: LoginStage,
+    pub attempt: u32,
+    /// 当前尝试绑定的连接世代；0 表示没有尝试，读取时回落到连接世代。
+    pub generation: u64,
+    pub login_id: Option<String>,
+    pub authorization_url: Option<String>,
+    pub user_code: Option<String>,
+    pub error: Option<String>,
+    pub last_logout: Option<LogoutRecord>,
+}
+
+/// 会话表 + 最近一次辅助进程自述；两者都只存在于内存，不落盘。
+#[derive(Clone, Debug, Default)]
+pub struct SessionState {
+    pub sessions: HashMap<String, SubscriptionSession>,
+    pub helper: HelperStatus,
+    /// 当前适配器真正支持登录的服务商标识（来自 `SubscriptionAdapter::supports`）。
+    /// 未列出的订阅行不得借用全局 helper 的版本与授权目录。
+    pub supported_providers: Vec<String>,
+}
+
+impl SessionState {
+    pub fn session(&self, provider_id: &str) -> Option<&SubscriptionSession> {
+        self.sessions.get(provider_id)
+    }
+
+    pub fn supports(&self, provider_id: &str) -> bool {
+        self.supported_providers.iter().any(|supported| supported == provider_id)
+    }
+}
+
+fn require_subscription_provider(store: &ConfigStore, provider_id: &str) -> Result<Provider, String> {
+    store
+        .read()
+        .providers
+        .into_iter()
+        .find(|provider| provider.id == provider_id && is_subscription_provider(provider))
+        .ok_or_else(|| format!("Unknown subscription provider: {provider_id}"))
+}
+
+/// 只有适配器声明支持该服务商类型时才允许动连接或拉起辅助进程。
+fn require_supported(store: &ConfigStore, provider: &Provider, action: &str) -> Result<(), String> {
+    if store.subscription.supports(&provider.kind) {
+        return Ok(());
+    }
+    Err(format!("{} subscription {action} is not implemented yet", label(provider)))
+}
+
+fn connection_generation(store: &ConfigStore, provider_id: &str) -> u64 {
+    store
+        .read()
+        .subscriptions
+        .get(provider_id)
+        .map(|connection| connection.generation)
+        .unwrap_or_default()
+}
+
+/// 适配器文本进入界面或日志前统一脱敏。
+fn sanitize_error(message: &str) -> String {
+    crate::codex_helper::redact(message)
+}
+
+/// 只在会话仍是同一尝试时改写其终态；否则说明结果已过期，调用方应整体丢弃。
+fn finish_session(
+    state: &mut SessionState,
+    provider_id: &str,
+    generation: u64,
+    attempt: u32,
+    stage: LoginStage,
+    error: Option<String>,
+) -> bool {
+    let Some(session) = state.sessions.get_mut(provider_id) else {
+        return false;
+    };
+    if session.stage != LoginStage::Pending || session.generation != generation || session.attempt != attempt
+    {
+        return false;
+    }
+    session.stage = stage;
+    session.login_id = None;
+    session.authorization_url = None;
+    session.user_code = None;
+    session.error = error;
+    true
+}
+
+async fn pending_attempt(
+    sessions: &tokio::sync::Mutex<SessionState>,
+    provider_id: &str,
+) -> Option<(u64, u32)> {
+    let state = sessions.lock().await;
+    state
+        .session(provider_id)
+        .filter(|session| session.stage == LoginStage::Pending)
+        .map(|session| (session.generation, session.attempt))
+}
+
+/// 只在新世代仍是当前世代时绑定已核实身份；证据必须重新读取，不沿用旧账号。
+fn bind_identity(store: &ConfigStore, provider_id: &str, generation: u64, identity: &str) -> Result<(), String> {
+    store
+        .update(|config| {
+            let Some(connection) = config.subscriptions.get_mut(provider_id) else { return };
+            if connection.generation != generation {
+                return;
+            }
+            connection.state = ConnectionState::Connected;
+            connection.identity = Some(identity.to_owned());
+            connection.evidence = None;
+        })
+        .map_err(|error| error.to_string())
+}
+
+/// 失败/取消的终态：只在仍是挂起态时回到未连接，绝不复活更早的身份。
+fn settle_not_connected(store: &ConfigStore, provider_id: &str, generation: u64) -> Result<(), String> {
+    store
+        .update(|config| {
+            let Some(connection) = config.subscriptions.get_mut(provider_id) else { return };
+            if connection.generation != generation {
+                return;
+            }
+            if connection.state == ConnectionState::AuthorizationPending {
+                connection.state = ConnectionState::NotConnected;
+            }
+        })
+        .map_err(|error| error.to_string())
+}
+
+/// 立即发起登录并把 pending 写进内存态。调用方随后 spawn [`await_login`] 等完成通知，
+/// 因此本函数不会阻塞在浏览器授权上，挂起链接只存在于内存。
+pub async fn begin_login(
+    store: &ConfigStore,
+    provider_id: &str,
+    sessions: &tokio::sync::Mutex<SessionState>,
+) -> Result<LoginStart, String> {
+    let provider = require_subscription_provider(store, provider_id)?;
+    // 不支持的订阅类型不得拉起任何辅助进程，也不得改动连接状态。
+    require_supported(store, &provider, "sign-in")?;
+    let generation = connection_generation(store, provider_id);
+    let start = store
+        .subscription
+        .start_login(provider_id, generation)
+        .await
+        .map_err(|error| sanitize_error(&error.to_string()))?;
+    // 进入非连接态：pending 期间生成准入与只读刷新都不得把连接当成已建立。
+    store
+        .update(|config| {
+            if let Some(connection) = config.subscriptions.get_mut(provider_id) {
+                connection.state = ConnectionState::AuthorizationPending;
+            }
+        })
+        .map_err(|error| error.to_string())?;
+    let mut state = sessions.lock().await;
+    let session = state.sessions.entry(provider_id.to_owned()).or_default();
+    session.stage = LoginStage::Pending;
+    session.attempt += 1;
+    session.generation = generation;
+    session.login_id = Some(start.login_id.clone());
+    session.authorization_url = start.authorization_url.clone();
+    session.user_code = start.user_code.clone();
+    session.error = None;
+    Ok(start)
+}
+
+/// 取消挂起登录：先把会话置为取消终态，迟到完成通知不可能再把它改回 completed。
+/// 会话表里可能没有该服务商（挂起期间进程重启过）：此时不伪造会话，
+/// 用连接的当前世代兜底把落盘的 `authorization_pending` 归位成未连接，幂等返回 `Ok`。
+pub async fn cancel_login(
+    store: &ConfigStore,
+    provider_id: &str,
+    sessions: &tokio::sync::Mutex<SessionState>,
+) -> Result<(), String> {
+    let provider = require_subscription_provider(store, provider_id)?;
+    require_supported(store, &provider, "sign-in cancellation")?;
+    let recorded = {
+        let mut state = sessions.lock().await;
+        match state.sessions.get_mut(provider_id) {
+            Some(session) => {
+                if session.stage == LoginStage::Pending {
+                    session.stage = LoginStage::Cancelled;
+                    session.login_id = None;
+                    session.authorization_url = None;
+                    session.user_code = None;
+                    session.error = None;
+                }
+                session.generation
+            }
+            None => 0,
+        }
+    };
+    let generation = if recorded == 0 { connection_generation(store, provider_id) } else { recorded };
+    let result = store.subscription.cancel_login(provider_id, generation).await;
+    settle_not_connected(store, provider_id, generation)?;
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let message = sanitize_error(&error.to_string());
+            let mut state = sessions.lock().await;
+            if let Some(session) = state.sessions.get_mut(provider_id) {
+                session.error = Some(message.clone());
+            }
+            Err(message)
+        }
+    }
+}
+
+/// 进程启动时把无法继续的挂起登录归位：挂起链接与登录会话只存在于内存，
+/// 重启后不可能还有活的挂起尝试。只把 `AuthorizationPending` 改回 `NotConnected`，
+/// 不改变世代，也不清除已有身份。
+pub fn reconcile_orphaned_pending(store: &ConfigStore) -> Result<(), String> {
+    store
+        .update(|config| {
+            for connection in config.subscriptions.values_mut() {
+                if connection.state == ConnectionState::AuthorizationPending {
+                    connection.state = ConnectionState::NotConnected;
+                }
+            }
+        })
+        .map_err(|error| error.to_string())
+}
+
+/// 后台等待一次已启动登录的终态。结果整体绑定 `(provider_id, generation, attempt)`：
+/// 世代或尝试在完成前变化时一律丢弃，不写入新世代、不复活旧账号。
+pub async fn await_login(
+    store: std::sync::Arc<ConfigStore>,
+    provider_id: String,
+    sessions: std::sync::Arc<tokio::sync::Mutex<SessionState>>,
+) -> Result<LoginResult, String> {
+    let Some((generation, attempt)) = pending_attempt(&sessions, &provider_id).await else {
+        return Err("No pending subscription login for this provider".to_owned());
+    };
+    let outcome = match store.subscription.login_result(&provider_id, generation).await {
+        Ok(Some(outcome)) => outcome,
+        // 辅助进程中途退出（stdout 关闭或尝试已不在跟踪）与出错同等处理：结束挂起态并如实报错，
+        // 否则会话会永远停在 Pending，用户既不能登录也不能取消。
+        Ok(None) => {
+            let message = "The Codex helper exited before the sign-in finished; sign in again".to_owned();
+            let mut state = sessions.lock().await;
+            if finish_session(&mut state, &provider_id, generation, attempt, LoginStage::Failed, Some(message.clone())) {
+                drop(state);
+                settle_not_connected(&store, &provider_id, generation)?;
+            }
+            return Err(message);
+        }
+        Err(error) => {
+            let message = sanitize_error(&error.to_string());
+            let mut state = sessions.lock().await;
+            if finish_session(&mut state, &provider_id, generation, attempt, LoginStage::Failed, Some(message.clone())) {
+                drop(state);
+                settle_not_connected(&store, &provider_id, generation)?;
+            }
+            return Err(message);
+        }
+    };
+    let mut state = sessions.lock().await;
+    let bound = state.sessions.get(&provider_id).is_some_and(|session| {
+        session.stage == LoginStage::Pending && session.generation == generation && session.attempt == attempt
+    });
+    if !bound || connection_generation(&store, &provider_id) != generation {
+        return Err("The login attempt changed before the result arrived; the result was discarded".to_owned());
+    }
+    match outcome {
+        LoginResult::Completed { identity } => {
+            let identity = identity.trim().to_owned();
+            if identity.is_empty() {
+                finish_session(
+                    &mut state,
+                    &provider_id,
+                    generation,
+                    attempt,
+                    LoginStage::Failed,
+                    Some("The Codex helper returned an empty account identity".to_owned()),
+                );
+                drop(state);
+                settle_not_connected(&store, &provider_id, generation)?;
+                return Err("The Codex helper returned an empty account identity".to_owned());
+            }
+            finish_session(&mut state, &provider_id, generation, attempt, LoginStage::Completed, None);
+            drop(state);
+            bind_identity(&store, &provider_id, generation, &identity)?;
+            Ok(LoginResult::Completed { identity })
+        }
+        LoginResult::Cancelled => {
+            finish_session(&mut state, &provider_id, generation, attempt, LoginStage::Cancelled, None);
+            drop(state);
+            settle_not_connected(&store, &provider_id, generation)?;
+            Ok(LoginResult::Cancelled)
+        }
+        LoginResult::Failed(message) => {
+            let message = sanitize_error(&message);
+            finish_session(&mut state, &provider_id, generation, attempt, LoginStage::Failed, Some(message.clone()));
+            drop(state);
+            settle_not_connected(&store, &provider_id, generation)?;
+            Ok(LoginResult::Failed(message))
+        }
+    }
+}
+
+/// 退出：先阻止新请求并递增世代、清空身份/额度/目录/能力缓存，再调辅助进程退出。
+/// 服务商、模型、路由与 API 配置原样保留；本地与远端结果分别记录。
+pub async fn logout(
+    store: &ConfigStore,
+    provider_id: &str,
+    sessions: &tokio::sync::Mutex<SessionState>,
+) -> Result<LogoutOutcome, String> {
+    let provider = require_subscription_provider(store, provider_id)?;
+    require_supported(store, &provider, "sign-out")?;
+    let generation = store
+        .update(|config| {
+            if !config.subscriptions.contains_key(provider_id) {
+                config.subscriptions.insert(provider_id.to_owned(), Connection::default());
+                return 1;
+            }
+            let connection = config.subscriptions.get_mut(provider_id).expect("checked above");
+            connection.generation += 1;
+            let generation = connection.generation;
+            connection.state = ConnectionState::NotConnected;
+            connection.identity = None;
+            connection.evidence = None;
+            generation
+        })
+        .map_err(|error| error.to_string())?;
+    let previous_generation = generation.saturating_sub(1);
+    let adapter = store.subscription.logout(provider_id, previous_generation).await;
+    let (local_cleared, remote) = match adapter {
+        Ok(outcome) => (outcome.local_cleared, Some(outcome.remote)),
+        // 没拿到“专用授权目录已清”的确认，就不能声称本地已清除；远端结果同样未知。
+        Err(_) => (false, None),
+    };
+    let record = LogoutRecord {
+        local_cleared,
+        remote,
+        observed_at: Some(chrono::Utc::now().to_rfc3339()),
+    };
+    {
+        let mut state = sessions.lock().await;
+        let session = state.sessions.entry(provider_id.to_owned()).or_default();
+        // 挂起登录在退出时一并作废：迟到完成通知不能再写入连接。
+        session.stage = LoginStage::Idle;
+        session.generation = generation;
+        session.login_id = None;
+        session.authorization_url = None;
+        session.user_code = None;
+        session.error = None;
+        session.last_logout = Some(record);
+    }
+    Ok(LogoutOutcome { local_cleared, remote: remote.unwrap_or(RemoteRevocation::Failed) })
+}
+
+/// 该服务商当前的订阅种类；不存在或不是订阅服务商时返回 `None`。
+fn subscription_kind(store: &ConfigStore, provider_id: &str) -> Option<ProviderKind> {
+    store
+        .read()
+        .providers
+        .iter()
+        .find(|provider| provider.id == provider_id)
+        .map(|provider| provider.kind.clone())
+        .filter(is_subscription)
+}
+
+/// 删除服务商或把它转成 API 服务商之前，先释放它占用的订阅资源：
+/// 停掉辅助进程、删除专用授权目录、清空内存会话。
+/// 失败即返回错误，调用方不得继续改配置——不做半清理。
+pub async fn dispose(
+    store: &ConfigStore,
+    provider_id: &str,
+    sessions: &tokio::sync::Mutex<SessionState>,
+) -> Result<(), String> {
+    let Some(kind) = subscription_kind(store, provider_id) else {
+        return Ok(());
+    };
+    if store.subscription.supports(&kind) {
+        logout(store, provider_id, sessions).await.map(|_| ())?;
+    }
+    let mut state = sessions.lock().await;
+    state.sessions.remove(provider_id);
+    Ok(())
+}
+
+/// 服务商在保留订阅类型的前提下改名：把适配器自有状态（辅助进程、挂起尝试、专用授权目录）
+/// 与内存会话迁到新标识。迁移失败时对旧标识走完整退出，配置改名后新标识为未连接，逼用户重新登录；
+/// 绝不只改配置而不碰辅助进程。
+pub async fn migrate_helper(
+    store: &ConfigStore,
+    old_id: &str,
+    new_id: &str,
+    sessions: &tokio::sync::Mutex<SessionState>,
+) -> Result<(), String> {
+    if old_id == new_id {
+        return Ok(());
+    }
+    let Some(kind) = subscription_kind(store, old_id) else {
+        return Ok(());
+    };
+    if store.subscription.supports(&kind) {
+        if let Err(error) = store.subscription.rename(old_id, new_id).await {
+            let message = sanitize_error(&error.to_string());
+            logout(store, old_id, sessions).await.map(|_| ())?;
+            eprintln!("AutoJev subscription rename fell back to sign-out: {message}");
+        }
+    }
+    let mut state = sessions.lock().await;
+    if let Some(mut session) = state.sessions.remove(old_id) {
+        // 在途登录绑定旧标识，改名后不可能再完成：作废它，别让新标识停在 Pending。
+        if session.stage == LoginStage::Pending {
+            session.stage = LoginStage::Idle;
+            session.login_id = None;
+            session.authorization_url = None;
+            session.user_code = None;
+            session.error = None;
+        }
+        state.sessions.insert(new_id.to_owned(), session);
+    }
+    Ok(())
+}
+
+/// 换号 = 退出 + 立即重新登录。退出已清掉旧身份；换号失败不会自动恢复旧账号。
+pub async fn switch_account(
+    store: &ConfigStore,
+    provider_id: &str,
+    sessions: &tokio::sync::Mutex<SessionState>,
+) -> Result<LoginStart, String> {
+    logout(store, provider_id, sessions).await?;
+    begin_login(store, provider_id, sessions).await
+}
+
 /// 订阅适配边界：只读状态、模型、额度，以及绑定账号与连接世代的生成交接。
 /// 实现只在构造 `ConfigStore` 时注入，配置与界面都无法替换它。
 pub trait SubscriptionAdapter: Send + Sync {
     /// 是否存在可用的官方辅助进程。缺少它不影响只读刷新本身，只影响能读到什么。
     fn available(&self) -> bool;
+    /// 这个适配器是否能承载该类型的订阅服务商；不支持的 kind 必须被明确拒绝，
+    /// 不得借用其它服务商的辅助进程或身份。
+    fn supports(&self, kind: &ProviderKind) -> bool;
+    /// 服务商标识重命名：适配器要把自有状态（辅助进程、挂起尝试、专用授权目录）整体迁到新标识。
+    /// 默认实现表示该适配器没有自有状态可迁；绝不静默失败，迁不动必须返回错误。
+    fn rename<'a>(&'a self, _old_id: &'a str, _new_id: &'a str) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+    /// 辅助进程自述状态：解析不到官方 `codex` 时如实报不可用，绝不 panic。
+    fn helper_status(&self) -> HelperStatus;
     fn status<'a>(&'a self, provider_id: &'a str, generation: u64) -> BoxFuture<'a, Result<ConnectionStatus>>;
     fn models<'a>(&'a self, provider_id: &'a str, generation: u64) -> BoxFuture<'a, Result<Vec<DiscoveredModel>>>;
     fn quota<'a>(&'a self, provider_id: &'a str, generation: u64) -> BoxFuture<'a, Result<QuotaEvidence>>;
     #[allow(dead_code)]
     fn generate<'a>(&'a self, request: GenerationRequest<'a>) -> BoxFuture<'a, Result<GenerationStream<'a>>>;
+    /// 发起一次浏览器登录；世代与尝试一起绑定，结果迟到即整体丢弃。
+    fn start_login<'a>(&'a self, provider_id: &'a str, generation: u64) -> BoxFuture<'a, Result<LoginStart>>;
+    /// 等待该登录尝试的终态；世代或尝试已变时返回 `Ok(None)`。
+    fn login_result<'a>(&'a self, provider_id: &'a str, generation: u64)
+        -> BoxFuture<'a, Result<Option<LoginResult>>>;
+    fn cancel_login<'a>(&'a self, provider_id: &'a str, generation: u64) -> BoxFuture<'a, Result<()>>;
+    fn logout<'a>(&'a self, provider_id: &'a str, generation: u64) -> BoxFuture<'a, Result<LogoutOutcome>>;
 }
 
 const UNAVAILABLE: &str = "No subscription helper is available in this build";
 
-/// 生产默认实现：尚未管理任何官方辅助进程，只读查询如实报不可用，生成一律拒绝。
-/// 没有任何配置、环境变量或界面开关可以把它换成替身；替身只能由测试注入。
+/// 默认实现（含测试构造）：尚未管理任何官方辅助进程，只读查询如实报不可用，生成一律拒绝。
+/// 它也不支持任何订阅服务商类型；没有任何配置、环境变量或界面开关能把它换成替身。
 pub struct UnavailableAdapter;
 
 impl SubscriptionAdapter for UnavailableAdapter {
     fn available(&self) -> bool {
         false
+    }
+
+    fn supports(&self, _kind: &ProviderKind) -> bool {
+        false
+    }
+
+    fn helper_status(&self) -> HelperStatus {
+        HelperStatus::default()
     }
 
     fn status<'a>(&'a self, _provider_id: &'a str, _generation: u64) -> BoxFuture<'a, Result<ConnectionStatus>> {
@@ -468,6 +1044,22 @@ impl SubscriptionAdapter for UnavailableAdapter {
     }
 
     fn generate<'a>(&'a self, _request: GenerationRequest<'a>) -> BoxFuture<'a, Result<GenerationStream<'a>>> {
+        Box::pin(async { bail!(UNAVAILABLE) })
+    }
+
+    fn start_login<'a>(&'a self, _provider_id: &'a str, _generation: u64) -> BoxFuture<'a, Result<LoginStart>> {
+        Box::pin(async { bail!(UNAVAILABLE) })
+    }
+
+    fn login_result<'a>(&'a self, _provider_id: &'a str, _generation: u64) -> BoxFuture<'a, Result<Option<LoginResult>>> {
+        Box::pin(async { bail!(UNAVAILABLE) })
+    }
+
+    fn cancel_login<'a>(&'a self, _provider_id: &'a str, _generation: u64) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async { bail!(UNAVAILABLE) })
+    }
+
+    fn logout<'a>(&'a self, _provider_id: &'a str, _generation: u64) -> BoxFuture<'a, Result<LogoutOutcome>> {
         Box::pin(async { bail!(UNAVAILABLE) })
     }
 }
@@ -486,7 +1078,11 @@ pub fn rename_provider(config: &mut AppConfig, old_id: &str, new_id: &str) {
     if old_id == new_id {
         return;
     }
-    if let Some(connection) = config.subscriptions.remove(old_id) {
+    if let Some(mut connection) = config.subscriptions.remove(old_id) {
+        // 在途登录绑定旧标识，重命名后不可能再完成：回到未连接，逼用户在新标识下重新登录。
+        if connection.state == ConnectionState::AuthorizationPending {
+            connection.state = ConnectionState::NotConnected;
+        }
         config.subscriptions.insert(new_id.to_owned(), connection);
     }
 }
@@ -504,18 +1100,24 @@ pub fn forget_provider(config: &mut AppConfig, provider_id: &str) {
 /// 读取失败时保留上一次已核实的证据，只把额度依据标为失败并如实返回错误；
 /// 临时失败不会被伪装成可用，也不会被伪装成余额为零。
 pub async fn refresh(store: &ConfigStore, provider_id: &str) -> Result<Connection, String> {
-    store
-        .read()
-        .providers
-        .iter()
-        .find(|provider| provider.id == provider_id && is_subscription_provider(provider))
-        .ok_or_else(|| format!("Unknown subscription provider: {provider_id}"))?;
+    let provider = require_subscription_provider(store, provider_id)?;
+    // 不支持的订阅类型不得借用其它服务商的辅助进程读取证据（#12「两家互不冒用」）。
+    require_supported(store, &provider, "read-only status")?;
     let generation = store
         .read()
         .subscriptions
         .get(provider_id)
         .map(|connection| connection.generation)
         .unwrap_or_default();
+    let pending = store
+        .read()
+        .subscriptions
+        .get(provider_id)
+        .is_some_and(|connection| connection.state == ConnectionState::AuthorizationPending);
+    if pending {
+        // 挂起登录期间只读刷新不得伪装成已连接，也不得让旧身份复活：一个连接字段都不改写。
+        return Ok(store.read().subscriptions.get(provider_id).cloned().unwrap_or_default());
+    }
     let reads = async {
         let status = store.subscription.status(provider_id, generation).await.map_err(|error| error.to_string())?;
         let models = store.subscription.models(provider_id, generation).await.map_err(|error| error.to_string())?;
@@ -585,9 +1187,15 @@ pub struct SubscriptionView {
     pub quota: QuotaEvidence,
     pub denial: Option<Denial>,
     pub adapter_available: bool,
+    /// 登录会话（内存态）：阶段、挂起链接、尝试序号与绑定世代。
+    pub login: SubscriptionLoginView,
+    /// 最近一次退出：本地与远端结果分别记录；从未退出过时为 `None`。
+    pub logout: Option<SubscriptionLogoutView>,
+    /// 辅助进程自述状态。
+    pub helper: SubscriptionHelperView,
 }
 
-pub fn views(config: &AppConfig, adapter_available: bool) -> Vec<SubscriptionView> {
+pub fn views(config: &AppConfig, adapter_available: bool, sessions: &SessionState) -> Vec<SubscriptionView> {
     let mut items: Vec<_> = config
         .providers
         .iter()
@@ -595,6 +1203,9 @@ pub fn views(config: &AppConfig, adapter_available: bool) -> Vec<SubscriptionVie
         .map(|provider| {
             let connection = config.subscriptions.get(&provider.id).cloned().unwrap_or_default();
             let evidence = connection.current_evidence();
+            let session = sessions.session(&provider.id);
+            // 适配器不支持这类服务商时，如实报 helper 不可用：不借用其它服务商的进程信息。
+            let supported = sessions.supports(&provider.id);
             SubscriptionView {
                 provider_id: provider.id.clone(),
                 label: label(provider).to_owned(),
@@ -608,6 +1219,23 @@ pub fn views(config: &AppConfig, adapter_available: bool) -> Vec<SubscriptionVie
                 quota: evidence.map(|evidence| evidence.quota.clone()).unwrap_or_default(),
                 denial: connection_denial(config, provider),
                 adapter_available,
+                login: SubscriptionLoginView {
+                    stage: session.map(|session| session.stage).unwrap_or_default(),
+                    authorization_url: session.and_then(|session| session.authorization_url.clone()),
+                    user_code: session.and_then(|session| session.user_code.clone()),
+                    attempt: session.map(|session| session.attempt).unwrap_or_default(),
+                    generation: session
+                        .map(|session| session.generation)
+                        .filter(|generation| *generation != 0)
+                        .unwrap_or(connection.generation),
+                    error: session.and_then(|session| session.error.clone()),
+                },
+                logout: session.and_then(|session| session.last_logout.as_ref()).map(LogoutRecord::view),
+                helper: SubscriptionHelperView {
+                    available: sessions.helper.available && supported,
+                    version: if supported { sessions.helper.version.clone() } else { None },
+                    auth_home: if supported { sessions.helper.auth_home.clone() } else { None },
+                },
             }
         })
         .collect();
@@ -816,7 +1444,7 @@ mod admission_tests {
         assert!(admit_model(&config, &codex_model, &codex, Protocol::Chat).is_ok());
         // Grok 没有自己的连接与证据，不会借用 Codex 的结果。
         assert_eq!(denial(&config, &grok_model, &grok).code, "not_connected");
-        let views = views(&config, false);
+        let views = views(&config, false, &SessionState::default());
         assert_eq!(views.len(), 2);
         assert_eq!(views[0].provider_id, "fixture-subscription");
         assert_eq!(views[0].identity.as_deref(), Some("fixture@example.invalid"));
@@ -883,6 +1511,11 @@ mod refresh_tests {
             true
         }
 
+        /// 只读替身只承载 Codex 订阅；Grok 一行不得借它读取。
+        fn supports(&self, kind: &ProviderKind) -> bool {
+            matches!(kind, ProviderKind::CodexSubscription)
+        }
+
         fn status<'a>(&'a self, provider_id: &'a str, generation: u64) -> BoxFuture<'a, Result<ConnectionStatus>> {
             Box::pin(async move {
                 self.reads.lock().unwrap().push(generation);
@@ -920,6 +1553,36 @@ mod refresh_tests {
                 let stream: GenerationStream<'a> = Box::pin(futures_util::stream::iter(events));
                 Ok(stream)
             })
+        }
+
+        fn helper_status(&self) -> HelperStatus {
+            HelperStatus {
+                available: true,
+                version: Some("fixture-helper-1.0".into()),
+                auth_home: Some("/tmp/fixture-account".into()),
+            }
+        }
+
+        fn start_login<'a>(&'a self, provider_id: &'a str, generation: u64) -> BoxFuture<'a, Result<LoginStart>> {
+            Box::pin(async move {
+                Ok(LoginStart {
+                    login_id: format!("{provider_id}-{generation}"),
+                    authorization_url: Some("https://example.invalid/auth".into()),
+                    user_code: None,
+                })
+            })
+        }
+
+        fn login_result<'a>(&'a self, _provider_id: &'a str, _generation: u64) -> BoxFuture<'a, Result<Option<LoginResult>>> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn cancel_login<'a>(&'a self, _provider_id: &'a str, _generation: u64) -> BoxFuture<'a, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn logout<'a>(&'a self, _provider_id: &'a str, _generation: u64) -> BoxFuture<'a, Result<LogoutOutcome>> {
+            Box::pin(async { Ok(LogoutOutcome { local_cleared: true, remote: RemoteRevocation::Revoked }) })
         }
     }
 
@@ -988,7 +1651,7 @@ mod refresh_tests {
         // 证据齐备后仍然缺能力记录：未验证能力不会因为一次只读刷新而被视为已验证。
         let (model, provider) = target(&store.read());
         assert_eq!(admit_model(&store.read(), &model, &provider, Protocol::Chat).unwrap_err().code, "capability_unverified");
-        let view = views(&store.read(), true).pop().unwrap();
+        let view = views(&store.read(), true, &SessionState::default()).pop().unwrap();
         assert_eq!(view.identity.as_deref(), Some("fixture@example.invalid"));
         assert_eq!(view.generation, 1);
         assert!(view.adapter_available);
@@ -1120,7 +1783,7 @@ mod refresh_tests {
             .unwrap();
         // 配置里没有任何字段能把它换成替身。
         assert!(!store.subscription.available());
-        let views = views(&store.read(), store.subscription.available());
+        let views = views(&store.read(), store.subscription.available(), &SessionState::default());
         assert_eq!(views.len(), 2);
         assert!(views.iter().all(|view| !view.adapter_available && view.denial.is_some()));
     }
@@ -1131,3 +1794,837 @@ mod refresh_tests {
 
 
 
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use crate::config::{AppConfig, Model, Provider, ProviderKind};
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    /// 生命周期替身：完成结果由测试显式投递，用来驱动成功/失败/取消/迟到结果与换号。
+    /// 它只存在于测试代码里，生产构造没有任何入口能装入它。
+    struct LifecycleStub {
+        helper: HelperStatus,
+        status: ConnectionStatus,
+        start_error: Mutex<Option<String>>,
+        started: Mutex<Vec<(String, u64)>>,
+        cancels: Mutex<Vec<(String, u64)>>,
+        logouts: Mutex<Vec<(String, u64)>>,
+        logout_outcome: Mutex<std::result::Result<LogoutOutcome, String>>,
+        completions: tokio::sync::Mutex<VecDeque<(String, u64, Option<LoginResult>)>>,
+        notify: tokio::sync::Notify,
+        late_completion_on_cancel: AtomicBool,
+        /// 置位后 `login_result` 立刻返回 `Ok(None)`：模拟辅助进程在授权中途退出。
+        helper_exited: AtomicBool,
+        renames: Mutex<Vec<(String, String)>>,
+        rename_error: Mutex<Option<String>>,
+    }
+
+    impl LifecycleStub {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                helper: HelperStatus {
+                    available: true,
+                    version: Some("fixture-helper-1.0".into()),
+                    auth_home: Some("/tmp/fixture-helper-home".into()),
+                },
+                status: ConnectionStatus {
+                    state: ConnectionState::Connected,
+                    identity: Some("helper@example.invalid".into()),
+                    helper_version: Some("fixture-helper-1.0".into()),
+                    account_path: Some("/tmp/fixture-helper-home".into()),
+                },
+                start_error: Mutex::new(None),
+                started: Mutex::new(Vec::new()),
+                cancels: Mutex::new(Vec::new()),
+                logouts: Mutex::new(Vec::new()),
+                logout_outcome: Mutex::new(Ok(LogoutOutcome {
+                    local_cleared: true,
+                    remote: RemoteRevocation::Revoked,
+                })),
+                completions: tokio::sync::Mutex::new(VecDeque::new()),
+                notify: tokio::sync::Notify::new(),
+                late_completion_on_cancel: AtomicBool::new(false),
+                helper_exited: AtomicBool::new(false),
+                renames: Mutex::new(Vec::new()),
+                rename_error: Mutex::new(None),
+            })
+        }
+
+        async fn push_completion(&self, provider_id: &str, generation: u64, result: LoginResult) {
+            self.completions
+                .lock()
+                .await
+                .push_back((provider_id.to_owned(), generation, Some(result)));
+            self.notify.notify_one();
+        }
+    }
+
+    impl SubscriptionAdapter for LifecycleStub {
+        fn available(&self) -> bool {
+            true
+        }
+
+        /// 替身只支持 Codex 订阅：Grok 必须被明确拒绝，且不得拉起任何进程。
+        fn supports(&self, kind: &ProviderKind) -> bool {
+            matches!(kind, ProviderKind::CodexSubscription)
+        }
+
+        fn helper_status(&self) -> HelperStatus {
+            self.helper.clone()
+        }
+
+        fn status<'a>(&'a self, _provider_id: &'a str, _generation: u64) -> BoxFuture<'a, Result<ConnectionStatus>> {
+            Box::pin(async move { Ok(self.status.clone()) })
+        }
+
+        fn models<'a>(&'a self, _provider_id: &'a str, _generation: u64) -> BoxFuture<'a, Result<Vec<DiscoveredModel>>> {
+            Box::pin(async { Ok(vec![DiscoveredModel { model_id: "fixture-model".into(), name: None, eligible: true }]) })
+        }
+
+        fn quota<'a>(&'a self, _provider_id: &'a str, _generation: u64) -> BoxFuture<'a, Result<QuotaEvidence>> {
+            Box::pin(async {
+                Ok(QuotaEvidence {
+                    state: EvidenceState::Available,
+                    source: Some("fixture".into()),
+                    observed_at: Some("2026-09-30T00:00:00Z".into()),
+                })
+            })
+        }
+
+        fn generate<'a>(&'a self, _request: GenerationRequest<'a>) -> BoxFuture<'a, Result<GenerationStream<'a>>> {
+            Box::pin(async { bail!("fixture generation is never allowed") })
+        }
+
+        fn start_login<'a>(&'a self, provider_id: &'a str, generation: u64) -> BoxFuture<'a, Result<LoginStart>> {
+            Box::pin(async move {
+                if let Some(error) = self.start_error.lock().unwrap().clone() {
+                    bail!("{error}");
+                }
+                self.started.lock().unwrap().push((provider_id.to_owned(), generation));
+                Ok(LoginStart {
+                    login_id: format!("{provider_id}-{generation}"),
+                    authorization_url: Some("https://example.invalid/authorize?state=fixture".into()),
+                    user_code: None,
+                })
+            })
+        }
+
+        fn login_result<'a>(&'a self, provider_id: &'a str, _generation: u64) -> BoxFuture<'a, Result<Option<LoginResult>>> {
+            Box::pin(async move {
+                if self.helper_exited.load(Ordering::SeqCst) {
+                    // 辅助进程中途退出：没有结果可读，如实返回 None。
+                    return Ok(None);
+                }
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+                loop {
+                    {
+                        let mut queue = self.completions.lock().await;
+                        if let Some(index) = queue.iter().position(|entry| entry.0 == provider_id) {
+                            let entry = queue.remove(index).expect("found above");
+                            return Ok(entry.2);
+                        }
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        return Ok(None);
+                    }
+                    let _ = tokio::time::timeout(std::time::Duration::from_millis(100), self.notify.notified()).await;
+                }
+            })
+        }
+
+        fn cancel_login<'a>(&'a self, provider_id: &'a str, generation: u64) -> BoxFuture<'a, Result<()>> {
+            Box::pin(async move {
+                self.cancels.lock().unwrap().push((provider_id.to_owned(), generation));
+                if self.late_completion_on_cancel.load(Ordering::SeqCst) {
+                    self.push_completion(provider_id, generation, LoginResult::Completed { identity: "late@example.invalid".into() }).await;
+                }
+                Ok(())
+            })
+        }
+
+        fn logout<'a>(&'a self, provider_id: &'a str, generation: u64) -> BoxFuture<'a, Result<LogoutOutcome>> {
+            Box::pin(async move {
+                self.logouts.lock().unwrap().push((provider_id.to_owned(), generation));
+                let recorded = self.logout_outcome.lock().unwrap().clone();
+                match recorded {
+                    Ok(outcome) => Ok(outcome),
+                    Err(message) => bail!("{message}"),
+                }
+            })
+        }
+
+        fn rename<'a>(&'a self, old_id: &'a str, new_id: &'a str) -> BoxFuture<'a, Result<()>> {
+            Box::pin(async move {
+                self.renames.lock().unwrap().push((old_id.to_owned(), new_id.to_owned()));
+                if let Some(error) = self.rename_error.lock().unwrap().clone() {
+                    bail!("{error}");
+                }
+                Ok(())
+            })
+        }
+    }
+
+    async fn fixture(adapter: Arc<LifecycleStub>) -> (Arc<ConfigStore>, tempfile::TempDir, Arc<tokio::sync::Mutex<SessionState>>) {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            ConfigStore::load_with_adapters(
+                directory.path().join("autojev.db"),
+                Arc::new(crate::dispatch::ApiDispatcher { loopback_only: true }),
+                adapter,
+            )
+            .unwrap(),
+        );
+        store
+            .update(|config| {
+                let provider = Provider {
+                    preset: String::new(),
+                    api_type: String::new(),
+                    test_model: String::new(),
+                    id: "codex".into(),
+                    name: "Codex".into(),
+                    kind: ProviderKind::CodexSubscription,
+                    base_url: String::new(),
+                    enabled: true,
+                    has_api_key: false,
+                };
+                config.providers.push(provider.clone());
+                sync_provider(config, &provider.id, &provider.kind);
+                let mut model = config.models[0].clone();
+                model.id = "codex-model".into();
+                model.provider_id = "codex".into();
+                model.model_id = "fixture-model".into();
+                config.models.push(model);
+            })
+            .unwrap();
+        (store, directory, Arc::new(tokio::sync::Mutex::new(SessionState::default())))
+    }
+
+    fn target(config: &AppConfig) -> (Model, Provider) {
+        let model = config.models.iter().find(|model| model.provider_id == "codex").unwrap().clone();
+        let provider = config.providers.iter().find(|provider| provider.id == "codex").unwrap().clone();
+        (model, provider)
+    }
+
+    async fn session(sessions: &Arc<tokio::sync::Mutex<SessionState>>, provider_id: &str) -> SubscriptionSession {
+        sessions.lock().await.session(provider_id).cloned().unwrap_or_default()
+    }
+
+    /// 与 lib.rs 的 snapshot 一样：先把辅助进程自述写进会话表，再取视图。
+    async fn view_of(
+        store: &ConfigStore,
+        adapter_available: bool,
+        sessions: &Arc<tokio::sync::Mutex<SessionState>>,
+    ) -> SubscriptionView {
+        let mut guard = sessions.lock().await;
+        guard.helper = store.subscription.helper_status();
+        guard.supported_providers = store
+            .read()
+            .providers
+            .iter()
+            .filter(|provider| is_subscription_provider(provider) && store.subscription.supports(&provider.kind))
+            .map(|provider| provider.id.clone())
+            .collect();
+        views(&store.read(), adapter_available, &guard).pop().unwrap()
+    }
+
+    fn connection(store: &ConfigStore, provider_id: &str) -> Connection {
+        store.read().subscriptions.get(provider_id).cloned().unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn login_success_binds_identity_to_the_current_generation() {
+        let adapter = LifecycleStub::new();
+        let (store, _directory, sessions) = fixture(adapter.clone()).await;
+        assert!(store.subscription.helper_status().available);
+        let start = begin_login(&store, "codex", &sessions).await.unwrap();
+        assert_eq!(start.login_id, "codex-1");
+        assert_eq!(start.authorization_url.as_deref(), Some("https://example.invalid/authorize?state=fixture"));
+        assert_eq!(adapter.started.lock().unwrap().clone(), vec![("codex".into(), 1)]);
+        let pending = session(&sessions, "codex").await;
+        assert_eq!(pending.stage, LoginStage::Pending);
+        assert_eq!((pending.attempt, pending.generation), (1, 1));
+        assert_eq!(connection(&store, "codex").state, ConnectionState::AuthorizationPending);
+        // pending 期间生成一律拒绝，刷新也不得伪装成已连接。
+        let (model, provider) = target(&store.read());
+        assert_eq!(admit_model(&store.read(), &model, &provider, Protocol::Chat).unwrap_err().code, "authorization_pending");
+        assert_eq!(admit_target(&store.read(), &provider, "fixture-model", Protocol::Chat).unwrap_err().code, "authorization_pending");
+        assert!(!generation_ready(&store.read(), &model, Protocol::Chat));
+        let refreshed = refresh(&store, "codex").await.unwrap();
+        assert_eq!(refreshed.state, ConnectionState::AuthorizationPending);
+        assert!(refreshed.identity.is_none() && refreshed.evidence.is_none());
+        // 完成通知 + 身份核实之后才绑定，且绑定在当前世代。
+        adapter.push_completion("codex", 1, LoginResult::Completed { identity: "new@example.invalid".into() }).await;
+        let result = await_login(store.clone(), "codex".into(), sessions.clone()).await.unwrap();
+        assert_eq!(result, LoginResult::Completed { identity: "new@example.invalid".into() });
+        let bound = connection(&store, "codex");
+        assert_eq!(bound.generation, 1);
+        assert_eq!(bound.state, ConnectionState::Connected);
+        assert_eq!(bound.identity.as_deref(), Some("new@example.invalid"));
+        assert!(bound.evidence.is_none(), "a new account must not inherit old evidence");
+        // 登录成功不放行生成：还没有当前世代的只读证据。
+        let (model, provider) = target(&store.read());
+        assert_eq!(admit_model(&store.read(), &model, &provider, Protocol::Chat).unwrap_err().code, "evidence_missing");
+        assert!(!generation_ready(&store.read(), &model, Protocol::Chat));
+        let view = view_of(&store, store.subscription.available(), &sessions).await;
+        assert_eq!(view.login.stage, LoginStage::Completed);
+        assert_eq!(view.login.generation, 1);
+        assert!(view.helper.available);
+        assert_eq!(view.helper.version.as_deref(), Some("fixture-helper-1.0"));
+        assert_eq!(view.logout, None);
+    }
+
+    #[tokio::test]
+    async fn login_failure_and_cancel_have_their_own_terminal_stages() {
+        let adapter = LifecycleStub::new();
+        let (store, _directory, sessions) = fixture(adapter.clone()).await;
+        begin_login(&store, "codex", &sessions).await.unwrap();
+        adapter
+            .push_completion("codex", 1, LoginResult::Failed("sign-in failed: authorization_code=SUPERSECRET1234567890".into()))
+            .await;
+        let failed = await_login(store.clone(), "codex".into(), sessions.clone()).await.unwrap();
+        let LoginResult::Failed(message) = failed else { panic!("expected a failed login") };
+        assert!(!message.contains("SUPERSECRET"), "the error must be redacted: {message}");
+        assert!(message.contains("[redacted]"), "{message}");
+        let ended = session(&sessions, "codex").await;
+        assert_eq!(ended.stage, LoginStage::Failed);
+        assert!(ended.error.as_deref().is_some_and(|error| !error.contains("SUPERSECRET")));
+        let settled = connection(&store, "codex");
+        assert_eq!(settled.state, ConnectionState::NotConnected);
+        assert!(settled.identity.is_none());
+        // 取消：终态 cancelled，且不会留下挂起链接。
+        begin_login(&store, "codex", &sessions).await.unwrap();
+        cancel_login(&store, "codex", &sessions).await.unwrap();
+        let cancelled = session(&sessions, "codex").await;
+        assert_eq!(cancelled.stage, LoginStage::Cancelled);
+        assert!(cancelled.authorization_url.is_none());
+        assert_eq!(connection(&store, "codex").state, ConnectionState::NotConnected);
+        assert_eq!(adapter.cancels.lock().unwrap().clone(), vec![("codex".into(), 1)]);
+    }
+
+    #[tokio::test]
+    async fn a_late_completion_never_revives_the_account_after_logout() {
+        let adapter = LifecycleStub::new();
+        let (store, _directory, sessions) = fixture(adapter.clone()).await;
+        begin_login(&store, "codex", &sessions).await.unwrap();
+        let waiting = tokio::spawn(await_login(store.clone(), "codex".into(), sessions.clone()));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let old_generation = connection(&store, "codex").generation;
+        logout(&store, "codex", &sessions).await.unwrap();
+        assert_eq!(connection(&store, "codex").generation, old_generation + 1);
+        adapter
+            .push_completion("codex", old_generation, LoginResult::Completed { identity: "late@example.invalid".into() })
+            .await;
+        let outcome = waiting.await.unwrap();
+        assert!(outcome.is_err(), "a late result must be discarded: {outcome:?}");
+        let after = connection(&store, "codex");
+        assert_eq!(after.generation, old_generation + 1);
+        assert!(after.identity.is_none(), "the old account must not be revived");
+        assert_eq!(after.state, ConnectionState::NotConnected);
+        assert_eq!(session(&sessions, "codex").await.stage, LoginStage::Idle);
+    }
+
+    #[tokio::test]
+    async fn a_late_completion_after_cancel_is_discarded() {
+        let adapter = LifecycleStub::new();
+        let (store, _directory, sessions) = fixture(adapter.clone()).await;
+        begin_login(&store, "codex", &sessions).await.unwrap();
+        let waiting = tokio::spawn(await_login(store.clone(), "codex".into(), sessions.clone()));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        adapter.late_completion_on_cancel.store(true, Ordering::SeqCst);
+        cancel_login(&store, "codex", &sessions).await.unwrap();
+        let outcome = waiting.await.unwrap();
+        assert!(outcome.is_err(), "a completion after cancel must be discarded: {outcome:?}");
+        let after = connection(&store, "codex");
+        assert_eq!(after.generation, 1);
+        assert!(after.identity.is_none());
+        assert_eq!(session(&sessions, "codex").await.stage, LoginStage::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn logout_clears_caches_keeps_configuration_and_records_both_results() {
+        let adapter = LifecycleStub::new();
+        let (store, _directory, sessions) = fixture(adapter.clone()).await;
+        store
+            .update(|config| {
+                let generation = config.subscriptions["codex"].generation;
+                let connection = config.subscriptions.get_mut("codex").unwrap();
+                connection.state = ConnectionState::Connected;
+                connection.identity = Some("old@example.invalid".into());
+                connection.evidence = Some(Evidence {
+                    generation,
+                    account: Some("old@example.invalid".into()),
+                    helper_version: Some("fixture-helper-1.0".into()),
+                    account_path: Some("/tmp/fixture-helper-home".into()),
+                    models: vec![DiscoveredModel { model_id: "fixture-model".into(), name: None, eligible: true }],
+                    capabilities: vec![Capability {
+                        model_id: "fixture-model".into(),
+                        protocol: protocol_key(Protocol::Chat).into(),
+                        status: CapabilityStatus::Verified,
+                    }],
+                    quota: QuotaEvidence {
+                        state: EvidenceState::Available,
+                        source: Some("fixture".into()),
+                        observed_at: Some("2026-09-30T00:00:00Z".into()),
+                    },
+                });
+            })
+            .unwrap();
+        begin_login(&store, "codex", &sessions).await.unwrap();
+        let before = store.read();
+        let providers = before.providers.len();
+        let models = before.models.len();
+        let routes = serde_json::to_value(&before.routes).unwrap();
+        let policy = serde_json::to_value(&before.policy).unwrap();
+        let outcome = logout(&store, "codex", &sessions).await.unwrap();
+        assert!(outcome.local_cleared);
+        assert_eq!(outcome.remote, RemoteRevocation::Revoked);
+        assert_eq!(adapter.logouts.lock().unwrap().clone(), vec![("codex".into(), 1)]);
+        let after = store.read();
+        let connection = after.subscriptions.get("codex").unwrap();
+        assert_eq!(connection.generation, 2, "logout must advance the generation");
+        assert_eq!(connection.state, ConnectionState::NotConnected);
+        assert!(connection.identity.is_none());
+        assert!(connection.evidence.is_none(), "identity, quota, directory and capability caches must be cleared");
+        // 服务商、模型、路由与 API 配置原样保留。
+        assert_eq!(after.providers.len(), providers);
+        assert_eq!(after.models.len(), models);
+        assert_eq!(serde_json::to_value(&after.routes).unwrap(), routes);
+        assert_eq!(serde_json::to_value(&after.policy).unwrap(), policy);
+        // 挂起 URL、user code 与错误只在内存态，不落盘。
+        assert!(!serde_json::to_string(&after).unwrap().contains("example.invalid/authorize"));
+        let ended = session(&sessions, "codex").await;
+        assert_eq!(ended.stage, LoginStage::Idle);
+        assert!(ended.authorization_url.is_none() && ended.login_id.is_none());
+        let record = ended.last_logout.unwrap();
+        assert!(record.local_cleared);
+        assert_eq!(record.remote, Some(RemoteRevocation::Revoked));
+        assert!(record.observed_at.is_some());
+        let view = view_of(&store, true, &sessions).await;
+        let logout_view = view.logout.unwrap();
+        assert_eq!(logout_view.local, LogoutLocal::Cleared);
+        assert_eq!(logout_view.remote, LogoutRemote::Revoked);
+        assert!(logout_view.observed_at.is_some());
+        assert_eq!(view.login.stage, LoginStage::Idle);
+        assert_eq!(view.login.generation, 2);
+    }
+
+    #[tokio::test]
+    async fn logout_without_an_observable_helper_records_unknown_results() {
+        let adapter = LifecycleStub::new();
+        *adapter.logout_outcome.lock().unwrap() = Err("No subscription helper is available in this build".into());
+        let (store, _directory, sessions) = fixture(adapter.clone()).await;
+        let outcome = logout(&store, "codex", &sessions).await.unwrap();
+        // 没拿到适配器的“本地已清”确认：不得声称本地已清除。
+        assert!(!outcome.local_cleared);
+        let record = session(&sessions, "codex").await.last_logout.unwrap();
+        assert!(!record.local_cleared);
+        assert_eq!(record.remote, None);
+        let view = view_of(&store, true, &sessions).await;
+        let logout_view = view.logout.unwrap();
+        assert_eq!(logout_view.local, LogoutLocal::Retained);
+        assert_eq!(logout_view.remote, LogoutRemote::Unknown);
+    }
+
+    #[tokio::test]
+    async fn switch_account_failure_never_restores_the_old_account() {
+        let adapter = LifecycleStub::new();
+        let (store, _directory, sessions) = fixture(adapter.clone()).await;
+        store
+            .update(|config| {
+                let connection = config.subscriptions.get_mut("codex").unwrap();
+                connection.state = ConnectionState::Connected;
+                connection.identity = Some("old@example.invalid".into());
+            })
+            .unwrap();
+        *adapter.start_error.lock().unwrap() = Some("The official Codex executable was not found".into());
+        let error = switch_account(&store, "codex", &sessions).await.unwrap_err();
+        assert!(error.contains("official Codex"), "{error}");
+        let after = connection(&store, "codex");
+        assert_eq!(after.generation, 2);
+        assert_eq!(after.state, ConnectionState::NotConnected);
+        assert!(after.identity.is_none() && after.evidence.is_none());
+        assert_eq!(session(&sessions, "codex").await.stage, LoginStage::Idle);
+        let (model, provider) = target(&store.read());
+        assert_eq!(admit_model(&store.read(), &model, &provider, Protocol::Chat).unwrap_err().code, "not_connected");
+    }
+
+    #[tokio::test]
+    async fn switch_account_success_binds_the_new_identity_to_a_new_generation() {
+        let adapter = LifecycleStub::new();
+        let (store, _directory, sessions) = fixture(adapter.clone()).await;
+        store
+            .update(|config| {
+                let connection = config.subscriptions.get_mut("codex").unwrap();
+                connection.state = ConnectionState::Connected;
+                connection.identity = Some("old@example.invalid".into());
+            })
+            .unwrap();
+        switch_account(&store, "codex", &sessions).await.unwrap();
+        assert_eq!(connection(&store, "codex").generation, 2);
+        assert!(connection(&store, "codex").identity.is_none());
+        adapter
+            .push_completion("codex", 2, LoginResult::Completed { identity: "new@example.invalid".into() })
+            .await;
+        let result = await_login(store.clone(), "codex".into(), sessions.clone()).await.unwrap();
+        assert_eq!(result, LoginResult::Completed { identity: "new@example.invalid".into() });
+        let bound = connection(&store, "codex");
+        assert_eq!(bound.generation, 2);
+        assert_eq!(bound.identity.as_deref(), Some("new@example.invalid"));
+        assert_eq!(session(&sessions, "codex").await.stage, LoginStage::Completed);
+    }
+
+    #[tokio::test]
+    async fn the_default_adapter_denies_the_whole_login_lifecycle() {
+        let adapter = UnavailableAdapter;
+        let status = adapter.helper_status();
+        assert!(!status.available && status.version.is_none() && status.auth_home.is_none());
+        assert!(adapter.start_login("codex", 1).await.is_err());
+        assert!(adapter.login_result("codex", 1).await.is_err());
+        assert!(adapter.cancel_login("codex", 1).await.is_err());
+        assert!(adapter.logout("codex", 1).await.is_err());
+        let message = adapter.start_login("codex", 1).await.unwrap_err().to_string();
+        assert!(message.contains("No subscription helper"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn unknown_providers_cannot_start_or_end_a_login() {
+        let adapter = LifecycleStub::new();
+        let (store, _directory, sessions) = fixture(adapter).await;
+        assert!(begin_login(&store, "missing", &sessions).await.is_err());
+        assert!(await_login(store.clone(), "missing".into(), sessions.clone()).await.is_err());
+        assert!(cancel_login(&store, "missing", &sessions).await.is_err());
+        assert!(logout(&store, "missing", &sessions).await.is_err());
+        assert!(switch_account(&store, "missing", &sessions).await.is_err());
+    }
+
+    #[test]
+    fn subscription_view_json_matches_the_frozen_shape() {
+        let mut config = AppConfig::default();
+        let provider = Provider {
+            preset: String::new(),
+            api_type: String::new(),
+            test_model: String::new(),
+            id: "codex".into(),
+            name: "Codex".into(),
+            kind: ProviderKind::CodexSubscription,
+            base_url: String::new(),
+            enabled: true,
+            has_api_key: false,
+        };
+        config.providers.push(provider.clone());
+        sync_provider(&mut config, &provider.id, &provider.kind);
+        // 没有会话时：idle、世代回落到连接世代、logout 为 null、helper 不可用。
+        let idle = views(&config, false, &SessionState::default()).pop().unwrap();
+        let json = serde_json::to_value(&idle).unwrap();
+        assert_eq!(json["login"]["stage"], "idle");
+        assert_eq!(json["login"]["attempt"], 0);
+        assert_eq!(json["login"]["generation"], 1);
+        assert!(json["login"]["authorization_url"].is_null());
+        assert!(json["login"]["user_code"].is_null());
+        assert!(json["login"]["error"].is_null());
+        assert!(json["logout"].is_null());
+        assert_eq!(json["helper"]["available"], false);
+        assert_eq!(json["adapter_available"], false);
+        assert_eq!(json["state"], "not_connected");
+        // 挂起登录 + 一次退出记录：字段名与取值都是冻结契约里的 snake_case。
+        let mut sessions = SessionState::default();
+        sessions.helper = HelperStatus {
+            available: true,
+            version: Some("1.2.3".into()),
+            auth_home: Some("/tmp/fixture-helper-home".into()),
+        };
+        sessions.supported_providers = vec!["codex".into()];
+        sessions.sessions.insert(
+            "codex".into(),
+            SubscriptionSession {
+                stage: LoginStage::Pending,
+                attempt: 3,
+                generation: 4,
+                login_id: Some("login-1".into()),
+                authorization_url: Some("https://example.invalid/auth".into()),
+                user_code: Some("ABCD-EFGH".into()),
+                error: None,
+                last_logout: Some(LogoutRecord {
+                    local_cleared: true,
+                    remote: Some(RemoteRevocation::Revoked),
+                    observed_at: Some("2026-09-30T00:00:00Z".into()),
+                }),
+            },
+        );
+        let pending = views(&config, true, &sessions).pop().unwrap();
+        let json = serde_json::to_value(&pending).unwrap();
+        assert_eq!(json["login"]["stage"], "pending");
+        assert_eq!(json["login"]["authorization_url"], "https://example.invalid/auth");
+        assert_eq!(json["login"]["user_code"], "ABCD-EFGH");
+        assert_eq!(json["login"]["attempt"], 3);
+        assert_eq!(json["login"]["generation"], 4);
+        assert_eq!(json["logout"]["local"], "cleared");
+        assert_eq!(json["logout"]["remote"], "revoked");
+        assert_eq!(json["logout"]["observed_at"], "2026-09-30T00:00:00Z");
+        assert_eq!(json["helper"]["available"], true);
+        assert_eq!(json["helper"]["version"], "1.2.3");
+        assert_eq!(json["helper"]["auth_home"], "/tmp/fixture-helper-home");
+        // 远端不可观察时展示 unknown。
+        sessions.sessions.get_mut("codex").unwrap().last_logout = Some(LogoutRecord {
+            local_cleared: false,
+            remote: None,
+            observed_at: None,
+        });
+        let json = serde_json::to_value(&views(&config, true, &sessions).pop().unwrap()).unwrap();
+        assert_eq!(json["logout"]["local"], "retained");
+        assert_eq!(json["logout"]["remote"], "unknown");
+        assert!(json["logout"]["observed_at"].is_null());
+    }
+
+    #[tokio::test]
+    async fn reconcile_orphaned_pending_recovers_a_restart_that_left_a_pending_state() {
+        let adapter = LifecycleStub::new();
+        let (store, _directory, sessions) = fixture(adapter.clone()).await;
+        // 挂起期间进程退出：配置里只剩 authorization_pending，会话表是空的。
+        store
+            .update(|config| {
+                let connection = config.subscriptions.get_mut("codex").unwrap();
+                connection.state = ConnectionState::AuthorizationPending;
+                connection.identity = Some("old@example.invalid".into());
+            })
+            .unwrap();
+        assert!(sessions.lock().await.session("codex").is_none());
+        reconcile_orphaned_pending(&store).unwrap();
+        let recovered = connection(&store, "codex");
+        assert_eq!(recovered.state, ConnectionState::NotConnected);
+        // 归位不改变世代，也不清除已有身份。
+        assert_eq!(recovered.generation, 1);
+        assert_eq!(recovered.identity.as_deref(), Some("old@example.invalid"));
+        // 归位后可以重新发起登录，不再卡在“只能取消”。
+        let start = begin_login(&store, "codex", &sessions).await.unwrap();
+        assert_eq!(start.login_id, "codex-1");
+        assert_eq!(connection(&store, "codex").state, ConnectionState::AuthorizationPending);
+        assert_eq!(session(&sessions, "codex").await.stage, LoginStage::Pending);
+    }
+
+    #[tokio::test]
+    async fn cancel_login_settles_an_orphaned_pending_without_a_session() {
+        let adapter = LifecycleStub::new();
+        let (store, _directory, sessions) = fixture(adapter.clone()).await;
+        // 第二家订阅服务商同样落盘为挂起：取消 codex 不得波及它。
+        store
+            .update(|config| {
+                let grok = Provider {
+                    preset: String::new(),
+                    api_type: String::new(),
+                    test_model: String::new(),
+                    id: "grok".into(),
+                    name: "Grok".into(),
+                    kind: ProviderKind::GrokSubscription,
+                    base_url: String::new(),
+                    enabled: true,
+                    has_api_key: false,
+                };
+                config.providers.push(grok.clone());
+                sync_provider(config, &grok.id, &grok.kind);
+                config.subscriptions.get_mut("codex").unwrap().state = ConnectionState::AuthorizationPending;
+                config.subscriptions.get_mut("grok").unwrap().state = ConnectionState::AuthorizationPending;
+            })
+            .unwrap();
+        // 模拟重启后的空会话表：cancel 用连接的当前世代兜底 settle。
+        cancel_login(&store, "codex", &sessions).await.unwrap();
+        assert_eq!(connection(&store, "codex").state, ConnectionState::NotConnected);
+        assert_eq!(connection(&store, "grok").state, ConnectionState::AuthorizationPending);
+        assert_eq!(adapter.cancels.lock().unwrap().clone(), vec![("codex".into(), 1)]);
+        assert!(sessions.lock().await.session("codex").is_none(), "cancel must not fabricate a session");
+        // 幂等：重复取消仍然 Ok，也不会凭空造出会话。
+        cancel_login(&store, "codex", &sessions).await.unwrap();
+        assert_eq!(connection(&store, "codex").state, ConnectionState::NotConnected);
+        assert!(sessions.lock().await.session("codex").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_normal_pending_session_still_cancels_with_its_own_generation() {
+        let adapter = LifecycleStub::new();
+        let (store, _directory, sessions) = fixture(adapter.clone()).await;
+        begin_login(&store, "codex", &sessions).await.unwrap();
+        cancel_login(&store, "codex", &sessions).await.unwrap();
+        assert_eq!(adapter.cancels.lock().unwrap().clone(), vec![("codex".into(), 1)]);
+        let cancelled = session(&sessions, "codex").await;
+        assert_eq!(cancelled.stage, LoginStage::Cancelled);
+        assert!(cancelled.authorization_url.is_none());
+        assert_eq!(connection(&store, "codex").state, ConnectionState::NotConnected);
+        // 回归：正常挂起会话被取消后，迟到的完成通知仍然整体丢弃。
+        adapter.late_completion_on_cancel.store(true, Ordering::SeqCst);
+        begin_login(&store, "codex", &sessions).await.unwrap();
+        let waiting = tokio::spawn(await_login(store.clone(), "codex".into(), sessions.clone()));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        cancel_login(&store, "codex", &sessions).await.unwrap();
+        let outcome = waiting.await.unwrap();
+        assert!(outcome.is_err(), "a late completion must be discarded: {outcome:?}");
+        assert!(connection(&store, "codex").identity.is_none());
+        assert_eq!(session(&sessions, "codex").await.stage, LoginStage::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn unsupported_subscription_kinds_are_rejected_without_touching_state() {
+        let adapter = LifecycleStub::new();
+        let (store, _directory, sessions) = fixture(adapter.clone()).await;
+        store
+            .update(|config| {
+                let grok = Provider {
+                    preset: String::new(),
+                    api_type: String::new(),
+                    test_model: String::new(),
+                    id: "grok".into(),
+                    name: "Grok".into(),
+                    kind: ProviderKind::GrokSubscription,
+                    base_url: String::new(),
+                    enabled: true,
+                    has_api_key: false,
+                };
+                config.providers.push(grok.clone());
+                sync_provider(config, &grok.id, &grok.kind);
+                let connection = config.subscriptions.get_mut("grok").unwrap();
+                connection.state = ConnectionState::Connected;
+                connection.identity = Some("grok@example.invalid".into());
+            })
+            .unwrap();
+        let before = serde_json::to_value(connection(&store, "grok")).unwrap();
+        let begin_error = begin_login(&store, "grok", &sessions).await.unwrap_err();
+        assert!(begin_error.contains("Grok subscription sign-in is not implemented yet"), "{begin_error}");
+        assert!(cancel_login(&store, "grok", &sessions).await.is_err());
+        assert!(logout(&store, "grok", &sessions).await.is_err());
+        assert!(switch_account(&store, "grok", &sessions).await.is_err());
+        assert!(refresh(&store, "grok").await.is_err());
+        // 连接状态一点没动，没有伪造会话，也没有拉起任何辅助进程。
+        assert_eq!(serde_json::to_value(connection(&store, "grok")).unwrap(), before);
+        assert!(sessions.lock().await.session("grok").is_none());
+        assert!(adapter.started.lock().unwrap().is_empty());
+        assert!(adapter.logouts.lock().unwrap().is_empty());
+        assert!(adapter.cancels.lock().unwrap().is_empty());
+        // 视图：只有支持的 Codex 行带 helper，Grok 行如实不可用（两家互不冒用）。
+        let mut state = SessionState::default();
+        state.helper = HelperStatus {
+            available: true,
+            version: Some("fixture-helper-1.0".into()),
+            auth_home: Some("/tmp/fixture-helper-home".into()),
+        };
+        state.supported_providers = vec!["codex".into()];
+        let all = views(&store.read(), true, &state);
+        let codex = all.iter().find(|view| view.provider_id == "codex").unwrap();
+        let grok = all.iter().find(|view| view.provider_id == "grok").unwrap();
+        assert!(codex.helper.available && codex.helper.version.is_some() && codex.helper.auth_home.is_some());
+        assert!(!grok.helper.available && grok.helper.version.is_none() && grok.helper.auth_home.is_none());
+        assert_eq!(grok.identity.as_deref(), Some("grok@example.invalid"));
+    }
+
+    #[tokio::test]
+    async fn a_helper_that_exits_mid_sign_in_never_leaves_the_session_pending() {
+        let adapter = LifecycleStub::new();
+        adapter.helper_exited.store(true, Ordering::SeqCst);
+        let (store, _directory, sessions) = fixture(adapter.clone()).await;
+
+        begin_login(&store, "codex", &sessions).await.unwrap();
+        assert_eq!(session(&sessions, "codex").await.stage, LoginStage::Pending);
+
+        // 辅助进程中途退出：与出错同等处理，不得让会话永远停在 Pending。
+        let error = await_login(store.clone(), "codex".into(), sessions.clone()).await.unwrap_err();
+        assert!(error.contains("exited"), "{error}");
+        let settled = session(&sessions, "codex").await;
+        assert_eq!(settled.stage, LoginStage::Failed);
+        assert!(settled.error.is_some());
+        assert_eq!(connection(&store, "codex").state, ConnectionState::NotConnected);
+
+        // 失败后可以再次发起登录，登录入口不会被上一次卡住。
+        begin_login(&store, "codex", &sessions).await.unwrap();
+        assert_eq!(session(&sessions, "codex").await.stage, LoginStage::Pending);
+        assert_eq!(adapter.started.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn disposing_a_subscription_provider_releases_the_helper_before_deletion() {
+        let adapter = LifecycleStub::new();
+        let (store, _directory, sessions) = fixture(adapter.clone()).await;
+        begin_login(&store, "codex", &sessions).await.unwrap();
+
+        dispose(&store, "codex", &sessions).await.unwrap();
+
+        assert_eq!(adapter.logouts.lock().unwrap().len(), 1, "删除订阅服务商必须先退出");
+        assert!(sessions.lock().await.session("codex").is_none(), "内存会话必须一并清除");
+        assert_eq!(connection(&store, "codex").state, ConnectionState::NotConnected);
+
+        // 未知服务商是空操作：不得误伤其它状态或重复退出。
+        dispose(&store, "missing", &sessions).await.unwrap();
+        assert_eq!(adapter.logouts.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn renaming_a_subscription_provider_migrates_the_helper_state() {
+        let adapter = LifecycleStub::new();
+        let (store, _directory, sessions) = fixture(adapter.clone()).await;
+        begin_login(&store, "codex", &sessions).await.unwrap();
+
+        migrate_helper(&store, "codex", "codex-work", &sessions).await.unwrap();
+
+        assert_eq!(
+            adapter.renames.lock().unwrap().as_slice(),
+            [("codex".to_owned(), "codex-work".to_owned())],
+            "改名必须让适配器迁移自有状态，不能只改配置"
+        );
+        assert!(adapter.logouts.lock().unwrap().is_empty(), "成功迁移不得走退出");
+        assert!(sessions.lock().await.session("codex").is_none());
+        // 在途尝试绑定旧标识：迁移后作废，不允许新标识停在 Pending。
+        assert_eq!(session(&sessions, "codex-work").await.stage, LoginStage::Idle);
+    }
+
+    #[tokio::test]
+    async fn a_failed_rename_signs_the_old_provider_out_and_forces_a_new_sign_in() {
+        let adapter = LifecycleStub::new();
+        *adapter.rename_error.lock().unwrap() = Some("the helper home could not be moved".into());
+        let (store, _directory, sessions) = fixture(adapter.clone()).await;
+        store
+            .update(|config| {
+                let connection = config.subscriptions.get_mut("codex").unwrap();
+                connection.state = ConnectionState::Connected;
+                connection.identity = Some("old@example.invalid".into());
+            })
+            .unwrap();
+        begin_login(&store, "codex", &sessions).await.unwrap();
+
+        migrate_helper(&store, "codex", "codex-work", &sessions).await.unwrap();
+
+        assert_eq!(adapter.logouts.lock().unwrap().len(), 1, "迁移失败必须对旧标识走退出");
+        assert_eq!(session(&sessions, "codex-work").await.stage, LoginStage::Idle);
+        // 配置键迁移由 apply_provider_edit 完成；旧身份不得被带到新标识。
+        store.update(|config| rename_provider(config, "codex", "codex-work")).unwrap();
+        let moved = connection(&store, "codex-work");
+        assert_eq!(moved.state, ConnectionState::NotConnected);
+        assert!(moved.identity.is_none() && moved.evidence.is_none());
+    }
+
+    #[test]
+    fn renaming_a_provider_voids_an_in_flight_sign_in() {
+        let mut config = AppConfig::default();
+        let provider = Provider {
+            preset: String::new(),
+            api_type: String::new(),
+            test_model: String::new(),
+            id: "codex".into(),
+            name: "Codex".into(),
+            kind: ProviderKind::CodexSubscription,
+            base_url: String::new(),
+            enabled: true,
+            has_api_key: false,
+        };
+        config.providers.push(provider.clone());
+        sync_provider(&mut config, &provider.id, &provider.kind);
+        config.subscriptions.get_mut("codex").unwrap().state = ConnectionState::AuthorizationPending;
+
+        rename_provider(&mut config, "codex", "codex-work");
+
+        assert!(!config.subscriptions.contains_key("codex"));
+        assert_eq!(
+            config.subscriptions["codex-work"].state,
+            ConnectionState::NotConnected,
+            "在途登录不可能跨标识完成，改名后必须回到未连接"
+        );
+    }
+}
