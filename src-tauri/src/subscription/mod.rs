@@ -698,6 +698,9 @@ pub struct GenerationRequest<'a> {
     pub model_id: &'a str,
     pub protocol: Protocol,
     pub body: serde_json::Value,
+    /// Rechecked by the Codex adapter after waiting for the provider lock and immediately before
+    /// dispatch. Production gateway calls bind this to the live ConfigStore admission snapshot.
+    pub pre_dispatch_check: std::sync::Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
 }
 
 /// 生成事件：辅助进程产出的上游输出。协议转换、捕获与错误仍由调用方负责。
@@ -3320,6 +3323,7 @@ mod refresh_tests {
                 model_id: "fixture-model",
                 protocol: Protocol::Chat,
                 body: serde_json::json!({}),
+                pre_dispatch_check: std::sync::Arc::new(|| Ok(())),
             })
             .await
             .is_err());
@@ -3336,6 +3340,7 @@ mod refresh_tests {
                 model_id: "fixture-model",
                 protocol: Protocol::Chat,
                 body: serde_json::json!({"model": "fixture-model"}),
+                pre_dispatch_check: std::sync::Arc::new(|| Ok(())),
             })
             .await
             .unwrap();

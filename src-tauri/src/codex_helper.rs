@@ -633,8 +633,8 @@ const MAX_GENERATION_INPUT_BYTES: usize = 32 * 1024;
 struct TurnCancellation {
     servers: Arc<tokio::sync::Mutex<HashMap<String, CodexAppServer>>>,
     provider_id: String,
-    thread_id: String,
-    turn_id: String,
+    thread_id: Option<String>,
+    turn_id: Option<String>,
     workspace: Option<PathBuf>,
     armed: bool,
 }
@@ -651,16 +651,26 @@ impl Drop for TurnCancellation {
         let thread_id = self.thread_id.clone();
         let turn_id = self.turn_id.clone();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            // Dropping an HTTP body drops this guard synchronously. Schedule interruption on
-            // the helper's own app-server and retain the isolated workspace until it replies.
+            // Before turn/start returns an id, interrupt cannot address the accepted work. Reap
+            // this app-owned helper instead; the per-account generation lock guarantees it owns
+            // no other active turn. Keep the workspace until either cleanup action completes.
             runtime.spawn(async move {
-                let mut servers = servers.lock().await;
-                if let Some(server) = servers.get_mut(&provider_id) {
-                    let _ = server.call("turn/interrupt", json!({"threadId":thread_id,"turnId":turn_id})).await;
+                match (thread_id, turn_id) {
+                    (Some(thread_id), Some(turn_id)) => {
+                        interrupt_active_turn(&servers, &provider_id, &thread_id, &turn_id).await;
+                    }
+                    _ => reap_owned_helper(&servers, &provider_id).await,
                 }
                 let _ = std::fs::remove_dir_all(workspace);
             });
         } else {
+            if self.turn_id.is_none() {
+                if let Ok(mut servers) = self.servers.try_lock() {
+                    if let Some(mut server) = servers.remove(&self.provider_id) {
+                        server.shutdown();
+                    }
+                }
+            }
             let _ = std::fs::remove_dir_all(workspace);
         }
     }
@@ -1051,6 +1061,9 @@ impl SubscriptionAdapter for CodexAdapter {
 
     fn logout<'a>(&'a self, provider_id: &'a str, _generation: u64) -> futures_util::future::BoxFuture<'a, Result<LogoutOutcome>> {
         Box::pin(async move {
+            // The subscription layer has already invalidated this generation. Serialize helper
+            // revocation with generation so queued old requests recheck and fail before dispatch.
+            let _generation_guard = self.generation_lock(provider_id).lock_owned().await;
             self.logins.lock().unwrap().remove(provider_id);
             self.deferred.lock().unwrap().remove(provider_id);
             let auth_home = match &self.home_root {
@@ -1104,11 +1117,23 @@ impl SubscriptionAdapter for CodexAdapter {
         let provider_id = request.provider_id.to_owned();
         let generation = request.generation;
         let model_id = request.model_id.to_owned();
+        let pre_dispatch_check = request.pre_dispatch_check.clone();
         Box::pin(async move {
             let generation_guard = self.generation_lock(&provider_id).lock_owned().await;
+            pre_dispatch_check().map_err(anyhow::Error::msg)?;
             let workspace = generation_workspace()?;
+            let servers_ref = self.servers.clone();
+            let mut cancellation = TurnCancellation {
+                servers: servers_ref.clone(),
+                provider_id: provider_id.clone(),
+                thread_id: None,
+                turn_id: None,
+                workspace: Some(workspace.clone()),
+                armed: false,
+            };
             let mut servers = self.server_for(&provider_id).await?;
             let server = servers.get_mut(&provider_id).expect("server_for inserted the Codex helper");
+            pre_dispatch_check().map_err(anyhow::Error::msg)?;
             let mut developer_instructions = String::from(
                 "Use only the request text and instructions below. Do not inspect files, use tools, browse, delegate, or continue with follow-up turns. Return assistant text only.",
             );
@@ -1116,6 +1141,9 @@ impl SubscriptionAdapter for CodexAdapter {
                 developer_instructions.push_str("\n\n");
                 developer_instructions.push_str(user_instructions);
             }
+            // These field names are from the pinned Codex version's ModelProviderInfo. A
+            // request-scoped custom provider avoids mutating the built-in OpenAI configuration.
+            let retry_provider_id = format!("autojev_no_retry_{}", uuid::Uuid::new_v4().simple());
             let mut thread_params = json!({
                 "model": model_id,
                 "ephemeral": true,
@@ -1138,12 +1166,28 @@ impl SubscriptionAdapter for CodexAdapter {
                     "request_permissions_tool": false
                 }}
             });
+            let mut retry_providers = serde_json::Map::new();
+            retry_providers.insert(retry_provider_id.clone(), json!({
+                "name": "OpenAI",
+                "requires_openai_auth": true,
+                "request_max_retries": 0,
+                "stream_max_retries": 0,
+                "supports_websockets": false
+            }));
+            thread_params["modelProvider"] = retry_provider_id.clone().into();
+            thread_params["config"]["model_providers"] = Value::Object(retry_providers);
             if let Some(tier) = turn.service_tier.as_deref() {
                 thread_params["serviceTier"] = tier.into();
             }
             let thread_result = server.call("thread/start", thread_params).await?;
             let thread_id = thread_result.pointer("/thread/id").and_then(Value::as_str)
                 .context("The Codex helper did not return a thread id")?.to_owned();
+            cancellation.thread_id = Some(thread_id.clone());
+            anyhow::ensure!(
+                thread_result.get("modelProvider").and_then(Value::as_str) == Some(retry_provider_id.as_str()),
+                "The Codex helper did not apply the request's zero-retry model provider"
+            );
+            pre_dispatch_check().map_err(anyhow::Error::msg)?;
             let mut turn_params = json!({
                 "threadId": thread_id,
                 "model": model_id,
@@ -1160,14 +1204,17 @@ impl SubscriptionAdapter for CodexAdapter {
             if let Some(tier) = turn.service_tier.as_deref() {
                 turn_params["serviceTierForTurn"] = tier.into();
             }
+            // Arm before the RPC write: a lost or delayed acknowledgement cannot leave work running
+            // without a guard; without turnId, cancel by reaping this application's owned helper.
+            cancellation.armed = true;
             let turn_result = server.call("turn/start", turn_params).await?;
             let turn_id = turn_result.pointer("/turn/id").and_then(Value::as_str)
                 .context("The Codex helper did not return a turn id")?.to_owned();
+            cancellation.turn_id = Some(turn_id.clone());
             drop(servers);
 
-            let servers = self.servers.clone();
             let state = GenerationState {
-                servers: servers.clone(),
+                servers: servers_ref.clone(),
                 provider_id: provider_id.clone(),
                 thread_id: thread_id.clone(),
                 turn_id: turn_id.clone(),
@@ -1176,14 +1223,7 @@ impl SubscriptionAdapter for CodexAdapter {
                 terminal: false,
                 deadline: tokio::time::Instant::now() + GENERATION_TIMEOUT,
                 _generation_guard: generation_guard,
-                cancellation: TurnCancellation {
-                    servers,
-                    provider_id,
-                    thread_id,
-                    turn_id,
-                    workspace: Some(workspace),
-                    armed: true,
-                },
+                cancellation,
             };
             let stream = futures_util::stream::unfold(state, |mut state| async move {
                 if state.terminal {
@@ -1248,10 +1288,21 @@ impl SubscriptionAdapter for CodexAdapter {
                             return Some((event, state));
                         }
                         method if method.starts_with("item/") && params["turnId"].as_str() == Some(state.turn_id.as_str()) => {
+                            let ordinary_lifecycle = matches!(method, "item/started" | "item/completed")
+                                && matches!(params.pointer("/item/type").and_then(Value::as_str),
+                                    Some("userMessage" | "agentMessage" | "reasoning" | "plan"));
+                            let reasoning_notification = matches!(method,
+                                "item/reasoning/summaryTextDelta"
+                                | "item/reasoning/summaryPartAdded"
+                                | "item/reasoning/textDelta"
+                            );
+                            if ordinary_lifecycle || reasoning_notification || method == "item/plan/delta" {
+                                continue;
+                            }
                             interrupt_active_turn(&state.servers, &state.provider_id, &state.thread_id, &state.turn_id).await;
                             state.cancellation.armed = false;
                             state.terminal = true;
-                            return Some((GenerationEvent::Failed { message: "Codex tool activity is not accepted by this gateway".into() }, state));
+                            return Some((GenerationEvent::Failed { message: "Codex tool activity or unknown item activity is not accepted by this gateway".into() }, state));
                         }
                         _ => continue,
                     }
@@ -1272,6 +1323,16 @@ async fn interrupt_active_turn(
     let mut servers = servers.lock().await;
     if let Some(server) = servers.get_mut(provider_id) {
         let _ = server.call("turn/interrupt", json!({"threadId":thread_id,"turnId":turn_id})).await;
+    }
+}
+
+async fn reap_owned_helper(
+    servers: &Arc<tokio::sync::Mutex<HashMap<String, CodexAppServer>>>,
+    provider_id: &str,
+) {
+    let mut servers = servers.lock().await;
+    if let Some(mut server) = servers.remove(provider_id) {
+        server.shutdown();
     }
 }
 
@@ -1597,6 +1658,7 @@ mod tests {
     const FIXTURE_HELPER: &str = r#"#!/bin/sh
 env_log="$1"
 queue="$1"
+helper_pid=$$
 if [ -n "$env_log" ]; then
   {
     printf 'CODEX_HOME=%s\n' "$CODEX_HOME"
@@ -1658,17 +1720,46 @@ while IFS= read -r line; do
       thread_id="fixture-thread-$n"
       case "$line" in *'"ephemeral":true'*) ephemeral=true ;; *) ephemeral=false ;; esac
       model=$(printf '%s' "$line" | sed -n 's/.*"model":"\([^"]*\)".*/\1/p')
+      model_provider=$(printf '%s' "$line" | sed -n 's/.*"modelProvider":"\([^"]*\)".*/\1/p')
       sandbox=$(printf '%s' "$line" | sed -n 's/.*"sandbox":"\([^"]*\)".*/\1/p')
       printf 'thread ephemeral=%s model=%s sandbox=%s\n' "$ephemeral" "$model" "$sandbox" >> "$queue.generation-params"
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"thread":{"id":"%s"}}}\n' "$id" "$thread_id" ;;
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"thread":{"id":"%s"},"modelProvider":"%s"}}\n' "$id" "$thread_id" "$model_provider" ;;
     *'"method":"turn/start"'*)
       thread_id=$(printf '%s' "$line" | sed -n 's/.*"threadId":"\([^"]*\)".*/\1/p')
       turn_id="$thread_id-turn"
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"turn":{"id":"%s","status":"inProgress"}}}\n' "$id" "$turn_id"
       scenario=success; if [ -f "$queue.generation" ]; then scenario=$(sed -n '1p' "$queue.generation"); fi
+      if [ "$scenario" = delayed-start-ack ] || [ "$scenario" = lost-start-ack ]; then
+        printf 'accepted\n' > "$queue.turn-start-accepted"
+      fi
+      if [ "$scenario" = delayed-start-ack ]; then sleep 0.15; fi
+      if [ "$scenario" = lost-start-ack ]; then
+        while IFS= read -r ignored; do :; done
+        continue
+      fi
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"turn":{"id":"%s","status":"inProgress"}}}\n' "$id" "$turn_id"
       (
         sleep 0.05
-        printf '{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"%s","turnId":"%s","itemId":"fixture-item","delta":"fixture"}}\n' "$thread_id" "$turn_id"
+        if [ "$scenario" = lifecycle ]; then
+          printf '{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"%s","turnId":"%s","startedAtMs":1,"item":{"type":"userMessage","id":"fixture-user","content":[{"type":"text","text":"hello"}]}}}\n' "$thread_id" "$turn_id"
+          printf '{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"%s","turnId":"%s","completedAtMs":2,"item":{"type":"userMessage","id":"fixture-user","content":[{"type":"text","text":"hello"}]}}}\n' "$thread_id" "$turn_id"
+          printf '{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"%s","turnId":"%s","startedAtMs":3,"item":{"type":"reasoning","id":"fixture-reasoning","summary":[],"content":[]}}}\n' "$thread_id" "$turn_id"
+          printf '{"jsonrpc":"2.0","method":"item/reasoning/summaryPartAdded","params":{"threadId":"%s","turnId":"%s","itemId":"fixture-reasoning","summaryIndex":0,"part":{"type":"summary_text","text":"private reasoning"}}}\n' "$thread_id" "$turn_id"
+          printf '{"jsonrpc":"2.0","method":"item/reasoning/summaryTextDelta","params":{"threadId":"%s","turnId":"%s","itemId":"fixture-reasoning","summaryIndex":0,"delta":"private reasoning"}}\n' "$thread_id" "$turn_id"
+          printf '{"jsonrpc":"2.0","method":"item/reasoning/textDelta","params":{"threadId":"%s","turnId":"%s","itemId":"fixture-reasoning","contentIndex":0,"delta":"private reasoning"}}\n' "$thread_id" "$turn_id"
+          printf '{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"%s","turnId":"%s","completedAtMs":4,"item":{"type":"reasoning","id":"fixture-reasoning","summary":["private reasoning"],"content":[]}}}\n' "$thread_id" "$turn_id"
+          printf '{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"%s","turnId":"%s","startedAtMs":5,"item":{"type":"agentMessage","id":"fixture-item","text":""}}}\n' "$thread_id" "$turn_id"
+          printf '{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"%s","turnId":"%s","itemId":"fixture-item","delta":"fixture"}}\n' "$thread_id" "$turn_id"
+          printf '{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"%s","turnId":"%s","completedAtMs":6,"item":{"type":"agentMessage","id":"fixture-item","text":"fixture"}}}\n' "$thread_id" "$turn_id"
+        elif [ "$scenario" = tool-activity ]; then
+          printf '{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"%s","turnId":"%s","startedAtMs":1,"item":{"type":"commandExecution","id":"fixture-command","command":"echo blocked","cwd":"/tmp","commandActions":[],"status":"inProgress"}}}\n' "$thread_id" "$turn_id"
+        elif [ "$scenario" = partial-disconnect ]; then
+          printf '{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"%s","turnId":"%s","itemId":"fixture-item","delta":"partial"}}\n' "$thread_id" "$turn_id"
+          sleep 0.05
+          kill "$helper_pid"
+          exit 0
+        else
+          printf '{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"%s","turnId":"%s","itemId":"fixture-item","delta":"fixture"}}\n' "$thread_id" "$turn_id"
+        fi
         if [ "$scenario" = slow-success ]; then sleep 0.25; fi
         if [ "$scenario" = hold ]; then sleep 5; fi
         if [ "$scenario" = partial-failure ]; then
@@ -2108,6 +2199,7 @@ done
                 model_id: "fixture-model",
                 protocol: crate::protocol::Protocol::Chat,
                 body: json!({"model":"fixture-model","messages":[{"role":"user","content":"hello"}]}),
+                pre_dispatch_check: Arc::new(|| Ok(())),
             })
             .await
             .unwrap();
@@ -2141,6 +2233,7 @@ done
             model_id: "fixture-model",
             protocol: Protocol::Chat,
             body: json!({"model":"fixture-model","messages":[{"role":"user","content":"hello"}]}),
+            pre_dispatch_check: Arc::new(|| Ok(())),
         }).await.unwrap();
         let mut observed = Vec::new();
         while let Some(event) = events.next().await { observed.push(event); }
@@ -2149,6 +2242,353 @@ done
             GenerationEvent::Chunk("fixture".into()),
             GenerationEvent::Failed { message: "fixture turn failure".into() },
         ]);
+    }
+
+    #[tokio::test]
+    async fn generation_accepts_text_and_reasoning_item_lifecycles_but_rejects_tool_items() {
+        let home = tempfile::tempdir().unwrap();
+        let log = home.path().join("lifecycle.log");
+        std::fs::write(format!("{}.generation", log.to_string_lossy()), "lifecycle").unwrap();
+        let adapter =
+            CodexAdapter::with_launch(home.path().to_path_buf(), fixture_launch(home.path(), &log));
+        let mut events = adapter
+            .generate(GenerationRequest {
+                provider_id: "codex-lifecycle",
+                generation: 1,
+                model_id: "fixture-model",
+                protocol: Protocol::Responses,
+                body: json!({"model":"fixture-model","input":"hello"}),
+                pre_dispatch_check: Arc::new(|| Ok(())),
+            })
+            .await
+            .unwrap();
+        let mut observed = Vec::new();
+        while let Some(event) = events.next().await {
+            observed.push(event);
+        }
+        assert_eq!(observed, vec![
+            GenerationEvent::Started { generation: 1 },
+            GenerationEvent::Chunk("fixture".into()),
+            GenerationEvent::Finished { status: 200 },
+        ], "ordinary message/reasoning lifecycle notifications must be ignored without leaking reasoning");
+
+        std::fs::write(
+            format!("{}.generation", log.to_string_lossy()),
+            "tool-activity",
+        )
+        .unwrap();
+        let mut events = adapter
+            .generate(GenerationRequest {
+                provider_id: "codex-tool-lifecycle",
+                generation: 2,
+                model_id: "fixture-model",
+                protocol: Protocol::Responses,
+                body: json!({"model":"fixture-model","input":"hello"}),
+                pre_dispatch_check: Arc::new(|| Ok(())),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            events.next().await,
+            Some(GenerationEvent::Started { generation: 2 })
+        );
+        assert!(
+            matches!(events.next().await, Some(GenerationEvent::Failed { message }) if message.contains("tool activity"))
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_generation_rechecks_admission_before_starting_a_thread() {
+        let home = tempfile::tempdir().unwrap();
+        let log = home.path().join("queued-admission.log");
+        std::fs::write(format!("{}.generation", log.to_string_lossy()), "hold").unwrap();
+        let adapter = Arc::new(CodexAdapter::with_launch(
+            home.path().to_path_buf(),
+            fixture_launch(home.path(), &log),
+        ));
+        let mut active = adapter
+            .generate(GenerationRequest {
+                provider_id: "codex-queued-admission",
+                generation: 1,
+                model_id: "fixture-model",
+                protocol: Protocol::Responses,
+                body: json!({"model":"fixture-model","input":"active"}),
+                pre_dispatch_check: Arc::new(|| Ok(())),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            active.next().await,
+            Some(GenerationEvent::Started { generation: 1 })
+        );
+        assert_eq!(
+            active.next().await,
+            Some(GenerationEvent::Chunk("fixture".into()))
+        );
+
+        let admitted = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let queued = {
+            let adapter = adapter.clone();
+            let admitted = admitted.clone();
+            let checks = checks.clone();
+            tokio::spawn(async move {
+                let result = adapter
+                    .generate(GenerationRequest {
+                        provider_id: "codex-queued-admission",
+                        generation: 1,
+                        model_id: "fixture-model",
+                        protocol: Protocol::Responses,
+                        body: json!({"model":"fixture-model","input":"queued"}),
+                        pre_dispatch_check: Arc::new(move || {
+                            checks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            if admitted.load(std::sync::atomic::Ordering::SeqCst) {
+                                Ok(())
+                            } else {
+                                Err("The live subscription admission changed".into())
+                            }
+                        }),
+                    })
+                    .await;
+                let rejected = result.is_err();
+                drop(result);
+                rejected
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            checks.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the queued request must still be waiting on the active turn lock"
+        );
+        admitted.store(false, std::sync::atomic::Ordering::SeqCst);
+        drop(active);
+
+        let queued_result = tokio::time::timeout(std::time::Duration::from_secs(3), queued)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            queued_result,
+            "stale queued admission must be rejected before dispatch"
+        );
+        assert!(checks.load(std::sync::atomic::Ordering::SeqCst) > 0);
+        let calls = std::fs::read_to_string(format!("{}.calls", log.to_string_lossy())).unwrap();
+        assert_eq!(
+            calls
+                .lines()
+                .filter(|method| *method == "thread/start")
+                .count(),
+            1,
+            "the old queued request must not start a thread"
+        );
+        assert_eq!(
+            calls
+                .lines()
+                .filter(|method| *method == "turn/start")
+                .count(),
+            1,
+            "the old queued request must not start a turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn logout_waits_for_active_generation_before_revoking_the_helper() {
+        let home = tempfile::tempdir().unwrap();
+        let log = home.path().join("logout-generation-lock.log");
+        std::fs::write(format!("{}.generation", log.to_string_lossy()), "hold").unwrap();
+        let adapter = Arc::new(CodexAdapter::with_launch(
+            home.path().to_path_buf(),
+            fixture_launch(home.path(), &log),
+        ));
+        let mut events = adapter
+            .generate(GenerationRequest {
+                provider_id: "codex-logout-lock",
+                generation: 1,
+                model_id: "fixture-model",
+                protocol: Protocol::Responses,
+                body: json!({"model":"fixture-model","input":"active"}),
+                pre_dispatch_check: Arc::new(|| Ok(())),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            events.next().await,
+            Some(GenerationEvent::Started { generation: 1 })
+        );
+        assert_eq!(
+            events.next().await,
+            Some(GenerationEvent::Chunk("fixture".into()))
+        );
+
+        let logout = {
+            let adapter = adapter.clone();
+            tokio::spawn(async move { adapter.logout("codex-logout-lock", 0).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let calls = std::fs::read_to_string(format!("{}.calls", log.to_string_lossy())).unwrap();
+        assert!(
+            !calls.lines().any(|method| method == "account/logout"),
+            "logout must wait for the account's active generation lock"
+        );
+
+        drop(events);
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(3), logout)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(outcome.local_cleared);
+        let calls = std::fs::read_to_string(format!("{}.calls", log.to_string_lossy())).unwrap();
+        assert!(calls.lines().any(|method| method == "account/logout"));
+    }
+
+    #[tokio::test]
+    async fn delayed_turn_start_ack_is_supported_and_lost_ack_cancellation_reaps_helper() {
+        let home = tempfile::tempdir().unwrap();
+        let log = home.path().join("turn-start-ack.log");
+        std::fs::write(
+            format!("{}.generation", log.to_string_lossy()),
+            "delayed-start-ack",
+        )
+        .unwrap();
+        let adapter = Arc::new(CodexAdapter::with_launch(
+            home.path().to_path_buf(),
+            fixture_launch(home.path(), &log),
+        ));
+        let mut events = adapter
+            .generate(GenerationRequest {
+                provider_id: "codex-delayed-ack",
+                generation: 1,
+                model_id: "fixture-model",
+                protocol: Protocol::Responses,
+                body: json!({"model":"fixture-model","input":"delayed"}),
+                pre_dispatch_check: Arc::new(|| Ok(())),
+            })
+            .await
+            .unwrap();
+        let mut observed = Vec::new();
+        while let Some(event) = events.next().await {
+            observed.push(event);
+        }
+        assert_eq!(
+            observed,
+            vec![
+                GenerationEvent::Started { generation: 1 },
+                GenerationEvent::Chunk("fixture".into()),
+                GenerationEvent::Finished { status: 200 },
+            ]
+        );
+
+        let accepted = format!("{}.turn-start-accepted", log.to_string_lossy());
+        let _ = std::fs::remove_file(&accepted);
+        std::fs::write(
+            format!("{}.generation", log.to_string_lossy()),
+            "lost-start-ack",
+        )
+        .unwrap();
+        let adapter_for_call = adapter.clone();
+        let request = GenerationRequest {
+            provider_id: "codex-lost-ack",
+            generation: 2,
+            model_id: "fixture-model",
+            protocol: Protocol::Responses,
+            body: json!({"model":"fixture-model","input":"lost"}),
+            pre_dispatch_check: Arc::new(|| Ok(())),
+        };
+        let pending = tokio::spawn(async move {
+            let result = adapter_for_call.generate(request).await;
+            drop(result);
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while !std::path::Path::new(&accepted).exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("fixture must record that turn/start was accepted before withholding its response");
+        pending.abort();
+        let _ = pending.await;
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if !adapter.servers.lock().await.contains_key("codex-lost-ack") {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cancellation before turnId must reap this application's owned helper");
+        let calls = std::fs::read_to_string(format!("{}.calls", log.to_string_lossy())).unwrap();
+        assert_eq!(
+            calls
+                .lines()
+                .filter(|method| *method == "turn/start")
+                .count(),
+            2,
+            "the lost acknowledgement must not trigger another generation attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_internal_retries_are_zero_and_disconnect_fails_without_replaying_output() {
+        let home = tempfile::tempdir().unwrap();
+        let log = home.path().join("retry-policy.log");
+        std::fs::write(
+            format!("{}.generation", log.to_string_lossy()),
+            "partial-disconnect",
+        )
+        .unwrap();
+        let adapter =
+            CodexAdapter::with_launch(home.path().to_path_buf(), fixture_launch(home.path(), &log));
+        let mut events = adapter
+            .generate(GenerationRequest {
+                provider_id: "codex-retry-policy",
+                generation: 1,
+                model_id: "fixture-model",
+                protocol: Protocol::Responses,
+                body: json!({"model":"fixture-model","input":"disconnect"}),
+                pre_dispatch_check: Arc::new(|| Ok(())),
+            })
+            .await
+            .unwrap();
+        let mut observed = Vec::new();
+        while let Some(event) = events.next().await {
+            observed.push(event);
+        }
+        assert_eq!(observed.len(), 3);
+        assert_eq!(observed[0], GenerationEvent::Started { generation: 1 });
+        assert_eq!(observed[1], GenerationEvent::Chunk("partial".into()));
+        assert!(
+            matches!(observed[2], GenerationEvent::Failed { .. }),
+            "a disconnect after partial text must terminate this one turn"
+        );
+
+        let rpc: Vec<Value> = std::fs::read_to_string(format!("{}.rpc", log.to_string_lossy()))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let thread_start = rpc
+            .iter()
+            .find(|call| call["method"] == "thread/start")
+            .unwrap();
+        let provider_id = thread_start["params"]["modelProvider"]
+            .as_str()
+            .expect("thread must use its request-scoped no-retry provider");
+        let provider = &thread_start["params"]["config"]["model_providers"][provider_id];
+        assert_eq!(provider["request_max_retries"], 0);
+        assert_eq!(provider["stream_max_retries"], 0);
+        assert_eq!(provider["requires_openai_auth"], true);
+        assert_eq!(provider["supports_websockets"], false);
+        assert_eq!(thread_start["params"]["model"], "fixture-model");
+        assert_eq!(
+            rpc.iter()
+                .filter(|call| call["method"] == "turn/start")
+                .count(),
+            1,
+            "the controlled disconnect must not be replayed by the gateway adapter"
+        );
     }
 
     #[tokio::test]
@@ -2163,6 +2603,7 @@ done
             model_id: "fixture-model",
             protocol: Protocol::Responses,
             body: json!({"model":"fixture-model","input":"hello"}),
+            pre_dispatch_check: Arc::new(|| Ok(())),
         }).await.unwrap();
         assert_eq!(events.next().await, Some(GenerationEvent::Started { generation: 9 }));
         assert_eq!(events.next().await, Some(GenerationEvent::Chunk("fixture".into())));
@@ -2188,6 +2629,7 @@ done
                 model_id: "fixture-model",
                 protocol: Protocol::Messages,
                 body: json!({"model":"fixture-model","system":"system","messages":[{"role":"user","content":"hello"}]}),
+                pre_dispatch_check: Arc::new(|| Ok(())),
             }).await.unwrap();
             while events.next().await.is_some() {}
         }
@@ -2215,6 +2657,89 @@ done
 
     fn gateway_endpoint(protocol: Protocol) -> &'static str {
         crate::subscription::protocol_key(protocol)
+    }
+
+    #[tokio::test]
+    async fn queued_gateway_request_is_rejected_after_logout_without_starting_a_turn() {
+        let home = tempfile::tempdir().unwrap();
+        let log = home.path().join("queued-gateway-logout.log");
+        std::fs::write(format!("{}.generation", log.to_string_lossy()), "hold").unwrap();
+        let adapter = Arc::new(CodexAdapter::with_launch(
+            home.path().to_path_buf(),
+            fixture_launch(home.path(), &log),
+        ));
+        let mut active = adapter
+            .generate(GenerationRequest {
+                provider_id: "codex-fixture",
+                generation: 1,
+                model_id: "codex-fixture-model",
+                protocol: Protocol::Responses,
+                body: json!({"model":"codex-fixture-model","input":"active"}),
+                pre_dispatch_check: Arc::new(|| Ok(())),
+            })
+            .await
+            .unwrap();
+        assert_eq!(active.next().await, Some(GenerationEvent::Started { generation: 1 }));
+        assert_eq!(active.next().await, Some(GenerationEvent::Chunk("fixture".into())));
+
+        let store = admitted_gateway_store(
+            home.path().join("queued-gateway.db").as_path(),
+            adapter.clone(),
+            "http://127.0.0.1:9",
+        );
+        let queued = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                crate::proxy::forward_test_request(
+                    store,
+                    json!({"model":"autojev/model/codex-fixture-binding","input":"queued"}),
+                    "responses",
+                )
+                .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let calls_path = format!("{}.calls", log.to_string_lossy());
+        let calls = std::fs::read_to_string(&calls_path).unwrap();
+        assert_eq!(calls.lines().filter(|method| *method == "turn/start").count(), 1,
+            "the queued gateway request must wait behind the active account turn");
+
+        let sessions = Arc::new(tokio::sync::Mutex::new(crate::subscription::SessionState::default()));
+        let logout = {
+            let store = store.clone();
+            let sessions = sessions.clone();
+            tokio::spawn(async move {
+                crate::subscription::logout(&store, "codex-fixture", &sessions).await
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if store.read().subscriptions["codex-fixture"].state
+                    == crate::subscription::ConnectionState::NotConnected
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("logout invalidates the live connection before waiting for the generation lock");
+        drop(active);
+
+        let response = tokio::time::timeout(std::time::Duration::from_secs(3), queued)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_GATEWAY,
+            "an adapter startup denial must terminate this request");
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), logout)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.is_ok());
+        let calls = std::fs::read_to_string(&calls_path).unwrap();
+        assert_eq!(calls.lines().filter(|method| *method == "turn/start").count(), 1,
+            "the old queued request must not dispatch a turn after logout");
     }
 
     #[tokio::test]

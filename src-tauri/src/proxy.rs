@@ -473,12 +473,26 @@ async fn forward_attempt(context: ProxyContext, headers: HeaderMap, body: Value,
         if let Err(error) = crate::codex_helper::validate_generation_request(source, &body) {
             return protocol_error_response(StatusCode::UNPROCESSABLE_ENTITY, source, &error.to_string());
         }
-        let generation = config.subscriptions.get(&resolved.provider.id).map_or(0, |connection| connection.generation);
+        let Some(connection) = config.subscriptions.get(&resolved.provider.id) else {
+            return protocol_error_response(StatusCode::PRECONDITION_REQUIRED, source,
+                "The Codex subscription connection changed before dispatch.");
+        };
+        let generation = connection.generation;
+        let identity = connection.identity.clone();
+        let pre_dispatch_check = codex_admission_check(
+            context.store.clone(),
+            resolved.provider.id.clone(),
+            resolved.model.id.clone(),
+            resolved.model.model_id.clone(),
+            generation,
+            identity,
+            source,
+        );
         capture.lock().unwrap().upstream(source, streaming);
         let request_metadata = capture.lock().unwrap().log.clone();
         let response = codex_subscription_response(
             &context, &resolved.provider, &resolved.model, generation, source, body, streaming,
-            &resolved.decision.source, capture,
+            &resolved.decision.source, pre_dispatch_check, capture,
         ).await;
         let _ = context.store.add_event(RouteEvent {
             id: request_metadata.id,
@@ -628,6 +642,37 @@ async fn forward_attempt(context: ProxyContext, headers: HeaderMap, body: Value,
 
 const MAX_CODEX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 
+fn codex_admission_check(
+    store: Arc<ConfigStore>,
+    provider_id: String,
+    model_binding_id: String,
+    model_id: String,
+    generation: u64,
+    identity: Option<String>,
+    protocol: Protocol,
+) -> Arc<dyn Fn() -> Result<(), String> + Send + Sync> {
+    Arc::new(move || {
+        let config = store.read();
+        let provider = config.providers.iter().find(|provider| provider.id == provider_id)
+            .ok_or_else(|| "The Codex provider was removed before dispatch".to_owned())?;
+        if provider.kind != ProviderKind::CodexSubscription {
+            return Err("The Codex provider type changed before dispatch".into());
+        }
+        let model = config.models.iter().find(|model| model.id == model_binding_id)
+            .ok_or_else(|| "The Codex model binding was removed before dispatch".to_owned())?;
+        if model.provider_id != provider_id || model.model_id != model_id {
+            return Err("The Codex model binding changed before dispatch".into());
+        }
+        let connection = config.subscriptions.get(&provider_id)
+            .ok_or_else(|| "The Codex subscription connection changed before dispatch".to_owned())?;
+        if connection.generation != generation || connection.identity != identity {
+            return Err("The Codex subscription account changed before dispatch".into());
+        }
+        crate::subscription::admit_model(&config, model, provider, protocol)
+            .map_err(|denial| denial.summary())
+    })
+}
+
 fn protocol_error_response(status: StatusCode, protocol: Protocol, message: &str) -> Response {
     let mut response = (status, Json(protocol.error(message))).into_response();
     response.headers_mut().insert("x-should-retry", HeaderValue::from_static("false"));
@@ -676,6 +721,7 @@ async fn codex_subscription_response(
     body: Value,
     streaming: bool,
     route_source: &str,
+    pre_dispatch_check: Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
     capture: crate::traffic::SharedCapture,
 ) -> Response {
     let Some(adapter) = context.store.subscription.for_kind(&provider.kind).cloned() else {
@@ -696,6 +742,7 @@ async fn codex_subscription_response(
                 model_id: &model.model_id,
                 protocol,
                 body,
+                pre_dispatch_check: pre_dispatch_check.clone(),
             }),
         ).await {
             Ok(Ok(events)) => events,
@@ -743,6 +790,7 @@ async fn codex_subscription_response(
     let output_limit = MAX_CODEX_OUTPUT_BYTES;
     let adapter_for_task = adapter.clone();
     let capture_for_task = capture.clone();
+    let pre_dispatch_check_for_task = pre_dispatch_check;
     let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(8);
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
     let task = tokio::spawn(async move {
@@ -752,6 +800,7 @@ async fn codex_subscription_response(
             model_id: &model_id,
             protocol,
             body,
+            pre_dispatch_check: pre_dispatch_check_for_task,
         };
         let mut events = match adapter_for_task.generate(request).await {
             Ok(events) => events,
