@@ -188,6 +188,35 @@ pub(crate) fn read_spec_with_program(
     Ok(HelperSpec { program: program.to_path_buf(), args, env: helper_env(&home), home })
 }
 
+/// 组装一次全新的 ACP 文本生成进程。生成始终使用 provider 专属 home，并且不继承
+/// 上游凭据环境变量；参数不接受外部拼接，避免覆盖模型或启用未支持的工具。
+#[cfg(test)]
+pub(crate) fn generation_spec_with_program(
+    provider_id: &str,
+    home_dir: &Path,
+    program: &Path,
+    model_id: &str,
+) -> Result<HelperSpec> {
+    ensure!(!model_id.trim().is_empty() && model_id.len() <= 256, "A bounded Grok model id is required");
+    ensure!(!model_id.chars().any(char::is_control), "The Grok model id contains a control character");
+    let home = helper_home(&ProviderKind::GrokSubscription, provider_id, home_dir)?;
+    let args = vec![
+        "agent".to_owned(),
+        "stdio".to_owned(),
+        "--no-auto-update".to_owned(),
+        "--no-subagents".to_owned(),
+        "--no-memory".to_owned(),
+        "--disable-web-search".to_owned(),
+        "--max-turns".to_owned(),
+        "1".to_owned(),
+        "--tools".to_owned(),
+        String::new(),
+        "--model".to_owned(),
+        model_id.to_owned(),
+    ];
+    Ok(HelperSpec { program: program.to_path_buf(), args, env: helper_env(&home), home })
+}
+
 /// `env_clear()` 之后唯一允许进入辅助进程的环境：基础运行变量 + `AUTOJEV_GROK_*` + `GROK_HOME`/`HOME`。
 /// `HOME` 也指向应用自有 home：即使真实 CLI 只认 `HOME`，也不会落到日常 `~/.grok`。
 /// 只透传本应用为该辅助进程显式定义的前缀：任意 `AUTOJEV_*` 都可能把真实 home 或其它来源带进辅助进程。

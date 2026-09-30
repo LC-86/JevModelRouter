@@ -8,6 +8,10 @@
 //! 两者都必须返回 `Err`，绝不能返回「成功但为空」的读数。同一服务商的只读读取串行化，
 //! 收尾只回收自己那个 pid，绝不复用登录会话的进程。
 
+// Production generation remains fail-closed until the real CLI contract is verified in #26.
+#[allow(dead_code)]
+mod generation;
+
 use std::{path::PathBuf, time::Duration};
 
 use anyhow::{bail, Result};
@@ -137,6 +141,20 @@ pub struct GrokSubscriptionAdapter {
     reads: tokio::sync::Mutex<()>,
     /// 一次读取的上限；生产固定 15s，测试可注入更短的值。
     read_timeout: Duration,
+    /// 每家账号串行处理生成；每次请求另建 ACP 会话。
+    #[cfg(test)]
+    generation_locks: std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+    #[cfg(test)]
+    generation_timeout: Duration,
+    /// 账号世代改变时取消该世代的子进程。
+    active_generations: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<(String, u64), std::collections::HashMap<String, tokio::sync::watch::Sender<bool>>>>>,
+    #[cfg(test)]
+    test_generation: bool,
+}
+
+/// Validate the strict ACP text subset before creating an HTTP response.
+pub(crate) fn validate_generation_request(protocol: crate::protocol::Protocol, body: &Value, model_id: &str) -> Result<()> {
+    generation::validate_generation_request(protocol, body, model_id)
 }
 
 impl GrokSubscriptionAdapter {
@@ -157,13 +175,22 @@ impl GrokSubscriptionAdapter {
             processes: OwnedProcesses::new(),
             reads: tokio::sync::Mutex::new(()),
             read_timeout,
+            #[cfg(test)]
+            generation_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
+            #[cfg(test)]
+            generation_timeout: Duration::from_secs(120),
+            active_generations: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            #[cfg(test)]
+            test_generation: false,
         }
     }
 
     /// 测试专用：注入隔离 home 与本地假 helper，绝不触碰真实用户目录或真实 CLI。
     #[cfg(test)]
     pub(crate) fn with_test_helper(home: PathBuf, program: PathBuf) -> Self {
-        Self::from_parts(home, Some(program), Vec::new(), READ_TIMEOUT)
+        let mut adapter = Self::from_parts(home, Some(program), Vec::new(), READ_TIMEOUT);
+        adapter.test_generation = true;
+        adapter
     }
 
     /// 测试专用：缩短读取上限，好让超时路径也能在单测里被覆盖。
@@ -569,9 +596,30 @@ impl SubscriptionAdapter for GrokSubscriptionAdapter {
         })
     }
 
-    /// 本票不接入真实生成：发现目录与额度不等于放行调用，生成仍在准入处默认拒绝。
-    fn generate<'a>(&'a self, _request: GenerationRequest<'a>) -> BoxFuture<'a, Result<GenerationStream<'a>>> {
-        Box::pin(async { bail!("Grok subscription generation is not implemented in this build") })
+    /// 未经 #26 人工核验前，生产版本明确 fail-closed。单测仅能经 `with_test_helper` 注入本地 ACP 替身。
+    fn generate<'a>(&'a self, request: GenerationRequest<'a>) -> BoxFuture<'a, Result<GenerationStream<'a>>> {
+        #[cfg(not(test))]
+        {
+            let _ = request;
+            Box::pin(async { bail!("Grok generation is disabled until its production entry is verified") })
+        }
+        #[cfg(test)]
+        {
+            Box::pin(async move {
+                if !self.test_generation {
+                    bail!("Grok generation is unavailable without an injected local test helper");
+                }
+                generation::generate(self, request).await
+            })
+        }
+    }
+
+    fn cancel_generation(&self, provider_id: &str, generation: u64) {
+        if let Some(senders) = self.active_generations.lock().unwrap().get(&(provider_id.to_owned(), generation)) {
+            for sender in senders.values() {
+                let _ = sender.send(true);
+            }
+        }
     }
 
     fn start_login<'a>(&'a self, _provider_id: &'a str, _generation: u64) -> BoxFuture<'a, Result<LoginStart>> {

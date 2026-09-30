@@ -466,20 +466,26 @@ async fn forward_attempt(context: ProxyContext, headers: HeaderMap, body: Value,
     };
     let streaming = body["stream"].as_bool().unwrap_or(false);
     if crate::subscription::is_subscription_provider(&resolved.provider) {
-        if resolved.provider.kind != ProviderKind::CodexSubscription {
+        if !matches!(resolved.provider.kind, ProviderKind::CodexSubscription | ProviderKind::GrokSubscription) {
             return protocol_error_response(StatusCode::NOT_IMPLEMENTED, source,
                 "Generation through this subscription provider is not implemented.");
         }
-        if let Err(error) = crate::codex_helper::validate_generation_request(source, &body) {
+        let validation = match resolved.provider.kind {
+            ProviderKind::CodexSubscription => crate::codex_helper::validate_generation_request(source, &body),
+            ProviderKind::GrokSubscription => crate::subscription::grok::validate_generation_request(source, &body, &resolved.model.model_id),
+            _ => unreachable!(),
+        };
+        if let Err(error) = validation {
             return protocol_error_response(StatusCode::UNPROCESSABLE_ENTITY, source, &error.to_string());
         }
         let Some(connection) = config.subscriptions.get(&resolved.provider.id) else {
             return protocol_error_response(StatusCode::PRECONDITION_REQUIRED, source,
-                "The Codex subscription connection changed before dispatch.");
+                "The subscription connection changed before dispatch.");
         };
         let generation = connection.generation;
         let identity = connection.identity.clone();
         let pre_dispatch_check = codex_admission_check(
+            resolved.provider.kind.clone(),
             context.store.clone(),
             resolved.provider.id.clone(),
             resolved.model.id.clone(),
@@ -643,6 +649,7 @@ async fn forward_attempt(context: ProxyContext, headers: HeaderMap, body: Value,
 const MAX_CODEX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 
 fn codex_admission_check(
+    expected_kind: ProviderKind,
     store: Arc<ConfigStore>,
     provider_id: String,
     model_binding_id: String,
@@ -654,19 +661,19 @@ fn codex_admission_check(
     Arc::new(move || {
         let config = store.read();
         let provider = config.providers.iter().find(|provider| provider.id == provider_id)
-            .ok_or_else(|| "The Codex provider was removed before dispatch".to_owned())?;
-        if provider.kind != ProviderKind::CodexSubscription {
-            return Err("The Codex provider type changed before dispatch".into());
+            .ok_or_else(|| "The subscription provider was removed before dispatch".to_owned())?;
+        if provider.kind != expected_kind {
+            return Err("The subscription provider type changed before dispatch".into());
         }
         let model = config.models.iter().find(|model| model.id == model_binding_id)
-            .ok_or_else(|| "The Codex model binding was removed before dispatch".to_owned())?;
+            .ok_or_else(|| "The subscription model binding was removed before dispatch".to_owned())?;
         if model.provider_id != provider_id || model.model_id != model_id {
-            return Err("The Codex model binding changed before dispatch".into());
+            return Err("The subscription model binding changed before dispatch".into());
         }
         let connection = config.subscriptions.get(&provider_id)
-            .ok_or_else(|| "The Codex subscription connection changed before dispatch".to_owned())?;
+            .ok_or_else(|| "The subscription connection changed before dispatch".to_owned())?;
         if connection.generation != generation || connection.identity != identity {
-            return Err("The Codex subscription account changed before dispatch".into());
+            return Err("The subscription account changed before dispatch".into());
         }
         crate::subscription::admit_model(&config, model, provider, protocol)
             .map_err(|denial| denial.summary())
@@ -679,7 +686,12 @@ fn protocol_error_response(status: StatusCode, protocol: Protocol, message: &str
     response
 }
 
-fn codex_text_completion(protocol: Protocol, model: &str, output: &str) -> Value {
+fn codex_text_completion(
+    protocol: Protocol,
+    model: &str,
+    output: &str,
+    finish_reason: Option<crate::subscription::GenerationFinishReason>,
+) -> Value {
     let suffix = uuid::Uuid::new_v4().simple().to_string();
     let created = chrono::Utc::now().timestamp();
     match protocol {
@@ -688,15 +700,15 @@ fn codex_text_completion(protocol: Protocol, model: &str, output: &str) -> Value
             "object": "chat.completion",
             "created": created,
             "model": model,
-            "choices": [{"index":0,"message":{"role":"assistant","content":output},"finish_reason":"stop"}]
+            "choices": [{"index":0,"message":{"role":"assistant","content":output},"finish_reason":if finish_reason == Some(crate::subscription::GenerationFinishReason::MaxTokens) {"length"} else {"stop"}}]
         }),
         Protocol::Responses => json!({
             "id": format!("resp_{suffix}"),
             "object": "response",
             "created_at": created,
-            "status": "completed",
+            "status": if finish_reason == Some(crate::subscription::GenerationFinishReason::MaxTokens) {"incomplete"} else {"completed"},
             "error": null,
-            "incomplete_details": null,
+            "incomplete_details": if finish_reason == Some(crate::subscription::GenerationFinishReason::MaxTokens) {json!({"reason":"max_output_tokens"})} else {Value::Null},
             "model": model,
             "output": [{"id":format!("msg_{suffix}"),"type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":output,"annotations":[]}]}]
         }),
@@ -706,9 +718,17 @@ fn codex_text_completion(protocol: Protocol, model: &str, output: &str) -> Value
             "role": "assistant",
             "model": model,
             "content": [{"type":"text","text":output}],
-            "stop_reason": "end_turn",
+            "stop_reason": if finish_reason == Some(crate::subscription::GenerationFinishReason::MaxTokens) {"max_tokens"} else {"end_turn"},
             "stop_sequence": null
         }),
+    }
+}
+
+fn subscription_generation_label(kind: &ProviderKind) -> &'static str {
+    match kind {
+        ProviderKind::CodexSubscription => "Codex",
+        ProviderKind::GrokSubscription => "Grok",
+        _ => "Subscription",
     }
 }
 
@@ -724,13 +744,14 @@ async fn codex_subscription_response(
     pre_dispatch_check: Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
     capture: crate::traffic::SharedCapture,
 ) -> Response {
+    let provider_label = subscription_generation_label(&provider.kind);
     let Some(adapter) = context.store.subscription.for_kind(&provider.kind).cloned() else {
         return protocol_error_response(StatusCode::SERVICE_UNAVAILABLE, protocol,
-            "The Codex subscription adapter is unavailable.");
+            "The subscription adapter is unavailable.");
     };
     if !adapter.supports(&provider.kind) {
         return protocol_error_response(StatusCode::SERVICE_UNAVAILABLE, protocol,
-            "The Codex subscription adapter is unavailable.");
+            "The subscription adapter is unavailable.");
     }
 
     if !streaming {
@@ -749,9 +770,9 @@ async fn codex_subscription_response(
         ).await {
             Ok(Ok(events)) => events,
             Ok(Err(_)) => return codex_json_response(StatusCode::BAD_GATEWAY, protocol,
-                model, route_source, protocol.error("Could not start Codex generation."), capture),
+                model, route_source, protocol.error(&format!("Could not start {provider_label} generation.")), capture),
             Err(_) => return codex_json_response(StatusCode::GATEWAY_TIMEOUT, protocol,
-                model, route_source, protocol.error("Codex did not start generation before the gateway timeout."), capture),
+                model, route_source, protocol.error(&format!("{provider_label} did not start generation before the gateway timeout.")), capture),
         };
         let mut output = String::new();
         loop {
@@ -759,38 +780,46 @@ async fn codex_subscription_response(
                 Ok(Some(event)) => event,
                 Ok(None) => break,
                 Err(_) => return codex_json_response(StatusCode::GATEWAY_TIMEOUT, protocol, model,
-                    route_source, protocol.error("Codex generation exceeded the gateway response timeout."), capture),
+                    route_source, protocol.error(&format!("{provider_label} generation exceeded the gateway response timeout.")), capture),
             };
             match event {
                 crate::subscription::GenerationEvent::Chunk(delta) => {
                     if output.len().saturating_add(delta.len()) > MAX_CODEX_OUTPUT_BYTES {
                         return codex_json_response(StatusCode::BAD_GATEWAY, protocol, model, route_source,
-                            protocol.error("Codex text output exceeded the gateway response limit."), capture);
+                            protocol.error(&format!("{provider_label} text output exceeded the gateway response limit.")), capture);
                     }
                     output.push_str(&delta);
                 }
                 crate::subscription::GenerationEvent::Failed { .. } => {
                     return codex_json_response(StatusCode::BAD_GATEWAY, protocol, model, route_source,
-                        protocol.error("Codex generation failed."), capture);
+                        protocol.error(&format!("{provider_label} generation failed.")), capture);
                 }
                 crate::subscription::GenerationEvent::Cancelled => {
                     let status = StatusCode::from_u16(499).unwrap_or(StatusCode::REQUEST_TIMEOUT);
                     return codex_json_response(status, protocol, model, route_source,
-                        protocol.error("Codex generation was interrupted."), capture);
+                        protocol.error(&format!("{provider_label} generation was interrupted.")), capture);
                 }
                 crate::subscription::GenerationEvent::Finished { status } if status == 200 => {
                     return codex_json_response(StatusCode::OK, protocol, model, route_source,
-                        codex_text_completion(protocol, &model.model_id, &output), capture);
+                        codex_text_completion(protocol, &model.model_id, &output, None), capture);
+                }
+                crate::subscription::GenerationEvent::FinishedWithReason { status: 200, reason } => {
+                    return codex_json_response(StatusCode::OK, protocol, model, route_source,
+                        codex_text_completion(protocol, &model.model_id, &output, Some(reason)), capture);
                 }
                 crate::subscription::GenerationEvent::Finished { .. } => {
                     return codex_json_response(StatusCode::BAD_GATEWAY, protocol, model, route_source,
-                        protocol.error("Codex generation did not complete."), capture);
+                        protocol.error(&format!("{provider_label} generation did not complete.")), capture);
+                }
+                crate::subscription::GenerationEvent::FinishedWithReason { .. } => {
+                    return codex_json_response(StatusCode::BAD_GATEWAY, protocol, model, route_source,
+                        protocol.error(&format!("{provider_label} generation did not complete.")), capture);
                 }
                 crate::subscription::GenerationEvent::Started { .. } => {}
             }
         }
         return codex_json_response(StatusCode::BAD_GATEWAY, protocol, model, route_source,
-            protocol.error("Codex ended the turn without a terminal status."), capture);
+            protocol.error(&format!("{provider_label} ended the turn without a terminal status.")), capture);
     }
 
     let provider_id = provider.id.clone();
@@ -814,12 +843,12 @@ async fn codex_subscription_response(
         let mut events = match adapter_for_task.generate(request).await {
             Ok(events) => events,
             Err(_) => {
-                let _ = ready_tx.send(Err("Could not start Codex generation.".into()));
+                let _ = ready_tx.send(Err(format!("Could not start {provider_label} generation.")));
                 return;
             }
         };
         if ready_tx.send(Ok(())).is_err() { return; }
-        let mut encoder = CodexSseEncoder::new(protocol, &model_id);
+        let mut encoder = CodexSseEncoder::new_for_provider(protocol, &model_id, provider_label);
         let mut output_bytes = 0usize;
         loop {
             let next = tokio::select! {
@@ -828,7 +857,7 @@ async fn codex_subscription_response(
             };
             let Some(event) = next else {
                 let frames = encoder.frames(
-                    crate::subscription::GenerationEvent::Failed { message: "Codex ended the turn without a terminal status.".into() },
+                    crate::subscription::GenerationEvent::Failed { message: format!("{provider_label} ended the turn without a terminal status.") },
                     &capture_for_task,
                 );
                 for frame in frames { if tx.send(frame).await.is_err() { return; } }
@@ -838,7 +867,7 @@ async fn codex_subscription_response(
                 output_bytes = output_bytes.saturating_add(delta.len());
                 if output_bytes > output_limit {
                     let frames = encoder.frames(
-                        crate::subscription::GenerationEvent::Failed { message: "Codex text output exceeded the gateway response limit.".into() },
+                        crate::subscription::GenerationEvent::Failed { message: format!("{provider_label} text output exceeded the gateway response limit.") },
                         &capture_for_task,
                     );
                     for frame in frames { if tx.send(frame).await.is_err() { return; } }
@@ -847,6 +876,7 @@ async fn codex_subscription_response(
             }
             let terminal = matches!(event,
                 crate::subscription::GenerationEvent::Finished { .. }
+                | crate::subscription::GenerationEvent::FinishedWithReason { .. }
                 | crate::subscription::GenerationEvent::Failed { .. }
                 | crate::subscription::GenerationEvent::Cancelled
             );
@@ -863,11 +893,11 @@ async fn codex_subscription_response(
         Ok(Ok(Err(message))) => return codex_json_response(StatusCode::BAD_GATEWAY, protocol, model,
             route_source, protocol.error(&message), capture),
         Ok(Err(_)) => return codex_json_response(StatusCode::BAD_GATEWAY, protocol, model,
-            route_source, protocol.error("Codex generation stopped before it became ready."), capture),
+            route_source, protocol.error(&format!("{provider_label} generation stopped before it became ready.")), capture),
         Err(_) => {
             task.abort();
             return codex_json_response(StatusCode::GATEWAY_TIMEOUT, protocol, model, route_source,
-                protocol.error("Codex did not start generation before the gateway timeout."), capture);
+                protocol.error(&format!("{provider_label} did not start generation before the gateway timeout.")), capture);
         }
     }
 
@@ -902,6 +932,7 @@ fn codex_json_response(status: StatusCode, protocol: Protocol, model: &Model, ro
 
 struct CodexSseEncoder {
     protocol: Protocol,
+    provider_label: &'static str,
     id: String,
     suffix: String,
     model: String,
@@ -913,14 +944,19 @@ struct CodexSseEncoder {
 }
 
 impl CodexSseEncoder {
+    #[cfg(test)]
     fn new(protocol: Protocol, model: &str) -> Self {
+        Self::new_for_provider(protocol, model, "Codex")
+    }
+
+    fn new_for_provider(protocol: Protocol, model: &str, provider_label: &'static str) -> Self {
         let suffix = uuid::Uuid::new_v4().simple().to_string();
         let id = match protocol {
             Protocol::Chat => format!("chatcmpl-{suffix}"),
             Protocol::Responses => format!("resp_{suffix}"),
             Protocol::Messages => format!("msg_{suffix}"),
         };
-        Self { protocol, id, suffix, model: model.into(), created: chrono::Utc::now().timestamp(), output: String::new(), started: false, content_started: false, terminal: false }
+        Self { protocol, provider_label, id, suffix, model: model.into(), created: chrono::Utc::now().timestamp(), output: String::new(), started: false, content_started: false, terminal: false }
     }
 
     fn frame(&self, event: &str, mut value: Value) -> Bytes {
@@ -934,8 +970,9 @@ impl CodexSseEncoder {
     }
 
     fn response_value(&self, status: &str, error: Option<Value>) -> Value {
+        let output_completed = matches!(status, "completed" | "incomplete");
         let output = if self.content_started {
-            json!([{"id":format!("msg_{}",self.suffix),"type":"message","status":if status == "completed" {"completed"} else {"in_progress"},"role":"assistant","content":[{"type":"output_text","text":self.output,"annotations":[]}]}])
+            json!([{"id":format!("msg_{}",self.suffix),"type":"message","status":if output_completed {"completed"} else {"in_progress"},"role":"assistant","content":[{"type":"output_text","text":self.output,"annotations":[]}]}])
         } else { json!([]) };
         json!({"id":self.id,"object":"response","created_at":self.created,"status":status,"error":error,"incomplete_details":null,"model":self.model,"output":output})
     }
@@ -956,7 +993,11 @@ impl CodexSseEncoder {
     fn error_frames(&mut self, message: &str, cancelled: bool, capture: &crate::traffic::SharedCapture) -> Vec<Bytes> {
         let mut frames = self.start_frames();
         self.terminal = true;
-        capture.lock().unwrap().log.error = if cancelled { "Codex generation was interrupted" } else { "Codex generation failed" }.into();
+        capture.lock().unwrap().log.error = if cancelled {
+            format!("{} generation was interrupted", self.provider_label)
+        } else {
+            format!("{} generation failed", self.provider_label)
+        };
         frames.push(match self.protocol {
             Protocol::Chat => self.frame("", json!({"error":{"message":message,"type":"server_error","code":if cancelled {"generation_cancelled"} else {"generation_failed"}}})),
             Protocol::Responses => self.frame(if cancelled {"response.cancelled"} else {"response.failed"}, json!({"response":self.response_value(if cancelled {"cancelled"} else {"failed"},Some(json!({"code":if cancelled {"generation_cancelled"} else {"server_error"},"message":message})))})),
@@ -964,6 +1005,40 @@ impl CodexSseEncoder {
         });
         if cancelled && self.protocol == Protocol::Messages {
             frames.push(self.frame("message_stop", json!({"type":"message_stop"})));
+        }
+        frames
+    }
+
+    fn finish_frames(&mut self, reason: Option<crate::subscription::GenerationFinishReason>) -> Vec<Bytes> {
+        let limited = reason == Some(crate::subscription::GenerationFinishReason::MaxTokens);
+        let mut frames = self.start_frames();
+        self.terminal = true;
+        match self.protocol {
+            Protocol::Chat => {
+                frames.push(self.frame("", json!({"id":self.id,"object":"chat.completion.chunk","created":self.created,"model":self.model,"choices":[{"index":0,"delta":{},"finish_reason":if limited {"length"} else {"stop"}}]})));
+                frames.push(Bytes::from_static(b"data: [DONE]\n\n"));
+            }
+            Protocol::Responses => {
+                if self.content_started {
+                    let item_id = format!("msg_{}",self.suffix);
+                    let part = json!({"type":"output_text","text":self.output,"annotations":[]});
+                    frames.push(self.frame("response.output_text.done", json!({"item_id":item_id,"output_index":0,"content_index":0,"text":self.output})));
+                    frames.push(self.frame("response.content_part.done", json!({"item_id":item_id,"output_index":0,"content_index":0,"part":part})));
+                    frames.push(self.frame("response.output_item.done", json!({"output_index":0,"item":{"id":item_id,"type":"message","status":"completed","role":"assistant","content":[part]}})));
+                }
+                if limited {
+                    let mut response = self.response_value("incomplete", None);
+                    response["incomplete_details"] = json!({"reason":"max_output_tokens"});
+                    frames.push(self.frame("response.incomplete", json!({"response":response})));
+                } else {
+                    frames.push(self.frame("response.completed", json!({"response":self.response_value("completed",None)})));
+                }
+            }
+            Protocol::Messages => {
+                if self.content_started { frames.push(self.frame("content_block_stop", json!({"index":0}))); }
+                frames.push(self.frame("message_delta", json!({"delta":{"stop_reason":if limited {"max_tokens"} else {"end_turn"},"stop_sequence":null}})));
+                frames.push(self.frame("message_stop", json!({"type":"message_stop"})));
+            }
         }
         frames
     }
@@ -997,35 +1072,12 @@ impl CodexSseEncoder {
                 }
                 frames
             }
-            Event::Finished { status: 200 } => {
-                let mut frames = self.start_frames();
-                self.terminal = true;
-                match self.protocol {
-                    Protocol::Chat => {
-                        frames.push(self.frame("", json!({"id":self.id,"object":"chat.completion.chunk","created":self.created,"model":self.model,"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]})));
-                        frames.push(Bytes::from_static(b"data: [DONE]\n\n"));
-                    }
-                    Protocol::Responses => {
-                        if self.content_started {
-                            let item_id = format!("msg_{}",self.suffix);
-                            let part = json!({"type":"output_text","text":self.output,"annotations":[]});
-                            frames.push(self.frame("response.output_text.done", json!({"item_id":item_id,"output_index":0,"content_index":0,"text":self.output})));
-                            frames.push(self.frame("response.content_part.done", json!({"item_id":item_id,"output_index":0,"content_index":0,"part":part})));
-                            frames.push(self.frame("response.output_item.done", json!({"output_index":0,"item":{"id":item_id,"type":"message","status":"completed","role":"assistant","content":[part]}})));
-                        }
-                        frames.push(self.frame("response.completed", json!({"response":self.response_value("completed",None)})));
-                    }
-                    Protocol::Messages => {
-                        if self.content_started { frames.push(self.frame("content_block_stop", json!({"index":0}))); }
-                        frames.push(self.frame("message_delta", json!({"delta":{"stop_reason":"end_turn","stop_sequence":null}})));
-                        frames.push(self.frame("message_stop", json!({"type":"message_stop"})));
-                    }
-                }
-                frames
-            }
-            Event::Finished { status } => self.error_frames(&format!("Codex turn ended with status {status}."), false, capture),
+            Event::Finished { status: 200 } => self.finish_frames(None),
+            Event::FinishedWithReason { status: 200, reason } => self.finish_frames(Some(reason)),
+            Event::Finished { status } => self.error_frames(&format!("{} turn ended with status {status}.", self.provider_label), false, capture),
+            Event::FinishedWithReason { status, .. } => self.error_frames(&format!("{} turn ended with status {status}.", self.provider_label), false, capture),
             Event::Failed { message } => self.error_frames(&message, false, capture),
-            Event::Cancelled => self.error_frames("Codex generation was interrupted.", true, capture),
+            Event::Cancelled => self.error_frames(&format!("{} generation was interrupted.", self.provider_label), true, capture),
         }
     }
 }

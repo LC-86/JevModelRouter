@@ -871,6 +871,7 @@ pub async fn logout(store: &ConfigStore, provider_id: &str) -> Result<AuthView, 
         ));
     }
     let generation = connection.generation;
+    store.subscription.cancel_generation(&provider.kind, provider_id, generation);
     let auth = store.auth.clone();
     // 先写配置（世代守卫）：失败时直接返回错误，磁盘凭据与专用 home 一个都不动。
     let (applied, next_generation) = store
