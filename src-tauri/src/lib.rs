@@ -63,6 +63,8 @@ struct DashboardSnapshot {
     models: Vec<Model>,
     /// 订阅服务商的连接、只读证据与当前拒绝原因。API 服务商不出现在这里。
     subscriptions: Vec<subscription::SubscriptionView>,
+    /// 订阅登录/退出视图：阶段、挑战、已核实身份与退出证据。不含任何凭据。
+    subscription_auth: Vec<subscription::auth::AuthView>,
     routes: Vec<config::RouteRule>,
     policy: RoutingPolicy,
     proxy: ProxyStatus,
@@ -84,6 +86,7 @@ async fn snapshot(state: &AppState) -> DashboardSnapshot {
     let paused = state.proxy.lock().await.as_ref().is_some_and(|p| p.running() && p.paused());
     let detected = detected_agents_with_selection(&config);
     let subscriptions = subscription::views(&config, state.store.subscription.available());
+    let subscription_auth = subscription::auth::views(&config, &*state.store.auth);
     DashboardSnapshot {
         recovery_notice: lifecycle::notice(config.port),
         gateway: config.gateway.clone(),
@@ -92,6 +95,7 @@ async fn snapshot(state: &AppState) -> DashboardSnapshot {
         providers: config.providers,
         models: config.models,
         subscriptions,
+        subscription_auth,
         routes: config.routes,
         policy: config.policy,
         proxy: ProxyStatus {
@@ -164,6 +168,41 @@ async fn get_snapshot(state: State<'_, AppState>) -> Result<DashboardSnapshot, S
 #[tauri::command]
 async fn refresh_subscription(state: State<'_, AppState>, provider_id: String) -> Result<DashboardSnapshot, String> {
     subscription::refresh(&state.store, &provider_id).await?;
+    Ok(snapshot(&state).await)
+}
+
+/// 开始订阅登录。仅订阅服务商、未连接、helper 可用且非隔离环境才会拉起官方辅助进程。
+#[tauri::command]
+async fn begin_subscription_login(state: State<'_, AppState>, provider_id: String) -> Result<DashboardSnapshot, String> {
+    subscription::auth::begin(&state.store, &provider_id).await?;
+    Ok(snapshot(&state).await)
+}
+
+/// 轮询进行中的订阅登录。只有当前世代与当前 attempt 的结果才会写入连接状态。
+#[tauri::command]
+async fn poll_subscription_login(state: State<'_, AppState>, provider_id: String) -> Result<DashboardSnapshot, String> {
+    subscription::auth::poll(&state.store, &provider_id).await?;
+    Ok(snapshot(&state).await)
+}
+
+/// 取消进行中的订阅登录：世代不变、连接归位为未连接。
+#[tauri::command]
+async fn cancel_subscription_login(state: State<'_, AppState>, provider_id: String) -> Result<DashboardSnapshot, String> {
+    subscription::auth::cancel(&state.store, &provider_id).await?;
+    Ok(snapshot(&state).await)
+}
+
+/// 退出订阅账号：本地清除与自有进程回收；未连接时诚实拒绝。
+#[tauri::command]
+async fn logout_subscription(state: State<'_, AppState>, provider_id: String) -> Result<DashboardSnapshot, String> {
+    subscription::auth::logout(&state.store, &provider_id).await?;
+    Ok(snapshot(&state).await)
+}
+
+/// 更换订阅账号：先退出（新世代）再登录；登录失败不恢复旧账号身份或证据。
+#[tauri::command]
+async fn switch_subscription_account(state: State<'_, AppState>, provider_id: String) -> Result<DashboardSnapshot, String> {
+    subscription::auth::switch_account(&state.store, &provider_id).await?;
     Ok(snapshot(&state).await)
 }
 
@@ -389,6 +428,9 @@ async fn save_policy(
 async fn safe_stop(state:&AppState)->Result<(),String> {
     let mut handle=state.proxy.lock().await;
     agents::restore_gateway(state.store.read().port).map_err(|e|e.to_string())?;
+    // 只回收本应用登记的自有辅助进程；不改配置，也不动别家进程。
+    let reclaimed=state.store.auth.shutdown();
+    if !reclaimed.is_empty(){eprintln!("AutoJev reclaimed subscription helper processes: {reclaimed:?}");}
     if let Some(proxy)=handle.take(){proxy.stop().await;}Ok(())
 }
 #[tauri::command]
@@ -923,6 +965,11 @@ pub fn run() {
             let handler: fn(tauri::ipc::Invoke<tauri::Wry>) -> bool = tauri::generate_handler![
             get_snapshot,
             refresh_subscription,
+            begin_subscription_login,
+            poll_subscription_login,
+            cancel_subscription_login,
+            logout_subscription,
+            switch_subscription_account,
             get_model_performance,
             start_model_speed_tests,
             cancel_model_speed_tests,

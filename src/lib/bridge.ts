@@ -15,6 +15,7 @@ const MOCK: DashboardSnapshot = {
   routes: [],
   install_id: 'preview',
   subscriptions: [],
+  subscription_auth: [],
   proxy: { running: true, port: 9526, base_url: 'http://127.0.0.1:9526' },
   policy: {
     mode: 'auto',
@@ -302,6 +303,37 @@ export async function testProviderDraft(provider: Provider, apiKey?: string): Pr
 export async function refreshSubscription(providerId: string): Promise<DashboardSnapshot> {
   if (!isTauri()) throw new Error('Open the desktop app to refresh a subscription connection.');
   return invoke('refresh_subscription', { providerId });
+}
+
+const DESKTOP_AUTH_ERROR = 'Open the desktop app to manage subscription authorization.';
+
+/** 开始一次订阅登录尝试；返回完整快照，界面直接替换即可。 */
+export async function beginSubscriptionLogin(providerId: string): Promise<DashboardSnapshot> {
+  if (!isTauri()) throw new Error(DESKTOP_AUTH_ERROR);
+  return invoke('begin_subscription_login', { providerId });
+}
+
+/** 读取当前尝试的进度；迟到结果由后端判定为 Superseded，不写入任何状态。 */
+export async function pollSubscriptionLogin(providerId: string): Promise<DashboardSnapshot> {
+  if (!isTauri()) throw new Error(DESKTOP_AUTH_ERROR);
+  return invoke('poll_subscription_login', { providerId });
+}
+
+export async function cancelSubscriptionLogin(providerId: string): Promise<DashboardSnapshot> {
+  if (!isTauri()) throw new Error(DESKTOP_AUTH_ERROR);
+  return invoke('cancel_subscription_login', { providerId });
+}
+
+/** 退出登录：本地清除与远端撤销的结论分开返回，前端不得互相推断。 */
+export async function logoutSubscription(providerId: string): Promise<DashboardSnapshot> {
+  if (!isTauri()) throw new Error(DESKTOP_AUTH_ERROR);
+  return invoke('logout_subscription', { providerId });
+}
+
+/** 更换账号：先退出（新世代）再登录，失败时不恢复旧账号。 */
+export async function switchSubscriptionAccount(providerId: string): Promise<DashboardSnapshot> {
+  if (!isTauri()) throw new Error(DESKTOP_AUTH_ERROR);
+  return invoke('switch_subscription_account', { providerId });
 }
 
 

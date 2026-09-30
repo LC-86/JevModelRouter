@@ -1,6 +1,7 @@
 import type {
-  DashboardSnapshot, Provider, ProviderKind, SubscriptionCapabilityStatus,
-  SubscriptionConnectionState, SubscriptionDenial, SubscriptionEvidenceState, SubscriptionView,
+  DashboardSnapshot, Provider, ProviderKind, SubscriptionAuthError, SubscriptionAuthPhase, SubscriptionAuthView,
+  SubscriptionCapabilityStatus, SubscriptionConnectionState, SubscriptionDenial, SubscriptionEvidenceState,
+  SubscriptionLocalLogoutState, SubscriptionRemoteRevokeState, SubscriptionView,
 } from '../types';
 import type { Translate } from './preferences-context';
 
@@ -90,4 +91,47 @@ export function denialLabel(denial: SubscriptionDenial | null | undefined, t: Tr
 export function identityLabel(view: SubscriptionView | undefined, t: Translate): string {
   const identity = view?.identity?.trim();
   return identity && identity.length > 0 ? identity : t('Unknown');
+}
+
+export function subscriptionAuthView(snapshot: DashboardSnapshot, providerId: string): SubscriptionAuthView | undefined {
+  return (snapshot.subscription_auth ?? []).find(view => view.provider_id === providerId);
+}
+
+export function authPhaseLabel(phase: SubscriptionAuthPhase, t: Translate): string {
+  return t({
+    idle: 'No sign-in in progress',
+    pending: 'Waiting for sign-in',
+    succeeded: 'Sign-in succeeded',
+    failed: 'Sign-in failed',
+    cancelled: 'Sign-in cancelled',
+  }[phase]);
+}
+
+/** 按稳定 code 本地化；未知 code 回退后端原文，不编造文案。 */
+export function authErrorLabel(error: SubscriptionAuthError | null | undefined, t: Translate): string {
+  if (!error) return '';
+  return t({
+    already_connected: 'This subscription is already connected. Sign out before signing in again.',
+    helper_isolated: 'Sign-in is disabled in the isolated verification environment.',
+    helper_missing: 'The Grok helper was not found on this machine.',
+    helper_unsupported: 'Only the Grok helper is managed in this build; sign-in, sign-out and account switching are not implemented for this provider.',
+  }[error.code] ?? (error.message || error.code));
+}
+
+export function logoutLocalLabel(state: SubscriptionLocalLogoutState, t: Translate): string {
+  return t({
+    not_attempted: 'Local clearing not attempted',
+    cleared: 'Local credentials cleared',
+    failed: 'Local clearing failed',
+  }[state]);
+}
+
+/** 远端撤销只由远端结论决定：本地 cleared 绝不推断成远端已撤销。 */
+export function remoteRevokeLabel(state: SubscriptionRemoteRevokeState, t: Translate): string {
+  return t({
+    not_attempted: 'Remote revoke not attempted',
+    failed: 'Remote revoke failed',
+    verified: 'Remote revoke verified',
+    unsupported: 'Remote revoke unsupported',
+  }[state]);
 }

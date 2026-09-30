@@ -21,6 +21,14 @@
     try { await invoke(command, args); throw new Error('Unexpected success'); }
     catch (error) { check(String(error).includes(text), `${command}: ${error}`); }
   };
+  // 接受多个可接受的错误关键词，但“意外成功”永远判失败。
+  const rejectedAny = async (command, args, texts) => {
+    try { await invoke(command, args); throw new Error('Unexpected success'); }
+    catch (error) {
+      if (String(error) === 'Unexpected success') throw error;
+      check(texts.some(text => String(error).includes(text)), `${command}: ${error}`);
+    }
+  };
   try {
     await wait(() => document.querySelector('.app-shell'));
     let snapshot = await invoke('get_snapshot');
@@ -95,6 +103,57 @@
       const denied = await wait(async () => { const v = await invoke('get_model_performance'); return !v.job.running && v.job.completed === 3 && v; });
       check(/not connected/i.test(denied.job.error || ''), `Subscription speed test must report the reason: ${denied.job.error}`);
       passed('subscription generation denied without upstream work');
+      // 订阅授权：隔离环境必须诚实报告辅助进程不可用，不得拉起真实进程、不得伪造远端撤销。
+      const subscriptionAuth = providerId => wait(async () => {
+        const s = await invoke('get_snapshot');
+        const auth = (s.subscription_auth ?? []).find(v => v.provider_id === providerId);
+        const connection = (s.subscriptions ?? []).find(v => v.provider_id === providerId);
+        return auth && connection ? { auth, connection } : null;
+      });
+      const authInitial = (await subscriptionAuth('codex-subscription')).auth;
+      check(authInitial.helper.available === false, `Isolation must not report an available helper: ${JSON.stringify(authInitial.helper)}`);
+      check(authInitial.phase === 'idle', `Isolation must not start a sign-in attempt: ${authInitial.phase}`);
+      check(authInitial.logout.remote === 'not_attempted', `Remote revoke must stay unattempted: ${authInitial.logout.remote}`);
+      check(authInitial.logout.local !== 'cleared', 'Isolation must not claim a local clear before any sign-out');
+      passed('subscription authorization reports no helper and no revoke');
+      await rejectedAny('begin_subscription_login', { providerId: 'codex-subscription' }, ['isolated', 'helper']);
+      passed('subscription sign-in rejected in isolation');
+      // 未连接且辅助进程不可用时的退出必须诚实失败，不得把未执行的本地清除报成成功。
+      await rejectedAny('logout_subscription', { providerId: 'codex-subscription' }, ['isolated', 'helper']);
+      const authAfter = (await subscriptionAuth('codex-subscription')).auth;
+      check(authAfter.logout.local !== 'cleared' && authAfter.logout.remote === 'not_attempted', `Isolated sign-out must not report success: ${JSON.stringify(authAfter.logout)}`);
+      check(authAfter.phase === 'idle', `Rejected sign-out must not start a sign-in: ${authAfter.phase}`);
+      passed('subscription sign-out honestly rejected without revoke claims');
+      await nav(1);
+      await wait(() => [...document.querySelectorAll('tbody tr')].find(row => row.textContent.includes('codex-subscription')));
+      await click('.subscription-auth-entry');
+      await click('.subscription-auth-begin');
+      const authError = await wait(() => document.querySelector('.subscription-auth-error')?.textContent?.trim());
+      check(authError.length > 0, 'The sign-in entry must show why sign-in failed');
+      const authDialogText = document.querySelector('.subscription-auth-dialog')?.textContent ?? '';
+      check(/未尝试远端撤销|Remote revoke not attempted/.test(authDialogText), `Sign-out evidence must keep the remote revoke unattempted: ${authDialogText}`);
+      check(!/远端撤销已验证|Remote revoke verified/.test(authDialogText), 'Isolation must not claim a verified remote revoke');
+      check(!/sk-[A-Za-z0-9]{4,}|Bearer\s[A-Za-z0-9]|api[_-]?key\s*[:=]/i.test(document.body.innerText), 'The sign-in dialog must not render credentials');
+      await click('.subscription-auth-footer button.primary');
+      await wait(() => !document.querySelector('.subscription-auth-dialog'));
+      passed('subscription sign-in UI shows an honest failure without credentials');
+      // Grok 分支的端到端隔离证据：必须由 isolated() 拒绝，而不是被 helper_missing/helper_unsupported 挡下。
+      const grokProvider = { ...provider, id: 'grok-subscription', kind: 'grok_subscription', name: 'Grok subscription', base_url: '', api_type: '', test_model: '' };
+      await invoke('save_provider', { provider: grokProvider, apiKey: null });
+      await invoke('save_model', { model: { ...model, id: 'grok-subscription-model', provider_id: 'grok-subscription', model_id: 'grok-fixture-model', name: 'Grok fixture' } });
+      const grokInitial = await subscriptionAuth('grok-subscription');
+      check(grokInitial.auth.helper.available === false, `Isolation must not report an available Grok helper: ${JSON.stringify(grokInitial.auth.helper)}`);
+      check(grokInitial.auth.phase === 'idle', `Isolation must not start a Grok sign-in attempt: ${grokInitial.auth.phase}`);
+      check(grokInitial.auth.logout.remote === 'not_attempted' && grokInitial.auth.logout.local !== 'cleared', `Grok sign-out evidence must stay unattempted: ${JSON.stringify(grokInitial.auth.logout)}`);
+      check(grokInitial.connection.state === 'not_connected', `Grok subscription must start unconnected: ${JSON.stringify(grokInitial.connection)}`);
+      await rejected('begin_subscription_login', { providerId: 'grok-subscription' }, 'isolated');
+      const grokAfterBegin = await subscriptionAuth('grok-subscription');
+      check(grokAfterBegin.auth.phase === 'idle' && grokAfterBegin.connection.state === 'not_connected', `Rejected Grok sign-in must not change state: ${grokAfterBegin.auth.phase}/${grokAfterBegin.connection.state}`);
+      await rejected('logout_subscription', { providerId: 'grok-subscription' }, 'isolated');
+      const grokAfterLogout = await subscriptionAuth('grok-subscription');
+      check(grokAfterLogout.auth.logout.local === 'not_attempted' && grokAfterLogout.auth.logout.remote === 'not_attempted', `Rejected Grok sign-out must not claim a clear: ${JSON.stringify(grokAfterLogout.auth.logout)}`);
+      check(grokAfterLogout.auth.phase === 'idle', `Rejected Grok sign-out must not start a sign-in: ${grokAfterLogout.auth.phase}`);
+      passed('grok subscription authorization rejected by isolation, not by helper detection');
       await nav(5);
       for (const option of ['OpenAI Chat Completions', 'OpenAI Responses', 'Anthropic Messages']) {
         await click('.debug-settings .select-control button');

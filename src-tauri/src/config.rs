@@ -267,6 +267,8 @@ pub struct ConfigStore {
     pub dispatcher: std::sync::Arc<dyn crate::dispatch::Dispatcher>,
     /// 订阅适配边界。生产构造只注入 [`crate::subscription::UnavailableAdapter`]。
     pub subscription: std::sync::Arc<dyn crate::subscription::SubscriptionAdapter>,
+    /// 订阅登录/退出边界。生产构造只注入 [`crate::subscription::auth::GrokCliAuth`]。
+    pub auth: std::sync::Arc<dyn crate::subscription::auth::SubscriptionAuth>,
     path: PathBuf,
     value: RwLock<AppConfig>,
 }
@@ -289,6 +291,22 @@ impl ConfigStore {
         path: PathBuf,
         dispatcher: std::sync::Arc<dyn crate::dispatch::Dispatcher>,
         subscription: std::sync::Arc<dyn crate::subscription::SubscriptionAdapter>,
+    ) -> Result<Self> {
+        Self::load_with_adapters_and_auth(
+            path,
+            dispatcher,
+            subscription,
+            std::sync::Arc::new(crate::subscription::auth::GrokCliAuth::new()),
+        )
+    }
+
+    /// 与 [`Self::load_with_adapters`] 相同，但允许测试注入授权替身。
+    /// 生产构造路径只有 [`Self::load_with_adapters`]，配置与界面都没有替换替身的开关。
+    pub fn load_with_adapters_and_auth(
+        path: PathBuf,
+        dispatcher: std::sync::Arc<dyn crate::dispatch::Dispatcher>,
+        subscription: std::sync::Arc<dyn crate::subscription::SubscriptionAdapter>,
+        auth: std::sync::Arc<dyn crate::subscription::auth::SubscriptionAuth>,
     ) -> Result<Self> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).context("create AutoJev data directory")?;
@@ -333,8 +351,19 @@ impl ConfigStore {
             transaction.execute("INSERT OR IGNORE INTO request_logs (id, created_at, data) VALUES (?1, ?2, ?3)",
                 rusqlite::params![log.id, log.created_at, serde_json::to_string(&log)?])?;
         }
+        // 登录会话是进程内的：重启后残留的授权中连接归位为未连接，pending 登录不会存活。
+        let mut resumed = false;
+        for connection in value.subscriptions.values_mut() {
+            if connection.state == crate::subscription::ConnectionState::AuthorizationPending {
+                connection.state = crate::subscription::ConnectionState::NotConnected;
+                resumed = true;
+            }
+        }
+        if resumed {
+            transaction.execute("UPDATE app_meta SET value = ?1 WHERE key = 'config'", [serde_json::to_string(&value)?])?;
+        }
         transaction.commit()?;
-        Ok(Self { path, value: RwLock::new(value), dispatcher, subscription })
+        Ok(Self { path, value: RwLock::new(value), dispatcher, subscription, auth })
     }
 
     fn connect(path: &PathBuf) -> Result<Connection> {
@@ -478,6 +507,36 @@ mod storage_tests {
         let mut unknown = serde_json::to_value(AppConfig::default()).unwrap();
         unknown["providers"][0]["kind"] = serde_json::json!("some_future_subscription");
         assert!(serde_json::from_value::<AppConfig>(unknown).is_err());
+    }
+
+    #[test]
+    fn a_restart_normalizes_pending_authorization_back_to_not_connected() {
+        // 登录会话是进程内的：重启后残留的“授权中”不得被当成仍然有效的登录。
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pending.db");
+        let store = ConfigStore::load(path.clone()).unwrap();
+        store
+            .update(|config| {
+                let mut provider = config.providers[0].clone();
+                provider.id = "grok".into();
+                provider.name = "Grok".into();
+                provider.kind = ProviderKind::GrokSubscription;
+                provider.base_url = String::new();
+                config.providers.push(provider.clone());
+                crate::subscription::sync_provider(config, &provider.id, &provider.kind);
+                config.subscriptions.get_mut("grok").unwrap().state = crate::subscription::ConnectionState::AuthorizationPending;
+            })
+            .unwrap();
+        drop(store);
+        let reopened = ConfigStore::load(path.clone()).unwrap();
+        assert_eq!(
+            reopened.read().subscriptions["grok"].state,
+            crate::subscription::ConnectionState::NotConnected
+        );
+        // 归位会落库：再开一次也不会回到 AuthorizationPending。
+        drop(reopened);
+        let again = ConfigStore::load(path).unwrap();
+        assert_eq!(again.read().subscriptions["grok"].state, crate::subscription::ConnectionState::NotConnected);
     }
 
     #[test]

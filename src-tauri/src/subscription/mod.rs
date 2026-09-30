@@ -4,6 +4,9 @@
 //! 可用适配器（[`UnavailableAdapter`]），因此未验证的订阅生成一律拒绝；替身只能由测试构造，
 //! 配置与界面都没有把它换成替身的开关。
 
+pub mod auth;
+pub mod helper;
+
 use anyhow::{bail, Result};
 use futures_util::future::BoxFuture;
 use serde::{Deserialize, Serialize};
