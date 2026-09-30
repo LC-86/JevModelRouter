@@ -79,13 +79,17 @@ const reaped = async pids => {
   }
   return false;
 };
-// 每次运行只排练一个登录场景，替身的场景队列与该运行一一对应；替身证据写进独立 JSONL。
-const runDesktop = async ({ label, scenarios, reload = false, loginMode = null }) => {
+// 每次运行只排练一组场景，替身的场景队列与该运行一一对应；替身证据写进独立 JSONL。
+// `reads`（额度）与 `catalog`（目录）各自一条队列：#15 的 catalog 运行用它排练多桶/单桶/缺字段/
+// 越界/拒绝/许可缺失/读取失败等场景。
+const runDesktop = async ({ label, scenarios, reload = false, loginMode = null, reads = null, catalog = null }) => {
   const helperLog = join(root, `helper-${label}.jsonl`);
   const args = ['--autojev-isolated', root, '--autojev-upstream', base, '--autojev-ui-url', `http://127.0.0.1:${uiPort}`, '--autojev-ui-check', base, '--autojev-helper', helper];
   if (reload) args.push('--autojev-check-reload');
   if (loginMode) args.push('--autojev-login-check', loginMode);
   const env = { ...environment, AUTOJEV_FAKE_HELPER_SCENARIOS: scenarios, AUTOJEV_FAKE_HELPER_LOG: helperLog, AUTOJEV_FAKE_HELPER_DELAY_MS: '150' };
+  if (reads) env.AUTOJEV_FAKE_HELPER_READS = reads;
+  if (catalog) env.AUTOJEV_FAKE_HELPER_CATALOG = catalog;
   const child = spawn(binary, args, { env, stdio: 'pipe' });
   desktop = child;
   let log = ''; child.stdout.on('data', b => { log += b; }); child.stderr.on('data', b => { log += b; });
@@ -137,11 +141,16 @@ try {
   const late = await runDesktop({ label: 'late', scenarios: 'late', loginMode: 'late' });
   const failedRun = await runDesktop({ label: 'failed', scenarios: 'failed', loginMode: 'failed' });
   const grokRun = await runDesktop({ label: 'grok', scenarios: 'success', loginMode: 'grok' });
-  const runs = [first, reload, late, failedRun, grokRun];
+  // #15：目录/额度只读验收。一次运行排练一组队列：登录成功后按刷新次序逐个取场景。
+  const catalogReads = 'multi,single,missing,invalid,denied,bucket-denied,no-permission,null-permission,fail-quota,fail-quota';
+  const catalogScenarios = 'success,legacy,missing,success,success,success,success,success,success,fail-catalog';
+  const catalogRun = await runDesktop({ label: 'catalog', scenarios: 'success', loginMode: 'catalog', reads: catalogReads, catalog: catalogScenarios });
+  const runs = [first, reload, late, failedRun, grokRun, catalogRun];
   const logs = {};
   for (const run of runs) logs[run.label] = await readLog(run.helperLog);
   const allEntries = Object.values(logs).flat();
-  const allowedMethods = new Set(['initialize', 'account/login/start', 'account/login/cancel', 'account/read', 'account/logout']);
+  // #15 新增的两个只读 RPC 与账号方法同属允许集合；生成方法仍必须一个都不出现。
+  const allowedMethods = new Set(['initialize', 'account/login/start', 'account/login/cancel', 'account/read', 'account/logout', 'model/list', 'account/rateLimits/read']);
   assert.ok(allEntries.length > 0, 'The stand-in must have logged its traffic');
   assert.ok(allEntries.some(entry => entry.event === 'request' && entry.method === 'initialize'), 'The stand-in must have been initialized');
   // 官方 app-server 握手：initialize 必须带客户端自述，响应之后再发一条无 id 的 initialized 通知。
@@ -241,6 +250,20 @@ try {
   assert.equal(grokRejected.codex?.state, grokStartObs.codexBefore?.state, `The Codex row state must not change because of Grok: ${JSON.stringify(grokRejected)}`);
   assert.equal(grokRejected.codex?.generation, grokStartObs.codexBefore?.generation, `The Codex generation must not change because of Grok: ${JSON.stringify(grokRejected)}`);
   assert.equal(logs.grok.length, 0, `The Grok run must not start the Codex stand-in: ${JSON.stringify(logs.grok)}`);
+  // #15：替身侧佐证——catalog 运行确实按队列次序、每次刷新各收到一次目录与额度读取，且两者互不串线。
+  // 真正的验收断言在 isolation-check.js 的 catalog 模式里，取自界面稳定文本与后端 snapshot，不依赖这些日志。
+  const readScenariosSeen = logs.catalog.filter(entry => entry.event === 'lifecycle' && entry.action === 'quota-read').map(entry => entry.scenario);
+  const catalogScenariosSeen = logs.catalog.filter(entry => entry.event === 'lifecycle' && entry.action === 'catalog-read').map(entry => entry.scenario);
+  assert.deepEqual(readScenariosSeen, catalogReads.split(','), `The quota queue must be consumed in order: ${JSON.stringify(readScenariosSeen)}`);
+  assert.deepEqual(catalogScenariosSeen, catalogScenarios.split(','), `The catalog queue must be consumed in order: ${JSON.stringify(catalogScenariosSeen)}`);
+  assert.ok(logs.catalog.some(entry => entry.event === 'request' && entry.method === 'model/list'), 'The catalog run must issue model/list');
+  assert.ok(logs.catalog.some(entry => entry.event === 'request' && entry.method === 'account/rateLimits/read'), 'The catalog run must issue account/rateLimits/read');
+  assert.equal(logs.catalog.filter(entry => entry.event === 'request' && entry.method === 'account/login/start').length, 1, 'The catalog run must sign in exactly once before reading the catalog');
+  const catalogChecks = catalogRun.report.checks || [];
+  for (const [pattern, label] of [['eligible=false', 'eligible=false'], ['permission=denied', 'permission=denied'], ['fail-closed', 'bucket-level fail-closed'], ['stale', 'stale catalog'], ['historical', 'historical quota'], ['invalid', 'invalid fields'], ['missing', 'missing fields'], ['remaining', 'remaining derivation']]) {
+    assert.ok(catalogChecks.some(name => name.includes(pattern)), `The catalog run must assert ${label}: ${JSON.stringify(catalogChecks)}`);
+  }
+  console.log(`Catalog rehearsal scenarios: quota=${JSON.stringify(readScenariosSeen)} catalog=${JSON.stringify(catalogScenariosSeen)}`);
   // 第 6 条：桌面退出后替身子进程被回收，且未波及无关进程。
   const helperPidsSeen = new Set(allEntries.map(entry => entry.pid).filter(Boolean));
   const liveObserved = new Set(runs.flatMap(run => [...run.liveDuringRun]));

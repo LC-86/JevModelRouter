@@ -18,8 +18,9 @@ use serde_json::{json, Value};
 
 use crate::config::ProviderKind;
 use crate::subscription::{
-    ConnectionState, ConnectionStatus, DiscoveredModel, GenerationRequest, GenerationStream, HelperStatus,
-    LoginResult, LoginStart, LogoutOutcome, QuotaEvidence, RemoteRevocation, SubscriptionAdapter,
+    quota_state, CatalogRead, ConnectionState, ConnectionStatus, DiscoveredModel, EvidenceState, GenerationRequest,
+    GenerationStream, HelperStatus, LoginResult, LoginStart, LogoutOutcome, QuotaBucket, QuotaCredits, QuotaEvidence,
+    QuotaPermission, QuotaView, QuotaWindow, RemoteRevocation, SubscriptionAdapter,
 };
 
 /// 用户主目录下由本应用独占的辅助进程根目录。
@@ -636,13 +637,28 @@ impl SubscriptionAdapter for CodexAdapter {
         })
     }
 
-    /// 模型目录与额度读取属于后续票据；这里如实报“尚未实现”，不编造证据。
-    fn models<'a>(&'a self, _provider_id: &'a str, _generation: u64) -> futures_util::future::BoxFuture<'a, Result<Vec<DiscoveredModel>>> {
-        Box::pin(async { bail!("Codex helper directory reads are not implemented in this build") })
+    /// 模型目录：`model/list`。
+    ///
+    /// 发现 ≠ 资格：契约 A 固定了 `eligible` 一律为 `false`。已核实的固定版本响应里条目字段是
+    /// `id`/`model`/`displayName`/`hidden`/`isDefault`/`availableAccessPrograms`，**没有任何资格
+    /// 布尔字段**；资格由 #17 定义，本票不得把发现的模型标成可调用。
+    fn models<'a>(&'a self, provider_id: &'a str, _generation: u64) -> futures_util::future::BoxFuture<'a, Result<CatalogRead>> {
+        Box::pin(async move {
+            let mut servers = self.server_for(provider_id).await?;
+            let server = servers.get_mut(provider_id).expect("the helper was just started");
+            let result = server.call(CATALOG_METHOD, json!({})).await?;
+            parse_catalog(&result)
+        })
     }
 
-    fn quota<'a>(&'a self, _provider_id: &'a str, _generation: u64) -> futures_util::future::BoxFuture<'a, Result<QuotaEvidence>> {
-        Box::pin(async { bail!("Codex helper quota reads are not implemented in this build") })
+    /// 额度：`account/rateLimits/read`。只读映射：不换算金额、不补默认值、不截断越界数字。
+    fn quota<'a>(&'a self, provider_id: &'a str, _generation: u64) -> futures_util::future::BoxFuture<'a, Result<QuotaEvidence>> {
+        Box::pin(async move {
+            let mut servers = self.server_for(provider_id).await?;
+            let server = servers.get_mut(provider_id).expect("the helper was just started");
+            let result = server.call(QUOTA_METHOD, json!({})).await?;
+            Ok(parse_quota(&result))
+        })
     }
 
     fn start_login<'a>(&'a self, provider_id: &'a str, generation: u64) -> futures_util::future::BoxFuture<'a, Result<LoginStart>> {
@@ -847,27 +863,325 @@ fn account_email(result: &Value) -> Option<String> {
         .filter(|email| !email.trim().is_empty())
 }
 
+/// 只读读取固定的 RPC 方法名：由本应用写死在代码里，不由配置或环境决定。
+const CATALOG_METHOD: &str = "model/list";
+const QUOTA_METHOD: &str = "account/rateLimits/read";
+
+/// 证据来源：每次成功读取都记下方法与视图，失败时不得更新。
+const CATALOG_SOURCE: &str = "codex-app-server:model/list";
+const QUOTA_SOURCE_BY_LIMIT_ID: &str = "codex-app-server:account/rateLimits/read#rateLimitsByLimitId";
+const QUOTA_SOURCE_RATE_LIMITS: &str = "codex-app-server:account/rateLimits/read#rateLimits";
+const QUOTA_SOURCE_BASE: &str = "codex-app-server:account/rateLimits/read";
+
+fn observed_at_now() -> String {
+    // 规范形式：`...Z` + 秒精度，界面会原样外露「最后成功更新 <时间>」，不带纳秒与 +00:00。
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+/// 读取一个非空字符串字段（去掉首尾空白）；缺失、null 或空白都算没有值。
+fn string_field(value: &Value, key: &str) -> Option<String> {
+    value.get(key).and_then(Value::as_str).map(str::trim).filter(|text| !text.is_empty()).map(str::to_owned)
+}
+
+/// `model/list` 的只读映射。主形状是 `{"data":[...]}`（`nextCursor` 本票不消费）；
+/// 同一辅助进程的旧形状 `{"models":[...]}` 仍然容忍。没有任何可用标识的条目记入
+/// `missing_fields`（`model.list[i].id`）并跳过，绝不编造标识。
+fn parse_catalog(result: &Value) -> Result<CatalogRead> {
+    let Some(entries) = ["data", "models"].iter().find_map(|key| result.get(*key).and_then(Value::as_array)) else {
+        // 既不是 data[] 也不是 models[]：这不是一份权威目录，按读取失败处理，
+        // 而不是声称「目录为空」（那会撤销全部已发现的模型）。
+        bail!("The Codex helper returned no model list");
+    };
+    let mut models = Vec::new();
+    let mut missing_fields = Vec::new();
+    for (index, entry) in entries.iter().enumerate() {
+        let Some(model_id) = string_field(entry, "id").or_else(|| string_field(entry, "model")) else {
+            missing_fields.push(format!("model.list[{index}].id"));
+            continue;
+        };
+        let name = string_field(entry, "displayName").or_else(|| string_field(entry, "name"));
+        // 发现 ≠ 资格：固定版本没有任何资格布尔字段，本票一律保持 false（资格由 #17 定义）。
+        models.push(DiscoveredModel { model_id, name, eligible: false });
+    }
+    Ok(CatalogRead { models, source: Some(CATALOG_SOURCE.to_owned()), observed_at: Some(observed_at_now()), missing_fields })
+}
+
+// CHUNK-QUOTA
+
+/// `account/rateLimits/read` 的只读映射。
+///
+/// 已核实的根层字段（openai/codex @ ed9e5a26，与当前 main 逐字节相同）：
+/// `ordinaryUsageAllowed: Option<bool>`（在**结果根层**，不在 snapshot 内，也不在 `account/read`；
+/// 服务端在账号不匹配或 FedRAMP 时强制为 null）、`rateLimits`（legacy 单桶，恒存在）、
+/// `rateLimitsByLimitId: Option<HashMap<limitId, snapshot>>`、`accountId`、`rateLimitResetCredits`、
+/// `rateLimitUpsell`。固定版本的 snapshot 还存在但**本票不读取**的字段：`normalModelSlug`、
+/// `individualLimit`、`spendControlReached`、`rateLimitReachedType`（额度耗尽与额外消费准入属 #17/#18/#25）。
+fn parse_quota(result: &Value) -> QuotaEvidence {
+    // 根层许可是权威值；没有任何桶内显式依据时才逐桶沿用，桶内显式的更严格取值优先（fail-closed）。
+    let root_permission = root_ordinary_usage_allowed(result);
+    let multi = result.get("rateLimitsByLimitId").and_then(Value::as_object).filter(|entries| !entries.is_empty());
+    let (view, source, buckets, malformed_buckets) = if let Some(entries) = multi {
+        // 稳定顺序：HashMap 迭代顺序随机，界面与测试都需要确定的多桶顺序。
+        let mut keys: Vec<&String> = entries.keys().collect();
+        keys.sort();
+        let mut malformed = false;
+        // 非对象条目解析不出桶：有意丢弃，不编造桶；若一个桶都解析不出来，下面如实记入顶层缺失。
+        let buckets: Vec<QuotaBucket> = keys
+            .into_iter()
+            .filter_map(|key| match entries.get(key) {
+                Some(snapshot) if snapshot.is_object() => Some(parse_bucket(key, snapshot, root_permission.as_ref())),
+                _ => {
+                    malformed = true;
+                    None
+                }
+            })
+            .collect();
+        let malformed_buckets = malformed && buckets.is_empty();
+        (QuotaView::RateLimitsByLimitId, QUOTA_SOURCE_BY_LIMIT_ID, buckets, malformed_buckets)
+    } else if let Some(snapshot) = result.get("rateLimits").filter(|snapshot| snapshot.is_object()) {
+        (QuotaView::RateLimits, QUOTA_SOURCE_RATE_LIMITS, vec![parse_bucket("", snapshot, root_permission.as_ref())], false)
+    } else {
+        // 读取成功但既无多桶也无旧版单桶：证据为 Unknown，顶层缺失字段由下面补齐。
+        (QuotaView::Unknown, QUOTA_SOURCE_BASE, Vec::new(), false)
+    };
+    let state = quota_state(&buckets);
+    let missing_fields = quota_missing_fields(view, state, &buckets, malformed_buckets);
+    QuotaEvidence {
+        state,
+        source: Some(source.to_owned()),
+        observed_at: Some(observed_at_now()),
+        view,
+        buckets,
+        missing_fields,
+        history: false,
+    }
+}
+
+/// 根层 `ordinaryUsageAllowed`：`Some(Ok(flag))` 为布尔，`Some(Err(text))` 为非布尔，`None` 为缺失/null。
+fn root_ordinary_usage_allowed(root: &Value) -> Option<std::result::Result<bool, String>> {
+    match root.get("ordinaryUsageAllowed") {
+        Some(Value::Bool(flag)) => Some(Ok(*flag)),
+        Some(Value::Null) | None => None,
+        Some(raw) => Some(Err(format!("ordinaryUsageAllowed={raw}"))),
+    }
+}
+
+/// 桶内许可解析：(许可, 记入 missing 的字段, 记入 invalid 的原始文本)。
+///
+/// fail-closed：桶内显式的 `false` 或非布尔**优先且更严格**，根层 `true` 不得把它覆盖成 Allowed。
+/// 桶内为 `true`、缺失或 null 时才沿用根层值（固定版本只在根层有该字段，桶内键属防御性输入）：
+/// 布尔 → Allowed/Denied；非布尔 → Unknown + invalid；缺失/null → Unknown + missing `ordinaryUsageAllowed`。
+fn bucket_permission(snapshot: &Value, root: Option<&std::result::Result<bool, String>>) -> (QuotaPermission, Option<&'static str>, Option<String>) {
+    match snapshot.get("ordinaryUsageAllowed") {
+        Some(Value::Bool(false)) => return (QuotaPermission::Denied, None, None),
+        Some(Value::Null) | Some(Value::Bool(true)) | None => {}
+        Some(raw) => return (QuotaPermission::Unknown, None, Some(format!("ordinaryUsageAllowed={raw}"))),
+    }
+    match root {
+        Some(Ok(true)) => (QuotaPermission::Allowed, None, None),
+        Some(Ok(false)) => (QuotaPermission::Denied, None, None),
+        Some(Err(raw)) => (QuotaPermission::Unknown, None, Some(raw.clone())),
+        None => (QuotaPermission::Unknown, Some("ordinaryUsageAllowed"), None),
+    }
+}
+
+/// 一个额度桶。窗口字段越界或类型不符时取值 `None` 并记下原始文本；缺失记入 `missing_fields`。
+fn parse_bucket(fallback_key: &str, snapshot: &Value, root_permission: Option<&std::result::Result<bool, String>>) -> QuotaBucket {
+    let mut missing_fields = Vec::new();
+    let mut invalid_fields = Vec::new();
+    let limit_id = match string_field(snapshot, "limitId").or_else(|| (!fallback_key.is_empty()).then(|| fallback_key.to_owned())) {
+        Some(limit_id) => limit_id,
+        None => {
+            // 单桶视图没有 limitId 时只能用占位标识，并如实记下缺失。
+            missing_fields.push("limitId".to_owned());
+            "unknown".to_owned()
+        }
+    };
+    let mut windows = Vec::new();
+    for label in ["primary", "secondary"] {
+        match snapshot.get(label).filter(|value| value.is_object()) {
+            Some(window) => windows.push(parse_window(label, window)),
+            None => missing_fields.push(label.to_owned()),
+        }
+    }
+    // 旧版单桶兼容：快照本身直接带窗口字段时按 single 读；只有确实没有 primary/secondary 才这样。
+    if windows.is_empty() && ["usedPercent", "windowDurationMins", "resetsAt"].iter().any(|key| snapshot.get(*key).is_some()) {
+        windows.push(parse_window("single", snapshot));
+        missing_fields.retain(|field| field != "primary" && field != "secondary");
+    }
+    let credits = match snapshot.get("credits") {
+        Some(Value::Object(map)) => {
+            let mut credits = QuotaCredits::default();
+            credits.has_credits = match map.get("hasCredits") {
+                Some(Value::Bool(flag)) => Some(*flag),
+                _ => {
+                    credits.missing_fields.push("hasCredits".to_owned());
+                    None
+                }
+            };
+            credits.unlimited = match map.get("unlimited") {
+                Some(Value::Bool(flag)) => Some(*flag),
+                _ => {
+                    credits.missing_fields.push("unlimited".to_owned());
+                    None
+                }
+            };
+            // balance 原样保留字符串：不解析为金额、不推断单位。
+            credits.balance = match map.get("balance").and_then(Value::as_str) {
+                Some(balance) => Some(balance.to_owned()),
+                None => {
+                    credits.missing_fields.push("balance".to_owned());
+                    None
+                }
+            };
+            Some(credits)
+        }
+        _ => {
+            missing_fields.push("credits".to_owned());
+            None
+        }
+    };
+    let (permission, permission_missing, permission_invalid) = bucket_permission(snapshot, root_permission);
+    if let Some(field) = permission_missing {
+        missing_fields.push(field.to_owned());
+    }
+    if let Some(text) = permission_invalid {
+        invalid_fields.push(text);
+    }
+    QuotaBucket {
+        limit_id,
+        name: string_field(snapshot, "limitName"),
+        plan_type: string_field(snapshot, "planType"),
+        windows,
+        credits,
+        permission,
+        missing_fields,
+        invalid_fields,
+    }
+}
+
+/// 一个额度窗口。`usedPercent` 只接受有限且 `0 <= x <= 100` 的数字（服务端为 i32）；
+/// `windowDurationMins` 只接受整数 `>= 0`；`resetsAt` 只接受整数 `> 0`（Unix 秒）。
+/// 越界/类型不符 → 取值 `None` + `invalid_fields` 记原始文本；缺失 → `missing_fields`。
+fn parse_window(label: &str, snapshot: &Value) -> QuotaWindow {
+    let mut window = QuotaWindow::new(label);
+    window.used_percent = match snapshot.get("usedPercent") {
+        None | Some(Value::Null) => {
+            window.missing_fields.push("usedPercent".to_owned());
+            None
+        }
+        Some(raw) => match raw.as_f64() {
+            Some(percent) if percent.is_finite() && (0.0..=100.0).contains(&percent) => Some(percent),
+            _ => {
+                window.invalid_fields.push(format!("usedPercent={raw}"));
+                None
+            }
+        },
+    };
+    window.window_minutes = match snapshot.get("windowDurationMins") {
+        None | Some(Value::Null) => {
+            window.missing_fields.push("windowDurationMins".to_owned());
+            None
+        }
+        Some(raw) => match raw.as_i64() {
+            Some(minutes) if minutes >= 0 => Some(minutes),
+            _ => {
+                window.invalid_fields.push(format!("windowDurationMins={raw}"));
+                None
+            }
+        },
+    };
+    window.resets_at = match snapshot.get("resetsAt") {
+        None | Some(Value::Null) => {
+            window.missing_fields.push("resetsAt".to_owned());
+            None
+        }
+        Some(raw) => match raw.as_i64() {
+            Some(seconds) if seconds > 0 => Some(seconds),
+            _ => {
+                window.invalid_fields.push(format!("resetsAt={raw}"));
+                None
+            }
+        },
+    };
+    window
+}
+
+/// 顶层缺失字段：没有视图时记下两个视图键；多桶形状不可用时说明无法解析出桶；
+/// 有桶但状态未知时说明缺许可或缺 usedPercent。
+fn quota_missing_fields(view: QuotaView, state: EvidenceState, buckets: &[QuotaBucket], malformed_buckets: bool) -> Vec<String> {
+    if view == QuotaView::Unknown {
+        return vec!["rateLimitsByLimitId".to_owned(), "rateLimits".to_owned()];
+    }
+    let mut missing_fields = Vec::new();
+    if malformed_buckets {
+        // 视图仍是多桶（map 存在且非空），但里面没有任何能解析成桶的形状：不是「没有视图」。
+        missing_fields.push("rateLimitsByLimitId".to_owned());
+    }
+    if state == EvidenceState::Unknown {
+        if buckets.iter().any(|bucket| bucket.permission == QuotaPermission::Unknown) {
+            missing_fields.push("ordinaryUsageAllowed".to_owned());
+        }
+        if !buckets.iter().flat_map(|bucket| bucket.windows.iter()).any(|window| window.used_percent.is_some()) {
+            missing_fields.push("usedPercent".to_owned());
+        }
+    }
+    missing_fields
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
     /// 只存在于 Rust 单测临时目录的假 Codex 辅助进程：不联网、不读任何真实凭据。
-    /// 第一个参数是环境记录文件路径。
+    /// 第一个参数是环境记录文件路径，同时也是只读场景队列的基名（`<base>.catalog` / `<base>.quota`，
+    /// 每行一个场景名，依次消费；没有队列文件时走各方法的默认场景）。
     const FIXTURE_HELPER: &str = r#"#!/bin/sh
 env_log="$1"
+queue="$1"
 if [ -n "$env_log" ]; then
   {
     printf 'CODEX_HOME=%s\n' "$CODEX_HOME"
     printf 'OPENAI_API_KEY=%s\n' "${OPENAI_API_KEY:-<unset>}"
   } > "$env_log"
 fi
+next_scenario() {
+  file="$1"
+  counter="$file.counter"
+  n=0
+  if [ -f "$counter" ]; then n=$(cat "$counter"); fi
+  n=$((n+1))
+  printf '%s' "$n" > "$counter"
+  if [ -f "$file" ]; then sed -n "${n}p" "$file"; fi
+}
 while IFS= read -r line; do
   id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
   if [ -z "$id" ]; then continue; fi
   case "$line" in
     *'"method":"initialize"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"version":"fixture-helper-1.0","codexHome":"%s"}}\n' "$id" "$CODEX_HOME" ;;
     *'"method":"account/read"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"account":{"email":"fixture@example.invalid","planType":"pro"},"requiresAuth":false}}\n' "$id" ;;
+    *'"method":"model/list"'*)
+      scenario=""
+      if [ -n "$queue" ]; then scenario=$(next_scenario "$queue.catalog"); fi
+      case "$scenario" in
+        missing) printf '{"jsonrpc":"2.0","id":%s,"result":{"data":[{"displayName":"no-identity"},{"id":"preset-ok","displayName":"OK"}],"nextCursor":null}}\n' "$id" ;;
+        models) printf '{"jsonrpc":"2.0","id":%s,"result":{"models":[{"id":"legacy-model","displayName":"Legacy"}]}}\n' "$id" ;;
+        fail) printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32000,"message":"fixture catalog read failed"}}\n' "$id" ;;
+        *) printf '{"jsonrpc":"2.0","id":%s,"result":{"data":[{"id":"preset-a","model":"gpt-5-codex","displayName":"GPT-5 Codex"},{"model":"slug-only"},{"displayName":"no-identity"}],"nextCursor":null}}\n' "$id" ;;
+      esac ;;
+    *'"method":"account/rateLimits/read"'*)
+      scenario=""
+      if [ -n "$queue" ]; then scenario=$(next_scenario "$queue.quota"); fi
+      case "$scenario" in
+        single) printf '{"jsonrpc":"2.0","id":%s,"result":{"ordinaryUsageAllowed":true,"accountId":"fixture-account","rateLimits":{"limitId":"legacy-single","limitName":"Legacy","primary":{"usedPercent":7,"windowDurationMins":60,"resetsAt":1800000000},"credits":{"hasCredits":true,"unlimited":false,"balance":"3 credits"}}}}\n' "$id" ;;
+        missing) printf '{"jsonrpc":"2.0","id":%s,"result":{"ordinaryUsageAllowed":true,"rateLimits":{"limitId":"legacy","primary":{"usedPercent":5}}}}\n' "$id" ;;
+        invalid) printf '{"jsonrpc":"2.0","id":%s,"result":{"ordinaryUsageAllowed":true,"rateLimits":{"limitId":"legacy","primary":{"usedPercent":142,"windowDurationMins":-5,"resetsAt":0}}}}\n' "$id" ;;
+        denied) printf '{"jsonrpc":"2.0","id":%s,"result":{"ordinaryUsageAllowed":false,"rateLimits":{"limitId":"legacy","primary":{"usedPercent":9,"windowDurationMins":60,"resetsAt":1800000000}}}}\n' "$id" ;;
+        no-permission) printf '{"jsonrpc":"2.0","id":%s,"result":{"rateLimits":{"limitId":"legacy","primary":{"usedPercent":9,"windowDurationMins":60,"resetsAt":1800000000}}}}\n' "$id" ;;
+        fail) printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32000,"message":"fixture quota read failed"}}\n' "$id" ;;
+        *) printf '{"jsonrpc":"2.0","id":%s,"result":{"ordinaryUsageAllowed":true,"accountId":"fixture-account","rateLimits":{"limitId":"legacy-single","primary":{"usedPercent":1,"windowDurationMins":60,"resetsAt":1800000000}},"rateLimitsByLimitId":{"limit-b":{"limitId":"limit-b","limitName":"B","planType":"pro","primary":{"usedPercent":10,"windowDurationMins":300,"resetsAt":1800000100},"secondary":{"usedPercent":20,"windowDurationMins":10080,"resetsAt":1800600000},"credits":{"hasCredits":true,"unlimited":false,"balance":"12.5 credits"}},"limit-a":{"limitId":"limit-a","ordinaryUsageAllowed":false,"primary":{"usedPercent":25,"windowDurationMins":300,"resetsAt":1800000000}}}}}\n' "$id" ;;
+      esac ;;
     *'"method":"account/login/start"'*) n=0; if [ -f "$1.counter" ]; then n=$(cat "$1.counter"); fi; n=$((n+1)); printf '%s' "$n" > "$1.counter"; printf '{"jsonrpc":"2.0","id":%s,"result":{"loginId":"fixture-login-%s","authorizationUrl":"https://example.invalid/auth"}}\n' "$id" "$n"; ( sleep 0.2; printf '{"jsonrpc":"2.0","method":"account/login/completed","params":{"loginId":"fixture-login-%s","ok":true,"account":{"email":"fixture@example.invalid","planType":"pro"}}}\n' "$n" ) & ;;
     *'"method":"account/login/cancel"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"cancelled":true}}\n' "$id" ;;
     *'"method":"account/logout"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"local":"cleared","remote":"revoked"}}\n' "$id" ;;
@@ -881,6 +1195,18 @@ done
         std::fs::write(&script, FIXTURE_HELPER).unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         HelperLaunch { program: script, args: vec![env_log.to_string_lossy().into_owned()] }
+    }
+
+    /// 写入只读场景队列：每个方法一行一个场景名，按顺序消费（没有文件时走默认场景）。
+    fn scenario_launch(directory: &Path, env_log: &Path, catalog: &[&str], quota: &[&str]) -> HelperLaunch {
+        let base = env_log.to_string_lossy().into_owned();
+        if !catalog.is_empty() {
+            std::fs::write(format!("{base}.catalog"), catalog.join("\n")).unwrap();
+        }
+        if !quota.is_empty() {
+            std::fs::write(format!("{base}.quota"), quota.join("\n")).unwrap();
+        }
+        fixture_launch(directory, env_log)
     }
 
     #[test]
@@ -1181,5 +1507,204 @@ done
         adapter.start_login("codex-fixture", 1).await.unwrap();
         assert_eq!(adapter.login_result("codex-fixture", 2).await.unwrap(), None);
         adapter.cancel_login("codex-fixture", 1).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn adapter_reads_the_catalog_without_granting_eligibility() {
+        let home = tempfile::tempdir().unwrap();
+        let log = home.path().join("env.log");
+        let adapter = CodexAdapter::with_launch(home.path().to_path_buf(), fixture_launch(home.path(), &log));
+        let read = adapter.models("codex-fixture", 1).await.unwrap();
+        assert_eq!(read.source.as_deref(), Some("codex-app-server:model/list"));
+        let observed = read.observed_at.as_deref().expect("a successful read records its time");
+        assert!(chrono::DateTime::parse_from_rfc3339(observed).is_ok(), "{observed}");
+        // 界面会原样外露这个时间：规范 RFC3339（`Z` + 秒精度），不带纳秒与 +00:00。
+        assert!(observed.ends_with('Z') && observed.len() == 20, "{observed}");
+        // `displayName` 优先，缺失时回落 `name`；没有可用标识的条目只记缺失并跳过。
+        assert_eq!(read.models.len(), 2);
+        assert_eq!(read.models[0].model_id, "preset-a");
+        assert_eq!(read.models[0].name.as_deref(), Some("GPT-5 Codex"));
+        assert_eq!(read.models[1].model_id, "slug-only");
+        assert!(read.models[1].name.is_none());
+        assert_eq!(read.missing_fields, vec!["model.list[2].id".to_owned()]);
+        // 发现 ≠ 资格：目录读取一律 false，资格由 #17 定义。
+        assert!(read.models.iter().all(|model| !model.eligible), "discovery must never be eligibility");
+    }
+
+    #[tokio::test]
+    async fn adapter_reads_multi_bucket_quota_with_the_root_permission() {
+        let home = tempfile::tempdir().unwrap();
+        let log = home.path().join("env.log");
+        let adapter = CodexAdapter::with_launch(home.path().to_path_buf(), fixture_launch(home.path(), &log));
+        let quota = adapter.quota("codex-fixture", 1).await.unwrap();
+        assert_eq!(quota.view, QuotaView::RateLimitsByLimitId);
+        // limit-a 桶内显式 false，根层是 true：fail-closed 取更严格的一方 → 该桶 denied，整体 Denied。
+        // 固定版本只在根层有该字段（桶内键属防御性输入），这里覆盖的是防御性冲突，不是真实形状。
+        assert_eq!(quota.state, EvidenceState::Denied);
+        assert_eq!(quota.source.as_deref(), Some("codex-app-server:account/rateLimits/read#rateLimitsByLimitId"));
+        assert!(quota.observed_at.as_deref().is_some_and(|at| chrono::DateTime::parse_from_rfc3339(at).is_ok()));
+        assert!(!quota.history);
+        assert!(quota.missing_fields.is_empty());
+        // 多桶按 limitId 稳定排序；桶内 limitId 优先于映射键。
+        assert_eq!(quota.buckets.len(), 2);
+        assert_eq!(quota.buckets[0].limit_id, "limit-a");
+        assert_eq!(quota.buckets[0].permission, QuotaPermission::Denied, "an explicit bucket-level false must never be overridden by the root true");
+        let second = &quota.buckets[1];
+        assert_eq!(second.limit_id, "limit-b");
+        // 根层 true 且桶内没有该键 → Allowed（固定版本的唯一真实形状）。
+        assert_eq!(second.permission, QuotaPermission::Allowed);
+        assert_eq!(second.name.as_deref(), Some("B"));
+        assert_eq!(second.plan_type.as_deref(), Some("pro"));
+        assert_eq!(second.windows.len(), 2);
+        assert_eq!(second.windows[0].label, "primary");
+        assert_eq!(second.windows[0].used_percent, Some(10.0));
+        assert_eq!(second.windows[0].window_minutes, Some(300));
+        assert_eq!(second.windows[0].resets_at, Some(1_800_000_100));
+        assert_eq!(second.windows[1].label, "secondary");
+        // credits 原样保留字符串：不解析金额、不推断单位。
+        let credits = second.credits.as_ref().expect("credits are mapped as-is");
+        assert_eq!(credits.balance.as_deref(), Some("12.5 credits"));
+        assert_eq!(credits.has_credits, Some(true));
+        assert_eq!(credits.unlimited, Some(false));
+        assert!(credits.missing_fields.is_empty());
+    }
+
+    #[tokio::test]
+    async fn adapter_covers_single_missing_invalid_denied_and_unknown_quota() {
+        let home = tempfile::tempdir().unwrap();
+        let log = home.path().join("env.log");
+        let launch = scenario_launch(home.path(), &log, &[], &["single", "missing", "invalid", "denied", "no-permission", "fail"]);
+        let adapter = CodexAdapter::with_launch(home.path().to_path_buf(), launch);
+
+        // single：只有旧版 rateLimits 时用单桶视图，来源与视图如实标记。
+        let single = adapter.quota("codex-fixture", 1).await.unwrap();
+        assert_eq!(single.view, QuotaView::RateLimits);
+        assert_eq!(single.state, EvidenceState::Available);
+        assert_eq!(single.source.as_deref(), Some("codex-app-server:account/rateLimits/read#rateLimits"));
+        assert_eq!(single.buckets.len(), 1);
+        assert_eq!(single.buckets[0].limit_id, "legacy-single");
+        assert_eq!(single.buckets[0].windows[0].used_percent, Some(7.0));
+        assert_eq!(single.buckets[0].credits.as_ref().unwrap().balance.as_deref(), Some("3 credits"));
+
+        // missing：缺 resetsAt/windowDurationMins/credits 分别记入各自层级，不补默认值。
+        let missing = adapter.quota("codex-fixture", 1).await.unwrap();
+        let window = &missing.buckets[0].windows[0];
+        assert_eq!(window.resets_at, None);
+        assert_eq!(window.window_minutes, None);
+        assert!(window.missing_fields.contains(&"resetsAt".to_owned()), "{:?}", window.missing_fields);
+        assert!(window.missing_fields.contains(&"windowDurationMins".to_owned()));
+        assert!(missing.buckets[0].missing_fields.contains(&"credits".to_owned()));
+        assert!(missing.buckets[0].credits.is_none());
+        assert_eq!(missing.state, EvidenceState::Available, "usedPercent alone is enough once permission is allowed");
+
+        // invalid：越界/类型不符的原值记入 invalid_fields，取值一律 None，绝不截断成合法值。
+        let invalid = adapter.quota("codex-fixture", 1).await.unwrap();
+        let window = &invalid.buckets[0].windows[0];
+        assert_eq!(window.used_percent, None);
+        assert_eq!(window.window_minutes, None);
+        assert_eq!(window.resets_at, None);
+        assert!(window.invalid_fields.contains(&"usedPercent=142".to_owned()), "{:?}", window.invalid_fields);
+        assert!(window.invalid_fields.contains(&"windowDurationMins=-5".to_owned()));
+        assert!(window.invalid_fields.contains(&"resetsAt=0".to_owned()));
+        assert_eq!(invalid.state, EvidenceState::Unknown);
+        assert!(invalid.missing_fields.contains(&"usedPercent".to_owned()), "{:?}", invalid.missing_fields);
+
+        // denied：明确拒绝就是 denied，不是 unknown。
+        let denied = adapter.quota("codex-fixture", 1).await.unwrap();
+        assert_eq!(denied.state, EvidenceState::Denied);
+        assert_eq!(denied.buckets[0].permission, QuotaPermission::Denied);
+
+        // no-permission：根层与桶内都没有该键 → unknown，并在顶层说明缺什么。
+        let unknown = adapter.quota("codex-fixture", 1).await.unwrap();
+        assert_eq!(unknown.state, EvidenceState::Unknown);
+        assert_eq!(unknown.buckets[0].permission, QuotaPermission::Unknown);
+        assert!(unknown.missing_fields.contains(&"ordinaryUsageAllowed".to_owned()), "{:?}", unknown.missing_fields);
+
+        // fail：读取失败如实返回错误，不编造证据。
+        let error = adapter.quota("codex-fixture", 1).await.unwrap_err().to_string();
+        assert!(error.contains("fixture quota read failed"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn adapter_covers_catalog_missing_identity_legacy_key_and_failure() {
+        let home = tempfile::tempdir().unwrap();
+        let log = home.path().join("env.log");
+        let launch = scenario_launch(home.path(), &log, &["missing", "models", "fail"], &[]);
+        let adapter = CodexAdapter::with_launch(home.path().to_path_buf(), launch);
+
+        let missing = adapter.models("codex-fixture", 1).await.unwrap();
+        assert_eq!(missing.models.len(), 1);
+        assert_eq!(missing.models[0].model_id, "preset-ok");
+        assert_eq!(missing.missing_fields, vec!["model.list[0].id".to_owned()]);
+
+        // 旧形状 `models[]` 仍然容忍。
+        let legacy = adapter.models("codex-fixture", 1).await.unwrap();
+        assert_eq!(legacy.models.len(), 1);
+        assert_eq!(legacy.models[0].model_id, "legacy-model");
+        assert!(!legacy.models[0].eligible);
+
+        let error = adapter.models("codex-fixture", 1).await.unwrap_err().to_string();
+        assert!(error.contains("fixture catalog read failed"), "{error}");
+    }
+
+    #[test]
+    fn catalog_and_quota_parsers_reject_payloads_without_an_authoritative_shape() {
+        // 既不是 data[] 也不是 models[]：按读取失败处理，不声称「目录为空」。
+        assert!(parse_catalog(&json!({"nextCursor": null})).is_err());
+        assert!(parse_catalog(&json!({"data": []})).unwrap().models.is_empty());
+        // 额度：没有多桶也没有旧版单桶时仍是一次成功读取，但证据为 unknown 并记下两个视图键。
+        let quota = parse_quota(&json!({"accountId": "fixture"}));
+        assert_eq!(quota.view, QuotaView::Unknown);
+        assert_eq!(quota.state, EvidenceState::Unknown);
+        assert!(quota.observed_at.is_some());
+        assert_eq!(quota.missing_fields, vec!["rateLimitsByLimitId".to_owned(), "rateLimits".to_owned()]);
+        // 空的 rateLimitsByLimitId 回落到旧版单桶。
+        let quota = parse_quota(&json!({
+            "ordinaryUsageAllowed": true,
+            "rateLimitsByLimitId": {},
+            "rateLimits": {"limitId": "legacy", "primary": {"usedPercent": 3, "windowDurationMins": 60, "resetsAt": 1800000000}}
+        }));
+        assert_eq!(quota.view, QuotaView::RateLimits);
+    }
+
+    #[test]
+    fn bucket_level_permission_is_fail_closed_against_the_root_value() {
+        // 桶内显式 false + 根层 true：取更严格的一方 → 该桶 denied，整体 Denied。
+        let quota = parse_quota(&json!({
+            "ordinaryUsageAllowed": true,
+            "rateLimits": {"limitId": "legacy", "ordinaryUsageAllowed": false, "primary": {"usedPercent": 9, "windowDurationMins": 60, "resetsAt": 1800000000}}
+        }));
+        assert_eq!(quota.buckets[0].permission, QuotaPermission::Denied);
+        assert_eq!(quota.state, EvidenceState::Denied);
+        // 桶内非布尔 + 根层 true：unknown 并记下原始文本，绝不猜成 true。
+        let quota = parse_quota(&json!({
+            "ordinaryUsageAllowed": true,
+            "rateLimits": {"limitId": "legacy", "ordinaryUsageAllowed": "yes", "primary": {"usedPercent": 9, "windowDurationMins": 60, "resetsAt": 1800000000}}
+        }));
+        assert_eq!(quota.buckets[0].permission, QuotaPermission::Unknown);
+        assert!(quota.buckets[0].invalid_fields.contains(&"ordinaryUsageAllowed=\"yes\"".to_owned()), "{:?}", quota.buckets[0].invalid_fields);
+        assert_eq!(quota.state, EvidenceState::Unknown);
+        assert!(quota.missing_fields.contains(&"ordinaryUsageAllowed".to_owned()));
+        // 桶内 true/缺失/null 才沿用根层：根层 true → allowed。
+        let quota = parse_quota(&json!({
+            "ordinaryUsageAllowed": true,
+            "rateLimits": {"limitId": "legacy", "ordinaryUsageAllowed": null, "primary": {"usedPercent": 9, "windowDurationMins": 60, "resetsAt": 1800000000}}
+        }));
+        assert_eq!(quota.buckets[0].permission, QuotaPermission::Allowed);
+        assert_eq!(quota.state, EvidenceState::Available);
+    }
+
+    #[test]
+    fn a_multi_bucket_map_without_bucket_shapes_stays_labelled_as_multi() {
+        // 非空 map 但值都不是对象：视图仍如实标多桶，一个桶都解析不出来，并记入顶层缺失。
+        let quota = parse_quota(&json!({
+            "ordinaryUsageAllowed": true,
+            "rateLimitsByLimitId": {"limit-a": "nope", "limit-b": 42}
+        }));
+        assert_eq!(quota.view, QuotaView::RateLimitsByLimitId);
+        assert_eq!(quota.source.as_deref(), Some("codex-app-server:account/rateLimits/read#rateLimitsByLimitId"));
+        assert!(quota.buckets.is_empty());
+        assert_eq!(quota.state, EvidenceState::Unknown);
+        assert!(quota.missing_fields.contains(&"rateLimitsByLimitId".to_owned()), "{:?}", quota.missing_fields);
     }
 }
