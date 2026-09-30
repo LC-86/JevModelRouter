@@ -1,8 +1,9 @@
 //! 订阅服务商边界：每家一个活动连接、证据绑定连接世代，以及所有生成入口共用的 fail-closed 准入。
 //!
-//! 本模块不依赖 Tauri 或 HTTP 框架，连接、证据、准入与只读刷新都能直接单测。生产默认没有任何
-//! 可用适配器（[`UnavailableAdapter`]），因此未验证的订阅生成一律拒绝；替身只能由测试构造，
-//! 配置与界面都没有把它换成替身的开关。
+//! 本模块不依赖 Tauri 或 HTTP 框架，连接、证据、准入与只读刷新都能直接单测。适配器只在构造
+//! `ConfigStore` 时注入：默认构造（含测试）装的是不提供任何辅助进程的 [`UnavailableAdapter`]，
+//! 生产在 `lib.rs` 唯一的 ConfigStore 构造处注入官方 Codex 适配器。两者都由代码固定，配置、环境
+//! 与界面都没有把它换成替身的开关；未验证的订阅生成一律拒绝。
 
 use anyhow::{bail, Result};
 use futures_util::future::BoxFuture;
@@ -570,22 +571,36 @@ pub struct SubscriptionSession {
 pub struct SessionState {
     pub sessions: HashMap<String, SubscriptionSession>,
     pub helper: HelperStatus,
+    /// 当前适配器真正支持登录的服务商标识（来自 `SubscriptionAdapter::supports`）。
+    /// 未列出的订阅行不得借用全局 helper 的版本与授权目录。
+    pub supported_providers: Vec<String>,
 }
 
 impl SessionState {
     pub fn session(&self, provider_id: &str) -> Option<&SubscriptionSession> {
         self.sessions.get(provider_id)
     }
+
+    pub fn supports(&self, provider_id: &str) -> bool {
+        self.supported_providers.iter().any(|supported| supported == provider_id)
+    }
 }
 
-fn require_subscription_provider(store: &ConfigStore, provider_id: &str) -> Result<(), String> {
+fn require_subscription_provider(store: &ConfigStore, provider_id: &str) -> Result<Provider, String> {
     store
         .read()
         .providers
-        .iter()
-        .any(|provider| provider.id == provider_id && is_subscription_provider(provider))
-        .then_some(())
+        .into_iter()
+        .find(|provider| provider.id == provider_id && is_subscription_provider(provider))
         .ok_or_else(|| format!("Unknown subscription provider: {provider_id}"))
+}
+
+/// 只有适配器声明支持该服务商类型时才允许动连接或拉起辅助进程。
+fn require_supported(store: &ConfigStore, provider: &Provider, action: &str) -> Result<(), String> {
+    if store.subscription.supports(&provider.kind) {
+        return Ok(());
+    }
+    Err(format!("{} subscription {action} is not implemented yet", label(provider)))
 }
 
 fn connection_generation(store: &ConfigStore, provider_id: &str) -> u64 {
@@ -674,7 +689,9 @@ pub async fn begin_login(
     provider_id: &str,
     sessions: &tokio::sync::Mutex<SessionState>,
 ) -> Result<LoginStart, String> {
-    require_subscription_provider(store, provider_id)?;
+    let provider = require_subscription_provider(store, provider_id)?;
+    // 不支持的订阅类型不得拉起任何辅助进程，也不得改动连接状态。
+    require_supported(store, &provider, "sign-in")?;
     let generation = connection_generation(store, provider_id);
     let start = store
         .subscription
@@ -709,7 +726,8 @@ pub async fn cancel_login(
     provider_id: &str,
     sessions: &tokio::sync::Mutex<SessionState>,
 ) -> Result<(), String> {
-    require_subscription_provider(store, provider_id)?;
+    let provider = require_subscription_provider(store, provider_id)?;
+    require_supported(store, &provider, "sign-in cancellation")?;
     let recorded = {
         let mut state = sessions.lock().await;
         match state.sessions.get_mut(provider_id) {
@@ -831,7 +849,8 @@ pub async fn logout(
     provider_id: &str,
     sessions: &tokio::sync::Mutex<SessionState>,
 ) -> Result<LogoutOutcome, String> {
-    require_subscription_provider(store, provider_id)?;
+    let provider = require_subscription_provider(store, provider_id)?;
+    require_supported(store, &provider, "sign-out")?;
     let generation = store
         .update(|config| {
             if !config.subscriptions.contains_key(provider_id) {
@@ -851,8 +870,8 @@ pub async fn logout(
     let adapter = store.subscription.logout(provider_id, previous_generation).await;
     let (local_cleared, remote) = match adapter {
         Ok(outcome) => (outcome.local_cleared, Some(outcome.remote)),
-        // 远端结果无法观察：本地连接已清，但远端撤销结果如实标记为未知。
-        Err(_) => (true, None),
+        // 没拿到“专用授权目录已清”的确认，就不能声称本地已清除；远端结果同样未知。
+        Err(_) => (false, None),
     };
     let record = LogoutRecord {
         local_cleared,
@@ -889,6 +908,9 @@ pub async fn switch_account(
 pub trait SubscriptionAdapter: Send + Sync {
     /// 是否存在可用的官方辅助进程。缺少它不影响只读刷新本身，只影响能读到什么。
     fn available(&self) -> bool;
+    /// 这个适配器是否能承载该类型的订阅服务商；不支持的 kind 必须被明确拒绝，
+    /// 不得借用其它服务商的辅助进程或身份。
+    fn supports(&self, kind: &ProviderKind) -> bool;
     /// 辅助进程自述状态：解析不到官方 `codex` 时如实报不可用，绝不 panic。
     fn helper_status(&self) -> HelperStatus;
     fn status<'a>(&'a self, provider_id: &'a str, generation: u64) -> BoxFuture<'a, Result<ConnectionStatus>>;
@@ -907,12 +929,16 @@ pub trait SubscriptionAdapter: Send + Sync {
 
 const UNAVAILABLE: &str = "No subscription helper is available in this build";
 
-/// 生产默认实现：尚未管理任何官方辅助进程，只读查询如实报不可用，生成一律拒绝。
-/// 没有任何配置、环境变量或界面开关可以把它换成替身；替身只能由测试注入。
+/// 默认实现（含测试构造）：尚未管理任何官方辅助进程，只读查询如实报不可用，生成一律拒绝。
+/// 它也不支持任何订阅服务商类型；没有任何配置、环境变量或界面开关能把它换成替身。
 pub struct UnavailableAdapter;
 
 impl SubscriptionAdapter for UnavailableAdapter {
     fn available(&self) -> bool {
+        false
+    }
+
+    fn supports(&self, _kind: &ProviderKind) -> bool {
         false
     }
 
@@ -985,12 +1011,9 @@ pub fn forget_provider(config: &mut AppConfig, provider_id: &str) {
 /// 读取失败时保留上一次已核实的证据，只把额度依据标为失败并如实返回错误；
 /// 临时失败不会被伪装成可用，也不会被伪装成余额为零。
 pub async fn refresh(store: &ConfigStore, provider_id: &str) -> Result<Connection, String> {
-    store
-        .read()
-        .providers
-        .iter()
-        .find(|provider| provider.id == provider_id && is_subscription_provider(provider))
-        .ok_or_else(|| format!("Unknown subscription provider: {provider_id}"))?;
+    let provider = require_subscription_provider(store, provider_id)?;
+    // 不支持的订阅类型不得借用其它服务商的辅助进程读取证据（#12「两家互不冒用」）。
+    require_supported(store, &provider, "read-only status")?;
     let generation = store
         .read()
         .subscriptions
@@ -1092,6 +1115,8 @@ pub fn views(config: &AppConfig, adapter_available: bool, sessions: &SessionStat
             let connection = config.subscriptions.get(&provider.id).cloned().unwrap_or_default();
             let evidence = connection.current_evidence();
             let session = sessions.session(&provider.id);
+            // 适配器不支持这类服务商时，如实报 helper 不可用：不借用其它服务商的进程信息。
+            let supported = sessions.supports(&provider.id);
             SubscriptionView {
                 provider_id: provider.id.clone(),
                 label: label(provider).to_owned(),
@@ -1118,9 +1143,9 @@ pub fn views(config: &AppConfig, adapter_available: bool, sessions: &SessionStat
                 },
                 logout: session.and_then(|session| session.last_logout.as_ref()).map(LogoutRecord::view),
                 helper: SubscriptionHelperView {
-                    available: sessions.helper.available,
-                    version: sessions.helper.version.clone(),
-                    auth_home: sessions.helper.auth_home.clone(),
+                    available: sessions.helper.available && supported,
+                    version: if supported { sessions.helper.version.clone() } else { None },
+                    auth_home: if supported { sessions.helper.auth_home.clone() } else { None },
                 },
             }
         })
@@ -1395,6 +1420,11 @@ mod refresh_tests {
     impl SubscriptionAdapter for StubAdapter {
         fn available(&self) -> bool {
             true
+        }
+
+        /// 只读替身只承载 Codex 订阅；Grok 一行不得借它读取。
+        fn supports(&self, kind: &ProviderKind) -> bool {
+            matches!(kind, ProviderKind::CodexSubscription)
         }
 
         fn status<'a>(&'a self, provider_id: &'a str, generation: u64) -> BoxFuture<'a, Result<ConnectionStatus>> {
@@ -1740,6 +1770,11 @@ mod lifecycle_tests {
             true
         }
 
+        /// 替身只支持 Codex 订阅：Grok 必须被明确拒绝，且不得拉起任何进程。
+        fn supports(&self, kind: &ProviderKind) -> bool {
+            matches!(kind, ProviderKind::CodexSubscription)
+        }
+
         fn helper_status(&self) -> HelperStatus {
             self.helper.clone()
         }
@@ -1874,6 +1909,13 @@ mod lifecycle_tests {
     ) -> SubscriptionView {
         let mut guard = sessions.lock().await;
         guard.helper = store.subscription.helper_status();
+        guard.supported_providers = store
+            .read()
+            .providers
+            .iter()
+            .filter(|provider| is_subscription_provider(provider) && store.subscription.supports(&provider.kind))
+            .map(|provider| provider.id.clone())
+            .collect();
         views(&store.read(), adapter_available, &guard).pop().unwrap()
     }
 
@@ -2059,16 +2101,20 @@ mod lifecycle_tests {
     }
 
     #[tokio::test]
-    async fn logout_without_an_observable_helper_records_an_unknown_remote_result() {
+    async fn logout_without_an_observable_helper_records_unknown_results() {
         let adapter = LifecycleStub::new();
         *adapter.logout_outcome.lock().unwrap() = Err("No subscription helper is available in this build".into());
         let (store, _directory, sessions) = fixture(adapter.clone()).await;
         let outcome = logout(&store, "codex", &sessions).await.unwrap();
-        assert!(outcome.local_cleared);
+        // 没拿到适配器的“本地已清”确认：不得声称本地已清除。
+        assert!(!outcome.local_cleared);
         let record = session(&sessions, "codex").await.last_logout.unwrap();
+        assert!(!record.local_cleared);
         assert_eq!(record.remote, None);
         let view = view_of(&store, true, &sessions).await;
-        assert_eq!(view.logout.unwrap().remote, LogoutRemote::Unknown);
+        let logout_view = view.logout.unwrap();
+        assert_eq!(logout_view.local, LogoutLocal::Retained);
+        assert_eq!(logout_view.remote, LogoutRemote::Unknown);
     }
 
     #[tokio::test]
@@ -2179,6 +2225,7 @@ mod lifecycle_tests {
             version: Some("1.2.3".into()),
             auth_home: Some("/tmp/fixture-helper-home".into()),
         };
+        sessions.supported_providers = vec!["codex".into()];
         sessions.sessions.insert(
             "codex".into(),
             SubscriptionSession {
@@ -2304,5 +2351,58 @@ mod lifecycle_tests {
         assert!(outcome.is_err(), "a late completion must be discarded: {outcome:?}");
         assert!(connection(&store, "codex").identity.is_none());
         assert_eq!(session(&sessions, "codex").await.stage, LoginStage::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn unsupported_subscription_kinds_are_rejected_without_touching_state() {
+        let adapter = LifecycleStub::new();
+        let (store, _directory, sessions) = fixture(adapter.clone()).await;
+        store
+            .update(|config| {
+                let grok = Provider {
+                    preset: String::new(),
+                    api_type: String::new(),
+                    test_model: String::new(),
+                    id: "grok".into(),
+                    name: "Grok".into(),
+                    kind: ProviderKind::GrokSubscription,
+                    base_url: String::new(),
+                    enabled: true,
+                    has_api_key: false,
+                };
+                config.providers.push(grok.clone());
+                sync_provider(config, &grok.id, &grok.kind);
+                let connection = config.subscriptions.get_mut("grok").unwrap();
+                connection.state = ConnectionState::Connected;
+                connection.identity = Some("grok@example.invalid".into());
+            })
+            .unwrap();
+        let before = serde_json::to_value(connection(&store, "grok")).unwrap();
+        let begin_error = begin_login(&store, "grok", &sessions).await.unwrap_err();
+        assert!(begin_error.contains("Grok subscription sign-in is not implemented yet"), "{begin_error}");
+        assert!(cancel_login(&store, "grok", &sessions).await.is_err());
+        assert!(logout(&store, "grok", &sessions).await.is_err());
+        assert!(switch_account(&store, "grok", &sessions).await.is_err());
+        assert!(refresh(&store, "grok").await.is_err());
+        // 连接状态一点没动，没有伪造会话，也没有拉起任何辅助进程。
+        assert_eq!(serde_json::to_value(connection(&store, "grok")).unwrap(), before);
+        assert!(sessions.lock().await.session("grok").is_none());
+        assert!(adapter.started.lock().unwrap().is_empty());
+        assert!(adapter.logouts.lock().unwrap().is_empty());
+        assert!(adapter.cancels.lock().unwrap().is_empty());
+        // 视图：只有支持的 Codex 行带 helper，Grok 行如实不可用（两家互不冒用）。
+        let mut state = SessionState::default();
+        state.helper = HelperStatus {
+            available: true,
+            version: Some("fixture-helper-1.0".into()),
+            auth_home: Some("/tmp/fixture-helper-home".into()),
+        };
+        state.supported_providers = vec!["codex".into()];
+        let all = views(&store.read(), true, &state);
+        let codex = all.iter().find(|view| view.provider_id == "codex").unwrap();
+        let grok = all.iter().find(|view| view.provider_id == "grok").unwrap();
+        assert!(codex.helper.available && codex.helper.version.is_some() && codex.helper.auth_home.is_some());
+        assert!(!grok.helper.available && grok.helper.version.is_none() && grok.helper.auth_home.is_none());
+        assert_eq!(grok.identity.as_deref(), Some("grok@example.invalid"));
     }
 }

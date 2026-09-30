@@ -19,6 +19,12 @@
 - 生产构造只安装 `UnavailableAdapter`：只读读取如实返回不可用，生成一律拒绝。
 - 配置、界面与环境变量都没有把它换成替身的开关；替身只存在于测试代码中（`refresh_tests`）。
 
+> 后续变更（#13）：该票之后，生产改在 `lib.rs` 构造 `ConfigStore` 的**唯一一处**注入真实的
+> `CodexAdapter`（专用官方 Codex 辅助进程），`UnavailableAdapter` 降级为不可用与测试路径。注入点仍写在
+> 代码里，配置、界面与环境变量都没有替身开关；`--autojev-helper` 只存在于 `isolation-check` 构建，
+> 且额外要求已进入隔离模式。因此隔离验收里 `adapter_available` 的期望由 `false` 改为 `true`，
+> 而真实生成依旧全部拒绝（见 `docs/testing/codex-login-handoff.md`）。
+
 只读刷新（`refresh_subscription`）绑定当前连接世代：读取期间换号、删除服务商或世代变化时，迟到的结果
 被整体丢弃，不写入新世代。刷新不检查网关暂停，因此生成暂停时仍可恢复必要的只读依据。
 

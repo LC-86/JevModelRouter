@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Fictional Codex app-server stand-in for the isolated acceptance build only.
 // It speaks newline-delimited JSON-RPC 2.0 over stdio and never performs real work.
-import { appendFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
@@ -42,6 +42,18 @@ const complete = (loginId, scenario, index) => {
   if (account) params.account = account;
   if (!ok) params.error = `login failed: refresh_token=${fictionalTokens[1]}&access_token=${fictionalTokens[0]}`;
   send({ jsonrpc: '2.0', method: 'account/login/completed', params });
+  // 只有真正的成功登录才在专用 CODEX_HOME 留一个虚构凭据文件：这是「引用隔离 + 受控存储 +
+  // 退出清理」的可观察证据。替身自己绝不删除它——清理必须由应用在注销时完成。
+  if (scenario === 'success' && codexHome) {
+    const credentialPath = join(codexHome, 'fictional-auth.json');
+    try {
+      mkdirSync(codexHome, { recursive: true });
+      writeFileSync(credentialPath, JSON.stringify({ email: identities.success, access_token: fictionalTokens[0], refresh_token: fictionalTokens[1] }) + '\n');
+      log({ event: 'lifecycle', method: null, action: 'credential-file-written', path: credentialPath });
+    } catch (error) {
+      log({ event: 'lifecycle', method: null, action: 'credential-file-error', error: String((error && error.message) || error) });
+    }
+  }
   log({ event: 'notification', method: 'account/login/completed', loginId, ok, scenario, attempt: index, error: params.error });
 };
 const handlers = {

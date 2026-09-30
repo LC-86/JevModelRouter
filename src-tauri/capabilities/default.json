@@ -20,6 +20,12 @@
         },
         {
           "url": "https://github.com/thinkany-ai/autojev/issues"
+        },
+        {
+          "url": "https://auth.openai.com/*"
+        },
+        {
+          "url": "https://chatgpt.com/*"
         }
       ]
     },

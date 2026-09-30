@@ -87,9 +87,17 @@ async fn snapshot(state: &AppState) -> DashboardSnapshot {
     let paused = state.proxy.lock().await.as_ref().is_some_and(|p| p.running() && p.paused());
     let detected = detected_agents_with_selection(&config);
     let helper = state.store.subscription.helper_status();
+    // 只有适配器真正支持的订阅行才能带上 helper 版本与授权目录，其余行如实不可用。
+    let supported: Vec<String> = config
+        .providers
+        .iter()
+        .filter(|provider| subscription::is_subscription_provider(provider) && state.store.subscription.supports(&provider.kind))
+        .map(|provider| provider.id.clone())
+        .collect();
     let subscriptions = {
         let mut sessions = state.sessions.lock().await;
         sessions.helper = helper.clone();
+        sessions.supported_providers = supported;
         subscription::views(&config, state.store.subscription.available(), &sessions)
     };
     DashboardSnapshot {
@@ -919,8 +927,9 @@ pub fn run() {
             }
             let root = crate::runtime::home_dir().context("find home directory")?.join(".autojev");
             let database = if app.config().identifier.ends_with(".dev") { "autojev-dev.db" } else { "autojev.db" };
-            // #13：真实官方 Codex 辅助进程适配器只在这里注入一次（代码内固定，无任何运行时替身开关）。
-            // 生产默认构造仍是 UnavailableAdapter；注入点就在 ConfigStore 构造处。
+            // #13：生产唯一的订阅适配器注入点就是这里——ConfigStore 构造处，代码内固定。
+            // 生产实际装的是官方 Codex 适配器；默认构造（`ConfigStore::load`，测试用）仍是不提供
+            // 任何辅助进程的 UnavailableAdapter。没有任何配置/环境/界面开关能把它换成替身。
             let mut store = ConfigStore::load(root.join(database))?;
             store.subscription = Arc::new(codex_helper::CodexAdapter::new());
             let store = Arc::new(store);

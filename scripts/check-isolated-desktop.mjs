@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
-import { realpathSync } from 'node:fs';
+import { realpathSync, readdirSync, statSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir, homedir } from 'node:os';
 import { resolve, join } from 'node:path';
@@ -15,6 +15,21 @@ const realHome = (() => { try { return realpathSync(homedir()); } catch { return
 // 替身注入的虚构凭据与身份：应用输出里出现任何一个都算脱敏失败或身份复活。
 const fictionalTokens = ['fictional-access-token-4f2c9a', 'fictional-refresh-token-8b1d7e'];
 const fictionalIdentities = { success: 'standin-success@example.invalid', late: 'standin-late@example.invalid' };
+// 专用授权目录（应用自己管理）与用户真实账号目录（只做元数据指纹，绝不读取内容）。
+const helperHome = join(root, '.autojev', 'helpers', 'codex', 'codex-subscription');
+const realCodexHome = join(realHome, '.codex');
+const codexHomeFingerprint = () => {
+  const stat = statSync(realCodexHome, { throwIfNoEntry: false });
+  return stat ? { exists: true, mtimeMs: stat.mtimeMs, ino: stat.ino } : { exists: false };
+};
+const helperHomeEntries = () => {
+  try { return readdirSync(helperHome); } catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+};
+// 本机正在运行的外部 Codex 客户端会持续写 ~/.codex；只要它在跑，mtime 就不能归因给本应用。
+const externalCodexClients = () => {
+  try { return execFileSync('pgrep', ['-fl', 'ChatGPT.app.*codex'], { encoding: 'utf8' }).trim().split('\n').filter(Boolean); }
+  catch { return []; }
+};
 const requests = [];
 const fixture = createServer(async (request, response) => {
   let data = ''; for await (const part of request) data += part;
@@ -100,11 +115,29 @@ try {
   }
   sentinel = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
   assert.ok(alive(sentinel.pid), 'Unrelated sentinel process must be alive before the desktop runs');
+  // 真实 ~/.codex 可能同时被用户自己的 Codex 客户端写入。先用一段完全没有隔离进程的
+  // 校准窗口测量环境噪声：安静时按 mtime 逐位断言，环境本身在变时如实记录并退回
+  // 存在性、inode 与「本应用虚构凭据绝不出现」这些可归因的硬断言。
+  const calibrationSamples = [];
+  for (let index = 0; index < 3; index += 1) { calibrationSamples.push(codexHomeFingerprint()); if (index < 2) await sleep(10000); }
+  const externalClients = externalCodexClients();
+  const realCodexNoisy = new Set(calibrationSamples.map(sample => JSON.stringify(sample))).size > 1 || externalClients.length > 0;
+  const realCodexBefore = codexHomeFingerprint();
+  if (realCodexNoisy) console.log(`Real ~/.codex mtime is not attributable here: control samples ${JSON.stringify(calibrationSamples)}, external Codex clients ${externalClients.length}.`);
   const first = await runDesktop({ label: 'first', scenarios: 'success' });
+  // AC4：登录成功时替身在专用目录里留下了虚构凭据；退出后该目录必须已被应用删除或清空。
+  const firstLog = await readLog(first.helperLog);
+  const credentialWrites = firstLog.filter(entry => entry.action === 'credential-file-written');
+  assert.ok(credentialWrites.length > 0, 'The stand-in must leave a fictional credential file behind a successful sign-in');
+  for (const write of credentialWrites) assert.ok(String(write.path).startsWith(helperHome + '/'), `The fictional credential must stay inside the dedicated helper home: ${write.path}`);
+  const entriesAfterSignOut = helperHomeEntries();
+  assert.ok(entriesAfterSignOut === null || entriesAfterSignOut.length === 0, `Sign-out must remove or empty the dedicated helper home: ${JSON.stringify(entriesAfterSignOut)}`);
+  console.log(`Sign-out cleanup asserted: ${credentialWrites.length} fictional credential file(s) removed with the dedicated helper home.`);
   const reload = await runDesktop({ label: 'reload', scenarios: 'success', reload: true });
   const late = await runDesktop({ label: 'late', scenarios: 'late', loginMode: 'late' });
   const failedRun = await runDesktop({ label: 'failed', scenarios: 'failed', loginMode: 'failed' });
-  const runs = [first, reload, late, failedRun];
+  const grokRun = await runDesktop({ label: 'grok', scenarios: 'success', loginMode: 'grok' });
+  const runs = [first, reload, late, failedRun, grokRun];
   const logs = {};
   for (const run of runs) logs[run.label] = await readLog(run.helperLog);
   const allEntries = Object.values(logs).flat();
@@ -153,8 +186,10 @@ try {
   assert.ok(logoutObs, 'A sign-out outcome must be observed');
   assert.ok(logoutObs.generation > firstObs.reconnected.generation, `Sign-out must advance the generation: ${JSON.stringify(logoutObs)}`);
   assert.ok(!logoutObs.identity, `Sign-out must clear the identity: ${JSON.stringify(logoutObs)}`);
-  assert.match(String(logoutObs.status), /local=(cleared|retained)/, `The row must report the local clearing result: ${logoutObs.status}`);
-  assert.match(String(logoutObs.status), /remote=(revoked|failed|unsupported|unknown)/, `The row must report the remote revocation result: ${logoutObs.status}`);
+  assert.match(String(logoutObs.status), /local=cleared/, `The successful sign-out path must report local=cleared: ${logoutObs.status}`);
+  assert.match(String(logoutObs.status), /remote=revoked/, `The successful sign-out path must report remote=revoked: ${logoutObs.status}`);
+  assert.equal(logoutObs.logout?.local, 'cleared', `The successful sign-out must clear locally: ${JSON.stringify(logoutObs.logout)}`);
+  assert.equal(logoutObs.logout?.remote, 'revoked', `The successful sign-out must revoke remotely: ${JSON.stringify(logoutObs.logout)}`);
   assert.ok(logs.first.some(entry => entry.event === 'request' && entry.method === 'account/logout'), 'The stand-in must receive the sign-out call');
   // 第 2 条：迟到的完成结果被丢弃，不影响新世代。
   const lateObs = allObservations(late.report);
@@ -175,6 +210,27 @@ try {
     assert.ok(!text.includes(fictionalIdentities.late), `${label} must not show the late identity: ${text}`);
     assert.ok(!text.includes(fictionalIdentities.success), `${label} must not revive the previous identity: ${text}`);
   }
+  // #12 边界：Codex helper 已自述时，Grok 行仍必须显示 Unknown，不得借用它的 version/auth_home。
+  const borrow = firstObs.grokBorrowCheck;
+  assert.ok(borrow?.codex?.version && borrow.codex.version !== 'Unknown', `The Codex helper must have reported a version: ${JSON.stringify(borrow)}`);
+  assert.ok(String(borrow?.codex?.home).startsWith(root + '/'), `The Codex helper home must be an isolation path: ${JSON.stringify(borrow)}`);
+  assert.ok(borrow?.grok?.helper?.available !== true && !borrow?.grok?.helper?.version && !borrow?.grok?.helper?.auth_home, `The Grok row must not attach the Codex helper report: ${JSON.stringify(borrow?.grok)}`);
+  assert.match(String(borrow?.grok?.status), /helper=Unknown auth_home=Unknown/, `The Grok row must show Unknown helper fields: ${borrow?.grok?.status}`);
+  assert.ok(!String(borrow?.grok?.status).includes(borrow.codex.version) && !String(borrow?.grok?.status).includes(borrow.codex.home), 'The Grok row must not display the Codex helper values');
+  // Grok 登录被拒：明确错误、零连接改动、Codex 行不受影响。
+  const grokRejected = observation(grokRun.report, 'grokRejected');
+  const grokStartObs = observation(grokRun.report, 'grokStart');
+  assert.ok(grokRejected && grokStartObs, 'The Grok sign-in rejection must be observed');
+  assert.match(String(grokRejected.directError), /grok/i, `The Grok rejection must name the provider: ${grokRejected.directError}`);
+  assert.match(String(grokRejected.directError), /not implemented|unsupported|not supported/i, `The Grok rejection must be explicit: ${grokRejected.directError}`);
+  assert.match(String(grokRejected.rowError), /not implemented|unsupported|not supported/i, `The row must show the Grok rejection: ${grokRejected.rowError}`);
+  assert.equal(grokStartObs.helper?.available, false, `The Grok row must report an unavailable helper: ${JSON.stringify(grokStartObs.helper)}`);
+  assert.match(String(grokStartObs.status), /helper=Unknown auth_home=Unknown/, `The Grok row must show Unknown helper fields: ${grokStartObs.status}`);
+  assert.equal(grokRejected.after?.state, 'not_connected', `A rejected Grok sign-in must not change its connection: ${JSON.stringify(grokRejected.after)}`);
+  assert.equal(grokRejected.after?.login?.stage, 'idle', `A rejected Grok sign-in must not create a session: ${JSON.stringify(grokRejected.after)}`);
+  assert.equal(grokRejected.codex?.state, grokStartObs.codexBefore?.state, `The Codex row state must not change because of Grok: ${JSON.stringify(grokRejected)}`);
+  assert.equal(grokRejected.codex?.generation, grokStartObs.codexBefore?.generation, `The Codex generation must not change because of Grok: ${JSON.stringify(grokRejected)}`);
+  assert.equal(logs.grok.length, 0, `The Grok run must not start the Codex stand-in: ${JSON.stringify(logs.grok)}`);
   // 第 6 条：桌面退出后替身子进程被回收，且未波及无关进程。
   const helperPidsSeen = new Set(allEntries.map(entry => entry.pid).filter(Boolean));
   const liveObserved = new Set(runs.flatMap(run => [...run.liveDuringRun]));
@@ -186,6 +242,29 @@ try {
   assert.equal(requests.filter(r => r.headers['user-agent'] === 'AutoJev/ModelTest').length, 3);
   assert.equal(requests.filter(r => r.headers['user-agent'] === 'AutoJev/Debug').length, 3);
   assert.ok(requests.filter(r => !r.path.startsWith('/redirect/')).every(r => r.body.model === 'fixture-model' && r.headers.authorization === 'Bearer fixture-key'));
+  // AC4 收尾：全部运行结束后专用授权目录仍然为空，且用户真实 ~/.codex 未被创建或修改（只看元数据）。
+  const finalEntries = helperHomeEntries();
+  assert.ok(finalEntries === null || finalEntries.length === 0, `The dedicated helper home must stay empty after the runs: ${JSON.stringify(finalEntries)}`);
+  const realCodexAfter = codexHomeFingerprint();
+  assert.equal(realCodexAfter.exists, realCodexBefore.exists, `The real user ~/.codex must not be created or deleted by the isolated runs: ${JSON.stringify({ before: realCodexBefore, after: realCodexAfter })}`);
+  if (realCodexBefore.exists) assert.equal(realCodexAfter.ino, realCodexBefore.ino, `The real user ~/.codex must not be replaced by the isolated runs: ${JSON.stringify({ before: realCodexBefore, after: realCodexAfter })}`);
+  // 可归因的泄漏探针：本应用替身的虚构凭据文件绝不能出现在真实账号目录里。
+  const leakedCredential = join(realCodexHome, 'fictional-auth.json');
+  assert.ok(!statSync(leakedCredential, { throwIfNoEntry: false }), `The isolated stand-in artifact must never appear in the real account directory: ${leakedCredential}`);
+  if (realCodexNoisy) {
+    console.log(`Real ~/.codex untouched by this run (existence and inode unchanged, no stand-in artifact); mtime drifted externally (${realCodexBefore.mtimeMs} -> ${realCodexAfter.mtimeMs}) so mtime equality is not asserted.`);
+  } else {
+    assert.deepEqual(realCodexAfter, realCodexBefore, 'The real user ~/.codex must not be created or modified by the isolated runs');
+    console.log('Real ~/.codex mtime unchanged across the isolated runs (quiet environment).');
+  }
+  // 授权链接 ACL：只做静态配置断言；隔离环境不真实打开浏览器，真实打开未执行。
+  const capabilities = JSON.parse(await readFile(resolve('src-tauri/capabilities/default.json'), 'utf8'));
+  const opener = (capabilities.permissions || []).find(entry => entry && entry.identifier === 'opener:allow-open-url');
+  assert.ok(opener, 'The desktop capability must allow opening authorization URLs');
+  const allowedUrls = (opener.allow || []).map(entry => entry.url || '');
+  assert.ok(allowedUrls.some(url => url.includes('auth.openai.com')), `The OpenAI authorization host must be allowed: ${JSON.stringify(allowedUrls)}`);
+  assert.ok(allowedUrls.some(url => url.includes('chatgpt.com')), `The ChatGPT authorization host must be allowed: ${JSON.stringify(allowedUrls)}`);
+  console.log('Authorization-link ACL asserted statically (auth.openai.com, chatgpt.com); the real browser open was NOT executed.');
   console.log(`Native desktop login lifecycle acceptance passed. Fictional evidence: ${root}`);
 } finally {
   await writeFile(join(root, 'requests.json'), JSON.stringify(requests, null, 2));

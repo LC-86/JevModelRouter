@@ -22,12 +22,15 @@
     catch (error) { check(String(error).includes(text), `${command}: ${error}`); }
   };
   const providerId = 'codex-subscription';
-  const statusSelector = `[data-testid="sub-status-${providerId}"]`;
-  const statusText = () => document.querySelector(statusSelector)?.textContent || '';
+  const grokProviderId = 'grok-subscription';
+  const statusTextFor = id => document.querySelector(`[data-testid="sub-status-${id}"]`)?.textContent || '';
+  const statusText = () => statusTextFor(providerId);
   const rowText = () => document.querySelector('tbody')?.textContent || '';
   // 界面按自己的轮询渲染：读取状态文本前必须等它反映后端快照，不能只读一次。
-  const waitStatus = predicate => wait(() => { const text = statusText(); return predicate(text) ? text : null; }, 'row status');
+  const waitStatusFor = (id, predicate) => wait(() => { const text = statusTextFor(id); return predicate(text) ? text : null; }, `row status ${id}`);
+  const waitStatus = predicate => waitStatusFor(providerId, predicate);
   const subscriptionView = async () => (await invoke('get_snapshot')).subscriptions.find(item => item.provider_id === providerId);
+  const grokView = async () => (await invoke('get_snapshot')).subscriptions.find(item => item.provider_id === grokProviderId);
   const clearedQuota = quota => !quota || ['unknown', 'unsupported'].includes(quota.state) === true;
   // Issue #13 登录/退出/换号闭环：每次桌面运行只排练一个场景，替身场景队列与之对应。
   const loginLifecycle = async mode => {
@@ -67,6 +70,13 @@
       record('pendingToCompleted', { from: pending.login.stage, to: completed.login.stage });
       record('completed', { generation: completed.generation, identity: completed.identity, home, login: completed.login, status: completedText });
       passed('verified identity, generation, helper version and isolated auth home in the row');
+      // Codex helper 已在本进程自述；同一时刻 Grok 行必须仍显示 Unknown，不得借用这份自述。
+      const grokDuring = await wait(async () => (await grokView()) || null, 'grok view during codex sign-in');
+      check(grokDuring.helper?.available !== true && !grokDuring.helper?.version && !grokDuring.helper?.auth_home, `Grok must not borrow the Codex helper report: ${JSON.stringify(grokDuring.helper)}`);
+      const grokDuringText = await waitStatusFor(grokProviderId, text => text.includes('helper=Unknown') && text.includes('auth_home=Unknown'));
+      check(!grokDuringText.includes(completed.helper.version) && !grokDuringText.includes(home), `The Grok row must not show the Codex helper values: ${grokDuringText}`);
+      record('grokBorrowCheck', { codex: { version: completed.helper?.version, home }, grok: { helper: grokDuring.helper ?? null, status: grokDuringText } });
+      passed('the Grok row never borrows the Codex helper version or auth home');
       // 登录成功不得放行真实生成：订阅模型仍被准入拒绝，替身也不会收到生成请求。
       const samplesBefore = ((await invoke('get_model_performance')).models['codex-subscription-model']?.samples) ?? 0;
       await invoke('start_model_speed_tests', { ids: ['codex-subscription-model'] });
@@ -153,6 +163,31 @@
       passed('a failed sign-in is reported in the row and the backend snapshot');
       passed('a restarted desktop reconciles the orphaned pending sign-in and can sign in again');
     }
+    if (mode === 'grok') {
+      // #12 边界：Grok 登录未实现，必须得到明确错误，且不拉起 Codex 替身、不改动任何连接。
+      const grok = await wait(async () => (await grokView()) || null, 'grok view');
+      const codexBefore = await subscriptionView();
+      check(grok.state === 'not_connected', `Grok rehearsal needs an unconnected Grok row: ${grok.state}`);
+      check(grok.helper?.available !== true && !grok.helper?.version && !grok.helper?.auth_home, `The Grok row must report an unavailable helper: ${JSON.stringify(grok.helper)}`);
+      const grokText = await waitStatusFor(grokProviderId, text => text.includes('helper=Unknown') && text.includes('auth_home=Unknown'));
+      record('grokStart', { state: grok.state, generation: grok.generation, login: grok.login, helper: grok.helper ?? null, status: grokText, codexBefore: { state: codexBefore.state, generation: codexBefore.generation, identity: codexBefore.identity ?? null } });
+      await click(`[data-testid="sub-login-${grokProviderId}"]`);
+      const rowError = await wait(() => {
+        const row = [...document.querySelectorAll('tbody tr')].find(item => item.textContent.includes(grokProviderId));
+        const text = row?.textContent || '';
+        return /not implemented|unsupported|not supported/i.test(text) ? text : null;
+      }, 'grok sign-in error in row');
+      const directError = await invoke('begin_subscription_login', { providerId: grokProviderId }).then(() => { throw new Error('Grok sign-in must be rejected'); }, error => String(error));
+      check(/grok/i.test(directError) && /not implemented|unsupported|not supported/i.test(directError), `Grok sign-in must fail with a clear message: ${directError}`);
+      const grokAfter = await wait(async () => (await grokView()) || null, 'grok view after rejection');
+      check(grokAfter.state === 'not_connected' && grokAfter.generation === grok.generation, `A rejected Grok sign-in must not change its connection: ${JSON.stringify({ state: grokAfter.state, generation: grokAfter.generation })}`);
+      check(grokAfter.login.stage === 'idle' && !grokAfter.identity, `A rejected Grok sign-in must not create a session: ${JSON.stringify(grokAfter.login)}`);
+      const codexAfter = await subscriptionView();
+      check(codexAfter.state === codexBefore.state && codexAfter.generation === codexBefore.generation && (codexAfter.identity ?? null) === (codexBefore.identity ?? null), `The Codex row must not be affected by the Grok action: ${JSON.stringify({ before: { state: codexBefore.state, generation: codexBefore.generation }, after: { state: codexAfter.state, generation: codexAfter.generation } })}`);
+      record('grokRejected', { rowError: rowError.slice(-500), directError, after: { state: grokAfter.state, generation: grokAfter.generation, login: grokAfter.login }, codex: { state: codexAfter.state, generation: codexAfter.generation } });
+      passed('an unsupported Grok sign-in is rejected with a clear error and changes nothing');
+      passed('the Codex row is unaffected by the rejected Grok sign-in');
+    }
   };
   try {
     await wait(() => document.querySelector('.app-shell'));
@@ -227,6 +262,19 @@
       check(subscription.adapter_available === true, 'The isolation build must install the real Codex helper adapter (no production stub)');
       check(subscription.denial && subscription.denial.code === 'not_connected', 'Unconnected subscription must stay denied');
       passed('subscription provider added from the provider panel with its real state');
+      // #12 边界：再加一家 Grok 订阅服务商。它不得借用 Codex 的适配器与 helper 自述。
+      await click('.provider-actions .button.primary');
+      await click('.provider-dialog .search-select-trigger');
+      (await wait(() => [...document.querySelectorAll('.provider-dialog [role="option"]')].find(option => /Grok subscription|Grok 订阅/.test(option.textContent)))).click();
+      setValue(await wait(() => document.querySelector('.provider-dialog input[pattern="[a-zA-Z0-9_-]+"]')), grokProviderId);
+      await click('.provider-dialog-actions button[type="submit"]');
+      await wait(() => !document.querySelector('.provider-dialog'));
+      await wait(() => [...document.querySelectorAll('tbody tr')].find(row => row.textContent.includes(grokProviderId)), 'grok row');
+      const grokStart = await wait(async () => (await grokView()) || null, 'grok view');
+      check(grokStart.state === 'not_connected', `Grok subscription must start unconnected: ${JSON.stringify(grokStart)}`);
+      check(grokStart.login.stage === 'idle', `Grok must start without a sign-in session: ${JSON.stringify(grokStart.login)}`);
+      check(grokStart.helper?.available !== true && !grokStart.helper?.version && !grokStart.helper?.auth_home, `Grok must not borrow the Codex helper report: ${JSON.stringify(grokStart.helper)}`);
+      passed('grok subscription provider added without borrowing the Codex helper');
       await invoke('save_model', { model: { ...model, id: 'codex-subscription-model', provider_id: 'codex-subscription', model_id: 'codex-fixture-model', name: 'Codex fixture' } });
       await rejected('test_provider_draft', { provider: { ...provider, id: 'codex-subscription', name: 'Codex subscription', kind: 'codex_subscription', base_url: '', api_type: '', test_model: 'codex-fixture-model' } }, 'not connected');
       // 只读刷新不得把未连接伪装成已连接；替身的目录/额度读取尚未实现时必须如实报错。

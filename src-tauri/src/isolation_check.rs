@@ -24,7 +24,7 @@ pub fn script() -> anyhow::Result<Option<String>> {
         .cloned();
     if let Some(mode) = &login_mode {
         anyhow::ensure!(
-            matches!(mode.as_str(), "success" | "late" | "failed"),
+            matches!(mode.as_str(), "success" | "late" | "failed" | "grok"),
             "Unknown login check mode: {mode}"
         );
     }

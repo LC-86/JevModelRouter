@@ -16,6 +16,7 @@ use std::{
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
+use crate::config::ProviderKind;
 use crate::subscription::{
     ConnectionState, ConnectionStatus, DiscoveredModel, GenerationRequest, GenerationStream, HelperStatus,
     LoginResult, LoginStart, LogoutOutcome, QuotaEvidence, RemoteRevocation, SubscriptionAdapter,
@@ -155,7 +156,12 @@ pub fn redact(text: &str) -> String {
         }
         out.push_str(&redact_word(word));
         if out.len() > 400 {
-            out.truncate(400);
+            // 绝不在多字节字符中间截断：先回退到合法字符边界（redact 不能 panic）。
+            let mut limit = 400;
+            while limit > 0 && !out.is_char_boundary(limit) {
+                limit -= 1;
+            }
+            out.truncate(limit);
             out.push('…');
             break;
         }
@@ -557,6 +563,11 @@ impl SubscriptionAdapter for CodexAdapter {
         self.launch().is_ok()
     }
 
+    /// 这个适配器只承载官方 Codex；Grok 等其它订阅服务商不得借用它的进程或身份。
+    fn supports(&self, kind: &ProviderKind) -> bool {
+        matches!(kind, ProviderKind::CodexSubscription)
+    }
+
     fn helper_status(&self) -> HelperStatus {
         let state = self.state.lock().unwrap().clone();
         HelperStatus { available: self.launch().is_ok(), version: state.version, auth_home: state.auth_home }
@@ -685,33 +696,61 @@ impl SubscriptionAdapter for CodexAdapter {
         })
     }
 
+    /// 退出：无论 RPC 成败都终止自有子进程并删除本服务商的专用授权目录。
+    /// 只删 `helper_home(provider_id)` 这一个自有目录，绝不触碰用户的 `~/.codex`；
+    /// 没有活动会话时也要清理，`local_cleared` 只在目录确实删除成功时为真。
     fn logout<'a>(&'a self, provider_id: &'a str, _generation: u64) -> futures_util::future::BoxFuture<'a, Result<LogoutOutcome>> {
         Box::pin(async move {
             self.logins.lock().unwrap().remove(provider_id);
             self.deferred.lock().unwrap().remove(provider_id);
-            let mut server = self
-                .servers()
-                .await
-                .remove(provider_id)
-                .context("The Codex helper has no active session to sign out of")?;
-            let result = server.call("account/logout", json!({})).await;
-            server.shutdown();
-            let value = result?;
-            let remote = match value.get("remote").and_then(Value::as_str) {
-                Some("revoked") => RemoteRevocation::Revoked,
-                Some("unsupported") => RemoteRevocation::Unsupported,
-                _ => RemoteRevocation::Failed,
+            let auth_home = match &self.home_root {
+                Some(root) => helper_home_in(root, provider_id),
+                None => helper_home(provider_id),
             };
-            Ok(LogoutOutcome {
-                local_cleared: value.get("local").and_then(Value::as_str) != Some("retained"),
-                remote,
-            })
+            let remote = match self.servers().await.remove(provider_id) {
+                Some(mut server) => {
+                    let result = server.call("account/logout", json!({})).await;
+                    server.shutdown();
+                    match result {
+                        Ok(value) => match value.get("remote").and_then(Value::as_str) {
+                            Some("revoked") => RemoteRevocation::Revoked,
+                            Some("unsupported") => RemoteRevocation::Unsupported,
+                            _ => RemoteRevocation::Failed,
+                        },
+                        Err(_) => RemoteRevocation::Failed,
+                    }
+                }
+                None => RemoteRevocation::Failed,
+            };
+            let local_cleared = remove_helper_home(&auth_home);
+            if local_cleared {
+                // 授权目录已不存在，不再对外声称一个已删除的路径。
+                let deleted = auth_home.to_string_lossy().into_owned();
+                let mut state = self.state.lock().unwrap();
+                if state.auth_home.as_deref() == Some(deleted.as_str()) {
+                    state.auth_home = None;
+                }
+            }
+            Ok(LogoutOutcome { local_cleared, remote })
         })
     }
 
     /// 生成仍然默认拒绝：登录成功不改变任何准入，真实传输不属于本票。
     fn generate<'a>(&'a self, _request: GenerationRequest<'a>) -> futures_util::future::BoxFuture<'a, Result<GenerationStream<'a>>> {
         Box::pin(async { bail!("Codex subscription generation is not implemented; this build keeps it denied") })
+    }
+}
+
+/// 只删除本应用的专用授权目录；路径越界一律拒绝（绝不触碰用户 `~/.codex`）。
+/// 目录本来就不存在也算清理成功。
+fn remove_helper_home(auth_home: &Path) -> bool {
+    let expected_parent = Path::new(HELPER_ROOT);
+    if auth_home.parent().map(|parent| parent.ends_with(expected_parent)) != Some(true) {
+        return false;
+    }
+    match std::fs::remove_dir_all(auth_home) {
+        Ok(()) => true,
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
     }
 }
 
@@ -820,6 +859,22 @@ done
         assert_eq!(value["authorizationUrl"], "https://example.invalid/auth");
     }
 
+    #[test]
+    fn redaction_never_panics_on_multibyte_text() {
+        // 单个无空格长词，每个汉字 3 字节：400 一定落在多字节字符中间（旧实现会 panic）。
+        let long = "汉字混合文本".repeat(30);
+        assert!(long.len() > 400 && !long.is_char_boundary(400));
+        let redacted = redact(&long);
+        assert!(redacted.ends_with('…'), "{redacted}");
+        assert!(redacted.len() <= 403, "{}", redacted.len());
+        // 输出仍是合法 UTF-8，且未把字符切坏。
+        assert_eq!(redacted, String::from_utf8(redacted.clone().into_bytes()).unwrap());
+        let mixed = format!("{long} authorization_code=SUPERSECRET1234567890");
+        let redacted = redact(&mixed);
+        assert!(!redacted.contains("SUPERSECRET"), "{redacted}");
+        assert!(redacted.ends_with('…'));
+    }
+
     #[tokio::test]
     async fn start_uses_a_dedicated_codex_home_and_strips_credentials() {
         let home = tempfile::tempdir().unwrap();
@@ -908,7 +963,37 @@ done
         let outcome = adapter.logout("codex-fixture", 1).await.unwrap();
         assert!(outcome.local_cleared);
         assert_eq!(outcome.remote, RemoteRevocation::Revoked);
-        assert!(adapter.logout("codex-fixture", 1).await.is_err(), "there is no active session left to sign out of");
+        // 没有活动会话时也要清理：再次退出不报错，远端撤销如实记为失败。
+        let again = adapter.logout("codex-fixture", 1).await.unwrap();
+        assert!(again.local_cleared);
+        assert_eq!(again.remote, RemoteRevocation::Failed);
+    }
+
+    #[tokio::test]
+    async fn adapter_logout_removes_only_its_own_auth_home() {
+        let home = tempfile::tempdir().unwrap();
+        let log = home.path().join("env.log");
+        let adapter = CodexAdapter::with_launch(home.path().to_path_buf(), fixture_launch(home.path(), &log));
+        adapter.start_login("codex-fixture", 1).await.unwrap();
+        adapter.login_result("codex-fixture", 1).await.unwrap();
+        let auth_home = helper_home_in(home.path(), "codex-fixture");
+        assert!(auth_home.is_dir(), "the dedicated auth home is used while signed in");
+        let outcome = adapter.logout("codex-fixture", 1).await.unwrap();
+        assert!(outcome.local_cleared, "logout must report the dedicated directory as cleared");
+        assert!(!auth_home.exists(), "the dedicated auth home must be removed");
+        assert!(adapter.helper_status().auth_home.is_none(), "a deleted path must not be reported");
+        // 没有活动会话时也删除：重启后残留的授权目录必须能被退出清掉。
+        std::fs::create_dir_all(&auth_home).unwrap();
+        let again = adapter.logout("codex-fixture", 1).await.unwrap();
+        assert!(again.local_cleared);
+        assert_eq!(again.remote, RemoteRevocation::Failed);
+        assert!(!auth_home.exists());
+        // 只删自有目录：用户的 ~/.codex 原样保留。
+        let user_codex = home.path().join(".codex");
+        std::fs::create_dir_all(&user_codex).unwrap();
+        std::fs::write(user_codex.join("auth.json"), "fixture").unwrap();
+        adapter.logout("codex-fixture", 1).await.unwrap();
+        assert!(user_codex.join("auth.json").is_file(), "the user's own ~/.codex must never be touched");
     }
 
     #[tokio::test]
