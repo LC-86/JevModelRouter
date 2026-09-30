@@ -445,6 +445,18 @@ impl OwnedProcesses {
         self.reclaim_where(|_| true)
     }
 
+    /// 只回收指定 pid（自己那次尝试的进程），返回是否真的回收到了。
+    /// 不做 provider 级连坐：并发尝试各自的失败收尾只能销毁自己那个进程。
+    pub fn reclaim_pid(&self, pid: u32) -> bool {
+        self.reclaim_where(|owned| owned.pid == pid).len() == 1
+    }
+
+    /// 该服务商是否仍有存活的自有进程。专用 home 是同一服务商共享的目录，
+    /// 只有它已无自有存活进程时才允许清理，否则会清掉当前（新）尝试正在用的目录。
+    pub fn has_owned(&self, provider_id: &str) -> bool {
+        self.children.lock().unwrap().iter().any(|owned| owned.provider_id == provider_id)
+    }
+
     /// 服务商改名时把登记条目的 provider_id 一并改写为新 id，返回改写的条目数。
     /// 不迁移的话，新 id 的 reclaim 抓不到旧进程，它会活到应用退出。
     pub fn rename_provider(&self, old_id: &str, new_id: &str) -> usize {
@@ -739,6 +751,29 @@ mod tests {
         assert_eq!(processes.reclaim("grok"), vec![pid]);
         // 已回收的 pid 不再持有读取端，也绝不对未知 pid 做任何事。
         assert!(processes.take_stdout(pid).is_none());
+        assert!(processes.reclaim_all().is_empty());
+    }
+
+    #[test]
+    fn reclaim_pid_only_touches_the_named_process_and_has_owned_tracks_the_provider() {
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("idle-helper.sh");
+        fs::write(&script, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let spec = spec_with_program(&grok(), "grok", directory.path(), &script, &[]).unwrap();
+        prepare_home(&spec.home).unwrap();
+        let processes = OwnedProcesses::new();
+        let first = processes.spawn("grok", &spec).unwrap();
+        let second = processes.spawn("grok", &spec).unwrap();
+        assert!(processes.has_owned("grok"));
+        assert!(!processes.has_owned("other"), "别家服务商的登记互不影响");
+        // 只回收指定 pid：同一服务商的另一个进程不得被连坐。
+        assert!(processes.reclaim_pid(first));
+        assert!(!processes.reclaim_pid(first), "已回收的 pid 不得重复回收");
+        assert!(!processes.reclaim_pid(999_999), "未知 pid 不得回收任何东西");
+        assert!(processes.has_owned("grok"), "另一个自有进程仍然存活");
+        assert_eq!(processes.reclaim("grok"), vec![second]);
+        assert!(!processes.has_owned("grok"));
         assert!(processes.reclaim_all().is_empty());
     }
 

@@ -108,16 +108,36 @@ export function authPhaseLabel(phase: SubscriptionAuthPhase, t: Translate): stri
   }[phase]);
 }
 
+/** 已知稳定 code 的本地化文案；新增 code 只在这里登记一次。 */
+const AUTH_ERROR_LABELS: Record<string, string> = {
+  already_connected: 'This subscription is already connected. Sign out before signing in again.',
+  helper_isolated: 'Sign-in is disabled in the isolated verification environment.',
+  helper_missing: 'The Grok helper was not found on this machine.',
+  helper_unsupported: 'Only the Grok helper is managed in this build; sign-in, sign-out and account switching are not implemented for this provider.',
+  logout_superseded: 'The connection changed while signing out; nothing was cleared. Refresh to review the current state, then retry.',
+};
+
 /** 按稳定 code 本地化；未知 code 回退后端原文，不编造文案。 */
 export function authErrorLabel(error: SubscriptionAuthError | null | undefined, t: Translate): string {
   if (!error) return '';
-  return t({
-    already_connected: 'This subscription is already connected. Sign out before signing in again.',
-    helper_isolated: 'Sign-in is disabled in the isolated verification environment.',
-    helper_missing: 'The Grok helper was not found on this machine.',
-    helper_unsupported: 'Only the Grok helper is managed in this build; sign-in, sign-out and account switching are not implemented for this provider.',
-    logout_superseded: 'The connection changed while signing out; nothing was cleared. Refresh to review the current state, then retry.',
-  }[error.code] ?? (error.message || error.code));
+  return t(AUTH_ERROR_LABELS[error.code] ?? (error.message || error.code));
+}
+
+export interface SubscriptionCommandErrorLabel { label: string; detail: string | null }
+/** 后端命令 Err 形如 `<code>: <message>`（refusal()）。 */
+const COMMAND_ERROR_PREFIX = /^([a-z][a-z0-9_]*)\s*:\s*([\s\S]*)$/;
+
+/**
+ * 命令错误文本的展示拆分：前缀是已知 code 时给出本地化 label，并把后端原文留在 detail 供核对；
+ * 没有前缀或前缀不是已知 code 时原样返回（label = 原文，detail = null），不猜测。
+ */
+export function commandErrorLabel(text: string, t: Translate): SubscriptionCommandErrorLabel {
+  const raw = text.trim();
+  const match = COMMAND_ERROR_PREFIX.exec(raw);
+  const code = match?.[1];
+  const message = match?.[2] ?? '';
+  if (!code || AUTH_ERROR_LABELS[code] === undefined) return { label: raw, detail: null };
+  return { label: authErrorLabel({ code, message, recovery: '' }, t), detail: raw };
 }
 
 export function logoutLocalLabel(state: SubscriptionLocalLogoutState, t: Translate): string {

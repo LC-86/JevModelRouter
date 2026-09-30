@@ -2,7 +2,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { PreferencesProvider, translate } from './preferences-context';
-import { authErrorLabel, authPhaseLabel, cancelAllowed, logoutLocalLabel, pollResultAllowed, pollTickAllowed, remoteRevokeLabel, subscriptionAuthView } from './subscription';
+import { authErrorLabel, authPhaseLabel, cancelAllowed, commandErrorLabel, logoutLocalLabel, pollResultAllowed, pollTickAllowed, remoteRevokeLabel, subscriptionAuthView } from './subscription';
 import { SubscriptionAuthDialog } from '../components/subscription-auth-dialog';
 import type {
   DashboardSnapshot, Provider, SubscriptionAuthView, SubscriptionLocalLogoutState, SubscriptionRemoteRevokeState,
@@ -46,6 +46,26 @@ describe('subscription authorization views', () => {
     expect(authErrorLabel({ code: 'logout_superseded', message: 'logout_superseded: the connection changed while signing out; nothing was cleared', recovery: 'Refresh and retry.' }, t)).toBe('退出过程中连接状态已变化，未清理任何内容。请刷新后查看当前状态并重试。');
     // 未知 code 仍回退后端原文，不编造文案。
     expect(authErrorLabel({ code: 'future_failure', message: 'Upstream said no.', recovery: '' }, t)).toBe('Upstream said no.');
+  });
+
+  it('localizes a command error that carries a known stable code and keeps the raw text for review', () => {
+    const logout = commandErrorLabel('logout_superseded: Grok subscription authorization changed while signing out; nothing was cleared, try again', t);
+    expect(logout.label).toBe('退出过程中连接状态已变化，未清理任何内容。请刷新后查看当前状态并重试。');
+    expect(logout.detail).toBe('logout_superseded: Grok subscription authorization changed while signing out; nothing was cleared, try again');
+    const isolated = commandErrorLabel('helper_isolated: authorization helpers are disabled in isolated validation', t);
+    expect(isolated.label).toBe('隔离验证环境中禁用登录。');
+    expect(isolated.detail).toBe('helper_isolated: authorization helpers are disabled in isolated validation');
+  });
+
+  it('leaves command errors without a known code prefix untouched', () => {
+    // 没有 `code: ` 前缀的普通错误：原样渲染，不添加 detail。
+    expect(commandErrorLabel('Open the desktop app to sign in to a subscription.', t)).toEqual({ label: 'Open the desktop app to sign in to a subscription.', detail: null });
+    // 有前缀但不是已知 code：不猜测、不本地化。
+    expect(commandErrorLabel('future_failure: something odd happened', t)).toEqual({ label: 'future_failure: something odd happened', detail: null });
+    // 消息里出现冒号时只按第一段前缀解析，其余保留在 detail。
+    const missing = commandErrorLabel('helper_missing: no official helper is available; install the CLI or set AUTOJEV_GROK_HELPER', t);
+    expect(missing.label).toBe('本机未找到 Grok 辅助进程。');
+    expect(missing.detail).toContain('AUTOJEV_GROK_HELPER');
   });
 
   it('never infers a remote revoke from a local clear', () => {

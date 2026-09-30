@@ -3,7 +3,7 @@ import { Check, Copy, LoaderCircle, LogIn, LogOut, RefreshCw, ShieldCheck, X } f
 import {
   beginSubscriptionLogin, cancelSubscriptionLogin, logoutSubscription, pollSubscriptionLogin, switchSubscriptionAccount,
 } from '../lib/bridge';
-import { authErrorLabel, authPhaseLabel, cancelAllowed, logoutLocalLabel, pollResultAllowed, pollTickAllowed, remoteRevokeLabel, subscriptionAuthView } from '../lib/subscription';
+import { authErrorLabel, authPhaseLabel, cancelAllowed, commandErrorLabel, logoutLocalLabel, pollResultAllowed, pollTickAllowed, remoteRevokeLabel, subscriptionAuthView } from '../lib/subscription';
 import { usePreferences } from '../lib/preferences-context';
 import type { DashboardSnapshot, Provider } from '../types';
 
@@ -85,6 +85,8 @@ export function SubscriptionAuthDialog({ provider, snapshot, onSnapshot, onNotif
   const userCode = challenge?.user_code ?? '';
   const localDetail = view?.logout.local_detail ?? '';
   const remoteDetail = view?.logout.remote_detail ?? '';
+  // 命令 Err 形如 `<code>: <message>`：已知 code 显示本地化文案，并另起一行展示后端原文供核对。
+  const commandError = failure ? commandErrorLabel(failure, t) : null;
   return (
     <dialog ref={dialog} className="dialog subscription-auth-dialog" aria-labelledby="subscription-auth-title" onCancel={(event) => { event.preventDefault(); if (!busy) onClose(); }}>
       <div className="subscription-auth-header">
@@ -118,7 +120,8 @@ export function SubscriptionAuthDialog({ provider, snapshot, onSnapshot, onNotif
           {view?.error && <p className="subscription-auth-error-label">{authErrorLabel(view.error, t)}</p>}
           {view?.error?.message && view.error.message !== authErrorLabel(view.error, t) && <p className="subscription-auth-error-detail">{view.error.message}</p>}
           {view?.error?.recovery && <p className="subscription-auth-recovery">{t('Recovery')}: {view.error.recovery}</p>}
-          {failure && <p className="subscription-auth-error-detail">{failure}</p>}
+          {commandError && <p className="subscription-auth-error-detail">{commandError.label}</p>}
+          {commandError?.detail && commandError.detail !== commandError.label && <p className="subscription-auth-error-detail subscription-auth-error-raw">{commandError.detail}</p>}
         </div>}
         <div className="subscription-auth-actions">
           {view?.phase === 'pending'

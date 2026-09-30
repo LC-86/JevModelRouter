@@ -185,6 +185,7 @@ pub trait SubscriptionAuth: Send + Sync {
     fn poll<'a>(&'a self, provider_id: &'a str, generation: u64, attempt: u64) -> BoxFuture<'a, Result<AuthPoll, String>>;
     /// 取消一次登录。语义固定：只在 session 仍为 Pending 且 attempt 匹配时生效，否则纯 no-op，
     /// 不得改动任何既有会话状态（已成功的 poll 不会被取消“撤销”）。
+    /// 收尾同样遵守不变式：只销毁这次尝试自己的进程；只有该 provider 已无自有存活进程时才清专用 home。
     fn cancel<'a>(&'a self, provider_id: &'a str, attempt: u64) -> BoxFuture<'a, Result<(), String>>;
     fn logout<'a>(&'a self, provider_id: &'a str, generation: u64) -> BoxFuture<'a, Result<LogoutEvidence, String>>;
     /// 只回收本应用登记的自有进程，返回 pid 列表；不改配置。
@@ -206,6 +207,9 @@ struct Session {
     identity: Option<String>,
     error: Option<AuthError>,
     events: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
+    /// 这次尝试自己拉起的自有进程 pid：失败/取消的收尾只能回收它，
+    /// 不得按 provider 连坐——同一服务商的并发新尝试不得被旧尝试的收尾杀掉。
+    pid: Option<u32>,
 }
 
 /// 生产实现：官方 Grok CLI 辅助进程 + 应用自有 home。
@@ -267,6 +271,8 @@ impl GrokCliAuth {
 
     /// 被取消或失败的登录必须清空该服务商的应用自有 home：pending 时不可能存在有效账号
     /// （begin 已拒绝 Connected），因此清理安全，这是 AC4「退出清理」的一部分。
+    /// 不变式：专用 home 由同一服务商的所有尝试共享，**只有该 provider 已无自有存活进程时**
+    /// 才允许调用这里的清理，否则会清掉并发新尝试正在用的目录。
     /// 清理失败不影响状态归位，也不把失败伪装成成功。
     fn cleanup_provider_home(&self, provider_id: &str) {
         if let Ok(home) = helper::helper_home(&ProviderKind::GrokSubscription, provider_id, &self.home) {
@@ -274,11 +280,18 @@ impl GrokCliAuth {
         }
     }
 
-    /// 中途失败的登录尝试统一收尾：回收刚拉起的自有进程并清掉专用 home，
-    /// 避免失败路径留下脏目录（下一次 begin 不得复用）。
-    fn abort_attempt(&self, provider_id: &str) {
-        self.processes.reclaim(provider_id);
-        self.cleanup_provider_home(provider_id);
+    /// 一次失败尝试的收尾：回收自己刚拉起的自有进程，并（在安全时）清掉专用 home，
+    /// 避免失败路径留下脏目录（下一次 begin 不得复用脏目录）。
+    /// 不变式：**销毁只针对自己那次尝试**——
+    /// 有 pid 时只回收这个 pid，绝不按 provider 连坐；专用 home 是同一服务商共享的目录，
+    /// 只有该 provider 已无任何自有存活进程（说明没有并发的新尝试在用）时才清理。
+    fn abort_attempt(&self, provider_id: &str, pid: Option<u32>) {
+        if let Some(pid) = pid {
+            self.processes.reclaim_pid(pid);
+        }
+        if !self.processes.has_owned(provider_id) {
+            self.cleanup_provider_home(provider_id);
+        }
     }
 
     fn provider_home(&self, provider_id: &str) -> Result<PathBuf, String> {
@@ -363,8 +376,8 @@ impl SubscriptionAuth for GrokCliAuth {
             };
             let spec = self.spec(provider_id, &program)?;
             if let Err(error) = helper::prepare_home(&spec.home) {
-                // 准备 home 失败也可能已经建出目录：同样按失败尝试收尾。
-                self.abort_attempt(provider_id);
+                // 准备 home 失败也可能已经建出目录：同样按失败尝试收尾（此时还没有 pid）。
+                self.abort_attempt(provider_id, None);
                 return Err(refusal(CODE_HELPER_MISSING, &error));
             }
             // 新尝试取代旧尝试：连接处于 Pending 时重入 begin 会拉起第二个 helper，
@@ -373,12 +386,12 @@ impl SubscriptionAuth for GrokCliAuth {
             let pid = match self.processes.spawn(provider_id, &spec) {
                 Ok(pid) => pid,
                 Err(error) => {
-                    self.abort_attempt(provider_id);
+                    self.abort_attempt(provider_id, None);
                     return Err(helper::redact(&error.to_string()));
                 }
             };
             let Some(stdout) = self.processes.take_stdout(pid) else {
-                self.abort_attempt(provider_id);
+                self.abort_attempt(provider_id, Some(pid));
                 return Err(refusal(CODE_HELPER_MISSING, "the helper produced no output stream"));
             };
             let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -402,17 +415,17 @@ impl SubscriptionAuth for GrokCliAuth {
                     Ok(Some(line)) => match parse_event(&line) {
                         Some(HelperEvent::Challenge(challenge)) => break challenge,
                         Some(HelperEvent::Error(error)) => {
-                            self.abort_attempt(provider_id);
+                            self.abort_attempt(provider_id, Some(pid));
                             return Err(refusal(&error.code, &error.message));
                         }
                         _ => {}
                     },
                     Ok(None) => {
-                        self.abort_attempt(provider_id);
+                        self.abort_attempt(provider_id, Some(pid));
                         return Err(refusal(CODE_HELPER_EXITED, "the helper exited before returning a challenge"));
                     }
                     Err(_) => {
-                        self.abort_attempt(provider_id);
+                        self.abort_attempt(provider_id, Some(pid));
                         return Err(refusal(CODE_HELPER_TIMEOUT, "the helper did not return a challenge in time"));
                     }
                 }
@@ -434,6 +447,7 @@ impl SubscriptionAuth for GrokCliAuth {
                     identity: None,
                     error: None,
                     events: Some(receiver),
+                    pid: Some(pid),
                 },
             );
             // 新登录开始即作废上一世代的退出证据：否则新账号界面仍会显示旧的「本地已清除」。
@@ -519,11 +533,16 @@ impl SubscriptionAuth for GrokCliAuth {
                 _ => AuthPoll::Pending,
             };
             let finished = !matches!(result, AuthPoll::Pending);
+            let attempt_pid = session.pid;
             drop(sessions);
             if finished {
-                self.processes.reclaim(provider_id);
-                // 失败的尝试按 AC4 清掉应用自有 home 内容；成功则保留该次授权需要的存储。
-                if matches!(result, AuthPoll::Failed { .. }) {
+                // 只回收这次尝试自己的进程：并发的新尝试不得被本尝试的终态收尾连坐。
+                if let Some(pid) = attempt_pid {
+                    self.processes.reclaim_pid(pid);
+                }
+                // 失败的尝试按 AC4 清掉应用自有 home 内容；但只有该 provider 已无自有存活进程时才清，
+                // 否则会把并发新尝试正在用的目录清掉。成功则保留该次授权需要的存储。
+                if matches!(result, AuthPoll::Failed { .. }) && !self.processes.has_owned(provider_id) {
                     self.cleanup_provider_home(provider_id);
                 }
             }
@@ -533,7 +552,7 @@ impl SubscriptionAuth for GrokCliAuth {
 
     fn cancel<'a>(&'a self, provider_id: &'a str, attempt: u64) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(async move {
-            let cancelled = {
+            let (cancelled, attempt_pid) = {
                 let mut sessions = self.sessions.lock().unwrap();
                 match sessions.get_mut(provider_id) {
                     Some(session) if session.phase == AuthPhase::Pending && session.attempt == attempt => {
@@ -541,14 +560,19 @@ impl SubscriptionAuth for GrokCliAuth {
                         session.challenge = None;
                         // 丢弃读取端：迟到的输出不会被消费，也就无法写入任何状态。
                         session.events = None;
-                        true
+                        (true, session.pid)
                     }
-                    _ => false,
+                    _ => (false, None),
                 }
             };
-            if cancelled {
-                self.processes.reclaim(provider_id);
+            if let Some(pid) = attempt_pid {
+                // 只回收本次尝试自己的进程：并发的新尝试（例如已 spawn 但还没写入 session 的那个）
+                // 不得被这次取消连坐杀掉。
+                self.processes.reclaim_pid(pid);
+            }
+            if cancelled && !self.processes.has_owned(provider_id) {
                 // 中止的尝试按 AC4 清掉应用自有 home 内容；pending 期间不可能存在有效账号。
+                // 只在无自有存活进程时清，避免清掉并发新尝试正在用的目录。
                 self.cleanup_provider_home(provider_id);
             }
             Ok(())
@@ -2450,6 +2474,132 @@ mod lifecycle_tests {
             }
             other => panic!("expected a failed poll, got {other:?}"),
         }
+    }
+
+    /// 按调用序号行为的假 helper：每次写 `session-<n>` 标记；`challenge_from` 及之后的调用才输出
+    /// challenge（可选随后输出 error 终态），最后 `exec sleep 30` 保持存活以便回收断言。
+    /// 全部是本地脚本：不联网、不装 CLI、不碰真实凭据。
+    fn sequenced_helper(directory: &tempfile::TempDir, name: &str, challenge_from: u32, fail_after_challenge: bool) -> PathBuf {
+        let mut body = String::from(
+            "n=$(cat \"$GROK_HOME/invocations\" 2>/dev/null || echo 0); n=$((n+1)); echo \"$n\" > \"$GROK_HOME/invocations\"; ",
+        );
+        body.push_str(&format!("if [ \"$n\" -ge {challenge_from} ]; then "));
+        body.push_str("echo fixture > \"$GROK_HOME/session-$n\"; ");
+        body.push_str("printf '%s\\n' '{\"event\":\"challenge\",\"kind\":\"device_code\",\"instructions\":\"Wait\"}'; ");
+        if fail_after_challenge {
+            body.push_str("sleep 0.2; printf '%s\\n' '{\"event\":\"error\",\"code\":\"helper_error\",\"message\":\"fixture poll failure\"}'; ");
+        }
+        body.push_str("fi; exec sleep 30");
+        fake_helper(directory, name, &body)
+    }
+
+    /// 等条件成立，避免依赖线程调度时序。
+    async fn wait_until(mut condition: impl FnMut() -> bool) {
+        for _ in 0..300 {
+            if condition() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("condition was not met in time");
+    }
+
+    /// 不变式：被取代尝试的失败收尾不得销毁当前尝试的进程与专用 home。
+    #[tokio::test]
+    async fn a_superseded_attempt_never_reclaims_the_current_attempt() {
+        let directory = tempfile::tempdir().unwrap();
+        // 第一次调用不输出 challenge：尝试 A 拿不到 challenge，随后被 B 取代。
+        let script = sequenced_helper(&directory, "superseded-grok.sh", 2, false);
+        let auth = Arc::new(GrokCliAuth::with_test_helper(directory.path().to_path_buf(), script));
+        let home = helper::helper_home(&ProviderKind::GrokSubscription, "grok", directory.path()).unwrap();
+
+        // 尝试 A 的进程（还停在首个 challenge 的等待里，随后会被 B 的 pre-reclaim 取代）。
+        let spec = auth.spec("grok", &auth.program.clone().unwrap()).unwrap();
+        helper::prepare_home(&spec.home).unwrap();
+        let pid_a = auth.processes.spawn("grok", &spec).unwrap();
+        // 等 A 的 helper 真正跑起来（写入调用计数）：否则 B 的 pre-reclaim 可能在 A 的脚本执行前就杀掉它，
+        // 第二次调用就会因为看不到计数而拿不到 challenge。
+        wait_until(|| home.join("invocations").is_file()).await;
+
+        // 尝试 B：真实 begin 取代 A 并成功进入 Pending（第二次调用输出 challenge 并写 session-2）。
+        auth.begin("grok", 1).await.unwrap();
+        assert!(auth.processes.has_owned("grok"), "尝试 B 的进程必须已登记");
+        assert!(home.join("session-2").is_file(), "尝试 B 必须写入自己的 home 内容");
+        assert_eq!(auth.view("grok", 1).phase, AuthPhase::Pending);
+
+        // A 迟到的失败收尾（它自己那个已经被取代的 pid）——显式调用以保证确定性，不依赖线程调度。
+        auth.abort_attempt("grok", Some(pid_a));
+
+        assert!(auth.processes.has_owned("grok"), "当前尝试 B 的进程不得被 A 的收尾杀掉");
+        assert!(home.join("session-2").is_file(), "当前尝试写入的 home 内容不得被清掉");
+        assert_eq!(auth.view("grok", 1).phase, AuthPhase::Pending, "当前尝试必须仍是 Pending");
+    }
+
+    /// 不变式：取消只销毁被取消那次尝试自己的进程；旧 attempt 的取消是 no-op，
+    /// 取消当前 attempt 时也不得连坐杀掉已 spawn 但尚未写入 session 的并发新尝试。
+    #[tokio::test]
+    async fn cancel_of_a_previous_attempt_does_not_reclaim_the_current_attempt() {
+        let directory = tempfile::tempdir().unwrap();
+        let script = sequenced_helper(&directory, "cancel-grok.sh", 1, false);
+        let auth = Arc::new(GrokCliAuth::with_test_helper(directory.path().to_path_buf(), script));
+        let home = helper::helper_home(&ProviderKind::GrokSubscription, "grok", directory.path()).unwrap();
+
+        auth.begin("grok", 1).await.unwrap();
+        auth.begin("grok", 1).await.unwrap();
+        let view = auth.view("grok", 1);
+        assert_eq!(view.phase, AuthPhase::Pending);
+        assert_eq!(view.attempt, Some(2));
+
+        // 旧 attempt 的取消是纯 no-op：当前尝试的进程与 home 都不受影响。
+        auth.cancel("grok", 1).await.unwrap();
+        assert_eq!(auth.view("grok", 1).phase, AuthPhase::Pending);
+        assert!(auth.processes.has_owned("grok"));
+        assert!(home.join("session-2").is_file());
+
+        // 并发的新尝试：进程已登记，但 session 里还没有它（begin 在 spawn 与写 session 之间的窗口）。
+        let spec = auth.spec("grok", &auth.program.clone().unwrap()).unwrap();
+        let concurrent_pid = auth.processes.spawn("grok", &spec).unwrap();
+        wait_until(|| home.join("session-3").is_file()).await;
+        auth.cancel("grok", 2).await.unwrap();
+        assert_eq!(auth.view("grok", 1).phase, AuthPhase::Cancelled);
+        assert!(auth.processes.has_owned("grok"), "并发新尝试的进程必须仍存活");
+        assert!(home.join("session-3").is_file(), "并发新尝试正在用的 home 不得被清掉");
+        assert_eq!(auth.processes.reclaim("grok"), vec![concurrent_pid], "只允许回收被取消那次尝试自己的 pid");
+    }
+
+    /// 不变式：poll 的 Failed 终态只销毁自己那次尝试；旧 attempt 的 poll 是 Superseded，
+    /// 当前 attempt 以 Failed 收尾时不得清掉并发新尝试正在用的 home。
+    #[tokio::test]
+    async fn a_failed_poll_of_a_previous_attempt_keeps_the_current_home() {
+        let directory = tempfile::tempdir().unwrap();
+        let script = sequenced_helper(&directory, "poll-grok.sh", 1, true);
+        let auth = Arc::new(GrokCliAuth::with_test_helper(directory.path().to_path_buf(), script));
+        let home = helper::helper_home(&ProviderKind::GrokSubscription, "grok", directory.path()).unwrap();
+
+        auth.begin("grok", 1).await.unwrap();
+        auth.begin("grok", 1).await.unwrap();
+        assert_eq!(auth.view("grok", 1).attempt, Some(2));
+        // 旧 attempt 的 poll 必须 Superseded，且什么都不销毁。
+        assert_eq!(auth.poll("grok", 1, 1).await.unwrap(), AuthPoll::Superseded);
+        assert!(auth.processes.has_owned("grok"));
+        assert!(home.join("session-2").is_file());
+
+        // 并发新尝试（已 spawn、尚未写 session）：当前 attempt 的 Failed 终态不得连坐。
+        let spec = auth.spec("grok", &auth.program.clone().unwrap()).unwrap();
+        let concurrent_pid = auth.processes.spawn("grok", &spec).unwrap();
+        wait_until(|| home.join("session-3").is_file()).await;
+        let mut result = AuthPoll::Pending;
+        for _ in 0..300 {
+            result = auth.poll("grok", 1, 2).await.unwrap();
+            if !matches!(result, AuthPoll::Pending) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(matches!(result, AuthPoll::Failed { .. }), "当前 attempt 应以 Failed 收尾");
+        assert!(auth.processes.has_owned("grok"), "并发新尝试的进程必须仍存活");
+        assert!(home.join("session-3").is_file(), "失败收尾不得清掉并发新尝试正在用的 home");
+        assert_eq!(auth.processes.reclaim("grok"), vec![concurrent_pid], "只允许回收本尝试自己的 pid");
     }
 
     #[tokio::test]
