@@ -510,6 +510,285 @@
     await invoke('logout_subscription', { providerId });
 
   };
+
+  // #17 受控目录全过程：替身只把「上游目录与额度读取」换成脚本可控文件（--autojev-catalog-fixture），
+  // 登录/退出、连接世代、准入、派发与快照仍走生产代码。步骤顺序与 scripts/check-isolated-desktop.mjs
+  // 的目录读取队列一一对应：发现 → 未选 → 勾选 → 取消选择 → 停用 → 同账号失败 → 权威移除 → 换号 → 删行重建。
+  const catalogModelId = 'codex-catalog-alpha';
+  const catalogPublicId = `codex-subscription/${catalogModelId}`;
+  const modelSelectionLifecycle = async () => {
+    const details = { mode: 'model-selection', observations: [] };
+    report.details = details;
+    const record = (label, value) => details.observations.push({ label, value });
+    const snapshot = () => invoke('get_snapshot');
+    const view = async () => (await snapshot()).subscriptions.find(item => item.provider_id === providerId);
+    // 目录视图按模型行组装；目录项缺失时（例如刚删掉模型行）等待下一次核对重建。
+    const entry = async () => {
+      const found = await wait(async () => {
+        const item = await view();
+        return item?.catalog_entries?.find(row => row.model_id === catalogModelId) ?? null;
+      }, 'controlled catalog entry');
+      return { ...found };
+    };
+    const row = async () => (await snapshot()).models.find(model => model.model_id === catalogModelId);
+    const setModel = async changes => {
+      const current = await row();
+      check(Boolean(current), 'The discovered model row must exist before changing it');
+      await invoke('save_model', { model: { ...current, ...changes } });
+    };
+    // 显式原 ID 直调走真实网关：Debug 入口与客户端请求共用同一准入，返回稳定的拒绝 code。
+    const admission = async label => {
+      const proxy = (await snapshot()).proxy;
+      check(proxy.running, 'The local gateway must be running for the direct-call probe');
+      const onProgress = (() => {
+        const id = window.__TAURI_INTERNALS__.transformCallback(() => {}, false);
+        const serialize = () => `__CHANNEL__:${id}`;
+        return { __TAURI_TO_IPC_KEY__: serialize, toJSON: serialize };
+      })();
+      const result = await invoke('debug_curl', {
+        id: `catalog-${label}`,
+        endpoint: 'chat/completions',
+        body: { model: catalogPublicId, messages: [{ role: 'user', content: 'fictional catalog probe' }], stream: false },
+        headers: {},
+        onProgress,
+      });
+      const headers = Object.fromEntries(Object.entries(result.headers || {}).map(([name, value]) => [name.toLowerCase(), value]));
+      const parsed = (() => { try { return JSON.parse(result.body); } catch { return {}; } })();
+      const observation = {
+        label,
+        status: result.status,
+        code: headers['x-autojev-subscription-denial'] || parsed?.error?.code || null,
+        message: parsed?.error?.message ?? null,
+      };
+      record(`direct:${label}`, observation);
+      return observation;
+    };
+    // 公共目录（无 Agent 头）由验收替身的 Node 侧代取：应用内 fetch 受同源策略限制，读取入口仍是真实网关。
+    const publicCatalog = async () => {
+      const proxy = (await snapshot()).proxy;
+      check(proxy.running, 'The local gateway must be running for the public catalog probe');
+      const response = await fetch(`${window.__ISOLATION_CHECK__.base}/__catalog-list`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ port: proxy.port }),
+      });
+      check(response.ok, `Public catalog probe failed: ${response.status}`);
+      const listing = await response.json();
+      check(Array.isArray(listing.ids), `Public catalog probe returned no ids: ${JSON.stringify(listing)}`);
+      return listing;
+    };
+    const start = await wait(async () => (await view()) || null, 'subscription view');
+    check(start.state !== 'connected', `The catalog rehearsal needs a disconnected subscription: ${start.state}`);
+    check((start.catalog_entries || []).every(item => item.model_id !== catalogModelId), `The controlled model must not exist before discovery: ${JSON.stringify(start.catalog_entries)}`);
+    record('start', { state: start.state, generation: start.generation, identity: start.identity ?? null, catalog: start.catalog_entries });
+    // 1. 真实登录（替身辅助进程承载官方握手），随后启动网关并做一次目录核对。
+    await nav(1);
+    await wait(() => [...document.querySelectorAll('tbody tr')].find(item => item.textContent.includes(providerId)), 'subscription row');
+    await click(`[data-testid="sub-login-${providerId}"]`);
+    const signedIn = await wait(async () => {
+      const item = await view();
+      return item?.login?.stage === 'completed' ? item : null;
+    }, 'catalog sign-in');
+    check(signedIn.identity === 'standin-success@example.invalid', `The controlled directory needs a verified stand-in account: ${signedIn.identity}`);
+    await click('.sidebar [aria-busy]');
+    const gateway = await wait(async () => { const current = await snapshot(); return current.proxy.running ? current.proxy : null; }, 'local gateway');
+    check(gateway.port !== 9526 && gateway.port !== 9527 && gateway.port !== 0, `The gateway must use an independent port: ${gateway.port}`);
+    const refreshed = await invoke('refresh_subscription', { providerId });
+    const discovered = await entry();
+    check(discovered.availability === 'available', `A successful directory read must confirm the entry: ${JSON.stringify(discovered)}`);
+    check(discovered.eligibility === 'eligible', `A confirmed entry must be eligible: ${JSON.stringify(discovered)}`);
+    check(discovered.selected === false && discovered.disabled === false, `A newly discovered model must start unselected and enabled: ${JSON.stringify(discovered)}`);
+    const discoveredRow = await row();
+    check(Boolean(discoveredRow), 'A discovered model must be materialized as a model row');
+    check(discoveredRow.id === discovered.internal_id, `The internal ID must be the model row ID: ${JSON.stringify({ row: discoveredRow.id, entry: discovered.internal_id })}`);
+    check(discoveredRow.selected === false && discoveredRow.enabled === true, `The materialized row must start unselected and enabled: ${JSON.stringify(discoveredRow)}`);
+    const unselectedList = await publicCatalog();
+    check(!unselectedList.ids.includes(catalogPublicId), `An unselected model must stay out of the public catalog: ${JSON.stringify(unselectedList)}`);
+    record('discovered', {
+      generation: signedIn.generation, identity: signedIn.identity, port: gateway.port,
+      internal_id: discovered.internal_id, availability: discovered.availability, eligibility: discovered.eligibility,
+      selected: discovered.selected, disabled: discovered.disabled,
+      upstream: (await view()).models, publicCatalog: unselectedList.ids,
+      refreshState: refreshed.subscriptions.find(item => item.provider_id === providerId)?.state ?? null,
+    });
+    record('unselected', { publicCatalog: unselectedList.ids, containsDiscovered: unselectedList.ids.includes(catalogPublicId) });
+    passed('a newly discovered subscription model stays unselected and out of the public catalog');
+    // 2. 勾选：进入公共目录；直调准入结论不变。
+    await setModel({ selected: true });
+    const selected = await entry();
+    check(selected.selected === true, `Selecting must reach the user configuration: ${JSON.stringify(selected)}`);
+    const selectedList = await publicCatalog();
+    check(selectedList.ids.includes(catalogPublicId), `A selected model must appear in the public catalog: ${JSON.stringify(selectedList)}`);
+    const admittedWhileSelected = await admission('selected');
+    record('selected', { publicCatalog: selectedList.ids, internal_id: selected.internal_id });
+    passed('selecting the discovered model puts it into the public catalog');
+    // 3. 取消选择：移出公共目录；显式原 ID 直调的准入结论必须与已选时完全一致。
+    await setModel({ selected: false });
+    const deselected = await entry();
+    check(deselected.selected === false && deselected.disabled === false, `Deselecting must only change the selection flag: ${JSON.stringify(deselected)}`);
+    const deselectedList = await publicCatalog();
+    check(!deselectedList.ids.includes(catalogPublicId), `Deselecting must remove the model from the public catalog: ${JSON.stringify(deselectedList)}`);
+    const admittedWhileDeselected = await admission('deselected');
+    check(
+      admittedWhileDeselected.code === admittedWhileSelected.code,
+      `Deselection must not change the direct-call admission: ${JSON.stringify({ selected: admittedWhileSelected, deselected: admittedWhileDeselected })}`,
+    );
+    check(admittedWhileDeselected.code !== 'model_disabled', `Deselection must not disable the model: ${JSON.stringify(admittedWhileDeselected)}`);
+    record('deselected', {
+      publicCatalog: deselectedList.ids, publicCatalog_contains: deselectedList.ids.includes(catalogPublicId),
+      admissionWhileSelected: admittedWhileSelected, admissionWhileDeselected: admittedWhileDeselected,
+    });
+    passed('deselecting removes the model from the public catalog and keeps the direct-call admission result');
+    // 4. 停用：后端禁止一切调用（含原 ID 直调），公共目录与手动测速都不放行。
+    await setModel({ enabled: false, selected: true });
+    const disabledEntry = await entry();
+    check(disabledEntry.disabled === true && disabledEntry.selected === true, `Disabling must be reported separately from selection: ${JSON.stringify(disabledEntry)}`);
+    const disabledList = await publicCatalog();
+    check(!disabledList.ids.includes(catalogPublicId), `A disabled model must stay out of the public catalog: ${JSON.stringify(disabledList)}`);
+    const deniedWhileDisabled = await admission('disabled');
+    check(deniedWhileDisabled.code === 'model_disabled', `Disabling must deny every direct call: ${JSON.stringify(deniedWhileDisabled)}`);
+    // 手动测速入口：停用的模型连任务都不该起（拒绝启动或任务以拒绝原因结束，两种都算禁止派发）。
+    const started = await invoke('start_model_speed_tests', { ids: [discoveredRow.id] }).then(() => null, error => String(error));
+    const measured = started === null
+      ? await wait(async () => { const value = await invoke('get_model_performance'); return !value.job.running ? value : null; }, 'disabled speed test')
+      : null;
+    const speedTestError = started ?? measured?.job?.error ?? null;
+    check(Boolean(speedTestError), 'A disabled model must not be measured');
+    record('disabled', {
+      publicCatalog: disabledList.ids, direct: deniedWhileDisabled, internal_id: disabledEntry.internal_id,
+      speedTestError,
+    });
+    passed('disabling denies the direct call, the public catalog and the manual speed test');
+    // 5. 同账号目录失败：保留已核实项、只标陈旧，直调资格仍成立（网络失败 ≠ 被移除）。
+    // #15 之后失败不再让 refresh 命令报错，而是如实写进证据状态（catalog=stale、保留模型与旧时间）；
+    // 目录资格同样只标陈旧，界面必须能看到这两层，而不是靠命令异常。
+    await setModel({ enabled: true, selected: true });
+    const failure = await invoke('refresh_subscription', { providerId }).then(() => null, error => String(error));
+    check(failure === null, `A failed directory read is reported in the evidence, not as a command error: ${failure}`);
+    const failureView = await view();
+    check(failureView?.catalog?.state === 'stale', `A failed read must keep the verified directory and mark it stale: ${JSON.stringify(failureView?.catalog)}`);
+    check((failureView?.models || []).length > 0, `A failed read must keep the verified models: ${JSON.stringify(failureView?.models)}`);
+    const stale = await entry();
+    check(stale.availability === 'stale', `A failed read must keep the entry and mark it stale: ${JSON.stringify(stale)}`);
+    check(stale.eligibility === 'stale', `A stale entry stays qualified for the same account: ${JSON.stringify(stale)}`);
+    check(stale.selected === true && stale.disabled === false, `A failed read must not rewrite user configuration: ${JSON.stringify(stale)}`);
+    const staleRow = await row();
+    check(Boolean(staleRow), 'A failed read must keep the model row');
+    const admittedWhileStale = await admission('stale');
+    check(admittedWhileStale.code === admittedWhileSelected.code, `A stale entry must keep the direct-call admission result: ${JSON.stringify(admittedWhileStale)}`);
+    record('stale', { evidence: failureView?.catalog?.state ?? null, error: failure, availability: stale.availability, eligibility: stale.eligibility, selected: stale.selected, disabled: stale.disabled, direct: admittedWhileStale });
+    passed('a same-account directory failure keeps the verified entry, marks it stale and keeps it qualified');
+    // 6. 权威移除：目录中不再出现 → 不可用，但配置、选择与稳定标识都保留。
+    await invoke('refresh_subscription', { providerId });
+    const removed = await entry();
+    check(removed.availability === 'removed', `An authoritatively removed model must be marked removed: ${JSON.stringify(removed)}`);
+    check(removed.eligibility === 'removed', `A removed model must be ineligible: ${JSON.stringify(removed)}`);
+    check(removed.internal_id === discovered.internal_id, `An authoritative removal must not change the internal ID: ${JSON.stringify(removed)}`);
+    check(removed.selected === true && removed.disabled === false, `An authoritative removal must not rewrite user configuration: ${JSON.stringify(removed)}`);
+    const removedList = await publicCatalog();
+    check(!removedList.ids.includes(catalogPublicId), `A removed model must stay out of the public catalog: ${JSON.stringify(removedList)}`);
+    const deniedWhileRemoved = await admission('removed');
+    check(deniedWhileRemoved.code === 'model_removed', `A removed model must be denied with its own code: ${JSON.stringify(deniedWhileRemoved)}`);
+    record('removed', {
+      publicCatalog: removedList.ids, internal_id: removed.internal_id,
+      availability: removed.availability, eligibility: removed.eligibility,
+      selected: removed.selected, disabled: removed.disabled, direct: deniedWhileRemoved,
+    });
+    passed('an authoritative removal denies the model with model_removed and keeps its configuration');
+    // 7. 换号：资格整体作废（保留选择/停用与标识），重新登录并核对后恢复可用。
+    await setModel({ selected: true, enabled: false });
+    const beforeSwitch = await view();
+    await click(`[data-testid="sub-switch-${providerId}"]`);
+    const switching = await wait(async () => {
+      const item = await view();
+      return item?.login?.stage === 'pending' ? item : null;
+    }, 'catalog account switch');
+    check(!switching.identity, `Switching accounts must clear the previous identity: ${switching.identity}`);
+    check(switching.generation > beforeSwitch.generation, `Switching accounts must advance the generation: ${beforeSwitch.generation} -> ${switching.generation}`);
+    const invalidated = await entry();
+    check(invalidated.availability === 'unknown', `Switching accounts must invalidate the confirmed catalogue: ${JSON.stringify(invalidated)}`);
+    check(invalidated.eligibility === 'account_changed', `Switching accounts must bind eligibility to the new account: ${JSON.stringify(invalidated)}`);
+    check(invalidated.selected === true && invalidated.disabled === true, `Switching accounts must keep selection and disable state: ${JSON.stringify(invalidated)}`);
+    const reconnected = await wait(async () => {
+      const item = await view();
+      return item?.login?.stage === 'completed' && item.identity ? item : null;
+    }, 'catalog re-sign-in');
+    check(reconnected.identity === signedIn.identity, `The switched sign-in must verify the stand-in account: ${reconnected.identity}`);
+    await invoke('refresh_subscription', { providerId });
+    const reverified = await entry();
+    check(reverified.availability === 'available' && reverified.eligibility === 'eligible', `A re-verified catalogue must be available again: ${JSON.stringify(reverified)}`);
+    check(reverified.internal_id === discovered.internal_id, `Re-verifying must reuse the stable internal ID: ${JSON.stringify(reverified)}`);
+    check(reverified.selected === true && reverified.disabled === true, `Selection and disable state must survive the account switch: ${JSON.stringify(reverified)}`);
+    const deniedWhileSwitched = await admission('switched');
+    check(deniedWhileSwitched.code === 'model_disabled', `The preserved disable state must still deny calls: ${JSON.stringify(deniedWhileSwitched)}`);
+    record('switched', {
+      from: { generation: beforeSwitch.generation }, to: { generation: reconnected.generation, identity: reconnected.identity },
+      invalidated: { availability: invalidated.availability, eligibility: invalidated.eligibility, selected: invalidated.selected, disabled: invalidated.disabled },
+      reverified: { availability: reverified.availability, eligibility: reverified.eligibility, internal_id: reverified.internal_id, selected: reverified.selected, disabled: reverified.disabled },
+      direct: deniedWhileSwitched,
+    });
+    passed('switching accounts invalidates the catalogue, then re-verifies it with selection and disable kept');
+    // 8. 删除模型行：目录项与稳定标识不被删除，下一次核对用同一个 internal_id 重建行。
+    await setModel({ selected: true, enabled: true });
+    const stableId = (await row()).id;
+    await invoke('delete_model', { id: stableId });
+    check(!(await row()), 'Deleting must remove the model row');
+    await invoke('refresh_subscription', { providerId });
+    const restored = await wait(async () => (await row()) ?? null, 're-materialized model row');
+    check(restored.id === stableId, `The re-materialized row must reuse the stable internal ID: ${JSON.stringify({ stableId, restored: restored.id })}`);
+    const restoredEntry = await entry();
+    check(restoredEntry.internal_id === stableId, `The catalog entry must keep the stable internal ID: ${JSON.stringify(restoredEntry)}`);
+    record('deletedRow', { internal_id: stableId, restored: restored.id, selected: restored.selected, availability: restoredEntry.availability });
+    passed('deleting a model row keeps the catalogue entry and rebuilds the row with the same stable ID');
+    // 9. Agent 保存目录：与当前选择不一致时显示待同步；后端撤销不因外部待同步而推迟。
+    await setModel({ selected: true, enabled: true });
+    await invoke('connect_agent', { id: 'codex', routeId: `model/${stableId}` });
+    const agent = async () => (await snapshot()).agents.find(item => item.id === 'codex');
+    const connected = await wait(async () => {
+      const item = await agent();
+      return item?.route_id === `model/${stableId}` ? item : null;
+    }, 'agent saved catalog');
+    check(connected.catalog_pending_sync === false, `A freshly saved Agent catalog must not be pending: ${JSON.stringify(connected)}`);
+    check((((await snapshot()).agent_catalogs || {}).codex || []).length === 1, `The Agent catalog must be saved: ${JSON.stringify((await snapshot()).agent_catalogs)}`);
+    await setModel({ selected: false });
+    const pendingSync = await wait(async () => {
+      const item = await agent();
+      return item?.catalog_pending_sync === true ? item : null;
+    }, 'agent pending sync');
+    const admittedWhilePending = await admission('pending-sync');
+    check(admittedWhilePending.code === admittedWhileSelected.code, `An external pending sync must not change backend admission: ${JSON.stringify(admittedWhilePending)}`);
+    await setModel({ enabled: false });
+    const pendingWhileDisabled = await wait(async () => {
+      const item = await agent();
+      return item?.catalog_pending_sync === true ? item : null;
+    }, 'agent pending sync while disabled');
+    const revokedWhilePending = await admission('pending-sync-disabled');
+    check(revokedWhilePending.code === 'model_disabled', `The backend revocation must not wait for the external configuration: ${JSON.stringify(revokedWhilePending)}`);
+    record('pendingSync', {
+      connected: { route_id: connected.route_id, pending: connected.catalog_pending_sync },
+      pending: pendingSync.catalog_pending_sync,
+      pendingWhileDisabled: pendingWhileDisabled.catalog_pending_sync,
+      admissionWhilePending: admittedWhilePending,
+      admissionAfterDisable: revokedWhilePending,
+    });
+    passed('an out-of-date saved Agent catalogue is reported as pending while the backend revokes immediately');
+    // 10. 收起会话：注销走生产路径，专用授权目录随退出清空，替身凭据不留盘（保持既有清理断言）。
+    await click(`[data-testid="sub-logout-${providerId}"]`);
+    const closedOut = await wait(async () => {
+      const item = await view();
+      return item?.logout && !item.identity ? item : null;
+    }, 'catalog sign-out');
+    check(clearedQuota(closedOut.quota), `Sign-out must clear the quota evidence: ${JSON.stringify(closedOut.quota)}`);
+    check(closedOut.generation > reconnected.generation, `Sign-out must advance the generation: ${reconnected.generation} -> ${closedOut.generation}`);
+    const invalidatedByLogout = await entry();
+    check(invalidatedByLogout.eligibility === 'account_changed', `Sign-out must invalidate the catalogue eligibility: ${JSON.stringify(invalidatedByLogout)}`);
+    record('closedOut', {
+      generation: closedOut.generation, state: closedOut.state, identity: closedOut.identity ?? null, logout: closedOut.logout,
+      availability: invalidatedByLogout.availability, eligibility: invalidatedByLogout.eligibility,
+    });
+    passed('signing out invalidates the catalogue eligibility and clears the dedicated helper home');
+  };
+
   try {
     await wait(() => document.querySelector('.app-shell'));
     if (window.__ISOLATION_CHECK__.loginMode === 'catalog') {
@@ -520,7 +799,12 @@
       return;
     }
     if (window.__ISOLATION_CHECK__.loginMode) {
-      try { await loginLifecycle(window.__ISOLATION_CHECK__.loginMode); report.ok = true; }
+      try {
+        if (window.__ISOLATION_CHECK__.loginMode === 'catalog') await catalogLifecycle();
+        else if (window.__ISOLATION_CHECK__.loginMode === 'model-selection') await modelSelectionLifecycle();
+        else await loginLifecycle(window.__ISOLATION_CHECK__.loginMode);
+        report.ok = true;
+      }
       catch (error) { report.error = String(error); report.screen = document.body.innerText.slice(-5000); }
       await invoke('isolation_check_report', { report });
       return;

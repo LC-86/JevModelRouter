@@ -6,6 +6,8 @@ use rusqlite::{Connection, OptionalExtension};
 use uuid::Uuid;
 
 fn default_tools() -> bool { true }
+/// 旧配置与 API 模型默认已选：迁移不得把既有模型变成未选。
+fn default_selected() -> bool { true }
 
 pub const DEFAULT_PORT: u16 = 9527;
 pub const DEV_PORT: u16 = 9526;
@@ -56,6 +58,9 @@ pub struct Model {
     pub name: String,
     pub tier: ModelTier,
     pub enabled: bool,
+    /// 用户是否把该模型列入模型列表与自动候选。取消选择不禁止原模型标识的合规直调，停用才禁止调用。
+    #[serde(default = "default_selected")]
+    pub selected: bool,
     #[serde(default = "default_tools")]
     pub supports_tools: bool,
     pub supports_vision: bool,
@@ -138,12 +143,6 @@ pub struct RouteRule {
     pub enabled: bool,
 }
 
-impl RouteRule {
-    pub fn includes_model(&self, id: &str) -> bool {
-        (self.strategy == "jev" && self.all_models) || self.model_ids.iter().any(|candidate| candidate == id)
-    }
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AppConfig {
     #[serde(skip)]
@@ -171,6 +170,10 @@ pub struct AppConfig {
     /// 订阅服务商的活动连接，按服务商标识索引：每家一个，证据绑定连接世代。
     #[serde(default)]
     pub subscriptions: std::collections::HashMap<String, crate::subscription::Connection>,
+    /// 订阅目录：按服务商保存上游已核实模型目录与账号绑定资格。用户的选择／停用保存在 `models` 行上，
+    /// 因此退出或换号只作废资格，不重建标识、也不丢失配置。
+    #[serde(default)]
+    pub subscription_catalogs: std::collections::HashMap<String, crate::subscription_catalog::ProviderCatalog>,
     pub install_id: String,
     pub port: u16,
     pub providers: Vec<Provider>,
@@ -193,6 +196,7 @@ impl Default for AppConfig {
             custom_agents: Vec::new(),
             routes: Vec::new(),
             subscriptions: Default::default(),
+            subscription_catalogs: Default::default(),
             install_id: Uuid::new_v4().to_string(),
             port: DEFAULT_PORT,
             providers: vec![
@@ -224,6 +228,7 @@ impl Default for AppConfig {
                     name: "Qwen 3 Coder Flash".into(),
                     tier: ModelTier::Fast,
                     enabled: true,
+                    selected: true,
                     supports_tools: true,
                     supports_vision: false,
                     supports_reasoning: false,
@@ -239,6 +244,7 @@ impl Default for AppConfig {
                     name: "Claude Sonnet 4".into(),
                     tier: ModelTier::Strong,
                     enabled: true,
+                    selected: true,
                     supports_tools: true,
                     supports_vision: true,
                     supports_reasoning: true,
@@ -815,3 +821,61 @@ mod request_log_tests {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RouteModelSettings { pub priority: u32, pub weight: u32 }
+
+#[cfg(test)]
+mod legacy_config_storage_tests {
+    use super::*;
+
+    /// 模拟本票之前的落库内容：每个模型没有 `selected` 字段，根上没有 `subscription_catalogs`。
+    /// 返回按旧库内容解析出的期望值，供加载后逐项比对。
+    fn write_legacy_config(path: &std::path::Path) -> AppConfig {
+        let mut legacy: serde_json::Value = serde_json::to_value(AppConfig::default()).unwrap();
+        legacy.as_object_mut().unwrap().remove("subscription_catalogs");
+        for model in legacy["models"].as_array_mut().unwrap() {
+            model.as_object_mut().unwrap().remove("selected");
+        }
+        // 旧库中用户停用过其中一个 API 模型：迁移不得把它重新启用。
+        legacy["models"][1]["enabled"] = serde_json::json!(false);
+
+        let db = Connection::open(path).unwrap();
+        db.execute_batch("CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);").unwrap();
+        db.execute("INSERT INTO app_meta (key, value) VALUES ('config', ?1)", [legacy.to_string()]).unwrap();
+        drop(db);
+
+        serde_json::from_value(legacy).unwrap()
+    }
+
+    #[test]
+    fn legacy_database_config_keeps_api_models_selected_on_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.db");
+        let expected = write_legacy_config(&path);
+
+        let store = ConfigStore::load(path.clone()).unwrap();
+        let loaded = store.read();
+        assert_eq!(loaded.models.len(), expected.models.len(), "迁移不增删模型行");
+        assert!(loaded.subscription_catalogs.is_empty(), "旧库没有目录时为空");
+        for (actual, original) in loaded.models.iter().zip(expected.models.iter()) {
+            assert!(actual.selected, "旧 API 模型迁移后必须保持已选：{}", actual.model_id);
+            assert_eq!(actual.enabled, original.enabled, "迁移不得改写停用状态：{}", actual.model_id);
+            assert_eq!(actual.id, original.id, "迁移不得重建内部标识：{}", actual.model_id);
+            assert_eq!(actual.model_id, original.model_id);
+        }
+        assert!(!loaded.models[1].enabled, "被停用的模型在旧库中保持停用");
+
+        // 选择与停用写回后再重读，仍然保持。
+        store
+            .update(|config| {
+                config.models[0].selected = true;
+                config.models[1].selected = false;
+                config.models[1].enabled = true;
+            })
+            .unwrap();
+        let reopened = ConfigStore::load(path).unwrap().read();
+        assert_eq!(reopened.models.len(), expected.models.len());
+        assert!(reopened.models[0].selected, "已选状态重读后保持");
+        assert!(!reopened.models[1].selected, "取消选择必须持久化");
+        assert!(reopened.models[1].enabled, "重新启用必须持久化");
+        assert!(reopened.subscription_catalogs.is_empty());
+    }
+}

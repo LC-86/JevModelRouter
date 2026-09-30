@@ -13,11 +13,14 @@ import { usePreferences } from '../lib/preferences-context';
 import { SearchSelect } from './search-select';
 import { Select } from './select';
 import { DEBUG_PREFERENCES_KEY, parseDebugPreferences } from '../lib/debug-preferences';
+import { connectableRoutes } from '../lib/route-candidates';
 export function DebugPage({ snapshot }: { snapshot: DashboardSnapshot }) {
   const { t } = usePreferences();
+  // 直调清单只要求未停用与服务商启用：取消选择不移出按原模型 ID 直调。
   const models = snapshot.models.filter(m => m.enabled && snapshot.providers.some(p => p.id === m.provider_id && p.enabled));
   const options = [
-    ...snapshot.routes.filter(r => r.enabled && models.some(m => (r.strategy === 'jev' && r.all_models) || r.model_ids.includes(m.id))).map(r => ({ value: 'autojev/' + r.id, label: r.id, group: t('Routes') })).sort((a,b) => a.label.localeCompare(b.label)),
+    // 路由可用性与后端连接校验同一套规则（all_models 只自动包含 API 模型）。
+    ...connectableRoutes(snapshot.routes, snapshot.models, snapshot.providers).map(r => ({ value: 'autojev/' + r.id, label: r.id, group: t('Routes') })).sort((a,b) => a.label.localeCompare(b.label)),
     ...models.map(m => ({ value: 'autojev/model/' + m.id, label: providerIdentifier(snapshot.providers.find(p => p.id === m.provider_id)!) + '/' + m.model_id, group: t('Models') })).sort((a,b) => a.label.localeCompare(b.label))
   ];
   const [saved] = useState(() => {

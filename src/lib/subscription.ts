@@ -1,8 +1,9 @@
 import type {
-  DashboardSnapshot, Provider, ProviderKind, SubscriptionAuthError, SubscriptionAuthPhase, SubscriptionAuthView,
-  SubscriptionCapabilityStatus, SubscriptionCatalogEvidence, SubscriptionCatalogState, SubscriptionConnectionState,
-  SubscriptionDenial, SubscriptionEvidenceState, SubscriptionLocalClearing, SubscriptionLocalLogoutState,
-  SubscriptionLoginStage, SubscriptionQuota, SubscriptionQuotaBucket, SubscriptionQuotaPermission, SubscriptionQuotaView,
+  DashboardSnapshot, Model, Provider, ProviderKind, SubscriptionAuthError, SubscriptionAuthPhase, SubscriptionAuthView,
+  SubscriptionCapabilityStatus, SubscriptionCatalogAvailability, SubscriptionCatalogEligibility, SubscriptionCatalogEntry,
+  SubscriptionCatalogEvidence, SubscriptionCatalogState, SubscriptionConnectionState, SubscriptionDenial,
+  SubscriptionEvidenceState, SubscriptionLocalClearing, SubscriptionLocalLogoutState, SubscriptionLoginStage,
+  SubscriptionQuota, SubscriptionQuotaBucket, SubscriptionQuotaPermission, SubscriptionQuotaView,
   SubscriptionQuotaWindow, SubscriptionRemoteRevocation, SubscriptionRemoteRevokeState, SubscriptionView,
 } from '../types';
 import type { Translate } from './preferences-context';
@@ -19,6 +20,108 @@ export function isSubscriptionProvider(provider: Provider | undefined): boolean 
 
 export function subscriptionView(snapshot: DashboardSnapshot, providerId: string): SubscriptionView | undefined {
   return (snapshot.subscriptions ?? []).find(view => view.provider_id === providerId);
+}
+
+/** 已发现目录；缺失视为空目录，不用界面文案补造条目。 */
+export function subscriptionCatalog(view: SubscriptionView | undefined): SubscriptionCatalogEntry[] {
+  return view?.catalog_entries ?? [];
+}
+
+/** 上游可用性文案：读取失败、移除、撤销与未知分开呈现。 */
+export function availabilityLabel(availability: SubscriptionCatalogAvailability | undefined, t: Translate): string {
+  const key = {
+    available: 'Available',
+    stale: 'Stale (last confirmed read kept)',
+    removed: 'Removed upstream',
+    revoked: 'Revoked for this account',
+    unknown: 'Availability unknown',
+  }[availability as SubscriptionCatalogAvailability] ?? 'Availability unknown';
+  return t(key);
+}
+
+/** 资格文案：不可用原因按稳定枚举分别说明，未知值回落为未知。 */
+export function eligibilityLabel(eligibility: SubscriptionCatalogEligibility | undefined, t: Translate): string {
+  const key = {
+    eligible: 'Eligible',
+    stale: 'Eligible (stale evidence)',
+    not_discovered: 'Not discovered',
+    removed: 'Removed from the upstream catalog',
+    revoked: 'Access revoked',
+    account_changed: 'Confirmed for another account',
+    unknown: 'Eligibility unknown',
+  }[eligibility as SubscriptionCatalogEligibility] ?? 'Eligibility unknown';
+  return t(key);
+}
+
+/** 目录行的可用性 + 资格摘要。 */
+export function catalogEntryStateLabel(entry: SubscriptionCatalogEntry, t: Translate): string {
+  return `${availabilityLabel(entry.availability, t)} · ${eligibilityLabel(entry.eligibility, t)}`;
+}
+
+/** 资格是否成立：同账号同世代的陈旧资格仍成立；网络失败不等于被移除。 */
+export function catalogEntryEligible(entry: Pick<SubscriptionCatalogEntry, 'eligibility'>): boolean {
+  return entry.eligibility === 'eligible' || entry.eligibility === 'stale';
+}
+
+/** 目录行是否进入模型列表与自动候选：已选、未停用、资格成立。 */
+export function catalogEntryInPool(entry: Pick<SubscriptionCatalogEntry, 'selected' | 'disabled' | 'eligibility'>): boolean {
+  return entry.selected && !entry.disabled && catalogEntryEligible(entry);
+}
+
+/** 按稳定内部标识找本地模型行；显示名不参与匹配，改名不改变调用目标。 */
+export function catalogModelRow(models: Model[], entry: Pick<SubscriptionCatalogEntry, 'internal_id'>): Model | undefined {
+  return models.find(model => model.id === entry.internal_id);
+}
+
+/**
+ * 用户是否选择了该模型。缺省视为已选：旧配置与 API 模型不因新增字段被移出列表。
+ */
+export function modelSelected(model: Pick<Model, 'selected'>): boolean {
+  return model.selected !== false;
+}
+
+export function selectedModels<M extends { selected?: boolean }>(models: M[]): M[] {
+  return models.filter(model => modelSelected(model));
+}
+
+/** 未选模型：仍可按原 ID 直调，但不进入列表、计数与任何候选。 */
+export function unselectedModels<M extends { selected?: boolean }>(models: M[]): M[] {
+  return models.filter(model => !modelSelected(model));
+}
+
+/** 模型列表成员：只由用户选择决定；停用模型仍在列表中出现并由行内标注停用。 */
+export function modelListMembers(models: Model[]): Model[] {
+  return selectedModels(models);
+}
+
+/** 测速候选：已选、未停用、服务商启用。 */
+export function speedTestCandidates(models: Model[], providers: Provider[]): Model[] {
+  return models.filter(model =>
+    modelSelected(model) && model.enabled && providers.some(provider => provider.id === model.provider_id && provider.enabled));
+}
+
+/** Agent 可选模型与测速候选同一条规则：未选模型不得进入注入目录。 */
+export function agentSelectableModels(models: Model[], providers: Provider[]): Model[] {
+  return speedTestCandidates(models, providers);
+}
+
+export interface AgentCatalogSyncState {
+  /** 已保存到磁盘的注入目录绑定（默认项在前）。 */
+  saved: readonly string[];
+  /** 当前应用内选择的绑定。 */
+  chosen: readonly string[];
+  /** 后端给出的待同步标记；缺省由绑定差异推断。 */
+  pendingSync?: boolean;
+}
+/**
+ * 保存目录与当前应用内选择是否不一致：不一致即待同步，需要重新连接才能刷新外部配置。
+ * 这只是外部配置的同步状态；停用与撤销始终由后端立即生效，不等待这里。
+ */
+export function agentCatalogPendingSync(state: AgentCatalogSyncState): boolean {
+  if (state.pendingSync === true) return true;
+  const saved = [...new Set(state.saved)];
+  const chosen = [...new Set(state.chosen)];
+  return saved.length !== chosen.length || saved.some((binding, index) => binding !== chosen[index]);
 }
 
 export function connectionStateLabel(state: SubscriptionConnectionState, t: Translate): string {
@@ -243,7 +346,10 @@ export function denialLabel(denial: SubscriptionDenial | null | undefined, t: Tr
     authorization_expired: 'Subscription expired',
     identity_unverified: 'Identity not verified',
     evidence_missing: 'No read-only evidence',
-    model_not_eligible: 'Model not eligible for this account',
+    model_not_discovered: 'Model is not in this account directory',
+    model_removed: 'Model was removed upstream',
+    model_revoked: 'Model access revoked for this account',
+    model_unqualified: 'Model qualification stale for this account',
     capability_unverified: 'Capability not verified',
     capability_unsupported: 'Capability unsupported',
     quota_unknown: 'Quota basis unknown',
