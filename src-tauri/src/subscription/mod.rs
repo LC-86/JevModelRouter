@@ -690,28 +690,32 @@ fn provider_admission_denial(config: &AppConfig, provider: &Provider) -> Option<
 /// 一次生成交接：绑定服务商、连接世代、模型与协议。适配器只负责外部辅助进程，
 /// 准入在调用前完成，所以这里没有任何“跳过检查”的参数。
 ///
-/// 生产构建里这些生成侧类型刻意不被调用：能力未验证前，准入会先拒绝，因此生成边界只在
-/// 测试的隔离替身中被驱动。它们不是可选的绕过开关，也没有对应的配置项。
-#[allow(dead_code)]
+/// 网关只在共享准入确认当前账号、连接世代、模型资格、协议能力与额度后调用；这些类型
+/// 不提供绕过准入的开关。契约测试用隔离替身制造已验证证据，不代表生产获得任何真实凭据。
 pub struct GenerationRequest<'a> {
     pub provider_id: &'a str,
     pub generation: u64,
     pub model_id: &'a str,
     pub protocol: Protocol,
     pub body: serde_json::Value,
-    pub streaming: bool,
+    /// Rechecked by the Codex adapter after waiting for the provider lock and immediately before
+    /// dispatch. Production gateway calls bind this to the live ConfigStore admission snapshot.
+    pub pre_dispatch_check: std::sync::Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
 }
 
 /// 生成事件：辅助进程产出的上游输出。协议转换、捕获与错误仍由调用方负责。
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq)]
 pub enum GenerationEvent {
     Started { generation: u64 },
     Chunk(String),
     Finished { status: u16 },
+    /// The helper reported a failed turn. Once any text was sent, callers must terminate this
+    /// response in place and must not append output from another provider.
+    Failed { message: String },
+    /// The helper reported an interrupted turn (including client disconnect cancellation).
+    Cancelled,
 }
 
-#[allow(dead_code)]
 pub type GenerationStream<'a> =
     std::pin::Pin<Box<dyn futures_util::Stream<Item = GenerationEvent> + Send + 'a>>;
 
@@ -1295,7 +1299,6 @@ pub trait SubscriptionAdapter: Send + Sync {
     fn status<'a>(&'a self, provider_id: &'a str, generation: u64) -> BoxFuture<'a, Result<ConnectionStatus>>;
     fn models<'a>(&'a self, provider_id: &'a str, generation: u64) -> BoxFuture<'a, Result<CatalogRead>>;
     fn quota<'a>(&'a self, provider_id: &'a str, generation: u64) -> BoxFuture<'a, Result<QuotaEvidence>>;
-    #[allow(dead_code)]
     fn generate<'a>(&'a self, request: GenerationRequest<'a>) -> BoxFuture<'a, Result<GenerationStream<'a>>>;
     /// 发起一次浏览器登录；世代与尝试一起绑定，结果迟到即整体丢弃。
     fn start_login<'a>(&'a self, provider_id: &'a str, generation: u64) -> BoxFuture<'a, Result<LoginStart>>;
@@ -3320,7 +3323,7 @@ mod refresh_tests {
                 model_id: "fixture-model",
                 protocol: Protocol::Chat,
                 body: serde_json::json!({}),
-                streaming: false,
+                pre_dispatch_check: std::sync::Arc::new(|| Ok(())),
             })
             .await
             .is_err());
@@ -3337,7 +3340,7 @@ mod refresh_tests {
                 model_id: "fixture-model",
                 protocol: Protocol::Chat,
                 body: serde_json::json!({"model": "fixture-model"}),
-                streaming: true,
+                pre_dispatch_check: std::sync::Arc::new(|| Ok(())),
             })
             .await
             .unwrap();
