@@ -17,6 +17,8 @@ pub fn script() -> anyhow::Result<Option<String>> {
     )?;
     crate::dispatch::ensure_loopback(&url)?;
     // Optional login-lifecycle mode: the acceptance driver only rehearses one scenario per run.
+    // `catalog` is the #15 read-only directory/quota acceptance path; it signs in first and then
+    // rehearses one catalog + quota scenario queue per refresh.
     let login_mode = args
         .iter()
         .position(|s| s == "--autojev-login-check")
@@ -24,7 +26,7 @@ pub fn script() -> anyhow::Result<Option<String>> {
         .cloned();
     if let Some(mode) = &login_mode {
         anyhow::ensure!(
-            matches!(mode.as_str(), "success" | "late" | "failed" | "grok" | "grok-read"),
+            matches!(mode.as_str(), "success" | "late" | "failed" | "grok" | "grok-read" | "catalog"),
             "Unknown login check mode: {mode}"
         );
     }

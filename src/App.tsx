@@ -63,13 +63,11 @@ import { SearchSelect } from './components/search-select';
 import { BrandMark } from './components/brand-mark';
 import { rangeStart, summarize } from './lib/traffic';
 import {
-  catalogLabel, catalogRemovedLabel, capabilityLabel, CATALOG_REFERENCE_URL, connectionStateLabel,
-  connectionStateTone, creditsAxisText, denialLabel, evidenceNumberText, identityLabel, isSubscriptionKind,
-  isSubscriptionProvider, knownOrUnknown, localLogoutLabel, loginStageLabel, loginStageTone, modelCapability,
-  modelEligibilityLabel, percentText, protocolKey, quotaHistoryLabel, quotaLabel, quotaPermission,
-  quotaPermissionLabel, quotaViewLabel, QUOTA_REFERENCE_URL, remoteRevocationLabel, remainingPercent,
-  subscriptionActions, subscriptionAuthView, subscriptionCatalogText, subscriptionQuotaText, subscriptionReason,
-  subscriptionStatusText, subscriptionView,
+  CATALOG_REFERENCE_URL, QUOTA_REFERENCE_URL, capabilityLabel, catalogLabel, catalogRemovedLabel, connectionStateLabel,
+  connectionStateTone, creditsAxisText, denialLabel, identityLabel, isSubscriptionKind, isSubscriptionProvider,
+  localLogoutLabel, loginStageLabel, loginStageTone, modelCapability, protocolKey, quotaHistoryLabel, quotaLabel,
+  quotaPermissionLabel, quotaViewLabel, remoteRevocationLabel, subscriptionActions, subscriptionAuthView,
+  subscriptionCatalogText, subscriptionQuotaText, subscriptionReason, subscriptionStatusText, subscriptionView,
 } from './lib/subscription';
 import {
   beginSubscriptionLogin,
@@ -100,7 +98,6 @@ import type {
   DashboardSnapshot,
   Model,
   Provider,
-  SubscriptionView,
 } from './types';
 
 type Page = 'overview' | 'providers' | 'models' | 'router' | 'agents' | 'activity' | 'usage' | 'debug';
@@ -310,7 +307,11 @@ export default function App() {
                 try {
                   setSnapshot(await refreshSubscription(provider.id));
                   setToast(t('Read-only status refreshed'));
-                } catch (error) { setToast(String(error instanceof Error ? error.message : error), true); }
+                } catch (error) {
+                  setToast(String(error instanceof Error ? error.message : error), true);
+                  // 刷新失败也可能已撤销当前连接并保留历史，立即展示落盘状态。
+                  getSnapshot().then(setSnapshot).catch(() => {});
+                }
               }}
               onTest={async (id) => {
                 setProviderTests((previous) => ({ ...previous, [id]: 'testing' }));
@@ -533,74 +534,6 @@ function ProviderImport({ onImport }: { onImport: (source: 'ccswitch' | 'termany
 
 type SubscriptionAction = 'login' | 'cancel' | 'logout' | 'switch';
 
-/**
- * 只读目录/额度块：稳定 token 行（契约 §7）与人类可读明细分开渲染。
- * 未知一律 `Unknown`，缺失不折算成 0/100%；`eligible=false` 只标为不具备资格，绝不写成可调用。
- */
-function SubscriptionEvidenceBlock({ providerId, view }: { providerId: string; view: SubscriptionView | undefined }) {
-  const { t } = usePreferences();
-  const catalog = view?.catalog ?? undefined;
-  const quota = view?.quota;
-  const models = view?.models ?? [];
-  const buckets = quota?.buckets ?? [];
-  const catalogState = catalog?.state ?? 'unknown';
-  const quotaState = quota?.state ?? 'unknown';
-  const catalogMissing = catalog?.missing_fields ?? [];
-  const quotaMissing = quota?.missing_fields ?? [];
-  const catalogRemoved = catalogRemovedLabel(catalog?.removed_models, t);
-  // 官方入口只在没有机器接口或尚未核实（unsupported/unknown）时出现；它只作查看。
-  const showCatalogReference = catalogState === 'unsupported' || catalogState === 'unknown';
-  const showQuotaReference = quotaState === 'unsupported' || quotaState === 'unknown';
-  return (
-    <div className="provider-subscription-evidence">
-      <span className="provider-subscription-evidence-state" data-testid={`sub-catalog-${providerId}`}>{subscriptionCatalogText(view)}</span>
-      <span className="provider-subscription-evidence-state" data-testid={`sub-quota-${providerId}`}>{subscriptionQuotaText(view)}</span>
-      <span className="provider-subscription-evidence-line">{t('Catalog')}: {catalogLabel(catalogState, t)} · {t('Source')}: {knownOrUnknown(catalog?.source)} · {t('Observed at')}: {knownOrUnknown(catalog?.observed_at)}</span>
-      {catalogMissing.length > 0 && <span className="provider-subscription-evidence-missing">{t('Missing fields')}: {catalogMissing.join(', ')}</span>}
-      {models.length > 0 && <ul className="provider-subscription-models">
-        {models.map((model, index) => <li key={`${model.model_id}-${index}`}>
-          <code>{model.model_id}</code>
-          <span className={cx('provider-subscription-eligible', model.eligible ? 'on' : 'off')}>{modelEligibilityLabel(model.eligible, t)}</span>
-        </li>)}
-      </ul>}
-      {catalogRemoved && <span className="provider-subscription-removed">{catalogRemoved}</span>}
-      <span className="provider-subscription-evidence-note">{t('Discovery is not admission: subscription models stay denied until every condition is verified.')}</span>
-      <span className="provider-subscription-evidence-line">{t('Quota')}: {quotaLabel(quotaState, t)} · {quotaPermissionLabel(quotaPermission(quota), t)} · {t('View')}: {quotaViewLabel(quota?.view ?? 'unknown', t)} · {t('Source')}: {knownOrUnknown(quota?.source)} · {t('Observed at')}: {knownOrUnknown(quota?.observed_at)}</span>
-      {quota?.history === true && <span className="provider-subscription-history" role="status">{quotaHistoryLabel(quota.history, quota.observed_at, t)}</span>}
-      {quotaMissing.length > 0 && <span className="provider-subscription-evidence-missing">{t('Missing fields')}: {quotaMissing.join(', ')}</span>}
-      {buckets.length === 0 && <span className="provider-subscription-evidence-line">{t('No quota buckets yet')}</span>}
-      {buckets.map(bucket => {
-        const windows = bucket.windows ?? [];
-        const credits = bucket.credits ?? null;
-        const bucketMissing = bucket.missing_fields ?? [];
-        const bucketInvalid = bucket.invalid_fields ?? [];
-        return (
-          <div className="provider-subscription-bucket" key={bucket.limit_id}>
-            <span className="provider-subscription-evidence-line">
-              <code>{bucket.limit_id}</code>{bucket.name?.trim() ? ` · ${bucket.name.trim()}` : ''} · {quotaPermissionLabel(bucket.permission ?? 'unknown', t)}
-            </span>
-            {windows.map((window, index) => <span className="provider-subscription-window" key={`${bucket.limit_id}-${window.label}-${index}`}>
-              {window.label} · {t('Used')}: {percentText(window.used_percent)} · {t('Remaining')}: {percentText(remainingPercent(window.used_percent))} · {t('Window minutes')}: {evidenceNumberText(window.window_minutes)} · {t('Resets at')}: {evidenceNumberText(window.resets_at)}
-              {(window.missing_fields?.length ?? 0) > 0 && <> · {t('Missing fields')}: {window.missing_fields?.join(', ')}</>}
-              {(window.invalid_fields?.length ?? 0) > 0 && <> · {t('Invalid fields')}: {window.invalid_fields?.join(', ')}</>}
-            </span>)}
-            {/* credits 轴始终渲染：后端完全没给也要一行诚实未知，不整段消失。 */}
-            <span className="provider-subscription-evidence-line">{creditsAxisText(credits, t)}</span>
-            {(bucketMissing.length > 0 || bucketInvalid.length > 0) && <span className="provider-subscription-evidence-missing">
-              {bucketMissing.length > 0 && <>{t('Missing fields')}: {bucketMissing.join(', ')}</>}
-              {bucketMissing.length > 0 && bucketInvalid.length > 0 && ' · '}
-              {bucketInvalid.length > 0 && <>{t('Invalid fields')}: {bucketInvalid.join(', ')}</>}
-            </span>}
-          </div>
-        );
-      })}
-      {showCatalogReference && <a className="provider-subscription-reference" href={CATALOG_REFERENCE_URL} target="_blank" rel="noreferrer" title={CATALOG_REFERENCE_URL}>{t('Official catalog reference')}</a>}
-      {showQuotaReference && <a className="provider-subscription-reference" href={QUOTA_REFERENCE_URL} target="_blank" rel="noreferrer" title={QUOTA_REFERENCE_URL}>{t('Official quota reference')}</a>}
-      {(showCatalogReference || showQuotaReference) && <span className="provider-subscription-evidence-note">{t('Viewing the official reference is not a bypass for admission.')}</span>}
-    </div>
-  );
-}
-
 function ProvidersPage({ snapshot, onAdd, onEdit, onDelete, onTest, onImport, onRefreshSubscription, onAuth, onSnapshot, onNotify, testStates, onToggle }: { onToggle: (provider: Provider) => Promise<void>; onRefreshSubscription: (provider: Provider) => Promise<void>; onAuth: (provider: Provider) => void; onSnapshot: (snapshot: DashboardSnapshot) => void; onNotify: (message: string, error?: boolean) => void; testStates: Record<string, ProviderTestStatus>; onImport: (source: 'ccswitch' | 'termany') => Promise<void>; snapshot: DashboardSnapshot; onAdd: () => void; onEdit: (p: Provider) => void; onDelete: (id: string) => void; onTest: (id: string) => void }) {
   const { t } = usePreferences();
   const [toggling, setToggling] = useState<Record<string, boolean>>({});
@@ -671,12 +604,28 @@ function ProvidersPage({ snapshot, onAdd, onEdit, onDelete, onTest, onImport, on
               const login = view?.login ?? null;
               const awaitingAuthorization = login?.stage === 'pending';
               const authorizationUrl = awaitingAuthorization ? login?.authorization_url ?? null : null;
+              const catalog = view?.catalog;
+              const quota = view?.quota;
+              const quotaHistory = quotaHistoryLabel(quota, t);
+              const catalogRemoved = catalogRemovedLabel(catalog?.removed_models, t);
+              // 官方查看入口只属于确有可靠入口的服务商类型（当前只有 Grok）。判断依据是服务商类型，
+              // 不是名称或标识；Codex 没有已核实的官方入口就不新增，不猜 URL。
+              const catalogState = catalog?.state ?? 'unknown';
+              const quotaState = quota?.state ?? 'unknown';
+              const showCatalogReference = grok && (catalogState === 'unsupported' || catalogState === 'unknown');
+              const showQuotaReference = grok && (quotaState === 'unsupported' || quotaState === 'unknown');
+              const openReference = (url: string) => (event: { preventDefault: () => void }) => {
+                // Tauri 下拦截默认跳转，交给系统浏览器；普通浏览器保留正常链接行为。
+                if (!isTauri()) return;
+                event.preventDefault();
+                void openUrl(url).catch(() => onNotify(t('Open official reference'), true));
+              };
               return (
               <tr key={provider.id}>
                 <td><div className="provider-table-name"><span className="provider-table-icon"><ProviderLogo id={providerPreset(provider)} /></span><div><strong>{provider.name}</strong><small>{provider.id}</small></div></div></td>
                 <td>{subscription ? <span className="provider-subscription-identity" title={t('Subscription identity')}><ShieldCheck size={14} aria-hidden="true" />{identityLabel(view, t)}</span> : <code className="provider-table-url" title={provider.base_url}>{provider.base_url}</code>}</td>
                 <td><div className="provider-enabled-cell"><button type="button" role="switch" aria-checked={provider.enabled} aria-label={t('Enable {provider}', { provider: provider.name })} disabled={toggling[provider.id]} className={cx('switch', provider.enabled && 'on')} onClick={() => void toggle(provider)}><span /></button><span>{t(provider.enabled ? 'ENABLED' : 'DISABLED')}</span></div></td>
-                <td>{subscription ? <div className="provider-subscription-status"><span className={cx('provider-connection', connectionStateTone(view?.state ?? 'not_connected'))}><Plug size={14} aria-hidden="true" />{connectionStateLabel(view?.state ?? 'not_connected', t)}</span><span className="provider-subscription-detail">{view && view.models.length > 0 ? t('{count} discovered models', { count: view.models.length }) : t('No discovered models yet')}</span><span className="provider-subscription-state" data-testid={`sub-status-${provider.id}`}>{subscriptionStatusText(view, t)}</span>{login && login.stage !== 'idle' && <span className={cx('provider-subscription-login', loginStageTone(login.stage))} role="status">{loginStageLabel(login.stage, t)}</span>}{authorizationUrl && <a className="provider-subscription-auth-link" href={authorizationUrl} target="_blank" rel="noreferrer" onClick={(event) => { if (isTauri()) { event.preventDefault(); void openUrl(authorizationUrl).catch(() => onNotify(t('Open authorization link'), true)); } }}>{t('Open authorization link')}</a>}{awaitingAuthorization && login?.user_code && <span className="provider-subscription-user-code"><span>{t('Authorization code')}</span><code>{login.user_code}</code></span>}{awaitingAuthorization && !authorizationUrl && !login?.user_code && <span className="provider-subscription-login">{t('Complete the authorization in your browser. This row updates automatically.')}</span>}{login?.error && <span className="provider-subscription-error" role="status">{login.error}</span>}{view?.logout && <span className="provider-subscription-logout" role="status">{localLogoutLabel(view.logout.local, t)} · {remoteRevocationLabel(view.logout.remote, t)}</span>}{subscriptionErrors[provider.id] && <span className="provider-subscription-error" role="status">{subscriptionErrors[provider.id]}</span>}{subscriptionReason(view, t) && <span className="provider-subscription-reason" role="status" title={subscriptionReason(view, t)}>{denialLabel(view?.denial, t) || quotaLabel(view?.quota.state ?? 'unknown', t)}</span>}<SubscriptionEvidenceBlock providerId={provider.id} view={view} /></div> : <span className="provider-table-key">{t('Not a subscription provider')}</span>}</td>
+                <td>{subscription ? <div className="provider-subscription-status"><span className={cx('provider-connection', connectionStateTone(view?.state ?? 'not_connected'))}><Plug size={14} aria-hidden="true" />{connectionStateLabel(view?.state ?? 'not_connected', t)}</span><span className="provider-subscription-detail">{view && view.models.length > 0 ? t('{count} discovered models', { count: view.models.length }) : t('No discovered models yet')}</span><span className="provider-subscription-state" data-testid={`sub-status-${provider.id}`}>{subscriptionStatusText(view, t)}</span>{login && login.stage !== 'idle' && <span className={cx('provider-subscription-login', loginStageTone(login.stage))} role="status">{loginStageLabel(login.stage, t)}</span>}{authorizationUrl && <a className="provider-subscription-auth-link" href={authorizationUrl} target="_blank" rel="noreferrer" onClick={(event) => { if (isTauri()) { event.preventDefault(); void openUrl(authorizationUrl).catch(() => onNotify(t('Open authorization link'), true)); } }}>{t('Open authorization link')}</a>}{awaitingAuthorization && login?.user_code && <span className="provider-subscription-user-code"><span>{t('Authorization code')}</span><code>{login.user_code}</code></span>}{awaitingAuthorization && !authorizationUrl && !login?.user_code && <span className="provider-subscription-login">{t('Complete the authorization in your browser. This row updates automatically.')}</span>}{login?.error && <span className="provider-subscription-error" role="status">{login.error}</span>}{view?.logout && <span className="provider-subscription-logout" role="status">{localLogoutLabel(view.logout.local, t)} · {remoteRevocationLabel(view.logout.remote, t)}</span>}{subscriptionErrors[provider.id] && <span className="provider-subscription-error" role="status">{subscriptionErrors[provider.id]}</span>}{subscriptionReason(view, t) && <span className="provider-subscription-reason" role="status" title={subscriptionReason(view, t)}>{denialLabel(view?.denial, t) || quotaLabel(view?.quota?.state ?? 'unknown', t)}</span>}{subscription && <span className="provider-subscription-catalog" data-testid={`sub-catalog-${provider.id}`}>{subscriptionCatalogText(view)}</span>}{subscription && <span className="provider-subscription-catalog-human">{t('Model catalog')} · {catalogLabel(catalog?.state ?? 'unknown', t)} · {catalog?.observed_at?.trim() || t('Unknown')}{catalog?.source?.trim() ? ` · ${catalog.source.trim()}` : ''}</span>}{subscription && <span className="provider-subscription-quota" data-testid={`sub-quota-${provider.id}`}>{subscriptionQuotaText(view)}</span>}{subscription && <span className="provider-subscription-quota-human">{quotaLabel(quota?.state ?? 'unknown', t)} · {quotaViewLabel(quota?.view, t)}</span>}{subscription && (quota?.buckets ?? []).map((bucket) => <span key={`${provider.id}-${bucket.limit_id}`} className="provider-subscription-quota-bucket">{quotaPermissionLabel(bucket.permission, t)}{bucket.credits?.balance?.trim() ? <code title={t('Raw balance text as reported; the unit is not inferred.')}>{bucket.credits.balance.trim()}</code> : null}<span className="provider-subscription-credits">{creditsAxisText(bucket.credits, t)}</span></span>)}{subscription && !(quota?.buckets ?? []).length && <span className="provider-subscription-quota-bucket">{quotaPermissionLabel(undefined, t)}</span>}{subscription && catalogRemoved && <span className="provider-subscription-removed" role="status">{catalogRemoved}</span>}{subscription && quotaHistory && <span className="provider-subscription-quota-history" role="status">{quotaHistory}</span>}{showCatalogReference && <a className="provider-subscription-reference" href={CATALOG_REFERENCE_URL} target="_blank" rel="noreferrer" title={CATALOG_REFERENCE_URL} onClick={openReference(CATALOG_REFERENCE_URL)}>{t('Official catalog reference')}</a>}{showQuotaReference && <a className="provider-subscription-reference" href={QUOTA_REFERENCE_URL} target="_blank" rel="noreferrer" title={QUOTA_REFERENCE_URL} onClick={openReference(QUOTA_REFERENCE_URL)}>{t('Official quota reference')}</a>}{(showCatalogReference || showQuotaReference) && <span className="provider-subscription-evidence-note">{t('Viewing the official reference is not a bypass for admission.')}</span>}</div> : <span className="provider-table-key">{t('Not a subscription provider')}</span>}</td>
                 <td><span className="provider-table-key"><KeyRound size={14} />{subscription ? t('No API key is used for subscription providers.') : provider.kind === 'ollama' ? t('No API key required') : provider.has_api_key ? t('API key saved locally') : t('API key required')}</span></td>
                 <td><div className="row-actions">{subscription && grok && <button className="icon-action subscription-auth-entry" aria-busy={auth?.phase === 'pending'} title={t('Subscription sign-in and sign-out')} aria-label={t('Subscription sign-in and sign-out')} onClick={() => onAuth(provider)}>{auth?.phase === 'pending' ? <LoaderCircle size={15} className="import-spinner" /> : view?.state === 'connected' ? <LogOut size={15} /> : <LogIn size={15} />}</button>}{subscription && !grok && <><button type="button" className="button ghost small subscription-action" data-testid={`sub-login-${provider.id}`} disabled={!available.canLogin || busyAction !== undefined} title={t('Sign in to subscription')} onClick={() => void runSubscriptionAction(provider, 'login')}>{busyAction === 'login' ? <LoaderCircle size={14} className="import-spinner" /> : null}{t('Sign in')}</button><button type="button" className="button ghost small subscription-action" data-testid={`sub-cancel-${provider.id}`} disabled={!available.canCancel || busyAction !== undefined} title={t('Cancel subscription sign-in')} onClick={() => void runSubscriptionAction(provider, 'cancel')}>{busyAction === 'cancel' ? <LoaderCircle size={14} className="import-spinner" /> : null}{t('Cancel')}</button><button type="button" className="button ghost small subscription-action" data-testid={`sub-logout-${provider.id}`} disabled={!available.canLogout || busyAction !== undefined} title={t('Sign out of subscription')} onClick={() => void runSubscriptionAction(provider, 'logout')}>{busyAction === 'logout' ? <LoaderCircle size={14} className="import-spinner" /> : null}{t('Sign out')}</button><button type="button" className="button ghost small subscription-action" data-testid={`sub-switch-${provider.id}`} disabled={!available.canLogout || busyAction !== undefined} title={t('Switch subscription account')} onClick={() => void runSubscriptionAction(provider, 'switch')}>{busyAction === 'switch' ? <LoaderCircle size={14} className="import-spinner" /> : null}{t('Switch account')}</button></>}{subscription && <button className="icon-action" disabled={refreshing[provider.id]} title={t('Refresh read-only status')} aria-label={t('Refresh read-only status')} onClick={() => void refresh(provider)}>{refreshing[provider.id] ? <LoaderCircle size={15} className="import-spinner" /> : <RefreshCw size={15} />}</button>}{!subscription && <button className="icon-action" disabled={testStates[provider.id] === 'testing'} title={t(testStates[provider.id] === 'testing' ? 'Testing…' : 'Test')} aria-label={t(testStates[provider.id] === 'testing' ? 'Testing…' : 'Test')} onClick={() => onTest(provider.id)}>{testStates[provider.id] === 'testing' ? <LoaderCircle size={15} className="import-spinner" /> : <Play size={15} />}</button>}<button className="icon-action" onClick={() => onEdit(provider)} title={t('Configure')} aria-label={t('Configure')}><Settings2 size={15} /></button><button className="icon-action danger" onClick={() => onDelete(provider.id)} title={t('Delete')} aria-label={t('Delete')}><Trash2 size={15} /></button></div></td>
               </tr>

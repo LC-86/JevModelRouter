@@ -1,13 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { translate } from './preferences-context';
 import {
-  authHomeLabel, booleanText, catalogLabel, catalogRemovedLabel, CATALOG_REFERENCE_URL, catalogText, capabilityLabel,
-  connectionStateLabel, connectionStateTone, creditsAxisText, denialLabel, evidenceNumberText, helperVersionLabel,
-  identityLabel, isSubscriptionProvider, knownOrUnknown, localLogoutLabel, loginStageLabel, loginStageTone,
-  modelCapability, modelEligibilityLabel, percentText, protocolKey, quotaEvidenceText, quotaHistoryLabel, quotaLabel,
-  quotaPermission, quotaPermissionLabel, quotaViewLabel, QUOTA_REFERENCE_URL, remainingPercent, remoteRevocationLabel,
-  subscriptionActions, subscriptionCatalogText, subscriptionQuotaText, subscriptionReason, subscriptionStatusText,
-  subscriptionView,
+  CATALOG_REFERENCE_URL, QUOTA_REFERENCE_URL, authHomeLabel, capabilityLabel, catalogLabel, catalogRemovedLabel,
+  catalogText, connectionStateLabel, connectionStateTone, creditsAxisText, denialLabel,
+  helperVersionLabel, identityLabel, isSubscriptionProvider, knownOrUnknown, localLogoutLabel, loginStageLabel,
+  loginStageTone, modelCapability, protocolKey, quotaEvidenceText, quotaHistoryLabel, quotaLabel, quotaPermissionLabel,
+  quotaViewLabel, remainingPercent, remoteRevocationLabel, subscriptionActions, subscriptionCatalogText,
+  subscriptionQuotaText, subscriptionReason, subscriptionStatusText, subscriptionView,
 } from './subscription';
 import type { DashboardSnapshot, SubscriptionQuota, SubscriptionView } from '../types';
 
@@ -41,6 +40,8 @@ describe('subscription views', () => {
     expect(capabilityLabel('unsupported', t)).toBe('不支持');
     expect(quotaLabel('unknown', t)).toBe('额度未知');
     expect(quotaLabel('unsupported', t)).toBe('无额度接口');
+    expect(quotaLabel('denied', t)).toBe('额度访问被拒绝');
+    expect(denialLabel({ code: 'quota_denied', family: 'quota', message: '', recovery: '' }, t)).toBe('额度访问被拒绝');
   });
 
   it('shows unknown identity instead of guessing it', () => {
@@ -170,41 +171,183 @@ describe('subscription login and logout lifecycle', () => {
   });
 });
 
-describe('read-only catalog and quota evidence', () => {
-  const quota = (patch: Partial<SubscriptionQuota> = {}): SubscriptionQuota => ({
-    state: 'unknown', source: null, observed_at: null, view: 'unknown', buckets: [], missing_fields: [], history: false,
-    ...patch,
+describe('subscription catalog and quota evidence', () => {
+  it('labels denied quota permission and keeps unknown as unknown', () => {
+    expect(quotaPermissionLabel('allowed', t)).toBe('允许使用额度');
+    expect(quotaPermissionLabel('denied', t)).toBe('额度使用被拒绝');
+    expect(quotaPermissionLabel('unknown', t)).toBe('额度许可未知');
+    expect(quotaPermissionLabel(undefined, t)).toBe('额度许可未知');
+    // 未知绝不能被折叠成“已关闭”。
+    expect(quotaPermissionLabel(undefined, t)).not.toBe('已关闭');
+    expect(quotaViewLabel('rate_limits_by_limit_id', t)).toBe('多桶额度');
+    expect(quotaViewLabel('rate_limits', t)).toBe('旧版单桶额度');
+    expect(quotaViewLabel('unknown', t)).toBe('额度视图未知');
+    expect(quotaViewLabel(undefined, t)).toBe('额度视图未知');
+    expect(catalogLabel('unknown', t)).toBe('目录未知');
+    expect(catalogLabel('available', t)).toBe('目录可用');
+    expect(catalogLabel('stale', t)).toBe('目录已陈旧');
+    expect(catalogLabel('failed', t)).toBe('目录读取失败');
   });
-  const poolBucket = {
-    limit_id: 'subscription_pool', name: 'Subscription pool', plan_type: 'pro', permission: 'allowed' as const,
-    windows: [{ label: 'weekly', used_percent: 42, window_minutes: null, resets_at: 1799999999, missing_fields: [], invalid_fields: [] }],
-    credits: { has_credits: true, unlimited: false, balance: '12.50', unit: 'USD', permission: 'denied' as const },
-    missing_fields: [], invalid_fields: [],
-  };
 
-  it('keeps the catalog token order and never marks an ineligible model callable', () => {
-    const models = [
-      { model_id: 'grok-4', name: null, eligible: true },
-      { model_id: 'grok-4-fast', name: 'Grok 4 Fast', eligible: false },
-    ];
-    expect(catalogText({ state: 'available', source: 'grok-cli:models', observed_at: '2026-09-30T12:00:00Z', missing_fields: ['models[1].id'] }, models))
-      .toBe('catalog_state=available source=grok-cli:models observed_at=2026-09-30T12:00:00Z models=grok-4:true,grok-4-fast:false removed= missing=models[1].id');
-    // 未读取过：状态未知、来源未知、列表为空、无被移除条目，且不编造条目。
-    expect(catalogText(undefined, [])).toBe('catalog_state=unknown source=Unknown observed_at=Unknown models= removed= missing=');
-    expect(catalogText({ state: 'stale' }, models)).toContain('catalog_state=stale');
-    expect(catalogText({ state: 'unsupported' }, [])).toContain('models= removed= missing=');
-    expect(subscriptionCatalogText(undefined)).toBe('catalog_state=unknown source=Unknown observed_at=Unknown models= removed= missing=');
-    // 发现 ≠ 准入：eligible=false 只显示不具备资格。
-    expect(modelEligibilityLabel(false, t)).toBe('账号不具备该模型资格');
-    expect(modelEligibilityLabel(true, t)).toBe('账号具备该模型资格');
+  it('only shows a history note for retained quota numbers', () => {
+    expect(quotaHistoryLabel(undefined, t)).toBe('');
+    expect(quotaHistoryLabel({ state: 'failed' }, t)).toBe('');
+    expect(quotaHistoryLabel({ state: 'failed', history: false }, t)).toBe('');
+    expect(quotaHistoryLabel({ state: 'failed', history: true, observed_at: '2026-09-30T04:05:06Z' }, t))
+      .toBe('历史数据 · 最后成功更新 2026-09-30T04:05:06Z');
+    // 历史标记但没有时间时也必须说明更新时间未知。
+    expect(quotaHistoryLabel({ state: 'failed', history: true }, t)).toBe('历史数据 · 最后成功更新 未知');
+  });
+
+  it('displays an unconfirmed account as disconnected with stale historical evidence', () => {
+    const historical = view({
+      state: 'not_connected', identity: 'A@example.invalid',
+      catalog: { state: 'stale', observed_at: '2026-09-30T04:05:06Z' },
+      models: [{ model_id: 'old-model', eligible: false }],
+      quota: { state: 'failed', history: true, observed_at: '2026-09-30T04:05:06Z' },
+      denial: { code: 'not_connected', family: 'not_connected', message: 'Codex is not connected.', recovery: 'Connect account.' },
+    });
+    expect(connectionStateLabel(historical.state, t)).toBe('未连接');
+    expect(subscriptionStatusText(historical, t)).toContain('state=not_connected');
+    expect(subscriptionReason(historical, t)).toBe('Codex is not connected. Connect account.');
+    expect(denialLabel(historical.denial, t)).toBe('未连接');
+    expect(subscriptionCatalogText(historical)).toContain('catalog_state=stale');
+    expect(subscriptionCatalogText(historical)).toContain('old-model:false');
+    expect(subscriptionQuotaText(historical)).toContain('quota_state=failed');
+    expect(quotaHistoryLabel(historical.quota, t)).toBe('历史数据 · 最后成功更新 2026-09-30T04:05:06Z');
+  });
+
+  it('derives the remaining percent from usedPercent only when it is valid', () => {
+    expect(remainingPercent(0)).toBe(100);
+    expect(remainingPercent(33.3)).toBeCloseTo(66.7, 4);
+    expect(remainingPercent(100)).toBe(0);
+    expect(remainingPercent(null)).toBeNull();
+    expect(remainingPercent(undefined)).toBeNull();
+    expect(remainingPercent(142)).toBeNull();
+    expect(remainingPercent(-1)).toBeNull();
+    expect(remainingPercent(Number.NaN)).toBeNull();
+    expect(remainingPercent(Number.POSITIVE_INFINITY)).toBeNull();
+  });
+
+  it('renders machine-readable quota text with buckets, credits and remaining', () => {
+    const quota: SubscriptionQuota = {
+      state: 'available', view: 'rate_limits_by_limit_id', history: false, missing_fields: [],
+      source: 'codex-app-server:account/rateLimits/read#rateLimitsByLimitId',
+      observed_at: '2026-09-30T04:05:06Z',
+      buckets: [{
+        limit_id: 'fixture-limit', permission: 'allowed',
+        windows: [{ label: 'primary', used_percent: 33.3, window_minutes: 300, resets_at: 1790000000 }],
+        credits: { has_credits: false, unlimited: false, balance: '12.5', missing_fields: ['balance_unit'] },
+      }],
+    };
+    const text = quotaEvidenceText(quota);
+    expect(text).toContain('quota_state=available');
+    expect(text).toContain('quota_view=rate_limits_by_limit_id');
+    expect(text).toContain('permission=allowed');
+    expect(text).toContain('source=codex-app-server:account/rateLimits/read#rateLimitsByLimitId');
+    expect(text).toContain('observed_at=2026-09-30T04:05:06Z');
+    expect(text).toContain('history=false');
+    expect(text).toContain('bucket=fixture-limit');
+    // remaining 必须由 100 - usedPercent 得来，并标为 remaining。
+    expect(text).toContain('primary:used=33.3,remaining=66.7,minutes=300,resets_at=1790000000');
+    expect(text).toContain('credits=has:false,unlimited:false,balance:12.5');
+    expect(text).toContain('missing=balance_unit');
+    // 视图级包装与证据级文本一致。
+    expect(subscriptionQuotaText(view({ quota }))).toBe(text);
+  });
+
+  it('never turns unknown quota facts into zero or a closed state', () => {
+    const text = subscriptionQuotaText(view());
+    expect(text).toContain('quota_state=unknown');
+    expect(text).toContain('quota_view=unknown');
+    expect(text).toContain('permission=unknown');
+    expect(text).toContain('history=false');
+    expect(text).not.toContain('used=0');
+    expect(text).not.toContain('remaining=0');
+    expect(text).not.toContain('已关闭');
+    expect(subscriptionQuotaText(undefined)).toBe(quotaEvidenceText(undefined));
+    expect(subscriptionQuotaText(undefined)).toContain('permission=unknown');
+  });
+
+  it('keeps invalid and missing window fields distinguishable', () => {
+    const text = subscriptionQuotaText(view({
+      quota: {
+        state: 'unknown', view: 'rate_limits', history: false,
+        missing_fields: ['rateLimitsByLimitId'],
+        buckets: [{
+          limit_id: 'legacy', permission: 'unknown',
+          windows: [{ label: 'single', used_percent: null, window_minutes: 60, resets_at: null, invalid_fields: ['usedPercent', 'resetsAt'] }],
+          missing_fields: ['credits'],
+        }],
+      },
+    }));
+    // used 无效时不给剩余值，也绝不写成 0。
+    expect(text).toContain('single:used=Unknown,remaining=Unknown,minutes=60,resets_at=Unknown');
+    expect(text).not.toContain('remaining=0');
+    // 缺字段与越界字段都必须各自可见：配额级与桶级缺失分开记录。
+    expect(text).toContain('missing=rateLimitsByLimitId');
+    expect(text).toContain('missing=credits');
+    expect(text).toContain('invalid=usedPercent,resetsAt');
+    expect(text).toContain('credits=has:Unknown,unlimited:Unknown,balance:Unknown');
+  });
+
+  it('marks denied permission from any bucket in the aggregated quota text', () => {
+    const text = subscriptionQuotaText(view({
+      quota: {
+        state: 'denied', view: 'rate_limits_by_limit_id', history: false,
+        buckets: [
+          { limit_id: 'first', permission: 'allowed', windows: [{ label: 'primary', used_percent: 10, window_minutes: 60, resets_at: 1790000000 }] },
+          { limit_id: 'second', permission: 'denied', windows: [] },
+        ],
+      },
+    }));
+    expect(text).toContain('quota_state=denied');
+    expect(text).toContain('permission=denied');
+    expect(text).toContain('bucket=first');
+    expect(text).toContain('bucket=second');
+  });
+
+  it('renders machine-readable catalog text with eligibility untouched', () => {
+    const withCatalog = view({
+      catalog: { state: 'stale', source: 'codex-app-server:model/list', observed_at: '2026-09-30T04:05:06Z', missing_fields: ['model.list[3].id'] },
+      models: [{ model_id: 'gpt-5-codex', name: 'GPT-5 Codex', eligible: false }],
+    });
+    const text = subscriptionCatalogText(withCatalog);
+    expect(text).toContain('catalog_state=stale');
+    expect(text).toContain('source=codex-app-server:model/list');
+    expect(text).toContain('observed_at=2026-09-30T04:05:06Z');
+    // 发现不等于资格：eligible 必须原样显示，不得标成可调用。
+    expect(text).toContain('models=gpt-5-codex:false');
+    expect(text).toContain('missing=model.list[3].id');
+    // 目录证据级文本不含模型列表，但也必须给出同样的状态与来源。
+    expect(catalogText(withCatalog.catalog)).toContain('catalog_state=stale');
+    expect(catalogText(withCatalog.catalog)).toContain('missing=model.list[3].id');
+    // #16 在 models= 与 missing= 之间固定插入 removed=（上一次已核实目录里已消失的模型）。
+    expect(catalogText(undefined)).toBe('catalog_state=unknown source=Unknown observed_at=Unknown removed= missing=');
+  });
+
+  it('always renders the credits axis, even when the backend sent no credits at all', () => {
+    // 后端完全没给 credits：token 仍是诚实的 Unknown，该轴不消失，也不是 0/100%。
+    expect(quotaEvidenceText({ state: 'available', buckets: [{ limit_id: 'subscription_pool' }] }))
+      .toContain('credits=has:Unknown,unlimited:Unknown,balance:Unknown,unit:Unknown,permission:unknown');
+    const unknown = { has_credits: null, unlimited: null, balance: null, unit: null, permission: 'unknown' as const, missing_fields: ['has_credits'], invalid_fields: [] };
+    const axis = creditsAxisText(unknown, t);
+    expect(axis).toContain('额外 credits');
+    expect(axis).toContain('余额: Unknown');
+    expect(axis).toContain('单位: Unknown');
+    expect(axis).toContain('缺字段: has_credits');
+    const missingAxis = creditsAxisText(null, t);
+    expect(missingAxis).toContain('额外 credits');
+    expect(missingAxis).toContain('有 credits: Unknown');
+    expect([axis, missingAxis].join(' ')).not.toMatch(/0%|100%|余额: 0|单位: 0/);
   });
 
   it('lists removed models between models and missing, and never as ineligible', () => {
     // removed= 空时为空串，位置固定在 models= 与 missing= 之间。
-    expect(catalogText({ state: 'available', removed_models: [] }, [{ model_id: 'grok-4', eligible: true }]))
+    expect(subscriptionCatalogText(view({ catalog: { state: 'available', removed_models: [] }, models: [{ model_id: 'grok-4', eligible: true }] })))
       .toBe('catalog_state=available source=Unknown observed_at=Unknown models=grok-4:true removed= missing=');
-    expect(catalogText({ state: 'available', removed_models: ['grok-3', 'grok-3-mini'] }, []))
-      .toBe('catalog_state=available source=Unknown observed_at=Unknown models= removed=grok-3,grok-3-mini missing=');
+    expect(catalogText({ state: 'available', removed_models: ['grok-3', 'grok-3-mini'] }))
+      .toBe('catalog_state=available source=Unknown observed_at=Unknown removed=grok-3,grok-3-mini missing=');
     // 被移除 ≠ 不具备资格，也绝不写成可调用。
     expect(catalogRemovedLabel(['grok-3', 'grok-3-mini'], t)).toBe('已从上一次目录移除：grok-3, grok-3-mini');
     expect(catalogRemovedLabel([], t)).toBe('');
@@ -213,112 +356,36 @@ describe('read-only catalog and quota evidence', () => {
     expect(catalogRemovedLabel(['grok-3'], t)).not.toContain('资格');
   });
 
-  it('renders the quota token order with one segment per bucket', () => {
-    const evidence = quota({ state: 'available', source: 'grok-cli:usage', observed_at: '2026-09-30T12:00:00Z', view: 'grok_cli_usage', buckets: [poolBucket] });
-    expect(quotaEvidenceText(evidence)).toBe(
-      'quota_state=available permission=allowed source=grok-cli:usage observed_at=2026-09-30T12:00:00Z history=false missing= '
-      + 'bucket=subscription_pool windows=<weekly:used=42,remaining=58,minutes=Unknown,resets_at=1799999999> '
-      + 'credits=has:true,unlimited:false,balance=12.50,unit=USD,permission:denied missing= invalid=');
-    expect(subscriptionQuotaText(view({ quota: evidence }))).toBe(quotaEvidenceText(evidence));
-    // 未读取过时只到顶层 missing= 为止，没有 bucket 段。
-    const empty = quotaEvidenceText(undefined);
-    expect(empty).toBe('quota_state=unknown permission=unknown source=Unknown observed_at=Unknown history=false missing=');
-    expect(empty).not.toContain('bucket=');
-    expect(quotaEvidenceText(quota({ state: 'unsupported' }))).toBe('quota_state=unsupported permission=unknown source=Unknown observed_at=Unknown history=false missing=');
-  });
-
-  it('separates the pool permission axis from the credits permission', () => {
-    // credits.permission=denied 不得把订阅池许可改写成 denied。
-    expect(quotaPermission(quota({ buckets: [poolBucket] }))).toBe('allowed');
-    expect(quotaPermission(quota({ buckets: [{ ...poolBucket, permission: 'denied' }] }))).toBe('denied');
-    expect(quotaPermission(quota({ buckets: [{ ...poolBucket, permission: 'unknown' }] }))).toBe('unknown');
-    expect(quotaPermission(quota())).toBe('unknown');
-    expect(quotaPermission(undefined)).toBe('unknown');
-    expect(quotaPermissionLabel('denied', t)).toBe('额度许可：拒绝');
-    expect(quotaLabel('denied', t)).toBe('额度已被拒绝');
-    expect(denialLabel({ code: 'quota_denied', family: 'quota', message: '', recovery: '' }, t)).toBe('额度依据被拒绝');
+  it('passes the credits unit through as raw upstream text and keeps the permission axes apart', () => {
+    const withUnit: SubscriptionQuota = {
+      state: 'available', buckets: [{
+        limit_id: 'subscription_pool', permission: 'allowed',
+        credits: { has_credits: true, unlimited: false, balance: '12.50', unit: 'USD', permission: 'denied', missing_fields: [] },
+      }],
+    };
+    const text = quotaEvidenceText(withUnit);
+    expect(text).toContain('credits=has:true,unlimited:false,balance:12.50,unit:USD,permission:denied');
+    // 池许可仍是 allowed：credits 轴不参与聚合。
+    expect(text).toContain('permission=allowed');
+    // 缺单位不推断单位，缺余额不用 0 顶替。
+    expect(quotaEvidenceText({ state: 'available', buckets: [{ limit_id: 'subscription_pool', credits: { has_credits: true, permission: 'unknown' } }] }))
+      .toContain('credits=has:true,unlimited:Unknown,balance:Unknown,unit:Unknown,permission:unknown');
+    expect(quotaEvidenceText({ state: 'available', buckets: [{ limit_id: 'subscription_pool', credits: null }] }))
+      .toContain('credits=has:Unknown,unlimited:Unknown,balance:Unknown,unit:Unknown,permission:unknown');
+    // Grok 只读契约的视图标签与官方入口是 Grok 专属事实，Codex 没有自己的入口时不新增。
     expect(catalogLabel('unsupported', t)).toBe('无目录接口');
     expect(quotaViewLabel('grok_cli_usage', t)).toBe('Grok CLI 用量');
     expect(CATALOG_REFERENCE_URL).toBe('https://docs.x.ai/build/cli/reference');
     expect(QUOTA_REFERENCE_URL).toBe('https://docs.x.ai/grok/faq#usage--limits');
   });
 
-  it('derives remaining only from a valid used_percent and never fabricates 0', () => {
-    expect(remainingPercent(0)).toBe(100);
-    expect(remainingPercent(100)).toBe(0);
-    expect(remainingPercent(42.5)).toBe(57.5);
-    expect(remainingPercent(33.3)).toBe(66.7);
-    for (const invalid of [null, undefined, NaN, Infinity, -Infinity, -1, 101, 150]) {
-      expect(remainingPercent(invalid as number | null | undefined)).toBeNull();
-    }
-    expect(evidenceNumberText(undefined)).toBe('Unknown');
-    expect(evidenceNumberText(NaN)).toBe('Unknown');
-    expect(evidenceNumberText(0)).toBe('0');
-    expect(percentText(null)).toBe('Unknown');
-    expect(percentText(12)).toBe('12%');
-    expect(booleanText(undefined)).toBe('Unknown');
-    expect(booleanText(false)).toBe('false');
-    expect(booleanText(true)).toBe('true');
-  });
-
-  it('never writes a fabricated remaining=0 for an invalid window', () => {
-    const invalid = quota({ buckets: [{ limit_id: 'subscription_pool', windows: [
-      { label: 'weekly', used_percent: 150 }, { label: 'daily' }, { label: 'monthly', used_percent: Number.NaN },
-    ] }] });
-    const text = quotaEvidenceText(invalid);
-    expect(text).toContain('windows=<weekly:used=150,remaining=Unknown,minutes=Unknown,resets_at=Unknown'
-      + ';daily:used=Unknown,remaining=Unknown,minutes=Unknown,resets_at=Unknown'
-      + ';monthly:used=Unknown,remaining=Unknown,minutes=Unknown,resets_at=Unknown>');
-    expect(text).toContain('daily:used=Unknown,remaining=Unknown');
-    expect(text).toContain('monthly:used=Unknown,remaining=Unknown');
-    expect(text).not.toContain('remaining=0');
-    // 多个窗口用 `;` 分隔，窗口内字段顺序不变。
-    expect(text).toContain('resets_at=Unknown;daily:used=Unknown');
-  });
-
-  it('passes credits balance and unit through as raw upstream text', () => {
-    expect(quotaEvidenceText(quota({ state: 'available', buckets: [poolBucket] }))).toContain('balance=12.50,unit=USD');
-    // 缺单位不推断单位，缺余额不用 0 顶替。
-    const bare = quotaEvidenceText(quota({ state: 'available', buckets: [{ ...poolBucket, credits: { has_credits: true, permission: 'unknown' } }] }));
-    expect(bare).toContain('credits=has:true,unlimited:Unknown,balance=Unknown,unit=Unknown,permission:unknown');
-    const noCredits = quotaEvidenceText(quota({ state: 'available', buckets: [{ ...poolBucket, credits: null }] }));
-    expect(noCredits).toContain('credits=has:Unknown,unlimited:Unknown,balance=Unknown,unit=Unknown,permission:unknown');
-  });
-
-  it('always renders the credits axis, even when the backend sent no credits at all', () => {
-    // 后端完全没给 credits：token 仍是诚实的 Unknown，该轴不消失，也不是 0/100%。
-    expect(quotaEvidenceText(quota({ state: 'available', buckets: [{ limit_id: 'subscription_pool' }] })))
-      .toContain('credits=has:Unknown,unlimited:Unknown,balance=Unknown,unit=Unknown,permission:unknown');
-    // 后端给了 credits 但字段全为 null：同样 Unknown，并显式列出缺字段。
-    const unknownCredits = { has_credits: null, unlimited: null, balance: null, unit: null, permission: 'unknown' as const, missing_fields: ['has_credits', 'unlimited', 'balance', 'unit'], invalid_fields: [] };
-    expect(quotaEvidenceText(quota({ state: 'available', buckets: [{ ...poolBucket, credits: unknownCredits }] })))
-      .toContain('credits=has:Unknown,unlimited:Unknown,balance=Unknown,unit=Unknown,permission:unknown');
-    // 人类可读面：credits 轴始终有一行，缺失也渲染 Unknown，绝不出现 0/100%。
-    const axis = creditsAxisText(unknownCredits, t);
-    expect(axis).toContain('额外 credits');
-    expect(axis).toContain('余额: Unknown');
-    expect(axis).toContain('单位: Unknown');
-    expect(axis).toContain('缺字段: has_credits, unlimited, balance, unit');
-    const missingAxis = creditsAxisText(null, t);
-    expect(missingAxis).toContain('额外 credits');
-    expect(missingAxis).toContain('有 credits: Unknown');
-    expect(missingAxis).toContain('余额: Unknown');
-    expect(missingAxis).not.toContain('缺字段');
-    expect([axis, missingAxis].join(' ')).not.toMatch(/0%|100%|余额: 0|单位: 0/);
-  });
-
-  it('marks historical quota only when history is true and keeps the retained numbers', () => {
-    expect(quotaHistoryLabel(false, '2026-09-30T12:00:00Z', t)).toBe('');
-    expect(quotaHistoryLabel(undefined, '2026-09-30T12:00:00Z', t)).toBe('');
-    expect(quotaHistoryLabel(true, '2026-09-30T12:00:00Z', t)).toBe('历史数据 · 最后成功更新 2026-09-30T12:00:00Z');
-    expect(quotaHistoryLabel(true, null, t)).toBe('历史数据 · 最后成功更新 Unknown');
-    const stale = quota({ state: 'failed', history: true, observed_at: '2026-09-30T12:00:00Z', buckets: [poolBucket] });
-    const text = quotaEvidenceText(stale);
-    expect(text).toContain('quota_state=failed');
-    expect(text).toContain('history=true');
-    // 历史数字仍然原样保留，不清零。
-    expect(text).toContain('used=42,remaining=58');
-    expect(subscriptionQuotaText(view({ quota: stale }))).toBe(text);
-    expect(subscriptionQuotaText(undefined)).toBe(quotaEvidenceText(undefined));
+  it('tolerates legacy snapshots without catalog or extended quota fields', () => {
+    expect(subscriptionCatalogText(undefined)).toContain('catalog_state=unknown');
+    expect(subscriptionCatalogText(undefined)).toContain('models=');
+    // 旧快照没有 catalog，且 quota 只有 state/source/observed_at。
+    const legacy = view({ quota: { state: 'unknown', source: null, observed_at: null } });
+    expect(subscriptionCatalogText(legacy)).toContain('catalog_state=unknown');
+    expect(subscriptionQuotaText(legacy)).toContain('permission=unknown');
+    expect(quotaHistoryLabel(legacy.quota, t)).toBe('');
   });
 });

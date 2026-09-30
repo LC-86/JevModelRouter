@@ -109,11 +109,18 @@ pub struct CatalogEvidence { state: EvidenceState, source: Option<String>, obser
                              removed_models: Vec<String>, missing_fields: Vec<String> }
 ```
 
-- `SubscriptionAdapter::models()` 返回 `CatalogRead`（不再返回裸 `Vec<DiscoveredModel>`）。
+- `SubscriptionAdapter::models()` 返回 `CatalogRead`（不再返回裸 `Vec<DiscoveredModel>`）；
+  `CatalogRead.state` 区分「成功读取」（`Available`）与「该固定版本没有这个机器接口」（`Unsupported`，如实结果而非失败）。
 - `Evidence` 增加 `catalog: CatalogEvidence`；`SubscriptionView` 增加 `catalog`。
-- `refresh()`：先读状态；读到身份与已核实身份不符 → 整体丢弃并报错；读到身份缺失 → 不改写任何证据并报错
-  （不能把已核实身份覆盖成 `None`，也不得把本次目录/额度挂到旧账号名下）。目录与额度**独立读**，任一失败
-  不影响另一项写回；写回前复查 provider 仍在、`generation` 与 `identity` 未变。
+- `refresh()` 沿用 #15/#31 合入 main 的编排与并发保护（本票不另造一套）：
+  - 每次刷新先登记进程内、按服务商递增的刷新序号（`ConfigStore::begin_subscription_refresh`），
+    写回经 `update_subscription_refresh` 校验；被更新的一次刷新抢先时，迟到的只读结果整体丢弃（按服务商，互不串扰）。
+  - **身份不完整**（状态读失败，或读到 `connected` 却没有账号标识）→ 连接归位 `not_connected`、立即阻止准入，
+    但保留同账号同世代的历史：有已核实目录标 `stale`、额度标 `failed` 并只在确有历史数字/时间时 `history=true`；
+    **不发起**本次目录与额度读取。
+  - **明确退出**（辅助进程报未登录）→ 推进世代并清空身份与全部证据。
+  - 读到身份与已核实身份不符 → 整体丢弃并报错；随后目录与额度**独立读**，任一失败不影响另一项写回；
+    写回前复查 provider 仍在、`generation`/`identity`/`state` 未变。
 - `QuotaEvidence`/`Evidence`/`Connection` 不再派生 `Eq`（含 `f64`）。
 
 ## 5. 适配器分派（两家互不冒用）
@@ -170,7 +177,7 @@ impl SubscriptionAdapters {
   `quota_state=<state> permission=<allowed|denied|unknown> source=<str|Unknown> observed_at=<str|Unknown>
   history=<true|false> missing=<csv|空>`，随后每桶一段
   `bucket=<limit_id> windows=<label:used=<n|Unknown>,remaining=<n|Unknown>,minutes=<n|Unknown>,resets_at=<n|Unknown>>
-  credits=has:<bool|Unknown>,unlimited:<bool|Unknown>,balance=<str|Unknown>,unit=<str|Unknown>,permission:<allowed|denied|unknown>
+  credits=has:<bool|Unknown>,unlimited:<bool|Unknown>,balance:<str|Unknown>,unit:<str|Unknown>,permission:<allowed|denied|unknown>
   missing=<csv|空> invalid=<csv|空>`。
   一个桶有多个窗口时用 `;` 分隔（窗口内部字段已用 `,`，`;` 避免歧义）；本票的 Grok 契约每个桶只有一个窗口。
   `remaining` 只由 `100 - used_percent` 推导且仅在 `used_percent` 有效时给出，否则 `Unknown`（不得出现 `remaining=0` 的伪造值）。

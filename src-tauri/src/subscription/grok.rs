@@ -536,6 +536,9 @@ impl SubscriptionAdapter for GrokSubscriptionAdapter {
                 .map(str::to_owned);
             Ok(ConnectionStatus {
                 state: if identity.is_some() { ConnectionState::Connected } else { ConnectionState::NotConnected },
+                // Grok 只读读不到账号事实时一律 Err（由调用方按「身份不完整」处理），
+                // 因此这里不会给出「读到但不完整」的状态。
+                identity_incomplete: false,
                 identity,
                 helper_version: None,
                 account_path: Some(self.provider_home(provider_id).map_err(anyhow::Error::msg)?.display().to_string()),
@@ -1215,6 +1218,7 @@ esac
                 self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Ok(ConnectionStatus {
                     state: ConnectionState::Connected,
+                    identity_incomplete: false,
                     identity: Some("codex@example.invalid".into()),
                     helper_version: Some("9.9.9".into()),
                     account_path: Some("/tmp/codex-home".into()),

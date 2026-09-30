@@ -82,8 +82,10 @@ const reaped = async pids => {
   }
   return false;
 };
-// 每次运行只排练一个登录场景，替身的场景队列与该运行一一对应；替身证据写进独立 JSONL。
-const runDesktop = async ({ label, scenarios, reload = false, loginMode = null, grokScenarios = null }) => {
+// 每次运行只排练一组场景，替身的场景队列与该运行一一对应；替身证据写进独立 JSONL。
+// `reads`（额度）与 `catalog`（目录）各自一条队列：#15 的 catalog 运行用它排练多桶/单桶/缺字段/
+// 越界/拒绝/许可缺失/读取失败等场景；`grokScenarios` 只给 #16 的 Grok 只读替身运行。
+const runDesktop = async ({ label, scenarios, reload = false, loginMode = null, grokScenarios = null, reads = null, catalog = null, accounts = null }) => {
   const helperLog = join(root, `helper-${label}.jsonl`);
   const grokHelperLog = join(root, `grok-helper-${label}.jsonl`);
   const args = ['--autojev-isolated', root, '--autojev-upstream', base, '--autojev-ui-url', `http://127.0.0.1:${uiPort}`, '--autojev-ui-check', base, '--autojev-helper', helper];
@@ -98,6 +100,9 @@ const runDesktop = async ({ label, scenarios, reload = false, loginMode = null, 
     // 冻结名 `AUTOJEV_FAKE_GROK_*` 作为兼容别名带同一份值。
     AUTOJEV_GROK_FAKE_SCENARIOS: grokScenarios, AUTOJEV_GROK_FAKE_LOG: grokHelperLog,
   });
+  if (reads) env.AUTOJEV_FAKE_HELPER_READS = reads;
+  if (catalog) env.AUTOJEV_FAKE_HELPER_CATALOG = catalog;
+  if (accounts) env.AUTOJEV_FAKE_HELPER_ACCOUNTS = accounts;
   const child = spawn(binary, args, { env, stdio: 'pipe' });
   desktop = child;
   let log = ''; child.stdout.on('data', b => { log += b; }); child.stderr.on('data', b => { log += b; });
@@ -158,11 +163,16 @@ try {
   const requestsBeforeGrokRead = requests.length;
   const grokReadRun = await runDesktop({ label: 'grok-read', scenarios: 'success', loginMode: 'grok-read', grokScenarios: grokReadScenarios });
   const grokReadRequests = requests.slice(requestsBeforeGrokRead);
-  const runs = [first, reload, late, failedRun, grokRun, grokReadRun];
+  // #15：目录/额度只读验收。一次运行排练一组队列：登录成功后按刷新次序逐个取场景。
+  const catalogReads = 'multi,single,missing,invalid,denied,bucket-denied,no-permission,null-permission,fail-quota,fail-quota,fail-quota,multi';
+  const catalogScenarios = 'success,legacy,missing,success,success,success,success,success,success,fail-catalog,fail-catalog,success';
+  const catalogRun = await runDesktop({ label: 'catalog', scenarios: 'success', loginMode: 'catalog', reads: catalogReads, catalog: catalogScenarios, accounts: [...Array(11).fill('connected'), 'incomplete', 'connected', 'connected', 'connected', 'signed-out'].join(',') });
+  const runs = [first, reload, late, failedRun, grokRun, grokReadRun, catalogRun];
   const logs = {};
   for (const run of runs) logs[run.label] = await readLog(run.helperLog);
   const allEntries = Object.values(logs).flat();
-  const allowedMethods = new Set(['initialize', 'account/login/start', 'account/login/cancel', 'account/read', 'account/logout']);
+  // #15 新增的两个只读 RPC 与账号方法同属允许集合；生成方法仍必须一个都不出现。
+  const allowedMethods = new Set(['initialize', 'account/login/start', 'account/login/cancel', 'account/read', 'account/logout', 'model/list', 'account/rateLimits/read']);
   assert.ok(allEntries.length > 0, 'The stand-in must have logged its traffic');
   assert.ok(allEntries.some(entry => entry.event === 'request' && entry.method === 'initialize'), 'The stand-in must have been initialized');
   // 官方 app-server 握手：initialize 必须带客户端自述，响应之后再发一条无 id 的 initialized 通知。
@@ -325,6 +335,32 @@ try {
   assert.deepEqual(grokReadObs.grokReadFabrication.fabricated ?? [], [], `The stand-in never supplied a zero/100% value, so none may appear: ${JSON.stringify(grokReadObs.grokReadFabrication)}`);
   assert.equal(grokReadRequests.filter(r => r.body?.model === 'grok-fixture-model' || r.body?.model === 'codex-fixture-model').length, 0, `The Grok stand-in run must not dispatch any subscription model upstream: ${JSON.stringify(grokReadRequests)}`);
   assert.equal(grokReadRequests.filter(r => r.headers['user-agent'] === 'AutoJev/ModelTest').length, 0, `The Grok stand-in run must not run upstream model tests: ${JSON.stringify(grokReadRequests)}`);
+  // #15：替身侧佐证——catalog 运行确实按队列次序、每次刷新各收到一次目录与额度读取，且两者互不串线。
+  // 真正的验收断言在 isolation-check.js 的 catalog 模式里，取自界面稳定文本与后端 snapshot，不依赖这些日志。
+  const readScenariosSeen = logs.catalog.filter(entry => entry.event === 'lifecycle' && entry.action === 'quota-read').map(entry => entry.scenario);
+  const catalogScenariosSeen = logs.catalog.filter(entry => entry.event === 'lifecycle' && entry.action === 'catalog-read').map(entry => entry.scenario);
+  assert.deepEqual(readScenariosSeen, catalogReads.split(','), `The quota queue must be consumed in order: ${JSON.stringify(readScenariosSeen)}`);
+  assert.deepEqual(catalogScenariosSeen, catalogScenarios.split(','), `The catalog queue must be consumed in order: ${JSON.stringify(catalogScenariosSeen)}`);
+  assert.ok(logs.catalog.some(entry => entry.event === 'request' && entry.method === 'model/list'), 'The catalog run must issue model/list');
+  assert.ok(logs.catalog.some(entry => entry.event === 'request' && entry.method === 'account/rateLimits/read'), 'The catalog run must issue account/rateLimits/read');
+  assert.equal(logs.catalog.filter(entry => entry.event === 'request' && entry.method === 'account/login/start').length, 2, 'The catalog run signs in again before testing helper-side disconnect');
+  const accountScenariosSeen = logs.catalog.filter(entry => entry.action === 'account-read').map(entry => entry.scenario);
+  assert.deepEqual(accountScenariosSeen.slice(-5), ['incomplete', 'connected', 'connected', 'connected', 'signed-out']);
+  const incompleteIndex = logs.catalog.findIndex(entry => entry.action === 'account-read' && entry.scenario === 'incomplete');
+  const nextAccountIndex = logs.catalog.findIndex((entry, index) => index > incompleteIndex && entry.action === 'account-read');
+  assert.ok(incompleteIndex >= 0 && nextAccountIndex > incompleteIndex);
+  assert.ok(!logs.catalog.slice(incompleteIndex + 1, nextAccountIndex).some(entry =>
+    entry.method === 'model/list' || entry.method === 'account/rateLimits/read'), 'No new evidence is read for an unconfirmed identity');
+  const helperOutIndex = logs.catalog.findLastIndex(entry => entry.action === 'account-read' && entry.scenario === 'signed-out');
+  const lastCatalogIndex = logs.catalog.findLastIndex(entry => entry.action === 'catalog-read');
+  assert.ok(helperOutIndex > lastCatalogIndex);
+  assert.ok(!logs.catalog.slice(lastCatalogIndex, helperOutIndex).some(entry => entry.method === 'account/logout'),
+    'Helper disconnect is reached by refresh after connected A, with no intervening app logout');
+  const catalogChecks = catalogRun.report.checks || [];
+  for (const [pattern, label] of [['eligible=false', 'eligible=false'], ['permission=denied', 'permission=denied'], ['fail-closed', 'bucket-level fail-closed'], ['stale', 'stale catalog'], ['historical', 'historical quota'], ['invalid', 'invalid fields'], ['missing', 'missing fields'], ['remaining', 'remaining derivation']]) {
+    assert.ok(catalogChecks.some(name => name.includes(pattern)), `The catalog run must assert ${label}: ${JSON.stringify(catalogChecks)}`);
+  }
+  console.log(`Catalog rehearsal scenarios: quota=${JSON.stringify(readScenariosSeen)} catalog=${JSON.stringify(catalogScenariosSeen)}`);
   // 第 6 条：桌面退出后替身子进程被回收，且未波及无关进程。
   const helperPidsSeen = new Set(allEntries.map(entry => entry.pid).filter(Boolean));
   const liveObserved = new Set(runs.flatMap(run => [...run.liveDuringRun]));
@@ -358,7 +394,9 @@ try {
   const allowedUrls = (opener.allow || []).map(entry => entry.url || '');
   assert.ok(allowedUrls.some(url => url.includes('auth.openai.com')), `The OpenAI authorization host must be allowed: ${JSON.stringify(allowedUrls)}`);
   assert.ok(allowedUrls.some(url => url.includes('chatgpt.com')), `The ChatGPT authorization host must be allowed: ${JSON.stringify(allowedUrls)}`);
-  console.log('Authorization-link ACL asserted statically (auth.openai.com, chatgpt.com); the real browser open was NOT executed.');
+  // 只读块的官方查看入口走同一条 openUrl 路径：桌面端必须允许该主机，否则未知/unsupported 的兜底入口实际打不开。
+  assert.ok(allowedUrls.some(url => url.includes('docs.x.ai')), `The Grok reference host must be allowed: ${JSON.stringify(allowedUrls)}`);
+  console.log('Authorization-link ACL asserted statically (auth.openai.com, chatgpt.com, docs.x.ai); the real browser open was NOT executed.');
   console.log(`Native desktop login lifecycle acceptance passed. Fictional evidence: ${root}`);
 } finally {
   await writeFile(join(root, 'requests.json'), JSON.stringify(requests, null, 2));

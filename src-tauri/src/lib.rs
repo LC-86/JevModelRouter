@@ -91,7 +91,8 @@ async fn snapshot(state: &AppState) -> DashboardSnapshot {
     // per-kind：每家订阅服务商只带自己那类适配器的 helper 自述与 availability，
     // Grok 行既拿不到 Codex 的版本/授权目录，也不会借用它的适配器可用性。
     let mut supported: Vec<String> = Vec::new();
-    let mut adapter_available = false;
+    // 全局回落值：本构建是否管理任何订阅辅助进程（per-kind 值在下面逐家覆盖）。
+    let mut adapter_available = state.store.subscription.any_available();
     let mut helpers: std::collections::HashMap<String, subscription::HelperStatus> =
         std::collections::HashMap::new();
     let mut adapters_available: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
