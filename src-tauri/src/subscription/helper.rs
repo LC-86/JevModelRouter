@@ -147,22 +147,28 @@ pub fn redact(text: &str) -> String {
         if index > 0 {
             result.push(' ');
         }
-        if redact_next {
+        let lower = token.to_ascii_lowercase();
+        let scheme_word = lower == "bearer" || lower == "token" || lower == "secret";
+        if redact_next && !scheme_word {
             result.push_str(REDACTED);
             redact_next = false;
             continue;
         }
-        let lower = token.to_ascii_lowercase();
-        if lower == "bearer" || lower == "token" || lower == "secret" {
+        if scheme_word {
+            // 方案词本身不是凭据（例如 `Authorization: Bearer <credential>`）：继续遮盖下一个片段。
             redact_next = true;
             result.push_str(token);
             continue;
         }
-        if let Some((key, separator)) = split_assignment(token) {
+        if let Some((key, separator, value)) = split_assignment(token) {
             if is_secret_key(key) {
                 result.push_str(key);
                 result.push(separator);
                 result.push_str(REDACTED);
+                // 分隔符后带空格时，真正的值在下一个空白片段：一并遮盖。
+                if value.is_empty() {
+                    redact_next = true;
+                }
                 continue;
             }
         }
@@ -175,15 +181,16 @@ pub fn redact(text: &str) -> String {
     result
 }
 
-/// 按第一个 `=` 或 `:` 拆出键名；键名带引号也算，因为 JSON 输出很常见。
-fn split_assignment(token: &str) -> Option<(&str, char)> {
+/// 按第一个 `=` 或 `:` 拆出键名、分隔符与值部分；键名带引号也算，因为 JSON 输出很常见。
+/// 值部分为空表示真正的值在下一个空白片段（例如 `token: secret`）。
+fn split_assignment(token: &str) -> Option<(&str, char, &str)> {
     let index = token.find(['=', ':'])?;
     let (key, rest) = token.split_at(index);
     let separator = rest.chars().next()?;
     if key.is_empty() {
         return None;
     }
-    Some((key, separator))
+    Some((key, separator, &rest[separator.len_utf8()..]))
 }
 
 fn is_secret_key(key: &str) -> bool {
@@ -486,6 +493,21 @@ mod tests {
         assert_eq!(redact("id_token=fixture"), "id_token=[redacted]");
         assert_eq!(redact("client_secret:fixture"), "client_secret:[redacted]");
         assert_eq!(redact("\"refresh_token\":\"fixture\""), "\"refresh_token\":[redacted]");
+        // ②b 分隔符后带空格时，真正的值在下一个片段：同样不得漏出（N1）。
+        for leaked in [
+            "token: shortsecret",
+            "refresh_token: abc123",
+            "device_code: ABCD1234",
+            "access_token: short",
+            "client_secret: abcdefghij0123456789klmn",
+        ] {
+            let redacted = redact(leaked);
+            let value = leaked.split_once(' ').unwrap().1;
+            assert!(!redacted.contains(value), "{leaked} leaked as {redacted}");
+            assert!(redacted.contains("[redacted]"), "{leaked} -> {redacted}");
+        }
+        // 反例：键名不命中 hints 的普通文本不得被遮盖。
+        assert_eq!(redact("note: this is fine"), "note: this is fine");
         // ③ 自由文本里的 >= 32 连续随机串仍遮盖（31 与 23 见 ①）。
         let long_run = "a".repeat(32);
         assert_eq!(redact(&format!("helper said {long_run}")), "helper said [redacted]");
