@@ -1681,13 +1681,23 @@ pub fn views(config: &AppConfig, adapter_available: bool, sessions: &SessionStat
                 logout: session.and_then(|session| session.last_logout.as_ref()).map(LogoutRecord::view),
                 helper: SubscriptionHelperView {
                     available: helper.map(|helper| helper.available).unwrap_or(sessions.helper.available) && supported,
+                    // #35：本服务商有自己的 helper 条目时，元信息原样使用——`None` 保持未知，
+                    // 绝不按字段回退到全局自述（否则 Grok 行会借到 Codex 的版本与授权目录，
+                    // 违反 #12「两家互不冒用」）。只有整条条目缺失（旧调用点尚未填 per-provider
+                    // 自述）时才按既有兼容规则回退全局值，且仍受 `supported` 守卫约束。
                     version: if supported {
-                        helper.and_then(|helper| helper.version.clone()).or_else(|| sessions.helper.version.clone())
+                        match helper {
+                            Some(helper) => helper.version.clone(),
+                            None => sessions.helper.version.clone(),
+                        }
                     } else {
                         None
                     },
                     auth_home: if supported {
-                        helper.and_then(|helper| helper.auth_home.clone()).or_else(|| sessions.helper.auth_home.clone())
+                        match helper {
+                            Some(helper) => helper.auth_home.clone(),
+                            None => sessions.helper.auth_home.clone(),
+                        }
                     } else {
                         None
                     },
@@ -3833,6 +3843,82 @@ mod lifecycle_tests {
         assert_eq!(json["logout"]["local"], "retained");
         assert_eq!(json["logout"]["remote"], "unknown");
         assert!(json["logout"]["observed_at"].is_null());
+    }
+
+    /// #35 的两个订阅服务商配置：codex + grok，只供视图层回退语义测试使用。
+    fn helper_fallback_config() -> AppConfig {
+        let mut config = AppConfig::default();
+        for (id, name, kind) in [
+            ("codex", "Codex", ProviderKind::CodexSubscription),
+            ("grok", "Grok", ProviderKind::GrokSubscription),
+        ] {
+            let provider = Provider {
+                preset: String::new(),
+                api_type: String::new(),
+                test_model: String::new(),
+                id: id.into(),
+                name: name.into(),
+                kind,
+                base_url: String::new(),
+                enabled: true,
+                has_api_key: false,
+            };
+            config.providers.push(provider.clone());
+            sync_provider(&mut config, &provider.id, &provider.kind);
+        }
+        config
+    }
+
+    /// #35：本服务商有自己的 helper 条目时，元信息必须原样使用——全局自述
+    /// （单适配器时代即 Codex 的值）再有值，Grok 行的 `None` 也保持未知，
+    /// Codex 行用条目自己的值，不被全局覆盖（两家互不冒用）。
+    #[test]
+    fn per_provider_helper_entries_never_borrow_the_global_metadata() {
+        let config = helper_fallback_config();
+        let mut sessions = SessionState::default();
+        sessions.helper = HelperStatus {
+            available: true,
+            version: Some("codex-global-9.9".into()),
+            auth_home: Some("/tmp/codex-global-home".into()),
+        };
+        sessions.supported_providers = vec!["codex".into(), "grok".into()];
+        sessions.helpers.insert(
+            "codex".into(),
+            HelperStatus { available: true, version: Some("codex-1.0".into()), auth_home: Some("/tmp/codex-owned-home".into()) },
+        );
+        // Grok 的自述恒把版本与授权目录留未知：探测不拉起进程，证据不绑定官方版本号。
+        sessions.helpers.insert("grok".into(), HelperStatus { available: true, version: None, auth_home: None });
+        let all = views(&config, true, &sessions);
+        let codex = all.iter().find(|view| view.provider_id == "codex").unwrap();
+        let grok = all.iter().find(|view| view.provider_id == "grok").unwrap();
+        assert_eq!(codex.helper.version.as_deref(), Some("codex-1.0"));
+        assert_eq!(codex.helper.auth_home.as_deref(), Some("/tmp/codex-owned-home"));
+        assert!(grok.helper.version.is_none(), "Grok 行不得借全局版本：{:?}", grok.helper.version);
+        assert!(grok.helper.auth_home.is_none(), "Grok 行不得借全局授权目录：{:?}", grok.helper.auth_home);
+        // available 的既有语义不变：条目级值 + supported 守卫。
+        assert!(codex.helper.available && grok.helper.available);
+    }
+
+    /// #35：只有整条 per-provider 映射缺失时才按旧兼容规则回退全局自述；
+    /// 未列入 supported 的行（这里是 Grok）仍然不得借到任何元信息。
+    #[test]
+    fn a_missing_helper_entry_keeps_the_legacy_global_fallback_without_cross_borrowing() {
+        let config = helper_fallback_config();
+        let mut sessions = SessionState::default();
+        sessions.helper = HelperStatus {
+            available: true,
+            version: Some("legacy-1.0".into()),
+            auth_home: Some("/tmp/legacy-home".into()),
+        };
+        // 旧调用点语义：只填 supported 列表，per-provider 映射尚未填充。
+        sessions.supported_providers = vec!["codex".into()];
+        let all = views(&config, true, &sessions);
+        let codex = all.iter().find(|view| view.provider_id == "codex").unwrap();
+        let grok = all.iter().find(|view| view.provider_id == "grok").unwrap();
+        assert_eq!(codex.helper.version.as_deref(), Some("legacy-1.0"));
+        assert_eq!(codex.helper.auth_home.as_deref(), Some("/tmp/legacy-home"));
+        assert!(codex.helper.available);
+        assert!(!grok.helper.available && grok.helper.version.is_none() && grok.helper.auth_home.is_none());
     }
 
     #[tokio::test]
