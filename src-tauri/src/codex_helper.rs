@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 
 use crate::config::ProviderKind;
 use crate::subscription::{
-    ConnectionState, ConnectionStatus, DiscoveredModel, GenerationRequest, GenerationStream, HelperStatus,
+    CatalogRead, ConnectionState, ConnectionStatus, GenerationRequest, GenerationStream, HelperStatus,
     LoginResult, LoginStart, LogoutOutcome, QuotaEvidence, RemoteRevocation, SubscriptionAdapter,
 };
 
@@ -637,7 +637,7 @@ impl SubscriptionAdapter for CodexAdapter {
     }
 
     /// 模型目录与额度读取属于后续票据；这里如实报“尚未实现”，不编造证据。
-    fn models<'a>(&'a self, _provider_id: &'a str, _generation: u64) -> futures_util::future::BoxFuture<'a, Result<Vec<DiscoveredModel>>> {
+    fn models<'a>(&'a self, _provider_id: &'a str, _generation: u64) -> futures_util::future::BoxFuture<'a, Result<CatalogRead>> {
         Box::pin(async { bail!("Codex helper directory reads are not implemented in this build") })
     }
 

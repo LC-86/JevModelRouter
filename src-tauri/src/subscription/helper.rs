@@ -140,6 +140,54 @@ pub(crate) fn spec_with_program(
     Ok(HelperSpec { program: program.to_path_buf(), args, env: helper_env(&home), home })
 }
 
+/// 只读读取的子命令（本应用的适配约定，未对真实 CLI 验证）。
+/// 登录路径固定是 `DEFAULT_ARGS = ["login"]`，这里的三条只读子命令绝不落到登录上。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReadCommand {
+    /// 当前辅助进程 home 里的账号标识：供 `status()` 使用。
+    Account,
+    /// 模型目录。
+    Models,
+    /// 订阅池与额外 credits。
+    Usage,
+}
+
+impl ReadCommand {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            ReadCommand::Account => "account",
+            ReadCommand::Models => "models",
+            ReadCommand::Usage => "usage",
+        }
+    }
+
+    /// 该读取对应的机器接口名：`unsupported` 事件靠它认领，只有同名接口才算本次读取的终态。
+    pub(crate) fn interface(self) -> &'static str {
+        match self {
+            ReadCommand::Account => "account",
+            ReadCommand::Models => "catalog",
+            ReadCommand::Usage => "quota",
+        }
+    }
+}
+
+/// 组装一次只读读取的启动 spec：argv = `extra_args… <subcommand> --json`。
+/// 程序、专用 home 与环境白名单都与登录路径共用，但参数里没有 `login`。
+pub(crate) fn read_spec_with_program(
+    kind: &ProviderKind,
+    provider_id: &str,
+    home_dir: &Path,
+    program: &Path,
+    extra_args: &[String],
+    command: ReadCommand,
+) -> Result<HelperSpec> {
+    let home = helper_home(kind, provider_id, home_dir)?;
+    let mut args = extra_args.to_vec();
+    args.push(command.as_str().to_owned());
+    args.push("--json".into());
+    Ok(HelperSpec { program: program.to_path_buf(), args, env: helper_env(&home), home })
+}
+
 /// `env_clear()` 之后唯一允许进入辅助进程的环境：基础运行变量 + `AUTOJEV_GROK_*` + `GROK_HOME`/`HOME`。
 /// `HOME` 也指向应用自有 home：即使真实 CLI 只认 `HOME`，也不会落到日常 `~/.grok`。
 /// 只透传本应用为该辅助进程显式定义的前缀：任意 `AUTOJEV_*` 都可能把真实 home 或其它来源带进辅助进程。
@@ -400,6 +448,28 @@ impl OwnedProcesses {
     /// 拉起辅助进程并登记 pid。隔离验证环境直接拒绝，绝不拉起真实进程。
     pub fn spawn(&self, provider_id: &str, spec: &HelperSpec) -> Result<u32> {
         ensure_spawn_allowed(crate::runtime::isolated())?;
+        self.spawn_registered(provider_id, spec)
+    }
+
+    /// 隔离验收专用的 pinned 拉起入口：只允许拉起 [`crate::runtime::grok_helper_override`]
+    /// 给出的那一个可执行文件（Grok **只读**读取的替身）。
+    ///
+    /// 通用 [`Self::spawn`] 的隔离守卫保持不变：这里不放宽隔离边界，而是把例外收紧到
+    /// 「隔离构建 + 显式 `--autojev-grok-helper` + 程序路径逐字相等」三者同时成立。
+    /// Grok 登录路径（`GrokCliAuth`）绝不使用本入口，隔离下登录仍然拒绝。
+    pub fn spawn_pinned(&self, provider_id: &str, spec: &HelperSpec) -> Result<u32> {
+        let pinned = crate::runtime::grok_helper_override().context(
+            "A pinned Grok helper is only available in isolated validation with --autojev-grok-helper",
+        )?;
+        ensure!(
+            spec.program == pinned,
+            "The pinned Grok helper must be the executable passed to --autojev-grok-helper"
+        );
+        self.spawn_registered(provider_id, spec)
+    }
+
+    /// 拉起并登记：调用方必须已经完成各自的守卫（通用隔离守卫或 pinned 校验）。
+    fn spawn_registered(&self, provider_id: &str, spec: &HelperSpec) -> Result<u32> {
         let mut command = Command::new(&spec.program);
         command
             .args(&spec.args)
@@ -504,6 +574,29 @@ mod tests {
 
     fn grok() -> ProviderKind {
         ProviderKind::GrokSubscription
+    }
+
+    /// pinned 拉起入口只有在隔离验收显式给了替身时才可用；通用隔离守卫不因此放宽。
+    #[test]
+    fn spawn_pinned_requires_the_explicit_isolation_override() {
+        let processes = OwnedProcesses::new();
+        let spec = HelperSpec {
+            program: PathBuf::from("/tmp/not-a-real-grok-helper"),
+            args: vec!["models".into(), "--json".into()],
+            env: Vec::new(),
+            home: std::env::temp_dir(),
+        };
+        let error = processes.spawn_pinned("grok", &spec).unwrap_err().to_string();
+        assert!(error.contains("--autojev-grok-helper"), "{error}");
+        // 通用入口本身没有被放宽：非隔离构建里照常拉起（隔离构建里仍由 ensure_spawn_allowed 拒绝）。
+        let real = HelperSpec {
+            program: PathBuf::from("/bin/sh"),
+            args: vec!["-c".into(), "exit 0".into()],
+            env: Vec::new(),
+            home: std::env::temp_dir(),
+        };
+        let pid = processes.spawn("grok", &real).unwrap();
+        assert!(processes.reclaim_pid(pid));
     }
 
     #[test]

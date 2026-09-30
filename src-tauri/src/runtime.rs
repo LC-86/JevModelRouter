@@ -12,6 +12,10 @@ static GATEWAY_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16
 /// `--autojev-helper <path>` 只在 isolation-check 构建里存在；生产二进制没有这个开关。
 #[cfg(feature = "isolation-check")]
 static HELPER_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
+/// `--autojev-grok-helper <path>`：Grok **只读**读取的隔离替身，同样只在 isolation-check 构建里存在。
+/// 它不适用于 Grok 登录路径（`GrokCliAuth`）：隔离下登录仍必须拒绝。
+#[cfg(feature = "isolation-check")]
+static GROK_HELPER_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 
 pub fn init() -> Result<()> {
     let args: Vec<_> = std::env::args_os().collect();
@@ -59,6 +63,27 @@ pub fn init() -> Result<()> {
             "--autojev-helper must point at an existing helper executable"
         );
         HELPER_OVERRIDE
+            .set(path)
+            .map_err(|_| anyhow::anyhow!("Isolation already initialized"))?;
+    }
+    #[cfg(feature = "isolation-check")]
+    if let Some(index) = args.iter().position(|arg| arg == "--autojev-grok-helper") {
+        // 与 --autojev-helper 同一套约束：只在隔离验收里、必须是绝对路径的真实文件。
+        // 这条开关只服务 Grok 只读读取；Grok 登录路径绝不使用它。
+        ensure!(
+            isolated(),
+            "--autojev-grok-helper requires --autojev-isolated"
+        );
+        let path = PathBuf::from(
+            args.get(index + 1)
+                .context("--autojev-grok-helper requires an absolute path")?,
+        );
+        ensure!(path.is_absolute(), "--autojev-grok-helper requires an absolute path");
+        ensure!(
+            path.is_file(),
+            "--autojev-grok-helper must point at an existing helper executable"
+        );
+        GROK_HELPER_OVERRIDE
             .set(path)
             .map_err(|_| anyhow::anyhow!("Isolation already initialized"))?;
     }
@@ -126,6 +151,19 @@ pub fn isolated() -> bool {
 #[cfg(feature = "isolation-check")]
 pub fn helper_override() -> Option<&'static Path> {
     HELPER_OVERRIDE.get().map(PathBuf::as_path)
+}
+
+/// 隔离验收显式指定的 Grok 只读替身；生产构建里这个入口不存在（恒为 `None`）。
+/// 它只允许 Grok 只读读取在隔离下拉起这一个可执行文件，绝不放开登录路径或通用拉起守卫。
+#[cfg(feature = "isolation-check")]
+pub fn grok_helper_override() -> Option<&'static Path> {
+    GROK_HELPER_OVERRIDE.get().map(PathBuf::as_path)
+}
+
+/// 非隔离验收构建（含生产）没有 pinned Grok 只读替身：隔离下的 Grok 只读仍然如实拒绝。
+#[cfg(not(feature = "isolation-check"))]
+pub fn grok_helper_override() -> Option<&'static Path> {
+    None
 }
 pub fn home_dir() -> Option<PathBuf> {
     ISOLATION_ROOT.get().cloned().or_else(dirs::home_dir)

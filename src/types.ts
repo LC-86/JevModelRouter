@@ -56,7 +56,12 @@ export interface ProxyStatus {
 
 export type SubscriptionConnectionState = 'not_connected' | 'authorization_pending' | 'connected' | 'expired';
 export type SubscriptionCapabilityStatus = 'unverified' | 'verified' | 'unsupported';
-export type SubscriptionEvidenceState = 'unknown' | 'available' | 'stale' | 'failed' | 'unsupported';
+export type SubscriptionEvidenceState = 'unknown' | 'available' | 'stale' | 'failed' | 'unsupported' | 'denied';
+/** 目录证据没有 `denied`：目录是发现，不是资格判定（契约 §6）。 */
+export type SubscriptionCatalogState = 'unknown' | 'available' | 'stale' | 'failed' | 'unsupported';
+export type SubscriptionQuotaPermission = 'unknown' | 'allowed' | 'denied';
+/** 额度视图来源：标明证据实际消费的机器接口，不混用交互界面或通用用量字段。 */
+export type SubscriptionQuotaView = 'unknown' | 'rate_limits_by_limit_id' | 'rate_limits' | 'grok_cli_usage';
 
 export type SubscriptionLoginStage = 'idle' | 'pending' | 'completed' | 'failed' | 'cancelled';
 export type SubscriptionLocalClearing = 'cleared' | 'retained';
@@ -88,7 +93,55 @@ export interface SubscriptionHelperView {
 
 export interface SubscriptionModel { model_id: string; name?: string | null; eligible: boolean }
 export interface SubscriptionCapability { model_id: string; protocol: string; status: SubscriptionCapabilityStatus }
-export interface SubscriptionQuota { state: SubscriptionEvidenceState; source?: string | null; observed_at?: string | null }
+/** 只读目录证据：只记录来源、时间与缺失字段；模型条目仍由 `SubscriptionView.models` 承载。 */
+export interface SubscriptionCatalogEvidence {
+  state: SubscriptionCatalogState;
+  source?: string | null;
+  observed_at?: string | null;
+  /** 上一次目录里有、这次整次替换后不再出现的模型 id；这不是「不具备资格」。 */
+  removed_models?: string[];
+  missing_fields?: string[];
+}
+/** 一个额度窗口；`used_percent` 只在后端核实有效时才有值，界面不得用 0/100% 顶替。 */
+export interface SubscriptionQuotaWindow {
+  label: string;
+  used_percent?: number | null;
+  window_minutes?: number | null;
+  resets_at?: number | null;
+  missing_fields?: string[];
+  invalid_fields?: string[];
+}
+/** 额外 credits：`balance`/`unit` 是上游原文，界面只原样展示，不解析、不换算、不推断单位。 */
+export interface SubscriptionQuotaCredits {
+  has_credits?: boolean | null;
+  unlimited?: boolean | null;
+  balance?: string | null;
+  unit?: string | null;
+  permission?: SubscriptionQuotaPermission;
+  missing_fields?: string[];
+  invalid_fields?: string[];
+}
+/** 一个额度桶：订阅池（windows）与额外 credits 是两个不同的计量轴，互不推导。 */
+export interface SubscriptionQuotaBucket {
+  limit_id: string;
+  name?: string | null;
+  plan_type?: string | null;
+  windows?: SubscriptionQuotaWindow[];
+  credits?: SubscriptionQuotaCredits | null;
+  permission?: SubscriptionQuotaPermission;
+  missing_fields?: string[];
+  invalid_fields?: string[];
+}
+export interface SubscriptionQuota {
+  state: SubscriptionEvidenceState;
+  source?: string | null;
+  observed_at?: string | null;
+  view?: SubscriptionQuotaView;
+  buckets?: SubscriptionQuotaBucket[];
+  missing_fields?: string[];
+  /** 额度读取失败但确实保留了上一次数字/时间时为 true；界面必须显式标注历史数据。 */
+  history?: boolean;
+}
 /** 准入拒绝：稳定 code、类别、原因与恢复动作。 */
 export interface SubscriptionDenial { code: string; family: string; message: string; recovery: string }
 /** 一家订阅服务商的实际状态、只读证据与当前拒绝原因。 */
@@ -103,6 +156,8 @@ export interface SubscriptionView {
   models: SubscriptionModel[];
   capabilities: SubscriptionCapability[];
   quota: SubscriptionQuota;
+  /** 只读目录证据；缺失即未知，不按 `models` 反推。 */
+  catalog?: SubscriptionCatalogEvidence | null;
   denial?: SubscriptionDenial | null;
   adapter_available: boolean;
   login?: SubscriptionLoginView | null;

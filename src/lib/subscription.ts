@@ -1,7 +1,9 @@
 import type {
   DashboardSnapshot, Provider, ProviderKind, SubscriptionAuthError, SubscriptionAuthPhase, SubscriptionAuthView,
-  SubscriptionCapabilityStatus, SubscriptionConnectionState, SubscriptionDenial, SubscriptionEvidenceState,
-  SubscriptionLocalClearing, SubscriptionLocalLogoutState, SubscriptionLoginStage, SubscriptionRemoteRevocation,
+  SubscriptionCapabilityStatus, SubscriptionCatalogEvidence, SubscriptionCatalogState, SubscriptionConnectionState,
+  SubscriptionDenial, SubscriptionEvidenceState, SubscriptionLocalClearing, SubscriptionLocalLogoutState,
+  SubscriptionLoginStage, SubscriptionModel, SubscriptionQuota, SubscriptionQuotaBucket, SubscriptionQuotaCredits,
+  SubscriptionQuotaPermission, SubscriptionQuotaView, SubscriptionQuotaWindow, SubscriptionRemoteRevocation,
   SubscriptionRemoteRevokeState, SubscriptionView,
 } from '../types';
 import type { Translate } from './preferences-context';
@@ -46,6 +48,7 @@ export function quotaLabel(state: SubscriptionEvidenceState, t: Translate): stri
     stale: 'Quota evidence stale',
     failed: 'Quota read failed',
     unsupported: 'No quota interface',
+    denied: 'Quota denied',
   }[state]);
 }
 
@@ -58,6 +61,183 @@ export function protocolKey(endpoint: string): string {
   if (endpoint === 'responses') return 'responses';
   if (endpoint === 'messages') return 'messages';
   return 'chat_completions';
+}
+
+/** 官方查看入口：只供人工查看当前支持情况，绝不作为绕过准入的依据。 */
+export const CATALOG_REFERENCE_URL = 'https://docs.x.ai/build/cli/reference';
+export const QUOTA_REFERENCE_URL = 'https://docs.x.ai/grok/faq#usage--limits';
+
+export function catalogLabel(state: SubscriptionCatalogState, t: Translate): string {
+  return t({
+    unknown: 'Catalog unknown',
+    available: 'Catalog available',
+    stale: 'Catalog evidence stale',
+    failed: 'Catalog read failed',
+    unsupported: 'No catalog interface',
+  }[state]);
+}
+
+export function quotaPermissionLabel(permission: SubscriptionQuotaPermission, t: Translate): string {
+  return t({
+    unknown: 'Quota permission unknown',
+    allowed: 'Quota permission allowed',
+    denied: 'Quota permission denied',
+  }[permission]);
+}
+
+export function quotaViewLabel(view: SubscriptionQuotaView, t: Translate): string {
+  return t({
+    unknown: 'Quota view unknown',
+    rate_limits_by_limit_id: 'Rate limits by limit id',
+    rate_limits: 'Rate limits',
+    grok_cli_usage: 'Grok CLI usage',
+  }[view]);
+}
+
+/** 历史数据必须显式标注；`history` 不是 `true` 就不出这句话，也不清零保留的数字。 */
+export function quotaHistoryLabel(history: boolean | null | undefined, observedAt: string | null | undefined, t: Translate): string {
+  if (history !== true) return '';
+  return t('Historical data · last successful update {observed_at}', { observed_at: knownOrUnknown(observedAt) });
+}
+
+/** 剩余额度只由有效 `used_percent` 推导；缺失、NaN/Infinity、越界一律 null，绝不回退成 0。 */
+export function remainingPercent(usedPercent: number | null | undefined): number | null {
+  if (usedPercent == null || !Number.isFinite(usedPercent)) return null;
+  if (usedPercent < 0 || usedPercent > 100) return null;
+  return Number((100 - usedPercent).toPrecision(12));
+}
+
+/** 数值 token：缺失或非有限数值一律 `Unknown`，不用 0 顶替。 */
+export function evidenceNumberText(value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(value)) return 'Unknown';
+  return String(value);
+}
+
+/** 布尔 token：非布尔（缺失/null）一律 `Unknown`，不把缺失当成 false。 */
+export function booleanText(value: boolean | null | undefined): string {
+  if (typeof value !== 'boolean') return 'Unknown';
+  return value ? 'true' : 'false';
+}
+
+/** 百分比展示：未知不加 `%` 后缀，避免看起来像已核实的数字。 */
+export function percentText(value: number | null | undefined): string {
+  const text = evidenceNumberText(value);
+  return text === 'Unknown' ? text : `${text}%`;
+}
+
+/**
+ * 桶级许可聚合：任一桶 denied → denied；全部桶 allowed → allowed；其余（含空桶）unknown。
+ * 与后端契约 B 的额度状态规则同向，且不把 `credits.permission` 混进这个计量轴。
+ */
+export function quotaPermission(quota: SubscriptionQuota | undefined): SubscriptionQuotaPermission {
+  const buckets = quota?.buckets ?? [];
+  if (buckets.some(bucket => (bucket.permission ?? 'unknown') === 'denied')) return 'denied';
+  if (buckets.length > 0 && buckets.every(bucket => bucket.permission === 'allowed')) return 'allowed';
+  return 'unknown';
+}
+
+/** 目录条目的资格文案：资格只来自后端证据；`eligible=false` 只说明不具备资格，绝不等同可调用。 */
+export function modelEligibilityLabel(eligible: boolean, t: Translate): string {
+  return eligible ? t('Eligible for this account') : t('Not eligible for this account');
+}
+
+function csv(fields: string[] | null | undefined): string {
+  return (fields ?? []).join(',');
+}
+
+/**
+ * 目录 node 的稳定机器文本（契约 §7）：token 顺序即契约，界面不得重排或插入本地化文案。
+ * `models` 只输出 `model_id:eligible`，目录发现不等于可调用；`removed` 是这次整次替换后消失的模型。
+ */
+export function catalogText(catalog: SubscriptionCatalogEvidence | undefined, models: SubscriptionModel[]): string {
+  const entries = models.map(model => `${model.model_id}:${model.eligible ? 'true' : 'false'}`);
+  return [
+    `catalog_state=${catalog?.state ?? 'unknown'}`,
+    `source=${knownOrUnknown(catalog?.source)}`,
+    `observed_at=${knownOrUnknown(catalog?.observed_at)}`,
+    `models=${entries.join(',')}`,
+    `removed=${csv(catalog?.removed_models)}`,
+    `missing=${csv(catalog?.missing_fields)}`,
+  ].join(' ');
+}
+
+/** 被移除的模型只说明「这次目录里没有了」，绝不写成不具备资格；为空时不出这一行。 */
+export function catalogRemovedLabel(removed: string[] | null | undefined, t: Translate): string {
+  const ids = (removed ?? []).map(id => id.trim()).filter(id => id.length > 0);
+  if (ids.length === 0) return '';
+  return t('Removed from the previous catalog: {models}', { models: ids.join(', ') });
+}
+
+export function subscriptionCatalogText(view: SubscriptionView | undefined): string {
+  return catalogText(view?.catalog ?? undefined, view?.models ?? []);
+}
+
+function windowText(window: SubscriptionQuotaWindow): string {
+  return [
+    `${window.label}:used=${evidenceNumberText(window.used_percent)}`,
+    `remaining=${evidenceNumberText(remainingPercent(window.used_percent))}`,
+    `minutes=${evidenceNumberText(window.window_minutes)}`,
+    `resets_at=${evidenceNumberText(window.resets_at)}`,
+  ].join(',');
+}
+
+/** credits 两个轴分开：balance/unit 是上游原文，permission 只是该 credits 的许可，不参与额度状态判定。 */
+function creditsText(credits: SubscriptionQuotaCredits | null | undefined): string {
+  return [
+    `has:${booleanText(credits?.has_credits)}`,
+    `unlimited:${booleanText(credits?.unlimited)}`,
+    `balance=${knownOrUnknown(credits?.balance)}`,
+    `unit=${knownOrUnknown(credits?.unit)}`,
+    `permission:${credits?.permission ?? 'unknown'}`,
+  ].join(',');
+}
+
+/**
+ * credits 轴的人类可读文本：后端完全没给 credits（null/undefined）时也要渲染一行诚实未知，
+ * 绝不整段消失；未知字段一律 `Unknown`，不出现 0/100% 之类的伪造值。
+ */
+export function creditsAxisText(credits: SubscriptionQuotaCredits | null | undefined, t: Translate): string {
+  const parts = [
+    `${t('Has credits')}: ${booleanText(credits?.has_credits)}`,
+    `${t('Unlimited')}: ${booleanText(credits?.unlimited)}`,
+    `${t('Balance')}: ${knownOrUnknown(credits?.balance)}`,
+    `${t('Unit')}: ${knownOrUnknown(credits?.unit)}`,
+    quotaPermissionLabel(credits?.permission ?? 'unknown', t),
+  ];
+  const missing = credits?.missing_fields ?? [];
+  const invalid = credits?.invalid_fields ?? [];
+  if (missing.length > 0) parts.push(`${t('Missing fields')}: ${missing.join(', ')}`);
+  if (invalid.length > 0) parts.push(`${t('Invalid fields')}: ${invalid.join(', ')}`);
+  return `${t('Credits')} · ${parts.join(' · ')}`;
+}
+
+function bucketText(bucket: SubscriptionQuotaBucket): string {
+  const windows = (bucket.windows ?? []).map(windowText).join(';');
+  return [
+    `bucket=${bucket.limit_id}`,
+    `windows=<${windows}>`,
+    `credits=${creditsText(bucket.credits)}`,
+    `missing=${csv(bucket.missing_fields)}`,
+    `invalid=${csv(bucket.invalid_fields)}`,
+  ].join(' ');
+}
+
+/** 额度 node 的稳定机器文本（契约 §7）：未读取过时只到顶层 `missing=` 为止，没有 bucket 段。 */
+export function quotaEvidenceText(quota: SubscriptionQuota | undefined): string {
+  const parts = [
+    `quota_state=${quota?.state ?? 'unknown'}`,
+    `permission=${quotaPermission(quota)}`,
+    `source=${knownOrUnknown(quota?.source)}`,
+    `observed_at=${knownOrUnknown(quota?.observed_at)}`,
+    `history=${quota?.history === true ? 'true' : 'false'}`,
+    `missing=${csv(quota?.missing_fields)}`,
+  ];
+  for (const bucket of quota?.buckets ?? []) parts.push(bucketText(bucket));
+  return parts.join(' ');
+}
+
+export function subscriptionQuotaText(view: SubscriptionView | undefined): string {
+  return quotaEvidenceText(view?.quota);
 }
 
 /** 完整原因文本（后端英文原文），用作提示与日志详情。 */
@@ -86,6 +266,7 @@ export function denialLabel(denial: SubscriptionDenial | null | undefined, t: Tr
     quota_stale: 'Quota basis stale',
     quota_failed: 'Quota read failed',
     quota_unsupported: 'No quota interface',
+    quota_denied: 'Quota basis denied',
   }[denial.code] ?? denial.code);
 }
 

@@ -366,6 +366,21 @@ input, select, textarea { width: 100%; border: 1px solid var(--line-light); back
 .provider-subscription-logout { color: var(--muted); font-size: 11px; line-height: 1.5; }
 .subscription-action { font-size: 11px; margin-left: 4px; }
 .provider-subscription-reason { color: var(--muted); font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
+.provider-subscription-evidence { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--line); }
+.provider-subscription-evidence-state { color: var(--muted); font-family: var(--mono); font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
+.provider-subscription-evidence-line, .provider-subscription-window { color: var(--muted); font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
+.provider-subscription-evidence-line code, .provider-subscription-window code { color: var(--text); font-size: 11px; }
+.provider-subscription-evidence-note { color: var(--faint); font-size: 11px; line-height: 1.5; }
+.provider-subscription-evidence-missing { color: var(--yellow); font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
+.provider-subscription-history { color: var(--yellow); font-size: 11px; line-height: 1.5; }
+/* 被移除 != 不具备资格：用中性提示色，与资格警告区分。 */
+.provider-subscription-removed { color: var(--faint); font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
+.provider-subscription-models { display: flex; flex-wrap: wrap; gap: 4px 10px; margin: 0; padding: 0; list-style: none; }
+.provider-subscription-models li { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; }
+.provider-subscription-eligible.on { color: var(--green); }
+.provider-subscription-eligible.off { color: var(--yellow); }
+.provider-subscription-bucket { display: flex; flex-direction: column; gap: 4px; padding-left: 8px; border-left: 2px solid var(--line); }
+.provider-subscription-reference { font-size: 11px; overflow-wrap: anywhere; }
 .subscription-provider-note { display: flex; align-items: flex-start; gap: 8px; color: var(--muted); }
 .subscription-provider-note svg { flex-shrink: 0; margin-top: 2px; }
 .subscription-provider-note .provider-test-help { margin: 0; }
