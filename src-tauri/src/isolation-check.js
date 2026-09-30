@@ -21,6 +21,15 @@
     try { await invoke(command, args); throw new Error('Unexpected success'); }
     catch (error) { check(String(error).includes(text), `${command}: ${error}`); }
   };
+  // 接受多个可接受的错误关键词，但“意外成功”永远判失败。
+  const rejectedAny = async (command, args, texts) => {
+    try { await invoke(command, args); throw new Error('Unexpected success'); }
+    catch (error) {
+      if (String(error) === 'Unexpected success') throw error;
+      check(texts.some(text => String(error).includes(text)), `${command}: ${error}`);
+    }
+  };
+
   const providerId = 'codex-subscription';
   const grokProviderId = 'grok-subscription';
   const statusTextFor = id => document.querySelector(`[data-testid="sub-status-${id}"]`)?.textContent || '';
@@ -164,19 +173,29 @@
       passed('a restarted desktop reconciles the orphaned pending sign-in and can sign in again');
     }
     if (mode === 'grok') {
-      // #12 边界：Grok 登录未实现，必须得到明确错误，且不拉起 Codex 替身、不改动任何连接。
+      // Grok 由本票的授权对话框承载（订阅行按 kind 分派后，Grok 行不再有 #13 的动作按钮）：
+      // 入口在 Grok 行内，拒绝原因只出现在该行的对话框里，行内不再显示错误文本。
       const grok = await wait(async () => (await grokView()) || null, 'grok view');
       const codexBefore = await subscriptionView();
       check(grok.state === 'not_connected', `Grok rehearsal needs an unconnected Grok row: ${grok.state}`);
       check(grok.helper?.available !== true && !grok.helper?.version && !grok.helper?.auth_home, `The Grok row must report an unavailable helper: ${JSON.stringify(grok.helper)}`);
       const grokText = await waitStatusFor(grokProviderId, text => text.includes('helper=Unknown') && text.includes('auth_home=Unknown'));
       record('grokStart', { state: grok.state, generation: grok.generation, login: grok.login, helper: grok.helper ?? null, status: grokText, codexBefore: { state: codexBefore.state, generation: codexBefore.generation, identity: codexBefore.identity ?? null } });
-      await click(`[data-testid="sub-login-${grokProviderId}"]`);
-      const rowError = await wait(() => {
+      const grokEntry = await wait(() => {
         const row = [...document.querySelectorAll('tbody tr')].find(item => item.textContent.includes(grokProviderId));
-        const text = row?.textContent || '';
-        return /not implemented|unsupported|not supported/i.test(text) ? text : null;
-      }, 'grok sign-in error in row');
+        return row?.querySelector('.subscription-auth-entry:not([disabled])') ?? null;
+      }, 'grok subscription sign-in entry');
+      grokEntry.click();
+      const grokDialog = () => {
+        const dialog = document.querySelector('.subscription-auth-dialog');
+        return dialog && dialog.textContent.includes(grokProviderId) ? dialog : null;
+      };
+      await wait(grokDialog, 'grok subscription auth dialog');
+      await click('.subscription-auth-dialog .subscription-auth-begin');
+      const rowError = await wait(() => {
+        const text = grokDialog()?.querySelector('.subscription-auth-error')?.textContent?.trim();
+        return text && /not implemented|unsupported|not supported/i.test(text) ? text : null;
+      }, 'grok sign-in error in dialog');
       const directError = await invoke('begin_subscription_login', { providerId: grokProviderId }).then(() => { throw new Error('Grok sign-in must be rejected'); }, error => String(error));
       check(/grok/i.test(directError) && /not implemented|unsupported|not supported/i.test(directError), `Grok sign-in must fail with a clear message: ${directError}`);
       const grokAfter = await wait(async () => (await grokView()) || null, 'grok view after rejection');
@@ -187,6 +206,8 @@
       record('grokRejected', { rowError: rowError.slice(-500), directError, after: { state: grokAfter.state, generation: grokAfter.generation, login: grokAfter.login }, codex: { state: codexAfter.state, generation: codexAfter.generation } });
       passed('an unsupported Grok sign-in is rejected with a clear error and changes nothing');
       passed('the Codex row is unaffected by the rejected Grok sign-in');
+      await click('.subscription-auth-dialog .subscription-auth-footer button.primary');
+      await wait(() => !grokDialog(), 'grok subscription auth dialog closed');
     }
   };
   try {
@@ -287,6 +308,65 @@
       const denied = await wait(async () => { const v = await invoke('get_model_performance'); return !v.job.running && v.job.completed === 3 && v; });
       check(/not connected/i.test(denied.job.error || ''), `Subscription speed test must report the reason: ${denied.job.error}`);
       passed('subscription generation denied without upstream work');
+      // 订阅授权视图：不得借用适配器 helper 的自述、不得伪造远端撤销或本地清除。
+      // Codex 的登录由 #13 的适配器替身在隔离环境里承载，因此这里只断言该视图保持中立。
+      const subscriptionAuth = providerId => wait(async () => {
+        const s = await invoke('get_snapshot');
+        const auth = (s.subscription_auth ?? []).find(v => v.provider_id === providerId);
+        const connection = (s.subscriptions ?? []).find(v => v.provider_id === providerId);
+        return auth && connection ? { auth, connection } : null;
+      });
+      const authInitial = (await subscriptionAuth('codex-subscription')).auth;
+      check(authInitial.helper.available === false, `Isolation must not report an available helper: ${JSON.stringify(authInitial.helper)}`);
+      check(authInitial.phase === 'idle', `Isolation must not start a sign-in attempt: ${authInitial.phase}`);
+      check(authInitial.logout.remote === 'not_attempted', `Remote revoke must stay unattempted: ${authInitial.logout.remote}`);
+      check(authInitial.logout.local !== 'cleared', 'Isolation must not claim a local clear before any sign-out');
+      passed('subscription authorization reports no helper and no revoke');
+      // Grok 分支的端到端隔离证据：必须由 isolated() 拒绝，而不是被 helper_missing/helper_unsupported 挡下。
+      const grokProvider = { ...provider, id: 'grok-subscription', kind: 'grok_subscription', name: 'Grok subscription', base_url: '', api_type: '', test_model: '' };
+      await invoke('save_provider', { provider: grokProvider, apiKey: null });
+      await invoke('save_model', { model: { ...model, id: 'grok-subscription-model', provider_id: 'grok-subscription', model_id: 'grok-fixture-model', name: 'Grok fixture' } });
+      const grokInitial = await subscriptionAuth('grok-subscription');
+      check(grokInitial.auth.helper.available === false, `Isolation must not report an available Grok helper: ${JSON.stringify(grokInitial.auth.helper)}`);
+      check(grokInitial.auth.phase === 'idle', `Isolation must not start a Grok sign-in attempt: ${grokInitial.auth.phase}`);
+      check(grokInitial.auth.logout.remote === 'not_attempted' && grokInitial.auth.logout.local !== 'cleared', `Grok sign-out evidence must stay unattempted: ${JSON.stringify(grokInitial.auth.logout)}`);
+      check(grokInitial.connection.state === 'not_connected', `Grok subscription must start unconnected: ${JSON.stringify(grokInitial.connection)}`);
+      await rejectedAny('begin_subscription_login', { providerId: 'grok-subscription' }, ['isolated', 'helper']);
+      const grokAfterBegin = await subscriptionAuth('grok-subscription');
+      check(grokAfterBegin.auth.phase === 'idle' && grokAfterBegin.connection.state === 'not_connected', `Rejected Grok sign-in must not change state: ${grokAfterBegin.auth.phase}/${grokAfterBegin.connection.state}`);
+      await rejectedAny('logout_subscription', { providerId: 'grok-subscription' }, ['isolated', 'helper']);
+      const grokAfterLogout = await subscriptionAuth('grok-subscription');
+      check(grokAfterLogout.auth.logout.local === 'not_attempted' && grokAfterLogout.auth.logout.remote === 'not_attempted', `Rejected Grok sign-out must not claim a clear: ${JSON.stringify(grokAfterLogout.auth.logout)}`);
+      check(grokAfterLogout.auth.phase === 'idle', `Rejected Grok sign-out must not start a sign-in: ${grokAfterLogout.auth.phase}`);
+      passed('grok subscription authorization rejected by isolation, not by helper detection');
+      // 界面侧：登录入口必须显示诚实失败原因，不得渲染凭据，也不得伪造远端撤销。
+      // 订阅行按 kind 分派后 Grok 行只渲染本票入口：仍要锁定 Grok 行自己的入口与含 grok-subscription 的对话框。
+      await nav(1);
+      const grokEntry = await wait(() => {
+        const row = [...document.querySelectorAll('tbody tr')].find(item => item.textContent.includes(grokProviderId));
+        return row?.querySelector('.subscription-auth-entry:not([disabled])') ?? null;
+      }, 'grok subscription sign-in entry');
+      grokEntry.click();
+      const grokDialog = () => {
+        const dialog = document.querySelector('.subscription-auth-dialog');
+        return dialog && dialog.textContent.includes(grokProviderId) ? dialog : null;
+      };
+      await wait(grokDialog, 'grok subscription auth dialog');
+      // 界面显示的世代必须与后端快照一致，手测可据此逐步核对 generation 不变／attempt 加一。
+      const grokGeneration = (await invoke('get_snapshot')).subscriptions.find(v => v.provider_id === grokProviderId).generation;
+      const generationText = await wait(() => grokDialog()?.querySelector('.subscription-auth-generation')?.textContent?.trim() || null, 'grok dialog generation');
+      check(generationText.includes(String(grokGeneration)), `Dialog generation must match the backend: ${generationText} vs ${grokGeneration}`);
+      await click('.subscription-auth-dialog .subscription-auth-begin');
+      const authError = await wait(() => grokDialog()?.querySelector('.subscription-auth-error')?.textContent?.trim() || null, 'grok dialog sign-in error');
+      check(authError.length > 0, 'The sign-in entry must show why sign-in failed');
+      const authDialogText = grokDialog()?.textContent ?? '';
+      check(authDialogText.includes(grokProviderId), `The sign-in dialog must belong to the Grok row: ${authDialogText.slice(0, 200)}`);
+      check(/未尝试远端撤销|Remote revoke not attempted/.test(authDialogText), `Sign-out evidence must keep the remote revoke unattempted: ${authDialogText}`);
+      check(!/远端撤销已验证|Remote revoke verified/.test(authDialogText), 'Isolation must not claim a verified remote revoke');
+      check(!/sk-[A-Za-z0-9]{4,}|Bearer\s[A-Za-z0-9]|api[_-]?key\s*[:=]/i.test(document.body.innerText), 'The sign-in dialog must not render credentials');
+      await click('.subscription-auth-dialog .subscription-auth-footer button.primary');
+      await wait(() => !grokDialog(), 'grok subscription auth dialog closed');
+      passed('subscription sign-in UI shows an honest failure without credentials');
       await nav(5);
       for (const option of ['OpenAI Chat Completions', 'OpenAI Responses', 'Anthropic Messages']) {
         await click('.debug-settings .select-control button');

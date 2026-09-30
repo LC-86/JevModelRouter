@@ -110,6 +110,28 @@ export interface SubscriptionView {
   helper?: SubscriptionHelperView | null;
 }
 
+export type SubscriptionAuthPhase = 'idle' | 'pending' | 'succeeded' | 'failed' | 'cancelled';
+export type SubscriptionLocalLogoutState = 'not_attempted' | 'cleared' | 'failed';
+export type SubscriptionRemoteRevokeState = 'not_attempted' | 'failed' | 'verified' | 'unsupported';
+
+export interface SubscriptionAuthChallenge { kind: string; instructions: string; verification_url?: string | null; user_code?: string | null }
+export interface SubscriptionAuthError { code: string; message: string; recovery: string }
+export interface SubscriptionHelperInfo { available: boolean; version?: string | null; program?: string | null; home?: string | null }
+/** 退出证据：本地清除与远端撤销分开记录，二者互不推断。 */
+export interface SubscriptionLogoutEvidence { local: SubscriptionLocalLogoutState; local_detail?: string | null; remote: SubscriptionRemoteRevokeState; remote_detail?: string | null }
+/** 一次登录尝试的界面视图；不含任何凭据、token 或辅助进程输出原文。 */
+export interface SubscriptionAuthView {
+  provider_id: string;
+  phase: SubscriptionAuthPhase;
+  generation: number;
+  attempt?: number | null;
+  challenge?: SubscriptionAuthChallenge | null;
+  identity?: string | null;
+  error?: SubscriptionAuthError | null;
+  helper: SubscriptionHelperInfo;
+  logout: SubscriptionLogoutEvidence;
+}
+
 export interface AgentInjection { template: string; path: string; api: string }
 
 export interface AgentStatus {
@@ -165,6 +187,8 @@ export interface DashboardSnapshot {
   models: Model[];
   /** 订阅服务商的连接与证据；API 服务商不出现在这里。 */
   subscriptions: SubscriptionView[];
+  /** 订阅登录/退出/换号的当前视图；API 服务商不出现在这里。 */
+  subscription_auth: SubscriptionAuthView[];
   policy: RoutingPolicy;
   proxy: ProxyStatus;
   agents: AgentStatus[];

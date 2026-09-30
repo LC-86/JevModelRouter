@@ -1,7 +1,8 @@
 import type {
-  DashboardSnapshot, Provider, ProviderKind, SubscriptionCapabilityStatus,
-  SubscriptionConnectionState, SubscriptionDenial, SubscriptionEvidenceState,
-  SubscriptionLocalClearing, SubscriptionLoginStage, SubscriptionRemoteRevocation, SubscriptionView,
+  DashboardSnapshot, Provider, ProviderKind, SubscriptionAuthError, SubscriptionAuthPhase, SubscriptionAuthView,
+  SubscriptionCapabilityStatus, SubscriptionConnectionState, SubscriptionDenial, SubscriptionEvidenceState,
+  SubscriptionLocalClearing, SubscriptionLocalLogoutState, SubscriptionLoginStage, SubscriptionRemoteRevocation,
+  SubscriptionRemoteRevokeState, SubscriptionView,
 } from '../types';
 import type { Translate } from './preferences-context';
 
@@ -91,6 +92,88 @@ export function denialLabel(denial: SubscriptionDenial | null | undefined, t: Tr
 export function identityLabel(view: SubscriptionView | undefined, t: Translate): string {
   const identity = view?.identity?.trim();
   return identity && identity.length > 0 ? identity : t('Unknown');
+}
+
+export function subscriptionAuthView(snapshot: DashboardSnapshot, providerId: string): SubscriptionAuthView | undefined {
+  return (snapshot.subscription_auth ?? []).find(view => view.provider_id === providerId);
+}
+
+export function authPhaseLabel(phase: SubscriptionAuthPhase, t: Translate): string {
+  return t({
+    idle: 'No sign-in in progress',
+    pending: 'Waiting for sign-in',
+    succeeded: 'Sign-in succeeded',
+    failed: 'Sign-in failed',
+    cancelled: 'Sign-in cancelled',
+  }[phase]);
+}
+
+/** 已知稳定 code 的本地化文案；新增 code 只在这里登记一次。 */
+const AUTH_ERROR_LABELS: Record<string, string> = {
+  already_connected: 'This subscription is already connected. Sign out before signing in again.',
+  helper_isolated: 'Sign-in is disabled in the isolated verification environment.',
+  helper_missing: 'The Grok helper was not found on this machine.',
+  helper_unsupported: 'Only the Grok helper is managed in this build; sign-in, sign-out and account switching are not implemented for this provider.',
+  logout_superseded: 'The connection changed while signing out; nothing was cleared. Refresh to review the current state, then retry.',
+};
+
+/** 按稳定 code 本地化；未知 code 回退后端原文，不编造文案。 */
+export function authErrorLabel(error: SubscriptionAuthError | null | undefined, t: Translate): string {
+  if (!error) return '';
+  return t(AUTH_ERROR_LABELS[error.code] ?? (error.message || error.code));
+}
+
+export interface SubscriptionCommandErrorLabel { label: string; detail: string | null }
+/** 后端命令 Err 形如 `<code>: <message>`（refusal()）。 */
+const COMMAND_ERROR_PREFIX = /^([a-z][a-z0-9_]*)\s*:\s*([\s\S]*)$/;
+
+/**
+ * 命令错误文本的展示拆分：前缀是已知 code 时给出本地化 label，并把后端原文留在 detail 供核对；
+ * 没有前缀或前缀不是已知 code 时原样返回（label = 原文，detail = null），不猜测。
+ */
+export function commandErrorLabel(text: string, t: Translate): SubscriptionCommandErrorLabel {
+  const raw = text.trim();
+  const match = COMMAND_ERROR_PREFIX.exec(raw);
+  const code = match?.[1];
+  const message = match?.[2] ?? '';
+  if (!code || AUTH_ERROR_LABELS[code] === undefined) return { label: raw, detail: null };
+  return { label: authErrorLabel({ code, message, recovery: '' }, t), detail: raw };
+}
+
+export function logoutLocalLabel(state: SubscriptionLocalLogoutState, t: Translate): string {
+  return t({
+    not_attempted: 'Local clearing not attempted',
+    cleared: 'Local credentials cleared',
+    failed: 'Local clearing failed',
+  }[state]);
+}
+
+/** 远端撤销只由远端结论决定：本地 cleared 绝不推断成远端已撤销。 */
+export function remoteRevokeLabel(state: SubscriptionRemoteRevokeState, t: Translate): string {
+  return t({
+    not_attempted: 'Remote revoke not attempted',
+    failed: 'Remote revoke failed',
+    verified: 'Remote revoke verified',
+    unsupported: 'Remote revoke unsupported',
+  }[state]);
+}
+
+export interface SubscriptionPollGuard { phase: SubscriptionAuthPhase; busy: boolean; inFlight: boolean; stopped: boolean }
+/** 轮询 tick 仅在仍处于 pending、没有其它命令在途、上次 poll 已返回且未被停止时才允许发起。 */
+export function pollTickAllowed(guard: SubscriptionPollGuard): boolean {
+  return guard.phase === 'pending' && !guard.busy && !guard.inFlight && !guard.stopped;
+}
+
+export interface SubscriptionCancelGuard { phase: SubscriptionAuthPhase; busy: boolean; pollInFlight: boolean }
+/** poll 在途时禁止取消：两个请求交叉写回会互相覆盖刚写入的连接状态。 */
+export function cancelAllowed(guard: SubscriptionCancelGuard): boolean {
+  return guard.phase === 'pending' && !guard.busy && !guard.pollInFlight;
+}
+
+export interface SubscriptionPollResultGuard { phase: SubscriptionAuthPhase; requestEpoch: number; currentEpoch: number; stopped: boolean }
+/** 迟到的 poll 响应必须丢弃：只有发起时的序号仍是当前序号、未被停止且仍处于 pending 才允许写快照。 */
+export function pollResultAllowed(guard: SubscriptionPollResultGuard): boolean {
+  return guard.phase === 'pending' && !guard.stopped && guard.requestEpoch === guard.currentEpoch;
 }
 
 /** 缺失或空白的只读证据一律显示 `Unknown`，不用界面文案猜测。 */

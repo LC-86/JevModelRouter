@@ -5,6 +5,9 @@
 //! 生产在 `lib.rs` 唯一的 ConfigStore 构造处注入官方 Codex 适配器。两者都由代码固定，配置、环境
 //! 与界面都没有把它换成替身的开关；未验证的订阅生成一律拒绝。
 
+pub mod auth;
+pub mod helper;
+
 use anyhow::{bail, Result};
 use futures_util::future::BoxFuture;
 use serde::{Deserialize, Serialize};

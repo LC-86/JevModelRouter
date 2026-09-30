@@ -37,6 +37,8 @@ import {
   GitBranch,
   KeyRound,
   Layers3,
+  LogIn,
+  LogOut,
   Network,
   Play,
   Plus,
@@ -55,14 +57,15 @@ import {
 } from 'lucide-react';
 import { useAppUpdate } from './components/app-update';
 import { SettingsDialog, type SettingsSection } from './components/settings-dialog';
+import { SubscriptionAuthDialog } from './components/subscription-auth-dialog';
 import { usePreferences } from './lib/preferences-context';
 import { SearchSelect } from './components/search-select';
 import { BrandMark } from './components/brand-mark';
 import { rangeStart, summarize } from './lib/traffic';
 import {
   capabilityLabel, connectionStateLabel, connectionStateTone, denialLabel, identityLabel, isSubscriptionKind,
-  isSubscriptionProvider, localLogoutLabel, loginStageLabel, loginStageTone, modelCapability, protocolKey, quotaLabel,
-  remoteRevocationLabel, subscriptionActions, subscriptionReason, subscriptionStatusText, subscriptionView,
+isSubscriptionProvider, localLogoutLabel, loginStageLabel, loginStageTone, modelCapability, protocolKey, quotaLabel,
+  remoteRevocationLabel, subscriptionActions, subscriptionAuthView, subscriptionReason, subscriptionStatusText, subscriptionView,
 } from './lib/subscription';
 import {
   beginSubscriptionLogin,
@@ -176,6 +179,7 @@ export default function App() {
   const [modelDeleteTarget, setModelDeleteTarget] = useState<Model | null>(null);
   const [deletingModel, setDeletingModel] = useState(false);
   const [providerModal, setProviderModal] = useState<Provider | null>(null);
+  const [authTarget, setAuthTarget] = useState<Provider | null>(null);
   const [modelModal, setModelModal] = useState<Model | null>(null);
 
   useEffect(() => {
@@ -294,6 +298,7 @@ export default function App() {
                 } catch (error) { setToast(String(error), true); }
               }}
               testStates={providerTests}
+              onAuth={(provider) => setAuthTarget(provider)}
               onSnapshot={setSnapshot}
               onNotify={setToast}
               onRefreshSubscription={async (provider) => {
@@ -386,6 +391,13 @@ export default function App() {
           }}
         />
       )}
+      {authTarget && snapshot && <SubscriptionAuthDialog
+        provider={authTarget}
+        snapshot={snapshot}
+        onSnapshot={setSnapshot}
+        onNotify={setToast}
+        onClose={() => setAuthTarget(null)}
+      />}
       {modelModal && (
         <ModelDialog
           onTestStatus={(id, status) => { setProviderTests((previous) => ({ ...previous, [id]: status })); if (status === 'error') getSnapshot().then(setSnapshot).catch(() => {}); }}
@@ -516,7 +528,7 @@ function ProviderImport({ onImport }: { onImport: (source: 'ccswitch' | 'termany
 
 type SubscriptionAction = 'login' | 'cancel' | 'logout' | 'switch';
 
-function ProvidersPage({ snapshot, onAdd, onEdit, onDelete, onTest, onImport, onRefreshSubscription, onSnapshot, onNotify, testStates, onToggle }: { onToggle: (provider: Provider) => Promise<void>; onRefreshSubscription: (provider: Provider) => Promise<void>; onSnapshot: (snapshot: DashboardSnapshot) => void; onNotify: (message: string, error?: boolean) => void; testStates: Record<string, ProviderTestStatus>; onImport: (source: 'ccswitch' | 'termany') => Promise<void>; snapshot: DashboardSnapshot; onAdd: () => void; onEdit: (p: Provider) => void; onDelete: (id: string) => void; onTest: (id: string) => void }) {
+function ProvidersPage({ snapshot, onAdd, onEdit, onDelete, onTest, onImport, onRefreshSubscription, onAuth, onSnapshot, onNotify, testStates, onToggle }: { onToggle: (provider: Provider) => Promise<void>; onRefreshSubscription: (provider: Provider) => Promise<void>; onAuth: (provider: Provider) => void; onSnapshot: (snapshot: DashboardSnapshot) => void; onNotify: (message: string, error?: boolean) => void; testStates: Record<string, ProviderTestStatus>; onImport: (source: 'ccswitch' | 'termany') => Promise<void>; snapshot: DashboardSnapshot; onAdd: () => void; onEdit: (p: Provider) => void; onDelete: (id: string) => void; onTest: (id: string) => void }) {
   const { t } = usePreferences();
   const [toggling, setToggling] = useState<Record<string, boolean>>({});
   const [refreshing, setRefreshing] = useState<Record<string, boolean>>({});
@@ -577,7 +589,10 @@ function ProvidersPage({ snapshot, onAdd, onEdit, onDelete, onTest, onImport, on
           <tbody>
             {providers.map((provider) => {
               const subscription = isSubscriptionProvider(provider);
+              // 两套订阅 UI 按 kind 分派：Grok 由本票的授权对话框承载，Codex 沿用 #13 的行内动作。
+              const grok = provider.kind === 'grok_subscription';
               const view = subscription ? subscriptionView(snapshot, provider.id) : undefined;
+              const auth = subscription ? subscriptionAuthView(snapshot, provider.id) : undefined;
               const available = subscriptionActions(view?.state ?? 'not_connected');
               const busyAction = subscriptionBusy[provider.id];
               const login = view?.login ?? null;
@@ -590,7 +605,7 @@ function ProvidersPage({ snapshot, onAdd, onEdit, onDelete, onTest, onImport, on
                 <td><div className="provider-enabled-cell"><button type="button" role="switch" aria-checked={provider.enabled} aria-label={t('Enable {provider}', { provider: provider.name })} disabled={toggling[provider.id]} className={cx('switch', provider.enabled && 'on')} onClick={() => void toggle(provider)}><span /></button><span>{t(provider.enabled ? 'ENABLED' : 'DISABLED')}</span></div></td>
                 <td>{subscription ? <div className="provider-subscription-status"><span className={cx('provider-connection', connectionStateTone(view?.state ?? 'not_connected'))}><Plug size={14} aria-hidden="true" />{connectionStateLabel(view?.state ?? 'not_connected', t)}</span><span className="provider-subscription-detail">{view && view.models.length > 0 ? t('{count} discovered models', { count: view.models.length }) : t('No discovered models yet')}</span><span className="provider-subscription-state" data-testid={`sub-status-${provider.id}`}>{subscriptionStatusText(view, t)}</span>{login && login.stage !== 'idle' && <span className={cx('provider-subscription-login', loginStageTone(login.stage))} role="status">{loginStageLabel(login.stage, t)}</span>}{authorizationUrl && <a className="provider-subscription-auth-link" href={authorizationUrl} target="_blank" rel="noreferrer" onClick={(event) => { if (isTauri()) { event.preventDefault(); void openUrl(authorizationUrl).catch(() => onNotify(t('Open authorization link'), true)); } }}>{t('Open authorization link')}</a>}{awaitingAuthorization && login?.user_code && <span className="provider-subscription-user-code"><span>{t('Authorization code')}</span><code>{login.user_code}</code></span>}{awaitingAuthorization && !authorizationUrl && !login?.user_code && <span className="provider-subscription-login">{t('Complete the authorization in your browser. This row updates automatically.')}</span>}{login?.error && <span className="provider-subscription-error" role="status">{login.error}</span>}{view?.logout && <span className="provider-subscription-logout" role="status">{localLogoutLabel(view.logout.local, t)} · {remoteRevocationLabel(view.logout.remote, t)}</span>}{subscriptionErrors[provider.id] && <span className="provider-subscription-error" role="status">{subscriptionErrors[provider.id]}</span>}{subscriptionReason(view, t) && <span className="provider-subscription-reason" role="status" title={subscriptionReason(view, t)}>{denialLabel(view?.denial, t) || quotaLabel(view?.quota.state ?? 'unknown', t)}</span>}</div> : <span className="provider-table-key">{t('Not a subscription provider')}</span>}</td>
                 <td><span className="provider-table-key"><KeyRound size={14} />{subscription ? t('No API key is used for subscription providers.') : provider.kind === 'ollama' ? t('No API key required') : provider.has_api_key ? t('API key saved locally') : t('API key required')}</span></td>
-                <td><div className="row-actions">{subscription && <><button type="button" className="button ghost small subscription-action" data-testid={`sub-login-${provider.id}`} disabled={!available.canLogin || busyAction !== undefined} title={t('Sign in to subscription')} onClick={() => void runSubscriptionAction(provider, 'login')}>{busyAction === 'login' ? <LoaderCircle size={14} className="import-spinner" /> : null}{t('Sign in')}</button><button type="button" className="button ghost small subscription-action" data-testid={`sub-cancel-${provider.id}`} disabled={!available.canCancel || busyAction !== undefined} title={t('Cancel subscription sign-in')} onClick={() => void runSubscriptionAction(provider, 'cancel')}>{busyAction === 'cancel' ? <LoaderCircle size={14} className="import-spinner" /> : null}{t('Cancel')}</button><button type="button" className="button ghost small subscription-action" data-testid={`sub-logout-${provider.id}`} disabled={!available.canLogout || busyAction !== undefined} title={t('Sign out of subscription')} onClick={() => void runSubscriptionAction(provider, 'logout')}>{busyAction === 'logout' ? <LoaderCircle size={14} className="import-spinner" /> : null}{t('Sign out')}</button><button type="button" className="button ghost small subscription-action" data-testid={`sub-switch-${provider.id}`} disabled={!available.canLogout || busyAction !== undefined} title={t('Switch subscription account')} onClick={() => void runSubscriptionAction(provider, 'switch')}>{busyAction === 'switch' ? <LoaderCircle size={14} className="import-spinner" /> : null}{t('Switch account')}</button></>}{subscription && <button className="icon-action" disabled={refreshing[provider.id]} title={t('Refresh read-only status')} aria-label={t('Refresh read-only status')} onClick={() => void refresh(provider)}>{refreshing[provider.id] ? <LoaderCircle size={15} className="import-spinner" /> : <RefreshCw size={15} />}</button>}{!subscription && <button className="icon-action" disabled={testStates[provider.id] === 'testing'} title={t(testStates[provider.id] === 'testing' ? 'Testing…' : 'Test')} aria-label={t(testStates[provider.id] === 'testing' ? 'Testing…' : 'Test')} onClick={() => onTest(provider.id)}>{testStates[provider.id] === 'testing' ? <LoaderCircle size={15} className="import-spinner" /> : <Play size={15} />}</button>}<button className="icon-action" onClick={() => onEdit(provider)} title={t('Configure')} aria-label={t('Configure')}><Settings2 size={15} /></button><button className="icon-action danger" onClick={() => onDelete(provider.id)} title={t('Delete')} aria-label={t('Delete')}><Trash2 size={15} /></button></div></td>
+                <td><div className="row-actions">{subscription && grok && <button className="icon-action subscription-auth-entry" aria-busy={auth?.phase === 'pending'} title={t('Subscription sign-in and sign-out')} aria-label={t('Subscription sign-in and sign-out')} onClick={() => onAuth(provider)}>{auth?.phase === 'pending' ? <LoaderCircle size={15} className="import-spinner" /> : view?.state === 'connected' ? <LogOut size={15} /> : <LogIn size={15} />}</button>}{subscription && !grok && <><button type="button" className="button ghost small subscription-action" data-testid={`sub-login-${provider.id}`} disabled={!available.canLogin || busyAction !== undefined} title={t('Sign in to subscription')} onClick={() => void runSubscriptionAction(provider, 'login')}>{busyAction === 'login' ? <LoaderCircle size={14} className="import-spinner" /> : null}{t('Sign in')}</button><button type="button" className="button ghost small subscription-action" data-testid={`sub-cancel-${provider.id}`} disabled={!available.canCancel || busyAction !== undefined} title={t('Cancel subscription sign-in')} onClick={() => void runSubscriptionAction(provider, 'cancel')}>{busyAction === 'cancel' ? <LoaderCircle size={14} className="import-spinner" /> : null}{t('Cancel')}</button><button type="button" className="button ghost small subscription-action" data-testid={`sub-logout-${provider.id}`} disabled={!available.canLogout || busyAction !== undefined} title={t('Sign out of subscription')} onClick={() => void runSubscriptionAction(provider, 'logout')}>{busyAction === 'logout' ? <LoaderCircle size={14} className="import-spinner" /> : null}{t('Sign out')}</button><button type="button" className="button ghost small subscription-action" data-testid={`sub-switch-${provider.id}`} disabled={!available.canLogout || busyAction !== undefined} title={t('Switch subscription account')} onClick={() => void runSubscriptionAction(provider, 'switch')}>{busyAction === 'switch' ? <LoaderCircle size={14} className="import-spinner" /> : null}{t('Switch account')}</button></>}{subscription && <button className="icon-action" disabled={refreshing[provider.id]} title={t('Refresh read-only status')} aria-label={t('Refresh read-only status')} onClick={() => void refresh(provider)}>{refreshing[provider.id] ? <LoaderCircle size={15} className="import-spinner" /> : <RefreshCw size={15} />}</button>}{!subscription && <button className="icon-action" disabled={testStates[provider.id] === 'testing'} title={t(testStates[provider.id] === 'testing' ? 'Testing…' : 'Test')} aria-label={t(testStates[provider.id] === 'testing' ? 'Testing…' : 'Test')} onClick={() => onTest(provider.id)}>{testStates[provider.id] === 'testing' ? <LoaderCircle size={15} className="import-spinner" /> : <Play size={15} />}</button>}<button className="icon-action" onClick={() => onEdit(provider)} title={t('Configure')} aria-label={t('Configure')}><Settings2 size={15} /></button><button className="icon-action danger" onClick={() => onDelete(provider.id)} title={t('Delete')} aria-label={t('Delete')}><Trash2 size={15} /></button></div></td>
               </tr>
             ); })}
           </tbody>
