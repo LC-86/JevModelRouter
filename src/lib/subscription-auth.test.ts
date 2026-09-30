@@ -1,8 +1,11 @@
-import { describe, expect, it } from 'vitest';
-import { translate } from './preferences-context';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import { createElement } from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
+import { PreferencesProvider, translate } from './preferences-context';
 import { authErrorLabel, authPhaseLabel, logoutLocalLabel, remoteRevokeLabel, subscriptionAuthView } from './subscription';
+import { SubscriptionAuthDialog } from '../components/subscription-auth-dialog';
 import type {
-  DashboardSnapshot, SubscriptionAuthView, SubscriptionLocalLogoutState, SubscriptionRemoteRevokeState,
+  DashboardSnapshot, Provider, SubscriptionAuthView, SubscriptionLocalLogoutState, SubscriptionRemoteRevokeState,
 } from '../types';
 
 const t = (message: string) => translate('zh-CN', message);
@@ -68,5 +71,44 @@ describe('subscription authorization views', () => {
     expect(view.logout.remote).toBe('failed');
     expect(logoutLocalLabel(view.logout.local, t)).not.toBe(remoteRevokeLabel(view.logout.remote, t));
     expect(view.helper.available).toBe(false);
+  });
+});
+
+// 渲染级用例：PreferencesProvider 需要 matchMedia 与 navigator，测试环境（node）里补齐这两个全局。
+beforeAll(() => {
+  vi.stubGlobal('matchMedia', () => ({ matches: false, addEventListener() {}, removeEventListener() {} }));
+  vi.stubGlobal('navigator', { language: 'zh-CN' });
+});
+afterAll(() => vi.unstubAllGlobals());
+
+const provider: Provider = { id: 'grok-subscription', name: 'Grok subscription', kind: 'grok_subscription', base_url: '', enabled: true, has_api_key: false };
+
+function renderDialog(view: SubscriptionAuthView): string {
+  const authSnapshot = { subscription_auth: [view] } as unknown as DashboardSnapshot;
+  return renderToStaticMarkup(createElement(
+    PreferencesProvider, null,
+    createElement(SubscriptionAuthDialog, { provider, snapshot: authSnapshot, onSnapshot: () => {}, onClose: () => {} }),
+  ));
+}
+
+describe('subscription authorization dialog', () => {
+  it('shows a local clear without ever claiming a remote revoke', () => {
+    const html = renderDialog(authView({ generation: 1, attempt: 2, logout: { local: 'cleared', local_detail: 'helper home removed', remote: 'not_attempted' } }));
+    expect(html).toContain('本地凭据已清除');
+    expect(html).toContain('未尝试远端撤销');
+    // 本地 cleared 绝不能渲染出远端已验证对应的任何文案。
+    expect(html).not.toContain('远端撤销已验证');
+    expect(html).not.toContain(t('Remote revoke verified'));
+    // 世代与尝试编号必须与后端视图一致，手测据此核对 generation 不变／attempt 加一。
+    expect(html).toContain('世代 1');
+    expect(html).toContain('尝试 2');
+  });
+
+  it('shows the verified remote revoke only when the backend reports it', () => {
+    const html = renderDialog(authView({ attempt: null, logout: { local: 'cleared', remote: 'verified' } }));
+    expect(html).toContain('远端撤销已验证');
+    expect(html).toContain('本地凭据已清除');
+    expect(html).not.toContain('尝试');
+    expect(html).toContain('世代 3');
   });
 });

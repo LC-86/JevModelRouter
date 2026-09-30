@@ -26,18 +26,9 @@ pub struct HelperSpec {
     pub home: PathBuf,
 }
 
-/// 只读探测结果：只说明能否解析到二进制与专用 home 在哪里，不说明它是否真的能登录。
-/// 生产由界面读取；当前票里只被测试与后续票据使用。
-#[allow(dead_code)]
-pub struct HelperAvailability {
-    pub available: bool,
-    pub version: Option<String>,
-    pub program: Option<String>,
-    pub home: Option<String>,
-}
-
-/// 可以原样带进辅助进程的环境变量：认证来源必须由 `GROK_HOME` 决定，其余上游凭据一律清除。
-const ENV_WHITELIST: &[&str] = &["PATH", "HOME", "TMPDIR", "LANG", "TERM"];
+/// 可以原样带进辅助进程的环境变量：认证来源必须由 `GROK_HOME`/`HOME` 决定，其余上游凭据一律清除。
+/// `HOME` 不在此列，它由 [`helper_env`] 显式指向应用自有 home。
+const ENV_WHITELIST: &[&str] = &["PATH", "TMPDIR", "LANG", "TERM"];
 
 /// 环境变量覆盖入口，可含空格分隔的附加参数（例如自定义子命令）。
 const HELPER_OVERRIDE: &str = "AUTOJEV_GROK_HELPER";
@@ -108,15 +99,8 @@ pub(crate) fn spec_with_program(
     Ok(HelperSpec { program: program.to_path_buf(), args, env: helper_env(&home), home })
 }
 
-/// 解析二进制并组装 spec；找不到二进制时如实报错。契约固定的解析入口，供登录路径与测试共用。
-#[allow(dead_code)]
-pub fn spec_for(kind: &ProviderKind, provider_id: &str, home_dir: &Path) -> Result<HelperSpec> {
-    let (program, extra_args) = resolve_program()
-        .context("No subscription helper was found; install the official CLI or set AUTOJEV_GROK_HELPER")?;
-    spec_with_program(kind, provider_id, home_dir, &program, &extra_args)
-}
-
-/// `env_clear()` 之后唯一允许进入辅助进程的环境：基础运行变量 + `GROK_HOME` + 显式 `AUTOJEV_*`。
+/// `env_clear()` 之后唯一允许进入辅助进程的环境：基础运行变量 + `AUTOJEV_*` + `GROK_HOME`/`HOME`。
+/// `HOME` 也指向应用自有 home：即使真实 CLI 只认 `HOME`，也不会落到日常 `~/.grok`。
 fn helper_env(home: &Path) -> Vec<(String, String)> {
     let mut env: Vec<(String, String)> = ENV_WHITELIST
         .iter()
@@ -125,22 +109,10 @@ fn helper_env(home: &Path) -> Vec<(String, String)> {
     let mut overrides: Vec<(String, String)> = std::env::vars().filter(|(key, _)| key.starts_with("AUTOJEV_")).collect();
     overrides.sort();
     env.extend(overrides);
-    env.push(("GROK_HOME".into(), home.display().to_string()));
+    let home = home.display().to_string();
+    env.push(("GROK_HOME".into(), home.clone()));
+    env.push(("HOME".into(), home));
     env
-}
-
-/// 只做探测：解析二进制、算出专用 home，不拉起进程、不联网。
-/// `version` 保持未知，因为不拉起进程就读不到版本；不得编造数值。
-#[allow(dead_code)]
-pub fn detect(kind: &ProviderKind, provider_id: &str, home_dir: &Path) -> HelperAvailability {
-    let program = resolve_program().map(|(program, _)| program);
-    let home = helper_home(kind, provider_id, home_dir).ok();
-    HelperAvailability {
-        available: program.is_some(),
-        version: None,
-        program: program.map(|program| program.display().to_string()),
-        home: home.map(|home| home.display().to_string()),
-    }
 }
 
 const REDACTED: &str = "[redacted]";
@@ -149,13 +121,14 @@ const REDACTED: &str = "[redacted]";
 const SECRET_KEY_HINTS: &[&str] = &[
     "token", "secret", "password", "passwd", "api_key", "apikey", "api-key", "authorization",
     "auth_key", "cookie", "credential", "private_key", "access_key",
+    "device_code", "access_token", "refresh_token", "id_token", "client_secret",
 ];
 
 /// 常见凭据前缀：即使长度不够门限也一律抹掉。
 const SECRET_PREFIXES: &[&str] = &["sk-", "xai-", "gsk_", "ghp_", "gho_", "ghs_", "aiza", "bearer"];
 
-/// 长得像随机串的连续片段门限。取值偏大是为了不误伤普通路径与模型名。
-const RANDOM_RUN_THRESHOLD: usize = 32;
+/// 长得像随机串的连续片段门限：24 已足以覆盖常见 token，同时不误伤普通路径片段（如 subscription-helpers）。
+const RANDOM_RUN_THRESHOLD: usize = 24;
 
 /// 去掉 token/secret/长随机串。所有错误、详情与视图字段都必须先经过它。
 pub fn redact(text: &str) -> String {
@@ -327,11 +300,17 @@ pub struct OwnedProcesses {
 }
 
 struct OwnedChild {
-    /// 从 spec.home 反推的服务商标识；reclaim 按它过滤。
-    provider_id: Option<String>,
+    /// 拉起时显式登记的服务商标识；reclaim 按它过滤，不从路径反推。
+    provider_id: String,
     pid: u32,
     child: Child,
     stdout: Option<ChildStdout>,
+}
+
+/// 隔离验证环境不得拉起任何真实进程。抽成独立函数便于直接单测这条守卫。
+fn ensure_spawn_allowed(isolated: bool) -> Result<()> {
+    ensure!(!isolated, "Refusing to launch a subscription helper in isolated validation");
+    Ok(())
 }
 
 impl OwnedProcesses {
@@ -340,11 +319,8 @@ impl OwnedProcesses {
     }
 
     /// 拉起辅助进程并登记 pid。隔离验证环境直接拒绝，绝不拉起真实进程。
-    pub fn spawn(&self, spec: &HelperSpec) -> Result<u32> {
-        ensure!(
-            !crate::runtime::isolated(),
-            "Refusing to launch a subscription helper in isolated validation"
-        );
+    pub fn spawn(&self, provider_id: &str, spec: &HelperSpec) -> Result<u32> {
+        ensure_spawn_allowed(crate::runtime::isolated())?;
         let mut command = Command::new(&spec.program);
         command
             .args(&spec.args)
@@ -361,7 +337,7 @@ impl OwnedProcesses {
         let pid = child.id();
         let stdout = child.stdout.take();
         self.children.lock().unwrap().push(OwnedChild {
-            provider_id: provider_of_home(&spec.home),
+            provider_id: provider_id.to_owned(),
             pid,
             child,
             stdout,
@@ -370,7 +346,7 @@ impl OwnedProcesses {
     }
 
     /// 取出某个自有进程的标准输出读取端（同一个 pid 只能取一次）。
-    /// 这是本模块内部的读取接缝，`spec` 里没有服务商标识，因此仍由调用方按 pid 取用。
+    /// 这是本模块内部的读取接缝，调用方按 spawn 返回的 pid 取用。
     pub fn take_stdout(&self, pid: u32) -> Option<ChildStdout> {
         self.children
             .lock()
@@ -382,18 +358,12 @@ impl OwnedProcesses {
 
     /// 回收某家服务商的自有进程，返回实际回收的 pid。
     pub fn reclaim(&self, provider_id: &str) -> Vec<u32> {
-        self.reclaim_where(|owned| owned.provider_id.as_deref() == Some(provider_id))
+        self.reclaim_where(|owned| owned.provider_id == provider_id)
     }
 
     /// 回收全部自有进程，返回实际回收的 pid。
     pub fn reclaim_all(&self) -> Vec<u32> {
         self.reclaim_where(|_| true)
-    }
-
-    /// 当前仍登记的自有 pid。
-    #[allow(dead_code)]
-    pub fn owned(&self) -> Vec<u32> {
-        self.children.lock().unwrap().iter().map(|entry| entry.pid).collect()
     }
 
     fn reclaim_where(&self, matches: impl Fn(&OwnedChild) -> bool) -> Vec<u32> {
@@ -419,11 +389,6 @@ impl Default for OwnedProcesses {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// 从 `<...>/subscription-helpers/<kind>/<provider_id>/home` 反推服务商标识。
-fn provider_of_home(home: &Path) -> Option<String> {
-    home.parent()?.file_name().map(|name| name.to_string_lossy().into_owned())
 }
 
 #[cfg(test)]
@@ -499,6 +464,19 @@ mod tests {
         );
         let long = "xai-".to_owned() + &"a1b2c3d4e5".repeat(5);
         assert_eq!(redact(&format!("helper said {long}")), "helper said [redacted]");
+        // 新增的凭据键名（OAuth 交换用的字段）同样抹掉。
+        assert_eq!(redact("device_code=ABCD-EFGH"), "device_code=[redacted]");
+        assert_eq!(redact("client_secret:fixture"), "client_secret:[redacted]");
+        // 冒号后带空格时，值本身是独立片段：同样不得留下长随机串。
+        let with_space = redact("client_secret: abcdefghij0123456789klmn");
+        assert!(!with_space.contains("abcdefghij0123456789klmn"), "{with_space}");
+        assert!(with_space.contains("[redacted]"), "{with_space}");
+        assert_eq!(redact("\"refresh_token\":\"fixture\""), "\"refresh_token\":[redacted]");
+        assert_eq!(redact("access_token=fixture"), "access_token=[redacted]");
+        assert_eq!(redact("id_token=fixture"), "id_token=[redacted]");
+        // 24 字符起算随机串；23 字符不误伤。
+        assert_eq!(redact("abcdefghij0123456789klmn"), "[redacted]");
+        assert_eq!(redact("abcdefghij0123456789klm"), "abcdefghij0123456789klm");
         // 普通文本、账号标识与普通路径不得被误伤。
         assert_eq!(redact("Grok helper is missing"), "Grok helper is missing");
         assert_eq!(redact("fixture@example.invalid"), "fixture@example.invalid");
@@ -516,7 +494,16 @@ mod tests {
         assert_eq!(spec.args, vec!["--device".to_owned(), "login".to_owned()]);
         assert_eq!(spec.program, program);
         assert_eq!(spec.home, PathBuf::from("/tmp/fixture-home/.autojev/subscription-helpers/grok_subscription/grok/home"));
-        assert!(spec.env.iter().any(|(key, value)| key == "GROK_HOME" && value == &spec.home.display().to_string()));
+        let helper_home = spec.home.display().to_string();
+        assert!(spec.env.iter().any(|(key, value)| key == "GROK_HOME" && value == &helper_home));
+        // HOME 必须指向应用自有 home：真实 CLI 若只认 HOME，也不能落到日常 ~/.grok。
+        assert!(spec.env.iter().any(|(key, value)| key == "HOME" && value == &helper_home));
+        let real_home = std::env::var("HOME").unwrap_or_default();
+        assert!(!real_home.is_empty());
+        assert!(
+            !spec.env.iter().any(|(_, value)| value == &real_home),
+            "the real user home must not reach the helper environment"
+        );
         assert!(
             !spec.env.iter().any(|(key, _)| key == "OPENAI_API_KEY" || key == "XAI_API_KEY" || key == "HTTP_PROXY"),
             "credential-bearing environment variables must not reach the helper"
@@ -530,17 +517,10 @@ mod tests {
     }
 
     #[test]
-    fn detect_reports_only_what_it_can_prove() {
-        let directory = tempfile::tempdir().unwrap();
-        let availability = detect(&grok(), "grok", directory.path());
-        // 探测不拉起进程，因此版本必须保持未知，不得编造。
-        assert!(availability.version.is_none());
-        assert!(availability.home.unwrap().ends_with("grok_subscription/grok/home"));
-        if availability.available {
-            assert!(availability.program.is_some());
-        } else {
-            assert!(availability.program.is_none());
-        }
+    fn ensure_spawn_allowed_rejects_isolated_and_permits_normal_builds() {
+        let refused = ensure_spawn_allowed(true).unwrap_err();
+        assert!(refused.to_string().contains("isolated"), "{refused}");
+        assert!(ensure_spawn_allowed(false).is_ok());
     }
 
     #[test]
@@ -548,23 +528,23 @@ mod tests {
         use std::io::BufRead;
         let directory = tempfile::tempdir().unwrap();
         let script = directory.path().join("fake-helper.sh");
-        fs::write(&script, "#!/bin/sh\nprintf '%s\\n' '{\"event\":\"challenge\"}'\nexec sleep 30\n").unwrap();
+        fs::write(&script, "#!/bin/sh\nprintf '%s\\n' 'first'\nsleep 0.3\nprintf '%s\\n' 'second'\nexec sleep 30\n").unwrap();
         fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
         let spec = spec_with_program(&grok(), "grok", directory.path(), &script, &[]).unwrap();
         prepare_home(&spec.home).unwrap();
         let processes = OwnedProcesses::new();
-        let pid = processes.spawn(&spec).unwrap();
+        let pid = processes.spawn("grok", &spec).unwrap();
         assert!(pid > 0);
-        assert_eq!(processes.owned(), vec![pid]);
         let mut reader = std::io::BufReader::new(processes.take_stdout(pid).expect("helper stdout"));
         let mut line = String::new();
         reader.read_line(&mut line).unwrap();
-        assert!(line.contains("challenge"), "unexpected helper line: {line}");
-        // 只回收自有 pid：别家服务商不匹配，登记表保持不变。
+        assert_eq!(line.trim(), "first");
+        // 只回收自有 pid：别家服务商不匹配，自有进程仍活着（能读出第二行）。
         assert!(processes.reclaim("other").is_empty());
-        assert_eq!(processes.owned(), vec![pid]);
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert_eq!(line.trim(), "second", "reclaim 别家服务商不得杀掉自有进程");
         assert_eq!(processes.reclaim("grok"), vec![pid]);
-        assert!(processes.owned().is_empty());
         // 已回收的 pid 不再持有读取端，也绝不对未知 pid 做任何事。
         assert!(processes.take_stdout(pid).is_none());
         assert!(processes.reclaim_all().is_empty());

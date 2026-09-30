@@ -127,6 +127,10 @@
       await nav(1);
       await wait(() => [...document.querySelectorAll('tbody tr')].find(row => row.textContent.includes('codex-subscription')));
       await click('.subscription-auth-entry');
+      // 界面显示的世代必须与后端快照一致，手测可据此逐步核对 generation 不变／attempt 加一。
+      const codexGeneration = (await invoke('get_snapshot')).subscriptions.find(v => v.provider_id === 'codex-subscription').generation;
+      const generationText = await wait(() => document.querySelector('.subscription-auth-generation')?.textContent?.trim());
+      check(generationText.includes(String(codexGeneration)), `Dialog generation must match the backend: ${generationText} vs ${codexGeneration}`);
       await click('.subscription-auth-begin');
       const authError = await wait(() => document.querySelector('.subscription-auth-error')?.textContent?.trim());
       check(authError.length > 0, 'The sign-in entry must show why sign-in failed');

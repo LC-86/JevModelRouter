@@ -71,7 +71,7 @@ export function SubscriptionAuthDialog({ provider, snapshot, onSnapshot, onNotif
   return (
     <dialog ref={dialog} className="dialog subscription-auth-dialog" aria-labelledby="subscription-auth-title" onCancel={(event) => { event.preventDefault(); if (!busy) onClose(); }}>
       <div className="subscription-auth-header">
-        <div><h2 id="subscription-auth-title">{t('Subscription sign-in')}</h2><p>{provider.name} · <code>{provider.id}</code></p></div>
+        <div><h2 id="subscription-auth-title">{t('Subscription sign-in')}</h2><p>{provider.name} · <code>{provider.id}</code></p>{view && <p className="subscription-auth-generation">{t('Generation {generation}', { generation: view.generation })}{view.attempt != null && ` · ${t('Attempt {attempt}', { attempt: view.attempt })}`}</p>}</div>
         <button type="button" className="icon-action" aria-label={t('Close')} disabled={busy} onClick={onClose}><X size={20} /></button>
       </div>
 

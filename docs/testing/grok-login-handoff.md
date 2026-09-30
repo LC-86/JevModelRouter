@@ -16,10 +16,10 @@
 
 | 命令 | 实际结果 |
 | --- | --- |
-| `cargo test --locked --manifest-path src-tauri/Cargo.toml --lib` | 224 passed；0 failed（本票新增 36 条：`subscription::auth::lifecycle_tests` 28 + `subscription::helper::tests` 8） |
+| `cargo test --locked --manifest-path src-tauri/Cargo.toml --lib` | 231 passed；0 failed（基线 187，本票新增 44 条：`subscription::auth::lifecycle_tests` 35 + `subscription::helper::tests` 8 + `config::storage_tests` 1） |
 | `cargo build --lib` | 完成，0 warning |
 | `cargo build --features isolation-check` | 构建通过 |
-| `pnpm test` | 12 个测试文件 / 46 条用例全部通过 |
+| `pnpm test` | 12 个测试文件 / 48 条用例全部通过 |
 | `pnpm build` | 通过（tsc + vite） |
 | `pnpm test:isolated` | exit 0；fresh 与 reload 两遍 `report.ok=true` |
 
@@ -32,7 +32,7 @@
 
 边界：Grok 的端到端证据走 Tauri IPC（`save_provider` + 5 条授权命令 + 快照断言），界面点击链路在
 Codex 订阅行验证（两行共用同一 dialog 组件）；独立验证由未参与实现的验证者在本分支上重跑本节命令并核对
-结论，结果记录在交付 PR 的验证记录中（本地临时报告不入库）。
+结论，见本票 PR 的验证记录（本地临时报告不入库）。
 
 ### 1.2 Rust 单测覆盖的语义（逐条对应契约）
 
@@ -51,8 +51,9 @@ JSON 事件（`challenge` / `identity` / `done` / `error`）。以上命令已�
 5. `switch_account`：先退出（新世代）再登录；登录失败时保持未连接且身份为空，**不恢复旧账号身份或证据**。
 6. 重启后待授权登录不存活：载入配置时把 `AuthorizationPending` 归位为未连接（登录会话是进程内的）。
 7. 辅助进程：解析顺序为 `AUTOJEV_GROK_HELPER` 再 `PATH` 中的 `grok`，找不到即不可用，**不下载、不安装**；
-   环境在白名单内重建（`PATH`／`HOME`／`TMPDIR`／`LANG`／`TERM` + `GROK_HOME` + 显式 `AUTOJEV_*`）；
-   隔离环境下 `spawn` 直接报错（错误含 `isolated`）。
+   环境在白名单内重建（`PATH`／`TMPDIR`／`LANG`／`TERM` + 显式 `AUTOJEV_*`），`GROK_HOME` 与 `HOME`
+   都显式注入并指向应用自有 home（`ENV_WHITELIST` 已移除 `HOME`，不再沿用进程的日常 home）；隔离环境下
+   `spawn` 直接报错（错误含 `isolated`）。
 8. 专用存储：`prepare_home` 创建目录并设 `0700`、拒绝 symlink；`cleanup_home` 只清空自家 home 内容
    并保留目录本身；`redact` 供全部错误与详情使用，`AuthView` 不含凭据、token 或辅助进程输出原文。
 9. 界面侧纯函数单测：阶段标签、未知错误码回退原文，以及**远端撤销状态不得由本地清除推断**。
@@ -62,14 +63,17 @@ JSON 事件（`challenge` / `identity` / `done` / `error`）。以上命令已�
     后端原文回退显示真实原因，不把它显示成已支持。
 11. 本次返工固化的两条边界：在已连接或未进行中的连接上调用取消一律早返回，**不改写连接状态与世代**；
     同一服务商重新发起登录会先回收上一次的自有辅助进程，再拉起新的尝试。
+12. A4 的脱敏边界：辅助进程返回的 `identity` 与 `challenge`（`instructions`／`verification_url`／`user_code`）
+    **原样保留、不脱敏**，界面能正常显示身份与授权地址，不会被涂成 `[redacted]`；`redact` 只作用于错误
+    `message`／`recovery` 与日志／详情（`local_detail`／`remote_detail`）。这也是 2.6 能核对身份的前提。
 
 ### 1.3 原生隔离桌面验收（实际结果）
 
 `pnpm test:isolated` 已跑通（exit 0，fresh 与 reload 两遍 `report.ok=true`），在真实界面中断言：
 `subscription_auth` 含该服务商且 `helper.available=false`、`phase=idle`、`logout.remote=not_attempted`；
-`begin_subscription_login` 被拒绝且错误含 `isolated` 或 `helper`；未连接时 `logout_subscription` 被诚实
-拒绝（不报告本地清除成功）；界面点击登录入口后显示失败原因且 DOM 中无凭据字样；上游 fixture 收到的
-订阅模型生成请求数仍为 0。
+`begin_subscription_login` 被拒绝且错误含 `isolated` 或 `helper`；隔离环境下 `logout_subscription` 的
+拒绝原因是 `helper_isolated`，非隔离的 Codex 行则是 `helper_unsupported`，两者都不报告本地清除成功；
+界面点击登录入口后显示失败原因且 DOM 中无凭据字样；上游 fixture 收到的订阅模型生成请求数仍为 0。
 
 ### 1.4 复现命令与证据位置
 
@@ -82,7 +86,7 @@ pnpm test:isolated
 ```
 
 - 已跑通命令的实际结果见 1.1；`pnpm release:check` 属既有发布检查，本文件不重复记录其输出。独立验证
-  由未参与实现的验证者在本分支上重跑本节命令并核对结论，结果记录在交付 PR 的验证记录中。
+  由未参与实现的验证者在本分支上重跑本节命令并核对结论，见本票 PR 的验证记录。
 - 隔离验收保留脱敏报告、进程日志与请求记录，位置和命名规则见
   [统一派发与隔离验证](isolated-dispatch.md)。
 
@@ -102,13 +106,18 @@ Agent 不代跑。
   与配置，这是真实手测的代价；如需减少影响，用手测专用的一次性账号，结束后按 2.4 退出、必要时在界面里
   删除该订阅服务商。不要为了“隔离”去复制或篡改日常配置，也不要把辅助进程指向日常 Grok CLI 的共享配置
   目录。
-- 应用自有的辅助进程存储是独立的：`<home_dir>/.autojev/subscription-helpers/grok/<provider_id>/home`，
+- 应用自有的辅助进程存储是独立的：`<home_dir>/.autojev/subscription-helpers/grok_subscription/<provider_id>/home`，
   与日常 `grok` CLI 默认使用的配置目录分开；`home_dir` 在普通启动下是用户 home。记录实际路径，不要凭
-  推测填写。
+  推测填写。路径里的服务商类型段是 `grok_subscription`（与配置的 serde 形状一致），不是 `grok`。
+- 环境隔离（已实现）：辅助进程环境按白名单重建，上游 API 凭据一律清除；`GROK_HOME` 与 `HOME` 都显式
+  注入并指向应用自有 home（`ENV_WHITELIST` 已移除 `HOME`，不再沿用进程的日常 home）。仍需实测确认真实
+  CLI 确实只用该目录：未触碰 `~/.grok` 或日常 CLI 配置目录（可对照文件时间戳或进程打开的文件）；一旦发现
+  CLI 忽略 `GROK_HOME`／`HOME` 而落回日常目录，立即按 2.9 停止并回报。
 - 使用一次性／专用账号，不要用日常账号；手测结束后按 2.4 退出并核对清理结果。
-- 固定并记录辅助进程来源与版本：`program`、`version`（界面的 helper 区展示，也可执行 `grok --version`，
-  或执行 `AUTOJEV_GROK_HELPER` 指向的 program 的 `--version`；该变量允许包含空格分隔的参数，取其
-  program 部分）。固定版本后不要在手测中途更换。
+- 固定并记录辅助进程来源与版本：记录 `program`，并执行 `grok --version`，或 `AUTOJEV_GROK_HELPER` 指向
+  程序的 `--version`，拿到实际版本（该变量允许包含空格分隔的参数，取其 program 部分）。**应用当前不读取
+  也不展示辅助进程版本，快照 `helper.version` 恒为“未知”（story 18 未实现）**，不要把它当作已支持的功能。
+  固定版本后不要在手测中途更换。
 - 本构建只管理 Grok 辅助进程：Codex 订阅行的登录/退出/换号/取消会以 `helper_unsupported` 诚实拒绝
   （零副作用，见 1.2 第 10 条）。手测只覆盖 Grok 订阅行，不要据此判断 Codex 授权能力。
 
@@ -126,7 +135,9 @@ Agent 不代跑。
 ### 2.3 取消
 
 在 `phase=pending` 时点“取消”，核对：`phase=cancelled`、challenge 清空、连接状态回到未连接、
-`generation` 不变。随后等待 30–60 秒，核对没有迟到结果把状态改回成功，也没有新身份写入。
+`generation` 不变，且应用自有 home 内容被清空（已实现：取消与 `poll` 终态 `Failed` 都会清空该服务商的
+home，见 `GrokCliAuth::cleanup_provider_home`）。随后等待 30–60 秒，核对没有迟到结果把状态改回成功，也
+没有新身份写入；并实测确认 home 里没有残留的部分凭据，有残留即按 2.9 停止回报。
 
 ### 2.4 退出（本地清除与远端撤销分别核对）
 
@@ -156,8 +167,13 @@ Agent 不代跑。
 
 ### 2.7 存储目标与权限核对
 
-- 路径核对：界面 helper 区的 `home` 与实际目录一致，且位于 2.1 记录的路径（普通启动下是用户 home 内的
-  应用专用子目录），不得指向共享的日常 Grok CLI 配置目录。
+- 路径核对：界面 helper 区的 `home` 与实际目录一致，应为
+  `<home_dir>/.autojev/subscription-helpers/grok_subscription/<provider_id>/home`
+  （普通启动下位于用户 home 内），不得指向共享的日常 Grok CLI 配置目录。类型段写错（例如按 `grok`
+  去核对）会误判成失败。
+- 环境归属核对（已实现 + 仍需实测确认）：应用已把 `GROK_HOME` 与 `HOME` 都指向该专用目录并清除上游
+  凭据；实测确认真实 CLI 只读写该专用目录，没有触碰 `~/.grok` 或日常 CLI 配置目录（见 2.1）；一旦落回
+  日常目录即按 2.9 停止回报。
 - 权限核对：目录应为 `0700` 且由应用创建：
 
   ```sh
@@ -188,7 +204,7 @@ Agent 不代跑。
 脱敏要求：`error.message`／`recovery`、`local_detail`／`remote_detail` 与日志都经过 `redact`。回报与截图
 不得包含 token、授权码、完整 `verification_url` 或真实账号全量标识；`user_code` 按需局部遮盖。
 
-证据位置：界面截图（脱敏后）、后端 `eprintln!` 退出回收日志、应用专用 home 与配置文件，以及交付 PR 的
+证据位置：界面截图（脱敏后）、后端 `eprintln!` 退出回收日志、应用专用 home 与配置文件，以及本票 PR 的
 验证记录。
 
 ### 2.9 失败停条件
@@ -203,12 +219,14 @@ Agent 不代跑。
 6. 待授权登录在重启后仍然存活。
 7. 订阅模型生成被放行，或生产路径出现可替换替身的开关。
 8. 宣称的字段与实际不符（例如 `phase` 与连接状态互相矛盾）。
+9. 取消或失败的登录尝试在应用自有 home 里留下部分凭据（已实现清理，实测到残留即失败），或真实 CLI
+   读写到 `~/.grok` 等日常目录。
 
 ### 2.10 回报格式
 
 ```text
 环境: commit <sha> / 分支 / 操作系统 / 构建方式（pnpm test:isolated 或手动启动）
-辅助进程: program=<路径> version=<版本> home=<路径>
+辅助进程: program=<路径> version=<CLI 自身输出，应用不展示> home=<路径>
 账号: <脱敏标识>
 步骤: <2.x 编号>
 期望: <契约期望>
@@ -234,6 +252,8 @@ Agent 不代跑。
 | 真实额度证据 | 未验证 | 只读额度读取的真实来源未验证；未知即未知，不填 0 |
 | 真实订阅生成 | 未验证（仍默认拒绝） | 生产注入不可用适配器，订阅生成 fail-closed；本票不放行真实生成，也不消耗订阅额度 |
 | Codex 订阅授权 | 未实现（`helper_unsupported`） | 本构建只管理 Grok CLI 辅助进程；Codex 的登录/退出/换号/取消/轮询以该 code 诚实拒绝且零副作用 |
+| 原生 token 刷新协调 | 未实现 | 本票只有既有的只读证据刷新 `refresh_subscription`（世代变化时丢弃迟到结果）；CLI 侧凭据刷新未实现也未验证 |
+| 辅助进程版本可追溯 | 未实现 | 应用不读取、不展示版本，快照 `helper.version` 恒为“未知”（story 18）；版本只能从 CLI 自身输出人工记录 |
 
 以上各条是 issue #26 的手测范围，**不构成本票合入的阻塞条件**；本票的合入依据是第一节的实际隔离验证
 （隔离替身、本地假回调、纯函数单测与原生隔离桌面断言），以及这些未验证项在界面与文档中如实呈现。

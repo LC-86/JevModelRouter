@@ -880,5 +880,7 @@
   "Remote revoke not attempted": "未尝试远端撤销",
   "Remote revoke failed": "远端撤销失败",
   "Remote revoke verified": "远端撤销已验证",
-  "Remote revoke unsupported": "远端撤销不支持"
+  "Remote revoke unsupported": "远端撤销不支持",
+  "Generation {generation}": "世代 {generation}",
+  "Attempt {attempt}": "尝试 {attempt}"
 }
