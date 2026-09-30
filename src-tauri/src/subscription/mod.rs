@@ -509,6 +509,77 @@ fn quota_denial(provider: &Provider, code: &str, state: EvidenceState) -> Denial
     )
 }
 
+/// An `Available` summary is admissible only when current bucket evidence still proves
+/// included usage is permitted. This rejects legacy snapshots that claim availability
+/// without carrying the permission evidence used to derive it.
+fn admission_quota_state(quota: &QuotaEvidence) -> EvidenceState {
+    if quota.state == EvidenceState::Available {
+        if quota.history {
+            EvidenceState::Stale
+        } else {
+            quota_state(&quota.buckets)
+        }
+    } else {
+        quota.state
+    }
+}
+
+/// Extra credits are a separate billing axis. Every quota bucket must explicitly deny
+/// their use; a balance (including zero) or a missing credits object is not proof.
+fn extra_usage_permission(quota: &QuotaEvidence) -> QuotaPermission {
+    if quota.buckets.is_empty() {
+        return QuotaPermission::Unknown;
+    }
+    if quota.buckets.iter().any(|bucket| {
+        bucket.credits.as_ref().is_some_and(|credits| credits.permission == QuotaPermission::Allowed)
+    }) {
+        return QuotaPermission::Allowed;
+    }
+    if quota.buckets.iter().all(|bucket| {
+        bucket.credits.as_ref().is_some_and(|credits| credits.permission == QuotaPermission::Denied)
+    }) {
+        QuotaPermission::Denied
+    } else {
+        QuotaPermission::Unknown
+    }
+}
+
+fn extra_usage_denial(provider: &Provider, permission: QuotaPermission) -> Option<Denial> {
+    let name = label(provider);
+    match permission {
+        QuotaPermission::Denied => None,
+        QuotaPermission::Allowed => Some(Denial::new(
+            "extra_usage_allowed",
+            DenialFamily::Quota,
+            format!("{name} currently permits use of extra credits, so AutoJev cannot keep this request within the subscription allowance."),
+            "Disable extra-usage permission upstream and refresh read-only evidence, or use an API provider.".into(),
+        )),
+        QuotaPermission::Unknown => Some(Denial::new(
+            "extra_usage_permission_unknown",
+            DenialFamily::Quota,
+            format!("{name} has no current evidence that extra-credit use is prohibited."),
+            "Refresh read-only evidence after confirming extra usage is disabled upstream, or use an API provider.".into(),
+        )),
+    }
+}
+
+fn quota_admission_denial(provider: &Provider, state: EvidenceState) -> Option<Denial> {
+    let (code, rejected_state) = match state {
+        EvidenceState::Available => return None,
+        EvidenceState::Denied => ("quota_denied", EvidenceState::Denied),
+        EvidenceState::Stale => ("quota_stale", EvidenceState::Stale),
+        EvidenceState::Failed => ("quota_failed", EvidenceState::Failed),
+        EvidenceState::Unsupported => ("quota_unsupported", EvidenceState::Unsupported),
+        EvidenceState::Unknown => ("quota_unknown", EvidenceState::Unknown),
+    };
+    Some(quota_denial(provider, code, rejected_state))
+}
+
+fn admission_denial(provider: &Provider, quota: &QuotaEvidence) -> Option<Denial> {
+    quota_admission_denial(provider, admission_quota_state(quota))
+        .or_else(|| extra_usage_denial(provider, extra_usage_permission(quota)))
+}
+
 fn evaluate(
     config: &AppConfig,
     provider: &Provider,
@@ -542,14 +613,7 @@ fn evaluate(
         }
         _ => return Err(capability_denial(provider, model_id, protocol, "capability_unverified", "not verified yet")),
     }
-    match evidence.quota.state {
-        EvidenceState::Available => Ok(()),
-        EvidenceState::Denied => Err(quota_denial(provider, "quota_denied", EvidenceState::Denied)),
-        EvidenceState::Stale => Err(quota_denial(provider, "quota_stale", EvidenceState::Stale)),
-        EvidenceState::Failed => Err(quota_denial(provider, "quota_failed", EvidenceState::Failed)),
-        EvidenceState::Unsupported => Err(quota_denial(provider, "quota_unsupported", EvidenceState::Unsupported)),
-        EvidenceState::Unknown => Err(quota_denial(provider, "quota_unknown", EvidenceState::Unknown)),
-    }
+    admission_denial(provider, &evidence.quota).map_or(Ok(()), Err)
 }
 
 /// 网关、Debug、服务商测试、模型测试与手动测速共用的准入；API 服务商保持原行为。
@@ -605,6 +669,22 @@ pub fn connection_denial(config: &AppConfig, provider: &Provider) -> Option<Deni
     connection_check(config, provider)
         .and_then(|connection| evidence_check(provider, connection).map(|_| ()))
         .err()
+}
+
+/// 当前已连接服务商的额度与额外用量准入原因；与连接级 `denial` 分开表达。
+fn provider_admission_denial(config: &AppConfig, provider: &Provider) -> Option<Denial> {
+    if !is_subscription_provider(provider) {
+        return None;
+    }
+    let connection = match connection_check(config, provider) {
+        Ok(connection) => connection,
+        Err(_) => return None,
+    };
+    let evidence = match evidence_check(provider, connection) {
+        Ok(evidence) => evidence,
+        Err(_) => return None,
+    };
+    admission_denial(provider, &evidence.quota)
 }
 
 /// 一次生成交接：绑定服务商、连接世代、模型与协议。适配器只负责外部辅助进程，
@@ -1605,7 +1685,10 @@ pub struct SubscriptionView {
     /// 订阅目录行：按服务商取全部已建档模型，逐行给出当前账号与世代下的资格。
     /// 与只读证据字段 `catalog`（`CatalogEvidence`）分开：这里是用户配置与账号资格的投影。
     pub catalog_entries: Vec<SubscriptionCatalogView>,
+    /// 连接/证据级拒绝原因；额度准入原因见 `admission_denial`。
     pub denial: Option<Denial>,
+    /// 当前额度或额外用量不满足派发条件时的原因。
+    pub admission_denial: Option<Denial>,
     pub adapter_available: bool,
     /// 登录会话（内存态）：阶段、挂起链接、尝试序号与绑定世代。
     pub login: SubscriptionLoginView,
@@ -1666,6 +1749,7 @@ pub fn views(config: &AppConfig, adapter_available: bool, sessions: &SessionStat
                 quota: evidence.map(|evidence| evidence.quota.clone()).unwrap_or_default(),
                 catalog_entries: catalog,
                 denial: connection_denial(config, provider),
+                admission_denial: provider_admission_denial(config, provider),
                 adapter_available: available,
                 login: SubscriptionLoginView {
                     stage: session.map(|session| session.stage).unwrap_or_default(),
@@ -1776,6 +1860,20 @@ mod admission_tests {
                     state: EvidenceState::Available,
                     source: Some("fixture".into()),
                     observed_at: Some("2026-09-30T00:00:00Z".into()),
+                    buckets: vec![QuotaBucket {
+                        limit_id: "subscription_pool".into(),
+                        permission: QuotaPermission::Allowed,
+                        windows: vec![QuotaWindow {
+                            label: "primary".into(),
+                            used_percent: Some(0.0),
+                            ..QuotaWindow::default()
+                        }],
+                        credits: Some(QuotaCredits {
+                            permission: QuotaPermission::Denied,
+                            ..QuotaCredits::default()
+                        }),
+                        ..QuotaBucket::default()
+                    }],
                     ..QuotaEvidence::default()
                 },
                 catalog: CatalogEvidence::default(),
@@ -1919,6 +2017,99 @@ mod admission_tests {
         // 未验证的第二协议仍然被拒绝，能力按协议分别判定。
         let denial = admit_model(&config, &model, &provider, Protocol::Responses).unwrap_err();
         assert_eq!(denial.code, "capability_unverified");
+    }
+
+    #[test]
+    fn admission_requires_current_evidence_that_extra_usage_is_prohibited() {
+        let (mut config, provider, model) = fixture(ProviderKind::CodexSubscription);
+        connected(&mut config);
+        let primary = QuotaBucket {
+            limit_id: "primary".into(),
+            permission: QuotaPermission::Allowed,
+            windows: vec![QuotaWindow {
+                label: "daily".into(),
+                used_percent: Some(25.0),
+                ..QuotaWindow::default()
+            }],
+            credits: Some(QuotaCredits {
+                has_credits: Some(true),
+                balance: Some("12.50".into()),
+                unit: Some("USD".into()),
+                permission: QuotaPermission::Unknown,
+                ..QuotaCredits::default()
+            }),
+            ..QuotaBucket::default()
+        };
+        config.subscriptions.get_mut(FIXTURE_PROVIDER).unwrap().evidence.as_mut().unwrap().quota.buckets = vec![primary];
+        assert_eq!(
+            admit_model(&config, &model, &provider, Protocol::Chat).unwrap_err().code,
+            "extra_usage_permission_unknown",
+            "a positive credits balance does not prove extra usage is prohibited"
+        );
+        assert!(connection_denial(&config, &provider).is_none());
+        assert_eq!(provider_admission_denial(&config, &provider).unwrap().code, "extra_usage_permission_unknown");
+
+        config.subscriptions.get_mut(FIXTURE_PROVIDER).unwrap().evidence.as_mut().unwrap().quota.buckets[0]
+            .credits.as_mut().unwrap().permission = QuotaPermission::Allowed;
+        assert_eq!(admit_model(&config, &model, &provider, Protocol::Chat).unwrap_err().code, "extra_usage_allowed");
+        assert!(connection_denial(&config, &provider).is_none());
+        assert_eq!(provider_admission_denial(&config, &provider).unwrap().code, "extra_usage_allowed");
+
+        config.subscriptions.get_mut(FIXTURE_PROVIDER).unwrap().evidence.as_mut().unwrap().quota.buckets[0]
+            .credits.as_mut().unwrap().permission = QuotaPermission::Denied;
+        assert!(admit_model(&config, &model, &provider, Protocol::Chat).is_ok());
+        assert!(connection_denial(&config, &provider).is_none());
+        assert!(provider_admission_denial(&config, &provider).is_none());
+
+        let mut secondary = QuotaBucket::default();
+        secondary.limit_id = "secondary".into();
+        secondary.permission = QuotaPermission::Allowed;
+        secondary.windows.push(QuotaWindow {
+            label: "weekly".into(),
+            used_percent: Some(10.0),
+            ..QuotaWindow::default()
+        });
+        config.subscriptions.get_mut(FIXTURE_PROVIDER).unwrap().evidence.as_mut().unwrap().quota.buckets.push(secondary);
+        assert_eq!(
+            admit_model(&config, &model, &provider, Protocol::Chat).unwrap_err().code,
+            "extra_usage_permission_unknown",
+            "one bucket without a prohibition makes the whole request unsafe"
+        );
+    }
+
+    #[test]
+    fn an_available_quota_state_cannot_override_missing_or_denied_bucket_permission() {
+        let (mut config, provider, model) = fixture(ProviderKind::CodexSubscription);
+        connected(&mut config);
+        let quota = &mut config.subscriptions.get_mut(FIXTURE_PROVIDER).unwrap().evidence.as_mut().unwrap().quota;
+        quota.buckets = vec![QuotaBucket {
+            limit_id: "primary".into(),
+            permission: QuotaPermission::Unknown,
+            windows: vec![QuotaWindow {
+                label: "daily".into(),
+                used_percent: Some(25.0),
+                ..QuotaWindow::default()
+            }],
+            credits: Some(QuotaCredits { permission: QuotaPermission::Denied, ..QuotaCredits::default() }),
+            ..QuotaBucket::default()
+        }];
+        assert_eq!(
+            admit_model(&config, &model, &provider, Protocol::Chat).unwrap_err().code,
+            "quota_unknown",
+            "a cached Available flag cannot replace an explicit current included-usage permit"
+        );
+
+        config.subscriptions.get_mut(FIXTURE_PROVIDER).unwrap().evidence.as_mut().unwrap().quota.buckets[0].permission = QuotaPermission::Denied;
+        assert_eq!(admit_model(&config, &model, &provider, Protocol::Chat).unwrap_err().code, "quota_denied");
+
+        let quota = &mut config.subscriptions.get_mut(FIXTURE_PROVIDER).unwrap().evidence.as_mut().unwrap().quota;
+        quota.buckets[0].permission = QuotaPermission::Allowed;
+        quota.history = true;
+        assert_eq!(
+            admit_model(&config, &model, &provider, Protocol::Chat).unwrap_err().code,
+            "quota_stale",
+            "historical buckets cannot become current through a contradictory Available summary"
+        );
     }
 
     #[test]
@@ -2448,8 +2639,12 @@ mod refresh_tests {
         assert!(view.adapter_available);
         assert_eq!(view.catalog.state, EvidenceState::Available);
         assert_eq!(view.quota.buckets.len(), 1);
-        // 连接级检查此时已通过；缺能力仍会挡在生成准入上。
-        assert!(view.denial.is_none());
+        // 服务商行暴露额外用量许可未知；缺能力仍会挡在模型级生成准入上。
+        assert!(view.denial.is_none(), "the connection-level denial remains empty once connection/evidence checks pass");
+        assert_eq!(
+            view.admission_denial.as_ref().map(|denial| denial.code.as_str()),
+            Some("extra_usage_permission_unknown")
+        );
         let json = serde_json::to_value(&view).unwrap();
         assert_eq!(json["catalog"]["state"], "available");
         assert_eq!(json["quota"]["view"], "rate_limits_by_limit_id");
@@ -3011,6 +3206,46 @@ mod refresh_tests {
         assert!(connection.identity.is_none(), "a signed-out connection must not revive the old account");
         assert!(connection.current_evidence().is_none(), "signed-out evidence must not become valid again");
         assert_ne!(connection.state, ConnectionState::Connected, "an unknown identity is never connected");
+    }
+
+    #[tokio::test]
+    async fn a_read_only_refresh_can_restore_admission_without_reviving_an_old_generation() {
+        let adapter = StubAdapter::new();
+        let (store, _directory) = fixture_store(adapter.clone());
+        refresh(&store, "codex").await.unwrap();
+        store.update(|config| {
+            config.subscriptions.get_mut("codex").unwrap().evidence.as_mut().unwrap().capabilities.push(Capability {
+                model_id: "fixture-model".into(),
+                protocol: protocol_key(Protocol::Chat).into(),
+                status: CapabilityStatus::Verified,
+            });
+        }).unwrap();
+
+        let (model, provider) = target(&store.read());
+        let denial = admit_model(&store.read(), &model, &provider, Protocol::Chat).unwrap_err();
+        assert_eq!(denial.code, "extra_usage_permission_unknown");
+
+        // The read-only fixture has a positive balance but explicitly prohibits extra-credit use.
+        // That permission, not the balance, restores admission.
+        adapter.quota.lock().unwrap().buckets[0].credits = Some(QuotaCredits {
+            has_credits: Some(true),
+            balance: Some("12.50".into()),
+            unit: Some("USD".into()),
+            permission: QuotaPermission::Denied,
+            ..QuotaCredits::default()
+        });
+        let refreshed = refresh(&store, "codex").await.unwrap();
+        let evidence = refreshed.current_evidence().unwrap();
+        assert_eq!(evidence.quota.buckets[0].credits.as_ref().unwrap().balance.as_deref(), Some("12.50"));
+        assert_eq!(evidence.quota.buckets[0].credits.as_ref().unwrap().permission, QuotaPermission::Denied);
+        assert!(admit_model(&store.read(), &model, &provider, Protocol::Chat).is_ok());
+
+        store.update(|config| config.subscriptions.get_mut("codex").unwrap().generation += 1).unwrap();
+        assert_eq!(
+            admit_model(&store.read(), &model, &provider, Protocol::Chat).unwrap_err().code,
+            "evidence_missing",
+            "the refreshed permit belongs only to its original connection generation"
+        );
     }
 
     #[tokio::test]
@@ -3791,6 +4026,8 @@ mod lifecycle_tests {
         assert_eq!(json["helper"]["available"], false);
         assert_eq!(json["adapter_available"], false);
         assert_eq!(json["state"], "not_connected");
+        assert!(json["denial"].is_object());
+        assert!(json["admission_denial"].is_null());
         // 目录投影字段名冻结：前端与 lib.rs 快照都按 `catalog_entries` 取；
         // 同名的 `catalog` 是 #15 的只读目录证据（对象），两者不能混用。
         assert!(json["catalog_entries"].is_array());

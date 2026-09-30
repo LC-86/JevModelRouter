@@ -193,7 +193,9 @@ export interface SubscriptionView {
   quota: SubscriptionQuota;
   /** 目录证据；旧快照可能没有该字段，缺失即 unknown。 */
   catalog?: SubscriptionCatalogEvidence | null;
+  /** 连接/证据级拒绝原因；额度准入原因单独记录。 */
   denial?: SubscriptionDenial | null;
+  admission_denial?: SubscriptionDenial | null;
   adapter_available: boolean;
   login?: SubscriptionLoginView | null;
   logout?: SubscriptionLogoutView | null;

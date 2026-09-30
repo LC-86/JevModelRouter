@@ -175,6 +175,15 @@ export function quotaPermissionLabel(permission: SubscriptionQuotaPermission | u
   }[permission ?? 'unknown']);
 }
 
+/** Extra-credit permission is a separate billing axis from the included quota permit. */
+export function extraUsagePermissionLabel(permission: SubscriptionQuotaPermission | undefined, t: Translate): string {
+  return t({
+    allowed: 'Extra credit use allowed',
+    denied: 'Extra credit use prohibited',
+    unknown: 'Extra credit restriction unknown',
+  }[permission ?? 'unknown']);
+}
+
 /** 额度视图文案：多桶 / 旧版单桶 / 未知。 */
 export function quotaViewLabel(view: SubscriptionQuotaView | undefined, t: Translate): string {
   return t({
@@ -346,7 +355,7 @@ export function creditsAxisText(credits: SubscriptionQuotaCredits | null | undef
     `${t('Unlimited')}: ${stableBoolean(credits?.unlimited)}`,
     `${t('Balance')}: ${knownOrUnknown(credits?.balance)}`,
     `${t('Unit')}: ${knownOrUnknown(credits?.unit)}`,
-    quotaPermissionLabel(credits?.permission, t),
+    extraUsagePermissionLabel(credits?.permission, t),
   ];
   const missing = credits?.missing_fields ?? [];
   const invalid = credits?.invalid_fields ?? [];
@@ -369,7 +378,8 @@ export function protocolKey(endpoint: string): string {
 /** 完整原因文本（后端英文原文），用作提示与日志详情。 */
 export function subscriptionReason(view: SubscriptionView | undefined, t: Translate): string {
   if (!view) return '';
-  if (view.denial) return `${view.denial.message} ${view.denial.recovery}`;
+  const denial = view.denial ?? view.admission_denial;
+  if (denial) return `${denial.message} ${denial.recovery}`;
   if ((view.quota?.state ?? 'unknown') !== 'available') return quotaLabel(view.quota?.state ?? 'unknown', t);
   return '';
 }
@@ -396,6 +406,8 @@ export function denialLabel(denial: SubscriptionDenial | null | undefined, t: Tr
     quota_failed: 'Quota read failed',
     quota_denied: 'Quota access denied',
     quota_unsupported: 'No quota interface',
+    extra_usage_allowed: 'Extra credits are currently allowed',
+    extra_usage_permission_unknown: 'Extra credit restriction unverified',
   }[denial.code] ?? denial.code);
 }
 
