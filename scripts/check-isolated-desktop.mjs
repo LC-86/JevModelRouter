@@ -82,7 +82,7 @@ const reaped = async pids => {
 // 每次运行只排练一组场景，替身的场景队列与该运行一一对应；替身证据写进独立 JSONL。
 // `reads`（额度）与 `catalog`（目录）各自一条队列：#15 的 catalog 运行用它排练多桶/单桶/缺字段/
 // 越界/拒绝/许可缺失/读取失败等场景。
-const runDesktop = async ({ label, scenarios, reload = false, loginMode = null, reads = null, catalog = null }) => {
+const runDesktop = async ({ label, scenarios, reload = false, loginMode = null, reads = null, catalog = null, accounts = null }) => {
   const helperLog = join(root, `helper-${label}.jsonl`);
   const args = ['--autojev-isolated', root, '--autojev-upstream', base, '--autojev-ui-url', `http://127.0.0.1:${uiPort}`, '--autojev-ui-check', base, '--autojev-helper', helper];
   if (reload) args.push('--autojev-check-reload');
@@ -90,6 +90,7 @@ const runDesktop = async ({ label, scenarios, reload = false, loginMode = null, 
   const env = { ...environment, AUTOJEV_FAKE_HELPER_SCENARIOS: scenarios, AUTOJEV_FAKE_HELPER_LOG: helperLog, AUTOJEV_FAKE_HELPER_DELAY_MS: '150' };
   if (reads) env.AUTOJEV_FAKE_HELPER_READS = reads;
   if (catalog) env.AUTOJEV_FAKE_HELPER_CATALOG = catalog;
+  if (accounts) env.AUTOJEV_FAKE_HELPER_ACCOUNTS = accounts;
   const child = spawn(binary, args, { env, stdio: 'pipe' });
   desktop = child;
   let log = ''; child.stdout.on('data', b => { log += b; }); child.stderr.on('data', b => { log += b; });
@@ -142,9 +143,9 @@ try {
   const failedRun = await runDesktop({ label: 'failed', scenarios: 'failed', loginMode: 'failed' });
   const grokRun = await runDesktop({ label: 'grok', scenarios: 'success', loginMode: 'grok' });
   // #15：目录/额度只读验收。一次运行排练一组队列：登录成功后按刷新次序逐个取场景。
-  const catalogReads = 'multi,single,missing,invalid,denied,bucket-denied,no-permission,null-permission,fail-quota,fail-quota';
-  const catalogScenarios = 'success,legacy,missing,success,success,success,success,success,success,fail-catalog';
-  const catalogRun = await runDesktop({ label: 'catalog', scenarios: 'success', loginMode: 'catalog', reads: catalogReads, catalog: catalogScenarios });
+  const catalogReads = 'multi,single,missing,invalid,denied,bucket-denied,no-permission,null-permission,fail-quota,fail-quota,fail-quota,multi';
+  const catalogScenarios = 'success,legacy,missing,success,success,success,success,success,success,fail-catalog,fail-catalog,success';
+  const catalogRun = await runDesktop({ label: 'catalog', scenarios: 'success', loginMode: 'catalog', reads: catalogReads, catalog: catalogScenarios, accounts: [...Array(11).fill('connected'), 'incomplete', 'connected', 'connected', 'connected', 'signed-out'].join(',') });
   const runs = [first, reload, late, failedRun, grokRun, catalogRun];
   const logs = {};
   for (const run of runs) logs[run.label] = await readLog(run.helperLog);
@@ -258,7 +259,19 @@ try {
   assert.deepEqual(catalogScenariosSeen, catalogScenarios.split(','), `The catalog queue must be consumed in order: ${JSON.stringify(catalogScenariosSeen)}`);
   assert.ok(logs.catalog.some(entry => entry.event === 'request' && entry.method === 'model/list'), 'The catalog run must issue model/list');
   assert.ok(logs.catalog.some(entry => entry.event === 'request' && entry.method === 'account/rateLimits/read'), 'The catalog run must issue account/rateLimits/read');
-  assert.equal(logs.catalog.filter(entry => entry.event === 'request' && entry.method === 'account/login/start').length, 1, 'The catalog run must sign in exactly once before reading the catalog');
+  assert.equal(logs.catalog.filter(entry => entry.event === 'request' && entry.method === 'account/login/start').length, 2, 'The catalog run signs in again before testing helper-side disconnect');
+  const accountScenariosSeen = logs.catalog.filter(entry => entry.action === 'account-read').map(entry => entry.scenario);
+  assert.deepEqual(accountScenariosSeen.slice(-5), ['incomplete', 'connected', 'connected', 'connected', 'signed-out']);
+  const incompleteIndex = logs.catalog.findIndex(entry => entry.action === 'account-read' && entry.scenario === 'incomplete');
+  const nextAccountIndex = logs.catalog.findIndex((entry, index) => index > incompleteIndex && entry.action === 'account-read');
+  assert.ok(incompleteIndex >= 0 && nextAccountIndex > incompleteIndex);
+  assert.ok(!logs.catalog.slice(incompleteIndex + 1, nextAccountIndex).some(entry =>
+    entry.method === 'model/list' || entry.method === 'account/rateLimits/read'), 'No new evidence is read for an unconfirmed identity');
+  const helperOutIndex = logs.catalog.findLastIndex(entry => entry.action === 'account-read' && entry.scenario === 'signed-out');
+  const lastCatalogIndex = logs.catalog.findLastIndex(entry => entry.action === 'catalog-read');
+  assert.ok(helperOutIndex > lastCatalogIndex);
+  assert.ok(!logs.catalog.slice(lastCatalogIndex, helperOutIndex).some(entry => entry.method === 'account/logout'),
+    'Helper disconnect is reached by refresh after connected A, with no intervening app logout');
   const catalogChecks = catalogRun.report.checks || [];
   for (const [pattern, label] of [['eligible=false', 'eligible=false'], ['permission=denied', 'permission=denied'], ['fail-closed', 'bucket-level fail-closed'], ['stale', 'stale catalog'], ['historical', 'historical quota'], ['invalid', 'invalid fields'], ['missing', 'missing fields'], ['remaining', 'remaining derivation']]) {
     assert.ok(catalogChecks.some(name => name.includes(pattern)), `The catalog run must assert ${label}: ${JSON.stringify(catalogChecks)}`);

@@ -198,6 +198,24 @@ describe('subscription catalog and quota evidence', () => {
     expect(quotaHistoryLabel({ state: 'failed', history: true }, t)).toBe('历史数据 · 最后成功更新 未知');
   });
 
+  it('displays an unconfirmed account as disconnected with stale historical evidence', () => {
+    const historical = view({
+      state: 'not_connected', identity: 'A@example.invalid',
+      catalog: { state: 'stale', observed_at: '2026-09-30T04:05:06Z' },
+      models: [{ model_id: 'old-model', eligible: false }],
+      quota: { state: 'failed', history: true, observed_at: '2026-09-30T04:05:06Z' },
+      denial: { code: 'not_connected', family: 'not_connected', message: 'Codex is not connected.', recovery: 'Connect account.' },
+    });
+    expect(connectionStateLabel(historical.state, t)).toBe('未连接');
+    expect(subscriptionStatusText(historical, t)).toContain('state=not_connected');
+    expect(subscriptionReason(historical, t)).toBe('Codex is not connected. Connect account.');
+    expect(denialLabel(historical.denial, t)).toBe('未连接');
+    expect(subscriptionCatalogText(historical)).toContain('catalog_state=stale');
+    expect(subscriptionCatalogText(historical)).toContain('old-model:false');
+    expect(subscriptionQuotaText(historical)).toContain('quota_state=failed');
+    expect(quotaHistoryLabel(historical.quota, t)).toBe('历史数据 · 最后成功更新 2026-09-30T04:05:06Z');
+  });
+
   it('derives the remaining percent from usedPercent only when it is valid', () => {
     expect(remainingPercent(0)).toBe(100);
     expect(remainingPercent(33.3)).toBeCloseTo(66.7, 4);

@@ -618,19 +618,11 @@ impl SubscriptionAdapter for CodexAdapter {
             let mut servers = self.server_for(provider_id).await?;
             let server = servers.get_mut(provider_id).expect("the helper was just started");
             let result = server.call("account/read", json!({})).await?;
-            let identity = account_email(&result);
-            let requires_auth = result
-                .get("requiresAuth")
-                .and_then(Value::as_bool)
-                .unwrap_or(identity.is_none());
-            let state = if requires_auth || identity.is_none() {
-                ConnectionState::NotConnected
-            } else {
-                ConnectionState::Connected
-            };
+            let (state, identity, identity_incomplete) = account_status(&result);
             Ok(ConnectionStatus {
                 state,
                 identity,
+                identity_incomplete,
                 helper_version: server.version().map(str::to_owned),
                 account_path: Some(server.auth_home().to_string_lossy().into_owned()),
             })
@@ -851,6 +843,28 @@ fn remove_helper_home(auth_home: &Path) -> bool {
     match std::fs::remove_dir_all(auth_home) {
         Ok(()) => true,
         Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
+/// `account:null` 是明确无账号；ChatGPT 的 nullable email 缺失不是退出证据。
+/// requiresOpenaiAuth 表示该服务需要 OpenAI 认证，已登录时同样可以为 true。
+/// 兼容既有替身/旧响应的 requiresAuth，但不从 email 缺失推导已退出。
+fn account_status(result: &Value) -> (ConnectionState, Option<String>, bool) {
+    let account = result.get("account");
+    let legacy_auth = result.get("requiresAuth").and_then(Value::as_bool);
+    let requires_auth = result.get("requiresOpenaiAuth").and_then(Value::as_bool).or(legacy_auth);
+    let signed_out = (account == Some(&Value::Null) && requires_auth.is_some())
+        || (account.is_none() && legacy_auth == Some(true));
+    if signed_out {
+        return (ConnectionState::NotConnected, None, false);
+    }
+    let account_type = account.and_then(|account| account.get("type"));
+    let subscription_account = account_type.is_none() || account_type.and_then(Value::as_str) == Some("chatgpt");
+    let identity = subscription_account.then(|| account_email(result)).flatten();
+    if identity.is_some() && requires_auth.is_some() && legacy_auth != Some(true) {
+        (ConnectionState::Connected, identity, false)
+    } else {
+        (ConnectionState::NotConnected, None, true)
     }
 }
 
@@ -1160,7 +1174,15 @@ while IFS= read -r line; do
   if [ -z "$id" ]; then continue; fi
   case "$line" in
     *'"method":"initialize"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"version":"fixture-helper-1.0","codexHome":"%s"}}\n' "$id" "$CODEX_HOME" ;;
-    *'"method":"account/read"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"account":{"email":"fixture@example.invalid","planType":"pro"},"requiresAuth":false}}\n' "$id" ;;
+    *'"method":"account/read"'*)
+      scenario=$(next_scenario "$queue.account")
+      case "$scenario" in
+        signed-out) result='{"account":null,"requiresOpenaiAuth":true}' ;;
+        incomplete) result='{"account":{"type":"chatgpt","email":null,"planType":"pro"},"requiresOpenaiAuth":true}' ;;
+        *) result='{"account":{"type":"chatgpt","email":"fixture@example.invalid","planType":"pro"},"requiresOpenaiAuth":true}' ;;
+      esac
+      printf '{"jsonrpc":"2.0","id":%s,"result":%s}\n' "$id" "$result" ;;
+
     *'"method":"model/list"'*)
       scenario=""
       if [ -n "$queue" ]; then scenario=$(next_scenario "$queue.catalog"); fi
@@ -1207,6 +1229,107 @@ done
             std::fs::write(format!("{base}.quota"), quota.join("\n")).unwrap();
         }
         fixture_launch(directory, env_log)
+    }
+
+    // Runs the production adapter and refresh against an isolated stdio helper, never OAuth.
+    fn refresh_fixture(accounts: &[&str]) -> (crate::config::ConfigStore, tempfile::TempDir, PathBuf) {
+        let home = tempfile::tempdir().unwrap();
+        let log = home.path().join("env.log");
+        std::fs::write(log.with_extension("log.account"), accounts.join("\n")).unwrap();
+        let adapter = std::sync::Arc::new(CodexAdapter::with_launch(
+            home.path().to_path_buf(), fixture_launch(home.path(), &log),
+        ));
+        let store = crate::config::ConfigStore::load_with_adapters(
+            home.path().join("app.db"),
+            std::sync::Arc::new(crate::dispatch::ApiDispatcher { loopback_only: true }), adapter,
+        ).unwrap();
+        store.update(|config| {
+            let mut provider = config.providers[0].clone();
+            provider.id = "codex".into();
+            provider.kind = ProviderKind::CodexSubscription;
+            provider.enabled = true;
+            config.providers.push(provider);
+            crate::subscription::sync_provider(config, "codex", &ProviderKind::CodexSubscription);
+            let mut model = config.models[0].clone();
+            model.provider_id = "codex".into();
+            model.model_id = "preset-a".into();
+            config.models.push(model);
+        }).unwrap();
+        (store, home, log)
+    }
+
+    #[tokio::test]
+    async fn refresh_helper_disconnect_invalidates_connected_account_without_app_logout() {
+        use crate::subscription::{refresh, admit_model};
+        let (store, _home, log) = refresh_fixture(&["connected", "signed-out"]);
+        let before = refresh(&store, "codex").await.unwrap();
+        assert_eq!(before.state, ConnectionState::Connected);
+        assert!(before.current_evidence().is_some());
+        let _ = refresh(&store, "codex").await;
+        let config = store.read();
+        let after = &config.subscriptions["codex"];
+        assert_eq!(after.state, ConnectionState::NotConnected);
+        assert!(after.generation > before.generation);
+        assert!(after.identity.is_none() && after.evidence.is_none());
+        assert!(after.current_evidence().is_none());
+        let provider = config.providers.iter().find(|p| p.id == "codex").unwrap();
+        let model = config.models.iter().find(|m| m.provider_id == "codex").unwrap();
+        assert_eq!(admit_model(&config, model, provider, crate::protocol::Protocol::Chat).unwrap_err().code, "not_connected");
+        assert_eq!(std::fs::read_to_string(log.with_extension("log.catalog.counter")).unwrap(), "1");
+    }
+
+    #[tokio::test]
+    async fn refresh_helper_incomplete_identity_retains_only_history_then_recovers_same_account() {
+        use crate::subscription::{refresh, views, SessionState};
+        let (store, _home, log) = refresh_fixture(&["connected", "incomplete", "connected"]);
+        std::fs::write(log.with_extension("log.catalog"), "success\nfail").unwrap();
+        std::fs::write(log.with_extension("log.quota"), "multi\nfail").unwrap();
+        let before = refresh(&store, "codex").await.unwrap();
+        let _ = refresh(&store, "codex").await;
+        let after = store.read().subscriptions["codex"].clone();
+        assert_ne!(after.state, ConnectionState::Connected);
+        assert!(after.current_evidence().is_none());
+        assert_eq!(after.identity, before.identity);
+        let history = after.evidence.as_ref().unwrap();
+        let old = before.evidence.as_ref().unwrap();
+        assert_eq!(history.models, old.models);
+        assert_eq!(history.catalog.observed_at, old.catalog.observed_at);
+        assert_eq!(history.quota.buckets, old.quota.buckets);
+        assert_eq!(history.quota.observed_at, old.quota.observed_at);
+        let view = views(&store.read(), true, &SessionState::default()).into_iter().find(|v| v.provider_id == "codex").unwrap();
+        assert_eq!(view.catalog.state, EvidenceState::Stale);
+        assert_eq!(view.quota.state, EvidenceState::Failed);
+        assert!(view.quota.history);
+        let restored = refresh(&store, "codex").await.unwrap();
+        assert_eq!(restored.state, ConnectionState::Connected);
+        let restored_evidence = restored.current_evidence().unwrap();
+        assert_eq!(restored_evidence.catalog.state, EvidenceState::Stale);
+        assert_eq!(restored_evidence.models, old.models);
+        assert_eq!(restored_evidence.catalog.observed_at, old.catalog.observed_at);
+        assert_eq!(restored_evidence.quota.state, EvidenceState::Failed);
+        assert!(restored_evidence.quota.history);
+        assert_eq!(restored_evidence.quota.buckets, old.quota.buckets);
+        assert_eq!(restored_evidence.quota.observed_at, old.quota.observed_at);
+    }
+
+    #[test]
+    fn account_status_distinguishes_signed_out_from_incomplete_and_auth_requirement() {
+        for (response, connected, incomplete) in [
+            (json!({"account":{"type":"chatgpt","email":"A@example.invalid"},"requiresOpenaiAuth":true}), true, false),
+            (json!({"account":null,"requiresOpenaiAuth":true}), false, false),
+            (json!({"requiresAuth":true}), false, false),
+            (json!({"account":{"type":"chatgpt","email":null},"requiresOpenaiAuth":true}), false, true),
+            (json!({"account":{"type":"chatgpt","email":" "},"requiresOpenaiAuth":true}), false, true),
+            (json!({"account":{"type":"apiKey"},"requiresOpenaiAuth":false}), false, true),
+            (json!({}), false, true),
+            (json!({"account":null}), false, true),
+            (json!({"account":{"type":"chatgpt","email":"A@example.invalid"}}), false, true),
+        ] {
+            let (state, identity, actual_incomplete) = account_status(&response);
+            assert_eq!(state == ConnectionState::Connected, connected, "{response}");
+            assert_eq!(identity.is_some(), connected, "{response}");
+            assert_eq!(actual_incomplete, incomplete, "{response}");
+        }
     }
 
     #[test]

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Fictional Codex app-server stand-in for the isolated acceptance build only.
 // It speaks newline-delimited JSON-RPC 2.0 over stdio and never performs real work.
-import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
@@ -13,6 +13,7 @@ const scenarios = queue('AUTOJEV_FAKE_HELPER_SCENARIOS', 'success');
 // 按该方法的调用次序取场景，队列用完后重复最后一项（与登录场景队列的既有语义一致）。
 const readScenarios = queue('AUTOJEV_FAKE_HELPER_READS', 'multi');
 const catalogScenarios = queue('AUTOJEV_FAKE_HELPER_CATALOG', 'success');
+const accountScenarios = queue('AUTOJEV_FAKE_HELPER_ACCOUNTS', 'connected');
 const logPath = process.env.AUTOJEV_FAKE_HELPER_LOG || '';
 const delay = Number(process.env.AUTOJEV_FAKE_HELPER_DELAY_MS || 150);
 const codexHome = process.env.CODEX_HOME || '';
@@ -36,7 +37,12 @@ const log = entry => {
 };
 const send = message => process.stdout.write(JSON.stringify(message) + '\n');
 
-const state = { attempt: 0, readIndex: 0, catalogIndex: 0, account: null, pendingLate: new Map(), timers: new Map() };
+// 一个隔离桌面运行内 helper 可在 logout 后重启；只读队列仍按该运行的 RPC 次序消费。
+let previousEntries = [];
+try { if (logPath) previousEntries = readFileSync(logPath, 'utf8').split('\n').filter(Boolean).map(line => JSON.parse(line)); } catch {}
+const previousReads = action => previousEntries.filter(entry => entry.action === action).length;
+const state = { attempt: 0, readIndex: previousReads('quota-read'), catalogIndex: previousReads('catalog-read'),
+  accountIndex: previousReads('account-read'), account: null, pendingLate: new Map(), timers: new Map() };
 const scenarioFor = index => scenarios[Math.min(index, scenarios.length - 1)] || 'success';
 const nextScenario = (list, index, fallback) => list[Math.min(index, list.length - 1)] || fallback;
 const nextRead = () => nextScenario(readScenarios, state.readIndex++, 'multi');
@@ -145,7 +151,7 @@ const quotaResponse = scenario => {
 
 const complete = (loginId, scenario, index) => {
   const ok = scenario !== 'failed';
-  const account = ok ? { email: scenario === 'late' ? identities.late : identities.success, planType: 'fictional-plus' } : undefined;
+  const account = ok ? { type: 'chatgpt', email: scenario === 'late' ? identities.late : identities.success, planType: 'fictional-plus' } : undefined;
   if (account) state.account = account;
   const params = { loginId, ok };
   if (account) params.account = account;
@@ -192,7 +198,11 @@ const handlers = {
   'account/read': () => {
     // Reading the account is the second trigger that flushes a pending `late` completion.
     for (const [loginId, pending] of [...state.pendingLate]) { state.pendingLate.delete(loginId); complete(loginId, 'late', pending.index); }
-    return { result: state.account ? { account: state.account, requiresAuth: false } : { requiresAuth: true } };
+    const scenario = state.account ? nextScenario(accountScenarios, state.accountIndex++, 'connected') : 'signed-out';
+    log({ event: 'lifecycle', method: null, action: 'account-read', scenario });
+    if (scenario === 'signed-out') state.account = null;
+    const account = scenario === 'incomplete' && state.account ? { ...state.account, email: null } : state.account;
+    return { result: { account, requiresOpenaiAuth: true } };
   },
   'account/logout': () => {
     state.account = null;

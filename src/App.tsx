@@ -301,7 +301,11 @@ export default function App() {
                 try {
                   setSnapshot(await refreshSubscription(provider.id));
                   setToast(t('Read-only status refreshed'));
-                } catch (error) { setToast(String(error instanceof Error ? error.message : error), true); }
+                } catch (error) {
+                  setToast(String(error instanceof Error ? error.message : error), true);
+                  // 刷新失败也可能已撤销当前连接并保留历史，立即展示落盘状态。
+                  getSnapshot().then(setSnapshot).catch(() => {});
+                }
               }}
               onTest={async (id) => {
                 setProviderTests((previous) => ({ ...previous, [id]: 'testing' }));

@@ -36,7 +36,7 @@ pub fn label(provider: &Provider) -> &'static str {
     }
 }
 
-/// 连接的授权状态。`Unknown` 不在此列：拿不到状态时保留上一次已核实结果并另标证据陈旧。
+/// 连接的授权状态。身份未确认时按未连接处理；已核实历史只用于展示与同账号恢复。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConnectionState {
@@ -292,6 +292,11 @@ impl Default for Connection {
 impl Connection {
     /// 只有同时绑定当前世代与已核实账号的证据才算数。
     pub fn current_evidence(&self) -> Option<&Evidence> {
+        (self.state == ConnectionState::Connected).then(|| self.account_evidence()).flatten()
+    }
+
+    /// 严格绑定账号与世代的历史；不代表当前授权，也不供生成准入使用。
+    fn account_evidence(&self) -> Option<&Evidence> {
         self.evidence.as_ref().filter(|evidence| {
             evidence.account.is_some()
                 && evidence.account == self.identity
@@ -304,6 +309,8 @@ impl Connection {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ConnectionStatus {
     pub state: ConnectionState,
+    /// 读取不完整与明确退出分开；仅适配器边界内部使用，不持久化。
+    pub identity_incomplete: bool,
     pub identity: Option<String>,
     /// 辅助进程版本与专用账号路径：证据据此绑定版本与账号路径。
     pub helper_version: Option<String>,
@@ -1242,13 +1249,8 @@ fn had_verified_catalog(previous: Option<&Evidence>) -> bool {
 /// 只读刷新：按当前连接世代读取状态、目录与额度并写回证据。
 /// 它与生成准入无关，因此生成被拒绝、网关暂停或服务商停用时仍可执行。
 ///
-/// 三项读取彼此独立：状态读不到就返回错误且不改写任何证据；目录或额度失败时按契约 B
-/// 写回（保留已核实的历史数字与时间，只把对应依据标为陈旧/失败），命令仍返回 `Ok`。
-///
-/// 本次状态读不到有效账号身份时无法确认数据归属：既不改写已核实身份（覆盖成 `None` 会让
-/// `current_evidence` 绑不上账号，连历史目录与额度都在下一次刷新时丢掉），也不读取本次的
-/// 目录与额度，直接返回错误。明确退出与换号不经过这条守卫：logout/switch 发生时已递增
-/// 世代并清空身份与证据。
+/// 身份不完整或状态读取失败：立即阻止准入，保留同账号同世代的历史并标陈旧/失败，
+/// 不发起本次目录与额度读取。明确未登录：推进世代并清空身份与所有证据。
 pub async fn refresh(store: &ConfigStore, provider_id: &str) -> Result<Connection, String> {
     let provider = require_subscription_provider(store, provider_id)?;
     // 不支持的订阅类型不得借用其它服务商的辅助进程读取证据（#12「两家互不冒用」）。
@@ -1259,27 +1261,48 @@ pub async fn refresh(store: &ConfigStore, provider_id: &str) -> Result<Connectio
         return Ok(before);
     }
     let generation = before.generation;
-    // 1) 连接状态：读不到状态就是「连接状态未知」，返回错误且不改写任何证据。
-    let status = store.subscription.status(provider_id, generation).await.map_err(|error| error.to_string())?;
+    let (status, status_error) = match store.subscription.status(provider_id, generation).await {
+        Ok(status) => (status, None),
+        Err(error) => (ConnectionStatus { identity_incomplete: true, ..ConnectionStatus::default() }, Some(error.to_string())),
+    };
     let read_identity = status.identity.clone().filter(|identity| !identity.trim().is_empty());
-    let verified_identity = before.identity.clone().filter(|identity| !identity.trim().is_empty());
-    if let Some(verified) = verified_identity.as_deref() {
-        match read_identity.as_deref() {
-            // 换号期间的旧响应不得污染新账号：读取到的身份与连接里已核实的身份不符时整体丢弃。
-            Some(read) if read != verified => {
-                return Err("The account changed while refreshing; the read-only result was discarded".into());
+    // 必须先落盘当前失效状态，不能由“保留历史”的身份守卫忽略 helper 的明确退出。
+    if status.identity_incomplete || status.state != ConnectionState::Connected || read_identity.is_none() {
+        let incomplete = status.identity_incomplete || (status.state == ConnectionState::Connected && read_identity.is_none());
+        let result = store.update(|config| -> Result<Connection, String> {
+            if !config.providers.iter().any(|provider| provider.id == provider_id && is_subscription_provider(provider)) {
+                return Err("The subscription provider was removed while refreshing".into());
             }
-            // 本次身份读取不完整：无法确认这次读到的数据属于谁。不得把已核实身份覆盖成 None，
-            // 也不得把本次读到的目录/额度挂到旧账号名下，所以停止本次目录与额度刷新。
-            None => {
-                return Err(
-                    "The Codex helper did not report an account identity; the read-only refresh could not \
-                     confirm which account the data belongs to, so nothing was changed"
-                        .into(),
-                );
+            let connection = config.subscriptions.entry(provider_id.to_owned()).or_default();
+            if connection.generation != generation || connection.identity != before.identity || connection.state != before.state {
+                return Err("The connection changed while refreshing; the read-only result was discarded".into());
             }
-            _ => {}
-        }
+            if incomplete {
+                connection.state = ConnectionState::NotConnected;
+                let had_catalog = had_verified_catalog(connection.account_evidence());
+                if let Some(evidence) = connection.evidence.as_mut() {
+                    evidence.catalog.state = if had_catalog { EvidenceState::Stale } else { EvidenceState::Failed };
+                    evidence.quota.state = EvidenceState::Failed;
+                    evidence.quota.history = evidence.quota.observed_at.is_some() || !evidence.quota.buckets.is_empty();
+                }
+            } else {
+                if connection.identity.is_some() || connection.evidence.is_some() || connection.state != status.state {
+                    connection.generation += 1;
+                }
+                connection.state = status.state;
+                connection.identity = None;
+                connection.evidence = None;
+            }
+            Ok(connection.clone())
+        }).map_err(|error| error.to_string())??;
+        return if incomplete {
+            Err(status_error.unwrap_or_else(|| "The Codex helper could not confirm which account the data belongs to; connection suspended and history retained".into()))
+        } else {
+            Ok(result)
+        };
+    }
+    if before.identity.as_ref().is_some_and(|verified| Some(verified) != read_identity.as_ref()) {
+        return Err("The account changed while refreshing; the read-only result was discarded".into());
     }
     // 2) 目录与额度独立读取：任一失败都不影响另一项写回。
     let catalog_read = store.subscription.models(provider_id, generation).await;
@@ -1290,10 +1313,10 @@ pub async fn refresh(store: &ConfigStore, provider_id: &str) -> Result<Connectio
             return Err("The subscription provider was removed while refreshing".into());
         }
         let connection = config.subscriptions.entry(provider_id.to_owned()).or_default();
-        if connection.generation != generation || connection.identity != before.identity {
+        if connection.generation != generation || connection.identity != before.identity || connection.state != before.state {
             return Err("The connection changed while refreshing; the read-only result was discarded".into());
         }
-        let previous = connection.current_evidence().cloned();
+        let previous = connection.account_evidence().cloned();
         // 目录：成功即以本次权威结果整体替换；失败保留已核实目录并标陈旧，没有目录才标失败。
         let (models, catalog) = match catalog_read {
             Ok(read) => (
@@ -1370,7 +1393,7 @@ pub fn views(config: &AppConfig, adapter_available: bool, sessions: &SessionStat
         .filter(|provider| is_subscription_provider(provider))
         .map(|provider| {
             let connection = config.subscriptions.get(&provider.id).cloned().unwrap_or_default();
-            let evidence = connection.current_evidence();
+            let evidence = connection.account_evidence();
             let session = sessions.session(&provider.id);
             // 适配器不支持这类服务商时，如实报 helper 不可用：不借用其它服务商的进程信息。
             let supported = sessions.supports(&provider.id);
@@ -1383,7 +1406,7 @@ pub fn views(config: &AppConfig, adapter_available: bool, sessions: &SessionStat
                 helper_version: evidence.and_then(|evidence| evidence.helper_version.clone()),
                 account_path: evidence.and_then(|evidence| evidence.account_path.clone()),
                 models: evidence.map(|evidence| evidence.models.clone()).unwrap_or_default(),
-                capabilities: evidence.map(|evidence| evidence.capabilities.clone()).unwrap_or_default(),
+                capabilities: connection.current_evidence().map(|evidence| evidence.capabilities.clone()).unwrap_or_default(),
                 catalog: evidence.map(|evidence| evidence.catalog.clone()).unwrap_or_default(),
                 quota: evidence.map(|evidence| evidence.quota.clone()).unwrap_or_default(),
                 denial: connection_denial(config, provider),
@@ -1659,6 +1682,9 @@ mod refresh_tests {
         fail_status: AtomicBool,
         fail_models: AtomicBool,
         fail_quota: AtomicBool,
+        pause_models: AtomicBool,
+        models_started: tokio::sync::Notify,
+        resume_models: tokio::sync::Notify,
     }
 
     /// 替身写回的固定读取时间：失败后必须原样保留，不能被刷新成「现在」。
@@ -1669,6 +1695,7 @@ mod refresh_tests {
         fn new() -> Arc<Self> {
             Arc::new(Self {
                 status: Mutex::new(ConnectionStatus {
+                    identity_incomplete: false,
                     state: ConnectionState::Connected,
                     identity: Some("fixture@example.invalid".into()),
                     helper_version: Some("fixture-helper-1.0".into()),
@@ -1705,6 +1732,9 @@ mod refresh_tests {
                 fail_status: AtomicBool::new(false),
                 fail_models: AtomicBool::new(false),
                 fail_quota: AtomicBool::new(false),
+                pause_models: AtomicBool::new(false),
+                models_started: tokio::sync::Notify::new(),
+                resume_models: tokio::sync::Notify::new(),
             })
         }
     }
@@ -1741,6 +1771,10 @@ mod refresh_tests {
         fn models<'a>(&'a self, _provider_id: &'a str, _generation: u64) -> BoxFuture<'a, Result<CatalogRead>> {
             Box::pin(async move {
                 self.catalog_reads.fetch_add(1, Ordering::SeqCst);
+                if self.pause_models.swap(false, Ordering::SeqCst) {
+                    self.models_started.notify_one();
+                    self.resume_models.notified().await;
+                }
                 if self.fail_models.load(Ordering::SeqCst) {
                     bail!("fixture catalog read failed");
                 }
@@ -1932,7 +1966,7 @@ mod refresh_tests {
     }
 
     #[tokio::test]
-    async fn a_status_read_failure_returns_an_error_and_changes_nothing() {
+    async fn a_status_read_failure_suspends_connection_and_preserves_history() {
         let adapter = StubAdapter::new();
         let (store, _directory) = fixture_store(adapter.clone());
         refresh(&store, "codex").await.unwrap();
@@ -1940,8 +1974,13 @@ mod refresh_tests {
         adapter.fail_status.store(true, Ordering::SeqCst);
         let error = refresh(&store, "codex").await.unwrap_err();
         assert!(error.contains("fixture helper status read failed"), "{error}");
-        // 连接状态未知：一个字段都不改写，旧证据（含目录与额度）原样保留。
-        assert_eq!(serde_json::to_value(stored(&store)).unwrap(), before);
+        let after = stored(&store);
+        assert_eq!(after.state, ConnectionState::NotConnected);
+        assert!(after.current_evidence().is_none());
+        let history = serde_json::to_value(&after).unwrap();
+        assert_eq!(history["evidence"]["models"], before["evidence"]["models"]);
+        assert_eq!(history["evidence"]["quota"]["buckets"], before["evidence"]["quota"]["buckets"]);
+        assert_eq!(history["evidence"]["quota"]["observed_at"], before["evidence"]["quota"]["observed_at"]);
         assert_eq!(adapter.reads.lock().unwrap().len(), 2, "status is read once per refresh");
     }
 
@@ -2047,6 +2086,44 @@ mod refresh_tests {
     }
 
     #[tokio::test]
+    async fn a_late_refresh_cannot_revive_a_after_helper_disconnect_or_switch_to_b() {
+        for switch_to_b in [false, true] {
+            let adapter = StubAdapter::new();
+            let (store, _directory) = fixture_store(adapter.clone());
+            refresh(&store, "codex").await.unwrap();
+            adapter.pause_models.store(true, Ordering::SeqCst);
+            let late_store = store.clone();
+            let late = tokio::spawn(async move { refresh(&late_store, "codex").await });
+            adapter.models_started.notified().await;
+            {
+                let mut status = adapter.status.lock().unwrap();
+                status.state = ConnectionState::NotConnected;
+                status.identity = None;
+            }
+            let signed_out = refresh(&store, "codex").await.unwrap();
+            assert!(signed_out.evidence.is_none());
+            if switch_to_b {
+                {
+                    let mut status = adapter.status.lock().unwrap();
+                    status.state = ConnectionState::Connected;
+                    status.identity = Some("B@example.invalid".into());
+                }
+                adapter.models.lock().unwrap().clear();
+                adapter.fail_quota.store(true, Ordering::SeqCst);
+                let b = refresh(&store, "codex").await.unwrap();
+                assert_eq!(b.identity.as_deref(), Some("B@example.invalid"));
+                assert!(b.evidence.as_ref().unwrap().models.is_empty());
+                assert!(b.evidence.as_ref().unwrap().quota.buckets.is_empty());
+                assert!(!b.evidence.as_ref().unwrap().quota.history);
+            }
+            let before_late = stored(&store);
+            adapter.resume_models.notify_one();
+            assert!(late.await.unwrap().unwrap_err().contains("changed while refreshing"));
+            assert_eq!(stored(&store), before_late, "A must not overwrite the disconnected or B connection");
+        }
+    }
+
+    #[tokio::test]
     async fn a_read_from_another_account_is_discarded_with_an_error() {
         let adapter = StubAdapter::new();
         let (store, _directory) = fixture_store(adapter.clone());
@@ -2060,7 +2137,7 @@ mod refresh_tests {
     }
 
     /// 本次 status 读不到有效账号身份时无法确认数据归属：不得把已核实身份覆盖成 `None`，
-    /// 不得让旧账号的历史目录与额度失去 `current_evidence` 的绑定，也不得把本次读到的
+    /// 历史目录与额度仍严格绑定原账号，但不再是 `current_evidence`，也不得把本次读到的
     /// 目录/额度挂到旧账号名下——本次目录与额度刷新必须根本不发起。
     #[tokio::test]
     async fn a_refresh_without_an_account_identity_keeps_the_verified_account_and_history() {
@@ -2070,16 +2147,28 @@ mod refresh_tests {
         let before = serde_json::to_value(stored(&store)).unwrap();
         let catalog_reads = adapter.catalog_reads.load(Ordering::SeqCst);
         let quota_reads = adapter.quota_reads.load(Ordering::SeqCst);
-        // 辅助进程这次没有返回可用身份：无法确认本次读到的数据属于谁。
-        adapter.status.lock().unwrap().identity = None;
+        // 真实适配器能产生的组合：未连接 + 身份读取不完整。
+        {
+            let mut status = adapter.status.lock().unwrap();
+            status.identity = None;
+            status.state = ConnectionState::NotConnected;
+            status.identity_incomplete = true;
+        }
         let error = refresh(&store, "codex").await.unwrap_err();
         assert!(error.contains("could not confirm which account"), "{error}");
-        // 一个字段都不改写：身份、证据与时间戳原样保留，也没有被标成未连接。
-        assert_eq!(serde_json::to_value(stored(&store)).unwrap(), before);
+        let after = serde_json::to_value(stored(&store)).unwrap();
+        assert_eq!(after["evidence"]["models"], before["evidence"]["models"]);
+        assert_eq!(after["evidence"]["quota"]["buckets"], before["evidence"]["quota"]["buckets"]);
         let connection = stored(&store);
         assert_eq!(connection.identity.as_deref(), Some("fixture@example.invalid"));
-        assert_eq!(connection.state, ConnectionState::Connected);
-        let evidence = connection.current_evidence().expect("the verified account keeps its evidence");
+        assert_eq!(connection.state, ConnectionState::NotConnected);
+        assert!(connection.current_evidence().is_none());
+        let evidence = connection.account_evidence().expect("history stays bound to the verified account");
+        assert_eq!(evidence.catalog.state, EvidenceState::Stale);
+        assert_eq!(evidence.quota.state, EvidenceState::Failed);
+        assert!(evidence.quota.history);
+        let (model, provider) = target(&store.read());
+        assert_eq!(admit_model(&store.read(), &model, &provider, Protocol::Chat).unwrap_err().code, "not_connected");
         assert_eq!(evidence.catalog.observed_at.as_deref(), Some(STUB_CATALOG_OBSERVED_AT));
         assert_eq!(evidence.quota.observed_at.as_deref(), Some(STUB_QUOTA_OBSERVED_AT));
         // 本次目录与额度刷新被停止：新数据既没有被读取，也不可能被挂到旧账号名下。
@@ -2094,10 +2183,20 @@ mod refresh_tests {
         let adapter = StubAdapter::new();
         let (store, _directory) = fixture_store(adapter.clone());
         refresh(&store, "codex").await.unwrap();
-        adapter.status.lock().unwrap().identity = None;
+        {
+            let mut status = adapter.status.lock().unwrap();
+            status.identity = None;
+            status.state = ConnectionState::NotConnected;
+            status.identity_incomplete = true;
+        }
         assert!(refresh(&store, "codex").await.unwrap_err().contains("could not confirm which account"));
         // 身份重新确认是同一个 A，但两项读取都失败。
-        adapter.status.lock().unwrap().identity = Some("fixture@example.invalid".into());
+        {
+            let mut status = adapter.status.lock().unwrap();
+            status.identity = Some("fixture@example.invalid".into());
+            status.state = ConnectionState::Connected;
+            status.identity_incomplete = false;
+        }
         adapter.fail_models.store(true, Ordering::SeqCst);
         adapter.fail_quota.store(true, Ordering::SeqCst);
         let connection = refresh(&store, "codex").await.unwrap();
@@ -2307,6 +2406,7 @@ mod lifecycle_tests {
                     auth_home: Some("/tmp/fixture-helper-home".into()),
                 },
                 status: ConnectionStatus {
+                    identity_incomplete: false,
                     state: ConnectionState::Connected,
                     identity: Some("helper@example.invalid".into()),
                     helper_version: Some("fixture-helper-1.0".into()),

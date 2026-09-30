@@ -43,6 +43,15 @@
 
 ### 状态规则
 
+- `account/read` 按固定版本的 [`GetAccountResponse` / `Account`](https://github.com/openai/codex/blob/ed9e5a26a88b8f3e36e70ccab0d8b9c5e14f015b/codex-rs/app-server-protocol/src/protocol/v2/account.rs) 区分：
+  `account:null` 且认证需求字段有效 → 明确无账号；`chatgpt.email:null`、空白、字段读取不完整或 RPC 失败
+  → 身份未确认。`requiresOpenaiAuth` 是认证需求，**不是当前未登录标志**，已连接时也可为 true。
+  兼容旧 `requiresAuth:true` 且无 account 的明确未登录响应；不凭缺 email 推断退出。
+- 明确无账号 → `not_connected`，推进世代并清空身份、目录、额度与能力；不读取目录/额度。
+- 身份未确认 → 当前 `not_connected`、准入拒绝；原账号/世代历史原地保留，目录 `stale`、额度
+  `failed + history`，原始数据、来源、时间不变。本次目录/额度不发起，前端错误后重新取快照。
+  `current_evidence` 额外要求 Connected；历史展示与同账号恢复仍要求账号/世代严格相等，能力不作为历史授权展示。
+- 同账号重新确认后读取失败仍保留旧目录与额度；明确退出/换号清空历史，迟到响应检查世代、身份与连接状态。
 - `quota.state`：从未读取 → `unknown`；任一桶 `denied` → `denied`；全部桶 `allowed` 且至少一个窗口有有效
   `used_percent` → `available`；否则 `unknown`（`missing_fields` 说明缺什么）。读取成功但既无
   `rateLimitsByLimitId` 也无 `rateLimits` → `unknown`，`missing_fields` 记两个视图键。
@@ -145,3 +154,19 @@ pnpm test:isolated
   `quota_denied`/`quota_failed` 在本票的端到端路径上不可达：它们由 `subscription.rs` 单测覆盖，
   隔离验收只断言界面与 snapshot 已展示的 `permission=denied`、`quota.state=denied`/`failed` 与 `history`。
   同理，`view.denial` 只承载连接级原因，不承载额度拒绝码。
+## PR #31 helper 退出回归证据
+
+- 在修复前 `9ffb887` 上新增真实 CodexAdapter + 隔离 stdio helper 回归，运行
+  `cargo test --locked --manifest-path src-tauri/Cargo.toml --lib refresh_helper -- --nocapture`：
+  **0 passed / 2 failed**。已连接 A 后直接读取 `account:null`（未调用应用内 logout）仍为 Connected；
+  `chatgpt.email:null` 同样仍为 Connected。测试替身使用真实契约形状，不构造 Connected + 无身份。
+- 首轮修复后上述两项通过；扩展原生隔离验收又捕获错误返回后界面仍显示旧连接状态，
+  `Desktop condition timed out: row status codex-subscription`。补充错误后读取快照，保留该 DOM 断言。
+- catalog 隔离运行增加身份不完整、同账号恢复后两项读取失败，以及重新连接 A 后 helper 自行退出。
+  后者只点刷新；检查真实 DOM、快照和生成准入拒绝，替身 RPC 日志核对不完整期间没有目录/额度读取。
+- Rust 另覆盖 A 的迟到刷新不能覆盖 helper 已退出状态或新世代 B；B 读取失败不能继承 A 的历史。
+  此证据不涉及真实 OAuth、真实生成或 #25 人工验证。
+- 修复后验证：Rust `--lib` **247 passed / 0 failed**；前端 **58 passed（11 files）**；
+  `pnpm exec tsc --noEmit`、`pnpm build`、`pnpm release:check` 通过。
+  `pnpm test:isolated` exit 0，六份原生 report 全部 `ok=true`（catalog 20 条）；
+  替身只有允许的账号/只读 RPC，未发出生成 RPC；身份不完整期间未读取目录/额度。

@@ -426,8 +426,25 @@
     record('failCatalog', { catalog: failCatalog.view.catalog, models: failCatalog.view.models, previousObservedAt: lastGoodCatalogObservedAt, dom: failCatalog.dom.catalog.slice(0, 500) });
     passed('a failed catalog read keeps the verified directory, marks it stale and keeps the last successful timestamp');
     passed('a catalog failure does not rewrite the independently failed quota evidence');
+    // Helper 自行改变状态：直接刷新，不先调用应用内 logout。
+    const incomplete = await refreshUntil('incomplete identity suspends current authorization', (view, dom) =>
+      view?.state === 'not_connected' && dom.quota.includes('history=true') && dom.catalog.includes('catalog_state=stale'));
+    check(incomplete.view.identity === failCatalog.view.identity, 'Keep the last verified owner for history');
+    check(incomplete.view.catalog.observed_at === failCatalog.view.catalog.observed_at, 'Incomplete identity must keep the catalog time');
+    check(incomplete.view.quota.observed_at === failCatalog.view.quota.observed_at, 'Incomplete identity must keep the quota time');
+    check(JSON.stringify(incomplete.view.models) === JSON.stringify(failCatalog.view.models), 'Incomplete identity must retain only the old models');
+    check(JSON.stringify(incomplete.view.quota.buckets) === JSON.stringify(failCatalog.view.quota.buckets), 'Incomplete identity must retain only the old buckets');
+    check(incomplete.view.denial?.code === 'not_connected', 'Incomplete identity must refuse admission');
+    await waitStatus(text => text.includes('state=not_connected'));
+    passed('incomplete identity suspends the connection and displays stale historical evidence with original timestamps');
+    const recovered = await refreshUntil('same account recovery with failed evidence reads', (view, dom) =>
+      view?.state === 'connected' && dom.catalog.includes('catalog_state=stale') && dom.quota.includes('quota_state=failed'));
+    check(recovered.view.identity === failCatalog.view.identity, 'Recovery must confirm the original account');
+    check(recovered.view.catalog.observed_at === failCatalog.view.catalog.observed_at, 'Recovery failure must keep historical catalog time');
+    check(recovered.view.quota.observed_at === failCatalog.view.quota.observed_at && recovered.view.quota.history, 'Recovery failure must keep historical quota time');
+    passed('same-account recovery retains the stale catalog and failed historical quota');
     // 10) 登出：目录与额度一并清空，生成仍被统一准入拒绝。
-    const connectedGeneration = failCatalog.view.generation;
+    const connectedGeneration = recovered.view.generation;
     await click(`[data-testid="sub-logout-${providerId}"]`);
     const after = await wait(async () => { const item = await subscriptionView(); return item?.logout && !item.identity ? item : null; }, 'logout outcome');
     check(after.generation > connectedGeneration, `Sign-out must advance the generation: ${connectedGeneration} -> ${after.generation}`);
@@ -450,6 +467,27 @@
     check(/not connected/i.test(deniedAfterLogout.job.error || ''), `A signed-out subscription must stay denied with its reason: ${deniedAfterLogout.job.error}`);
     record('deniedAfterLogout', { error: deniedAfterLogout.job.error });
     passed('generation stays denied after the catalog and quota evidence is cleared');
+    // 重新连接 A，留下有效证据，再排练 helper 自行退出（此前应用内退出不参与这次故障路径）。
+    await click(`[data-testid="sub-login-${providerId}"]`);
+    await wait(async () => { const item = await subscriptionView(); return item?.login?.stage === 'completed' && item?.state === 'connected' ? item : null; }, 'second account verification');
+    const helperConnected = await refreshUntil('connected A before helper disconnect', (view, dom) =>
+      view?.state === 'connected' && dom.catalog.includes('catalog_state=available') && dom.quota.includes('quota_state=available'));
+    const helperOut = await refreshUntil('helper disconnect without app logout', (view, dom) =>
+      view?.state === 'not_connected' && !view.identity && dom.catalog.includes('catalog_state=unknown') && !dom.quota.includes('bucket='));
+    check(helperOut.view.generation > helperConnected.view.generation, 'Helper disconnect must invalidate the generation');
+    check(!helperOut.view.models.length && !helperOut.view.quota.buckets.length, 'Helper disconnect must clear active evidence');
+    check(helperOut.view.denial?.code === 'not_connected', 'Helper disconnect must refuse admission');
+    await invoke('start_model_speed_tests', { ids: ['codex-subscription-model'] });
+    const helperDenied = await wait(async () => {
+      const value = await invoke('get_model_performance');
+      return !value.job.running && value.job.completed === 3 && value.job.error ? value : null;
+    }, 'helper disconnect admission refusal');
+    check(/not connected/i.test(helperDenied.job.error), `Helper disconnect must refuse generation: ${helperDenied.job.error}`);
+    record('helperDisconnect', { generation: helperOut.view.generation, denial: helperOut.view.denial, error: helperDenied.job.error });
+    passed('helper disconnect clears evidence and refuses generation without app logout');
+    // 全部故障断言完成后才调用退出，清理本次替身生成的专用授权文件。
+    await invoke('logout_subscription', { providerId });
+
   };
   try {
     await wait(() => document.querySelector('.app-shell'));
