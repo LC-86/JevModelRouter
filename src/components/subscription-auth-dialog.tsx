@@ -3,7 +3,7 @@ import { Check, Copy, LoaderCircle, LogIn, LogOut, RefreshCw, ShieldCheck, X } f
 import {
   beginSubscriptionLogin, cancelSubscriptionLogin, logoutSubscription, pollSubscriptionLogin, switchSubscriptionAccount,
 } from '../lib/bridge';
-import { authErrorLabel, authPhaseLabel, logoutLocalLabel, remoteRevokeLabel, subscriptionAuthView } from '../lib/subscription';
+import { authErrorLabel, authPhaseLabel, cancelAllowed, logoutLocalLabel, pollResultAllowed, pollTickAllowed, remoteRevokeLabel, subscriptionAuthView } from '../lib/subscription';
 import { usePreferences } from '../lib/preferences-context';
 import type { DashboardSnapshot, Provider } from '../types';
 
@@ -22,6 +22,12 @@ export function SubscriptionAuthDialog({ provider, snapshot, onSnapshot, onNotif
   const [busy, setBusy] = useState(false);
   const [failure, setFailure] = useState('');
   const [copied, setCopied] = useState('');
+  const [polling, setPolling] = useState(false);
+  // poll 在途用 ref 同步记录（定时器闭包读不到最新 state）；busy 亦然。
+  const pollInFlight = useRef(false);
+  const busyRef = useRef(false);
+  // 任何新命令都会推进序号：cancel/logout 之后回来的迟到 poll 响应据此丢弃。
+  const pollEpoch = useRef(0);
   const view = subscriptionAuthView(snapshot, provider.id);
   const helper = view?.helper;
   const errorText = (cause: unknown) => String(cause instanceof Error ? cause.message : cause);
@@ -33,29 +39,40 @@ export function SubscriptionAuthDialog({ provider, snapshot, onSnapshot, onNotif
     return () => { element.close(); previous?.focus(); };
   }, []);
 
-  // 只在 pending 时轮询；相位变化或卸载立即清除定时器，且单次轮询不并发。
+  // 只在 pending 时轮询；相位离开 pending 或卸载立即清除定时器。
+  // tick 同时尊重「停止／其它命令在途／上次 poll 未返回」，取消后迟到的响应按序号丢弃。
   useEffect(() => {
     if (view?.phase !== 'pending') return;
-    let stopped = false;
-    let running = false;
-    const timer = window.setInterval(async () => {
-      if (stopped || running) return;
-      running = true;
-      try { onSnapshot(await pollSubscriptionLogin(provider.id)); }
-      catch (cause) { if (!stopped) { setFailure(errorText(cause)); window.clearInterval(timer); } }
-      finally { running = false; }
-    }, POLL_MS);
-    return () => { stopped = true; window.clearInterval(timer); };
+    let active = true;
+    let timer = 0;
+    const tick = async () => {
+      if (!pollTickAllowed({ phase: view?.phase ?? 'idle', busy: busyRef.current, inFlight: pollInFlight.current, stopped: !active })) return;
+      const requestEpoch = pollEpoch.current;
+      pollInFlight.current = true;
+      setPolling(true);
+      try {
+        const next = await pollSubscriptionLogin(provider.id);
+        if (pollResultAllowed({ phase: view?.phase ?? 'idle', requestEpoch, currentEpoch: pollEpoch.current, stopped: !active })) onSnapshot(next);
+      } catch (cause) {
+        if (active) { setFailure(errorText(cause)); window.clearInterval(timer); }
+      } finally {
+        if (active) { pollInFlight.current = false; setPolling(false); }
+      }
+    };
+    timer = window.setInterval(() => void tick(), POLL_MS);
+    return () => { active = false; window.clearInterval(timer); pollInFlight.current = false; };
   }, [view?.phase, provider.id, onSnapshot]);
 
   // 所有命令都返回完整快照，界面直接替换，不自行推断状态。
   const run = async (action: () => Promise<DashboardSnapshot>, done?: string) => {
-    if (busy) return;
+    if (busyRef.current) return;
+    pollEpoch.current += 1;
+    busyRef.current = true;
     setBusy(true);
     setFailure('');
     try { onSnapshot(await action()); if (done) onNotify?.(done); }
     catch (cause) { setFailure(errorText(cause)); }
-    finally { setBusy(false); }
+    finally { busyRef.current = false; setBusy(false); }
   };
 
   const copy = async (label: string, value: string) => {
@@ -105,7 +122,7 @@ export function SubscriptionAuthDialog({ provider, snapshot, onSnapshot, onNotif
         </div>}
         <div className="subscription-auth-actions">
           {view?.phase === 'pending'
-            ? <button type="button" className="button ghost" disabled={busy} onClick={() => void run(() => cancelSubscriptionLogin(provider.id))}>{busy ? <LoaderCircle size={16} className="import-spinner" /> : <X size={16} />}{t('Cancel sign-in')}</button>
+            ? <button type="button" className="button ghost" disabled={!cancelAllowed({ phase: view?.phase ?? 'idle', busy, pollInFlight: polling })} title={polling ? t('Waiting for the current poll to finish') : undefined} onClick={() => void run(() => cancelSubscriptionLogin(provider.id))}>{busy ? <LoaderCircle size={16} className="import-spinner" /> : <X size={16} />}{t('Cancel sign-in')}</button>
             : <button type="button" className="button primary subscription-auth-begin" disabled={busy} onClick={() => void run(() => beginSubscriptionLogin(provider.id))}>{busy ? <LoaderCircle size={16} className="import-spinner" /> : <LogIn size={16} />}{t('Sign in')}</button>}
         </div>
       </section>

@@ -2,7 +2,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { PreferencesProvider, translate } from './preferences-context';
-import { authErrorLabel, authPhaseLabel, logoutLocalLabel, remoteRevokeLabel, subscriptionAuthView } from './subscription';
+import { authErrorLabel, authPhaseLabel, cancelAllowed, logoutLocalLabel, pollResultAllowed, pollTickAllowed, remoteRevokeLabel, subscriptionAuthView } from './subscription';
 import { SubscriptionAuthDialog } from '../components/subscription-auth-dialog';
 import type {
   DashboardSnapshot, Provider, SubscriptionAuthView, SubscriptionLocalLogoutState, SubscriptionRemoteRevokeState,
@@ -110,5 +110,39 @@ describe('subscription authorization dialog', () => {
     expect(html).toContain('本地凭据已清除');
     expect(html).not.toContain('尝试');
     expect(html).toContain('世代 3');
+  });
+});
+
+// 轮询与取消重叠的前端守卫：全部为纯函数，不用 jsdom／timer。
+describe('subscription poll and cancel guards', () => {
+  const tick = { phase: 'pending' as const, busy: false, inFlight: false, stopped: false };
+
+  it('allows a poll tick only while pending, idle and not stopped', () => {
+    expect(pollTickAllowed(tick)).toBe(true);
+    expect(pollTickAllowed({ ...tick, busy: true })).toBe(false);
+    expect(pollTickAllowed({ ...tick, inFlight: true })).toBe(false);
+    expect(pollTickAllowed({ ...tick, stopped: true })).toBe(false);
+    for (const phase of ['idle', 'succeeded', 'failed', 'cancelled'] as const) {
+      expect(pollTickAllowed({ ...tick, phase })).toBe(false);
+    }
+  });
+
+  it('blocks a cancel while busy or while a poll is in flight', () => {
+    const cancel = { phase: 'pending' as const, busy: false, pollInFlight: false };
+    expect(cancelAllowed(cancel)).toBe(true);
+    expect(cancelAllowed({ ...cancel, busy: true })).toBe(false);
+    expect(cancelAllowed({ ...cancel, pollInFlight: true })).toBe(false);
+    for (const phase of ['idle', 'succeeded', 'failed', 'cancelled'] as const) {
+      expect(cancelAllowed({ ...cancel, phase })).toBe(false);
+    }
+  });
+
+  it('drops a poll response that arrives after a cancel superseded its epoch', () => {
+    const result = { phase: 'pending' as const, requestEpoch: 4, currentEpoch: 4, stopped: false };
+    expect(pollResultAllowed(result)).toBe(true);
+    // cancel／logout 推进序号后，迟到的响应不得覆盖新状态。
+    expect(pollResultAllowed({ ...result, currentEpoch: 5 })).toBe(false);
+    expect(pollResultAllowed({ ...result, stopped: true })).toBe(false);
+    expect(pollResultAllowed({ ...result, phase: 'cancelled' })).toBe(false);
   });
 });

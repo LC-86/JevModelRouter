@@ -135,3 +135,21 @@ export function remoteRevokeLabel(state: SubscriptionRemoteRevokeState, t: Trans
     unsupported: 'Remote revoke unsupported',
   }[state]);
 }
+
+export interface SubscriptionPollGuard { phase: SubscriptionAuthPhase; busy: boolean; inFlight: boolean; stopped: boolean }
+/** 轮询 tick 仅在仍处于 pending、没有其它命令在途、上次 poll 已返回且未被停止时才允许发起。 */
+export function pollTickAllowed(guard: SubscriptionPollGuard): boolean {
+  return guard.phase === 'pending' && !guard.busy && !guard.inFlight && !guard.stopped;
+}
+
+export interface SubscriptionCancelGuard { phase: SubscriptionAuthPhase; busy: boolean; pollInFlight: boolean }
+/** poll 在途时禁止取消：两个请求交叉写回会互相覆盖刚写入的连接状态。 */
+export function cancelAllowed(guard: SubscriptionCancelGuard): boolean {
+  return guard.phase === 'pending' && !guard.busy && !guard.pollInFlight;
+}
+
+export interface SubscriptionPollResultGuard { phase: SubscriptionAuthPhase; requestEpoch: number; currentEpoch: number; stopped: boolean }
+/** 迟到的 poll 响应必须丢弃：只有发起时的序号仍是当前序号、未被停止且仍处于 pending 才允许写快照。 */
+export function pollResultAllowed(guard: SubscriptionPollResultGuard): boolean {
+  return guard.phase === 'pending' && !guard.stopped && guard.requestEpoch === guard.currentEpoch;
+}

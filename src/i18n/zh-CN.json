@@ -882,5 +882,6 @@
   "Remote revoke verified": "远端撤销已验证",
   "Remote revoke unsupported": "远端撤销不支持",
   "Generation {generation}": "世代 {generation}",
-  "Attempt {attempt}": "尝试 {attempt}"
+  "Attempt {attempt}": "尝试 {attempt}",
+  "Waiting for the current poll to finish": "正在等待本轮状态查询返回"
 }

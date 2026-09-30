@@ -8,6 +8,7 @@
 //! JSON 事件都是本应用的适配约定，不是已核实的上游行为。
 
 use std::{
+    ffi::OsStr,
     fs,
     path::{Component, Path, PathBuf},
     process::{Child, ChildStdout, Command, Stdio},
@@ -74,15 +75,55 @@ pub(crate) fn resolve_program() -> Option<(PathBuf, Vec<String>)> {
             return Some((PathBuf::from(program), parts.map(str::to_owned).collect()));
         }
     }
-    let path = std::env::var("PATH").ok()?;
-    find_on_path("grok", &path).map(|program| (program, Vec::new()))
+    let path = std::env::var_os("PATH")?;
+    let candidates = executable_candidates("grok", cfg!(windows), std::env::var_os("PATHEXT").as_deref());
+    find_in_path(&candidates, &path).map(|program| (program, Vec::new()))
 }
 
-fn find_on_path(name: &str, path: &str) -> Option<PathBuf> {
-    path.split(':')
-        .filter(|directory| !directory.is_empty())
-        .map(|directory| Path::new(directory).join(name))
-        .find(|candidate| candidate.is_file())
+/// 可执行文件候选名：非 Windows 只有原名；Windows 先原名，再按 PATHEXT 追加扩展名，
+/// 大小写不敏感去重。默认扩展名 `.COM;.EXE;.BAT;.CMD`。
+fn executable_candidates(name: &str, windows: bool, pathext: Option<&OsStr>) -> Vec<String> {
+    if !windows {
+        return vec![name.to_owned()];
+    }
+    let extensions = pathext
+        .map(|value| value.to_string_lossy().into_owned())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".to_owned());
+    let mut candidates: Vec<String> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    let push = |candidate: String, candidates: &mut Vec<String>, seen: &mut Vec<String>| {
+        let key = candidate.to_lowercase();
+        if !seen.contains(&key) {
+            seen.push(key);
+            candidates.push(candidate);
+        }
+    };
+    push(name.to_owned(), &mut candidates, &mut seen);
+    for extension in extensions.split(';') {
+        let extension = extension.trim();
+        if extension.is_empty() {
+            continue;
+        }
+        push(format!("{name}{extension}"), &mut candidates, &mut seen);
+    }
+    candidates
+}
+
+/// 按平台正确的 PATH 分隔符查找候选可执行文件；跳过空目录项，`is_file()` 判定。
+fn find_in_path(candidates: &[String], path: &OsStr) -> Option<PathBuf> {
+    for directory in std::env::split_paths(path) {
+        if directory.as_os_str().is_empty() {
+            continue;
+        }
+        for candidate in candidates {
+            let full = directory.join(candidate);
+            if full.is_file() {
+                return Some(full);
+            }
+        }
+    }
+    None
 }
 
 /// 组装启动 spec。`program` 已经解析完成；环境按白名单重建，认证来源只由 `GROK_HOME` 决定。
@@ -279,6 +320,28 @@ pub fn cleanup_home(home: &Path) -> Result<()> {
     Ok(())
 }
 
+/// 把一家服务商的自有 home 移到新 id 的 home。old 不存在视为已迁移；new 已存在时拒绝覆盖。
+pub(crate) fn move_home(old_home: &Path, new_home: &Path) -> Result<()> {
+    ensure_owned_helper_home(old_home)?;
+    ensure_owned_helper_home(new_home)?;
+    if !old_home.exists() {
+        return Ok(());
+    }
+    reject_symlink(old_home)?;
+    reject_symlink(new_home)?;
+    ensure!(
+        !new_home.exists(),
+        "Refusing to overwrite an existing subscription helper home: {}",
+        new_home.display()
+    );
+    if let Some(parent) = new_home.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    fs::rename(old_home, new_home)
+        .with_context(|| format!("move {} to {}", old_home.display(), new_home.display()))?;
+    Ok(())
+}
+
 fn reject_symlink(path: &Path) -> Result<()> {
     match fs::symlink_metadata(path) {
         Ok(metadata) => ensure!(
@@ -382,6 +445,20 @@ impl OwnedProcesses {
         self.reclaim_where(|_| true)
     }
 
+    /// 服务商改名时把登记条目的 provider_id 一并改写为新 id，返回改写的条目数。
+    /// 不迁移的话，新 id 的 reclaim 抓不到旧进程，它会活到应用退出。
+    pub fn rename_provider(&self, old_id: &str, new_id: &str) -> usize {
+        let mut children = self.children.lock().unwrap();
+        let mut renamed = 0;
+        for owned in children.iter_mut() {
+            if owned.provider_id == old_id {
+                owned.provider_id = new_id.to_owned();
+                renamed += 1;
+            }
+        }
+        renamed
+    }
+
     fn reclaim_where(&self, matches: impl Fn(&OwnedChild) -> bool) -> Vec<u32> {
         let mut children = self.children.lock().unwrap();
         let all: Vec<OwnedChild> = children.drain(..).collect();
@@ -410,6 +487,7 @@ impl Default for OwnedProcesses {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
     use std::os::unix::fs::PermissionsExt;
 
     fn grok() -> ProviderKind {
@@ -563,9 +641,71 @@ mod tests {
 
         let directory = tempfile::tempdir().unwrap();
         fs::write(directory.path().join("grok"), "#!/bin/sh\n").unwrap();
-        let found = find_on_path("grok", directory.path().to_str().unwrap()).unwrap();
+        let found = find_in_path(&["grok".to_owned()], directory.path().as_os_str()).unwrap();
         assert_eq!(found, directory.path().join("grok"));
-        assert!(find_on_path("grok", "/nonexistent-fixture-dir").is_none());
+    }
+
+    #[test]
+    fn executable_candidates_cover_windows_extensions_and_dedupe() {
+        // 非 Windows 只有原名。
+        assert_eq!(executable_candidates("grok", false, None), vec!["grok".to_owned()]);
+        // Windows 默认 PATHEXT。
+        assert_eq!(
+            executable_candidates("grok", true, None),
+            vec!["grok", "grok.COM", "grok.EXE", "grok.BAT", "grok.CMD"]
+        );
+        // 自定义 PATHEXT：大小写不敏感去重，空扩展名跳过。
+        let pathext = OsStr::new(".exe;.EXE;;.Cmd");
+        assert_eq!(
+            executable_candidates("grok", true, Some(pathext)),
+            vec!["grok", "grok.exe", "grok.Cmd"]
+        );
+        // 空 PATHEXT 值回落默认。
+        assert_eq!(
+            executable_candidates("grok", true, Some(OsStr::new("   "))),
+            vec!["grok", "grok.COM", "grok.EXE", "grok.BAT", "grok.CMD"]
+        );
+    }
+
+    #[test]
+    fn find_in_path_skips_empty_entries_and_reports_misses() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("grok.exe"), "fixture").unwrap();
+        let candidates = vec!["grok.exe".to_owned()];
+        // 单个 tempdir 条目：Unix 上 split_paths 把整段当一项。
+        assert_eq!(
+            find_in_path(&candidates, directory.path().as_os_str()),
+            Some(directory.path().join("grok.exe"))
+        );
+        // 空目录项不 panic，也不改变命中结果。
+        let with_empty = OsString::from(format!(":{}:", directory.path().display()));
+        assert_eq!(find_in_path(&candidates, &with_empty), Some(directory.path().join("grok.exe")));
+        // 只有空项 / 不存在的目录时返回 None。
+        assert!(find_in_path(&candidates, OsStr::new("::")).is_none());
+        assert!(find_in_path(&candidates, OsStr::new("/nonexistent-fixture-dir")).is_none());
+    }
+
+    #[test]
+    fn move_home_relocates_and_refuses_to_overwrite() {
+        let directory = tempfile::tempdir().unwrap();
+        let old_home = helper_home(&grok(), "grok", directory.path()).unwrap();
+        let new_home = helper_home(&grok(), "grok-renamed", directory.path()).unwrap();
+        prepare_home(&old_home).unwrap();
+        fs::write(old_home.join("session"), "fixture").unwrap();
+        move_home(&old_home, &new_home).unwrap();
+        assert!(!old_home.exists(), "旧 home 必须已迁走");
+        assert!(new_home.join("session").is_file(), "内容必须跟着迁走");
+        assert_eq!(fs::metadata(&new_home).unwrap().permissions().mode() & 0o777, 0o700);
+        // 目标已存在时拒绝覆盖。
+        prepare_home(&old_home).unwrap();
+        fs::write(old_home.join("other"), "fixture").unwrap();
+        assert!(move_home(&old_home, &new_home).is_err());
+        assert!(new_home.join("session").is_file(), "拒绝覆盖时目标内容不得被改动");
+        assert!(old_home.join("other").is_file(), "拒绝覆盖时源目录保持不变");
+        // 源 home 不存在视为已迁移。
+        let absent = helper_home(&grok(), "grok-absent", directory.path()).unwrap();
+        let absent_target = helper_home(&grok(), "grok-absent-2", directory.path()).unwrap();
+        assert!(move_home(&absent, &absent_target).is_ok(), "源 home 不存在视为已迁移");
     }
 
     #[test]
@@ -599,6 +739,24 @@ mod tests {
         assert_eq!(processes.reclaim("grok"), vec![pid]);
         // 已回收的 pid 不再持有读取端，也绝不对未知 pid 做任何事。
         assert!(processes.take_stdout(pid).is_none());
+        assert!(processes.reclaim_all().is_empty());
+    }
+
+    #[test]
+    fn rename_provider_rekeys_owned_processes() {
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("fake-helper.sh");
+        fs::write(&script, "#!/bin/sh\nprintf '%s\\n' 'first'\nexec sleep 30\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let spec = spec_with_program(&grok(), "grok", directory.path(), &script, &[]).unwrap();
+        prepare_home(&spec.home).unwrap();
+        let processes = OwnedProcesses::new();
+        let pid = processes.spawn("grok", &spec).unwrap();
+        assert_eq!(processes.rename_provider("grok", "grok-2"), 1);
+        assert_eq!(processes.rename_provider("other", "other-2"), 0);
+        // 旧 key 抓不到它，新 key 能回收：否则进程会活到应用退出。
+        assert!(processes.reclaim("grok").is_empty());
+        assert_eq!(processes.reclaim("grok-2"), vec![pid]);
         assert!(processes.reclaim_all().is_empty());
     }
 }

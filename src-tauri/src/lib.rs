@@ -221,18 +221,153 @@ async fn save_provider(
         return Err("Subscription providers keep their authorization in the provider helper, not as an API key".into());
     }
     provider.has_api_key = false;
+    let creating = creating.unwrap_or(false);
     let old_id = original_id.as_deref().unwrap_or(&provider.id).to_owned();
+    // 重命名/新建的冲突检查必须早于授权迁移：否则 home 已经搬走，配置才失败。
+    if let Some(message) = provider_edit_conflict(&state.store.read(), &provider, original_id.as_deref(), creating) {
+        return Err(message.to_owned());
+    }
+    // 授权资源先于配置迁移：重命名会搬 home，类型转换会丢弃订阅连接。
+    let transition = prepare_provider_auth_change(&state.store.read(), &*state.store.auth, &provider, original_id.as_deref())?;
+    let new_id = provider.id.clone();
     let old_account = format!("provider:{old_id}");
-    let new_account = format!("provider:{}", provider.id);
-    state.store.update_checked(|config| apply_provider_edit(config, provider, original_id.as_deref(), creating.unwrap_or(false), add_test_model.unwrap_or(false)), Some((&old_account, &new_account, api_key.as_deref().map(str::trim).filter(|key|!key.is_empty())))).map_err(|e|e.to_string())?;
+    let new_account = format!("provider:{new_id}");
+    let outcome = state.store.update_checked(
+        |config| {
+            apply_provider_edit(config, provider, original_id.as_deref(), creating, add_test_model.unwrap_or(false))?;
+            // 授权已经丢失（迁移失败或同 id 类型变更）：连接必须重置，逼重新登录。
+            if matches!(transition, AuthTransition::RenameFailed | AuthTransition::Disposed) {
+                reset_connection_after_authorization_loss(config, &new_id);
+            }
+            Ok(())
+        },
+        Some((&old_account, &new_account, api_key.as_deref().map(str::trim).filter(|key| !key.is_empty()))),
+    );
+    if let Err(error) = outcome {
+        if transition == AuthTransition::Disposed {
+            // 凭据已清且无法回滚：配置保持旧 kind、连接仍标已连接，必须诚实告警而不是静默。
+            eprintln!(
+                "AutoJev subscription authorization for {old_id} was already cleared, but saving the provider change failed: {}; the saved provider keeps its previous type and the connection still shows connected until the user signs in again or deletes it",
+                subscription::helper::redact(&error.to_string())
+            );
+        }
+        rollback_provider_auth_change(&*state.store.auth, transition, &old_id, &new_id);
+        return Err(error.to_string());
+    }
     Ok(snapshot(&state).await)
 }
 
-fn apply_provider_edit(config: &mut AppConfig, provider: Provider, original_id: Option<&str>, creating: bool, add_test_model: bool) -> anyhow::Result<()> {
-    let old_id = original_id.unwrap_or(&provider.id).to_owned();
+/// 编辑服务商的前置冲突检查：重命名/新建时先确认 id 可用，避免授权资源先搬走再失败。
+fn provider_edit_conflict(config: &AppConfig, provider: &Provider, original_id: Option<&str>, creating: bool) -> Option<&'static str> {
+    let old_id = original_id.unwrap_or(&provider.id);
+    if original_id.is_some() && !config.providers.iter().any(|existing| existing.id == old_id) {
+        return Some("Provider no longer exists");
+    }
+    if (creating || old_id != provider.id) && config.providers.iter().any(|existing| existing.id == provider.id) {
+        return Some("Provider ID already exists");
+    }
+    None
+}
 
-    if original_id.is_some() && !config.providers.iter().any(|p|p.id==old_id) { return Err(anyhow!("Provider no longer exists")); }
-    if (creating || old_id != provider.id) && config.providers.iter().any(|p|p.id==provider.id) { return Err(anyhow!("Provider ID already exists")); }
+/// 授权资源的迁移结果：决定配置写失败时是否需要回滚，以及连接是否要重置为未连接。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AuthTransition {
+    None,
+    Renamed,
+    RenameFailed,
+    /// 跨订阅 kind 的类型变更：旧授权已 dispose，无法回滚，连接必须重置。
+    Disposed,
+}
+
+/// 在改配置之前处理订阅授权，先看 kind 再看 id：
+/// - 旧非订阅：不动授权资源；
+/// - 旧订阅 → 非订阅：丢弃该服务商的自有授权资源（sync_provider 会丢掉订阅连接）；
+/// - 旧订阅 → 订阅但 kind 不同（无论是否改名）：helper home 按 kind 分路径，跨 kind 无法迁移，
+///   直接 dispose 旧授权并返回 Disposed，连接必须重置；
+/// - 旧订阅 → 同 kind 且同 id：纯编辑，不触碰授权资源；
+/// - 旧订阅 → 同 kind 且改名：迁移 session 与专用 home；迁移失败则清掉旧授权并返回 RenameFailed。
+/// 返回 Err 时调用方必须拒绝本次编辑，provider 与连接保持原样。
+fn prepare_provider_auth_change(
+    config: &AppConfig,
+    auth: &dyn subscription::auth::SubscriptionAuth,
+    provider: &Provider,
+    original_id: Option<&str>,
+) -> Result<AuthTransition, String> {
+    let old_id = original_id.unwrap_or(&provider.id);
+    let Some(old_provider) = config.providers.iter().find(|existing| existing.id == old_id) else {
+        return Ok(AuthTransition::None);
+    };
+    if !subscription::is_subscription_provider(old_provider) {
+        return Ok(AuthTransition::None);
+    }
+    if !subscription::is_subscription_provider(provider) {
+        auth.dispose(old_id)
+            .map_err(|error| format!("Could not remove the subscription authorization for {old_id}: {error}"))?;
+        return Ok(AuthTransition::None);
+    }
+    if old_provider.kind != provider.kind {
+        // 跨 kind：新 provider 的专用 home 在另一条 kind 路径下，搬过去也没有任何东西会再读它，
+        // 只会把凭据留在无人清理的旧 kind 路径里。因此一律作废旧授权。
+        auth.dispose(old_id)
+            .map_err(|error| format!("Could not remove the subscription authorization for {old_id}: {error}"))?;
+        return Ok(AuthTransition::Disposed);
+    }
+    if old_id == provider.id {
+        return Ok(AuthTransition::None);
+    }
+    match auth.rename(old_id, &provider.id) {
+        Ok(()) => Ok(AuthTransition::Renamed),
+        Err(error) => {
+            let _ = auth.dispose(old_id);
+            eprintln!("AutoJev subscription rename {old_id} -> {}: {error}", provider.id);
+            Ok(AuthTransition::RenameFailed)
+        }
+    }
+}
+
+/// 授权丢失后的连接重置：世代 +1、未连接、身份与证据清空，逼用户重新登录。
+/// 重命名迁移失败与同 id 类型变更都用它。
+fn reset_connection_after_authorization_loss(config: &mut AppConfig, provider_id: &str) {
+    let connection = config.subscriptions.entry(provider_id.to_owned()).or_default();
+    connection.generation += 1;
+    connection.state = subscription::ConnectionState::NotConnected;
+    connection.identity = None;
+    connection.evidence = None;
+}
+
+/// 配置写失败时回滚已经完成的授权迁移：只有 Renamed 才需要搬回去，避免留下孤儿 home。
+/// 回滚本身失败也不再静默：脱敏后记录，调用方仍会把原始错误返回给界面。
+fn rollback_provider_auth_change(auth: &dyn subscription::auth::SubscriptionAuth, transition: AuthTransition, old_id: &str, new_id: &str) {
+    if transition != AuthTransition::Renamed {
+        return;
+    }
+    if let Err(error) = auth.rename(new_id, old_id) {
+        eprintln!(
+            "AutoJev subscription rename rollback {new_id} -> {old_id} failed: {}",
+            subscription::helper::redact(&error)
+        );
+    }
+}
+
+/// 删除前的授权清理：订阅服务商必须先成功 dispose，否则拒绝删除（provider 与连接都保留）。
+fn prepare_provider_deletion(config: &AppConfig, auth: &dyn subscription::auth::SubscriptionAuth, id: &str) -> Result<(), String> {
+    let is_subscription = config
+        .providers
+        .iter()
+        .find(|provider| provider.id == id)
+        .is_some_and(subscription::is_subscription_provider);
+    if !is_subscription {
+        return Ok(());
+    }
+    auth.dispose(id)
+        .map_err(|error| format!("Could not remove the subscription authorization for {id}: {error}"))
+}
+
+fn apply_provider_edit(config: &mut AppConfig, provider: Provider, original_id: Option<&str>, creating: bool, add_test_model: bool) -> anyhow::Result<()> {
+    if let Some(message) = provider_edit_conflict(config, &provider, original_id, creating) {
+        return Err(anyhow!(message));
+    }
+    let old_id = original_id.unwrap_or(&provider.id).to_owned();
     for model in &mut config.models { if model.provider_id==old_id { model.provider_id=provider.id.clone(); } }
     if add_test_model { add_provider_test_model(config, &provider); }
     subscription::rename_provider(config, &old_id, &provider.id);
@@ -287,6 +422,8 @@ async fn delete_provider(
     state: State<'_, AppState>,
     id: String,
 ) -> Result<DashboardSnapshot, String> {
+    // 订阅服务商必须先清掉自有授权资源；失败则拒绝删除，provider 与连接都保留。
+    prepare_provider_deletion(&state.store.read(), &*state.store.auth, &id)?;
     state
         .store
         .update(|config| {
@@ -1258,5 +1395,292 @@ mod subscription_provider_tests {
         let api = config.providers[0].clone();
         apply_provider_edit(&mut config, api, None, false, false).unwrap();
         assert!(config.subscriptions.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod provider_authorization_tests {
+    use super::*;
+    use crate::subscription::auth::{AuthChallenge, AuthPoll, AuthView, LogoutEvidence, SubscriptionAuth};
+    use futures_util::future::BoxFuture;
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+
+    /// 只为 teardown 用例服务的最小替身：同步记录 dispose/rename，可脚本化失败。
+    struct RecordingAuth {
+        dispose_calls: Mutex<Vec<String>>,
+        rename_calls: Mutex<Vec<(String, String)>>,
+        dispose_error: Mutex<Option<String>>,
+        rename_error: Mutex<Option<String>>,
+    }
+
+    impl RecordingAuth {
+        fn new() -> Self {
+            Self {
+                dispose_calls: Mutex::new(Vec::new()),
+                rename_calls: Mutex::new(Vec::new()),
+                dispose_error: Mutex::new(None),
+                rename_error: Mutex::new(None),
+            }
+        }
+
+        fn fail_dispose(&self, message: &str) {
+            *self.dispose_error.lock().unwrap() = Some(message.to_owned());
+        }
+
+        fn fail_rename(&self, message: &str) {
+            *self.rename_error.lock().unwrap() = Some(message.to_owned());
+        }
+    }
+
+    impl SubscriptionAuth for RecordingAuth {
+        fn available(&self) -> bool {
+            false
+        }
+
+        fn isolated(&self) -> bool {
+            false
+        }
+
+        fn view(&self, provider_id: &str, generation: u64) -> AuthView {
+            AuthView { provider_id: provider_id.to_owned(), generation, ..Default::default() }
+        }
+
+        fn begin<'a>(&'a self, provider_id: &'a str, _generation: u64) -> BoxFuture<'a, Result<AuthChallenge, String>> {
+            Box::pin(async move { Err(format!("no login for {provider_id}")) })
+        }
+
+        fn poll<'a>(&'a self, provider_id: &'a str, _generation: u64, _attempt: u64) -> BoxFuture<'a, Result<AuthPoll, String>> {
+            Box::pin(async move { Err(format!("no poll for {provider_id}")) })
+        }
+
+        fn cancel<'a>(&'a self, _provider_id: &'a str, _attempt: u64) -> BoxFuture<'a, Result<(), String>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn logout<'a>(&'a self, provider_id: &'a str, _generation: u64) -> BoxFuture<'a, Result<LogoutEvidence, String>> {
+            Box::pin(async move { Err(format!("no logout for {provider_id}")) })
+        }
+
+        fn shutdown(&self) -> Vec<u32> {
+            Vec::new()
+        }
+
+        fn dispose(&self, provider_id: &str) -> Result<(), String> {
+            self.dispose_calls.lock().unwrap().push(provider_id.to_owned());
+            match self.dispose_error.lock().unwrap().clone() {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
+        }
+
+        fn rename(&self, old_id: &str, new_id: &str) -> Result<(), String> {
+            self.rename_calls.lock().unwrap().push((old_id.to_owned(), new_id.to_owned()));
+            match self.rename_error.lock().unwrap().clone() {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
+        }
+    }
+
+    /// 一个已连接的 Grok 订阅服务商；各用例只改动其中一项。
+    fn subscription_config() -> AppConfig {
+        let mut config = AppConfig::default();
+        let mut provider = config.providers[0].clone();
+        provider.id = "grok".into();
+        provider.name = "Grok".into();
+        provider.kind = ProviderKind::GrokSubscription;
+        provider.base_url = String::new();
+        config.providers.push(provider.clone());
+        subscription::sync_provider(&mut config, &provider.id, &provider.kind);
+        let connection = config.subscriptions.get_mut("grok").unwrap();
+        let generation = connection.generation;
+        connection.state = subscription::ConnectionState::Connected;
+        connection.identity = Some("old@example.invalid".into());
+        connection.evidence = Some(subscription::Evidence {
+            generation,
+            account: Some("old@example.invalid".into()),
+            helper_version: None,
+            account_path: None,
+            models: Vec::new(),
+            capabilities: Vec::new(),
+            quota: Default::default(),
+        });
+        config
+    }
+
+    fn renamed_provider(config: &AppConfig, new_id: &str) -> Provider {
+        let mut provider = config.providers.iter().find(|provider| provider.id == "grok").unwrap().clone();
+        provider.id = new_id.into();
+        provider
+    }
+
+    #[test]
+    fn deleting_a_subscription_provider_requires_a_successful_dispose() {
+        let config = subscription_config();
+        let auth = RecordingAuth::new();
+        prepare_provider_deletion(&config, &auth, "grok").unwrap();
+        assert_eq!(*auth.dispose_calls.lock().unwrap(), vec!["grok".to_owned()]);
+        // 非订阅服务商不触碰授权资源。
+        prepare_provider_deletion(&config, &auth, "openrouter").unwrap();
+        assert_eq!(auth.dispose_calls.lock().unwrap().len(), 1);
+
+        // dispose 失败必须拒绝删除（调用方不会执行配置删除，provider 与连接都保留）。
+        let auth = RecordingAuth::new();
+        auth.fail_dispose("fixture dispose failure");
+        let error = prepare_provider_deletion(&config, &auth, "grok").unwrap_err();
+        assert!(error.contains("grok") && error.contains("fixture dispose failure"), "{error}");
+    }
+
+    #[test]
+    fn renaming_a_subscription_provider_migrates_and_cleans_up_on_failure() {
+        let config = subscription_config();
+        let target = renamed_provider(&config, "grok-2");
+        let auth = RecordingAuth::new();
+        assert_eq!(prepare_provider_auth_change(&config, &auth, &target, Some("grok")).unwrap(), AuthTransition::Renamed);
+        assert_eq!(*auth.rename_calls.lock().unwrap(), vec![("grok".to_owned(), "grok-2".to_owned())]);
+        assert!(auth.dispose_calls.lock().unwrap().is_empty());
+
+        // 迁移失败：旧 id 被 dispose，返回 RenameFailed 让调用方重置新 id 的连接。
+        let auth = RecordingAuth::new();
+        auth.fail_rename("fixture rename failure");
+        assert_eq!(prepare_provider_auth_change(&config, &auth, &target, Some("grok")).unwrap(), AuthTransition::RenameFailed);
+        assert_eq!(*auth.dispose_calls.lock().unwrap(), vec!["grok".to_owned()]);
+    }
+
+    #[test]
+    fn converting_a_subscription_provider_disposes_before_dropping_the_connection() {
+        let config = subscription_config();
+        let mut target = renamed_provider(&config, "grok");
+        target.kind = ProviderKind::OpenaiCompatible;
+        let auth = RecordingAuth::new();
+        assert_eq!(prepare_provider_auth_change(&config, &auth, &target, Some("grok")).unwrap(), AuthTransition::None);
+        assert_eq!(*auth.dispose_calls.lock().unwrap(), vec!["grok".to_owned()]);
+        assert!(auth.rename_calls.lock().unwrap().is_empty());
+        // dispose 失败必须拒绝这次编辑。
+        let auth = RecordingAuth::new();
+        auth.fail_dispose("fixture dispose failure");
+        assert!(prepare_provider_auth_change(&config, &auth, &target, Some("grok")).is_err());
+    }
+
+    #[test]
+    fn a_failed_rename_resets_the_new_connection_to_a_fresh_login() {
+        let mut config = subscription_config();
+        let connection = config.subscriptions.remove("grok").unwrap();
+        config.subscriptions.insert("grok-2".into(), connection);
+        reset_connection_after_authorization_loss(&mut config, "grok-2");
+        let connection = config.subscriptions.get("grok-2").unwrap();
+        assert_eq!(connection.generation, 2, "世代必须 +1");
+        assert_eq!(connection.state, subscription::ConnectionState::NotConnected);
+        assert!(connection.identity.is_none(), "身份必须清空");
+        assert!(connection.evidence.is_none(), "证据必须清空");
+    }
+
+    #[test]
+    fn a_failed_config_write_rolls_the_authorization_move_back() {
+        let auth = RecordingAuth::new();
+        rollback_provider_auth_change(&auth, AuthTransition::Renamed, "grok", "grok-2");
+        assert_eq!(*auth.rename_calls.lock().unwrap(), vec![("grok-2".to_owned(), "grok".to_owned())]);
+        // 没有迁移成功或迁移失败时都不回滚。
+        rollback_provider_auth_change(&auth, AuthTransition::None, "grok", "grok-2");
+        rollback_provider_auth_change(&auth, AuthTransition::RenameFailed, "grok", "grok-2");
+        rollback_provider_auth_change(&auth, AuthTransition::Disposed, "grok", "grok-2");
+        assert_eq!(auth.rename_calls.lock().unwrap().len(), 1);
+
+        // 回滚自身失败也要被记录（脱敏日志），不得静默吞掉。
+        let auth = RecordingAuth::new();
+        auth.fail_rename("fixture rollback failure");
+        rollback_provider_auth_change(&auth, AuthTransition::Renamed, "grok", "grok-2");
+        assert_eq!(auth.rename_calls.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn changing_the_kind_of_a_same_id_subscription_provider_disposes_and_resets() {
+        let config = subscription_config();
+        let mut target = renamed_provider(&config, "grok");
+        target.kind = ProviderKind::CodexSubscription;
+        let auth = RecordingAuth::new();
+        assert_eq!(prepare_provider_auth_change(&config, &auth, &target, Some("grok")).unwrap(), AuthTransition::Disposed);
+        assert_eq!(*auth.dispose_calls.lock().unwrap(), vec!["grok".to_owned()], "必须清掉旧类型的专用授权资源");
+        assert!(auth.rename_calls.lock().unwrap().is_empty());
+
+        // 写配置闭包里的重置语义：世代 +1、未连接、身份与证据清空。
+        let mut config = config;
+        reset_connection_after_authorization_loss(&mut config, "grok");
+        let connection = config.subscriptions.get("grok").unwrap();
+        assert_eq!(connection.generation, 2, "世代必须 +1");
+        assert_eq!(connection.state, subscription::ConnectionState::NotConnected);
+        assert!(connection.identity.is_none(), "旧账号身份不得被当成新类型的已核实身份");
+        assert!(connection.evidence.is_none());
+
+        // dispose 失败必须拒绝这次类型变更。
+        let auth = RecordingAuth::new();
+        auth.fail_dispose("fixture dispose failure");
+        assert!(prepare_provider_auth_change(&config, &auth, &target, Some("grok")).is_err());
+    }
+
+    #[test]
+    fn a_same_kind_subscription_edit_never_touches_the_authorization() {
+        let config = subscription_config();
+        let target = renamed_provider(&config, "grok");
+        let auth = RecordingAuth::new();
+        assert_eq!(prepare_provider_auth_change(&config, &auth, &target, Some("grok")).unwrap(), AuthTransition::None);
+        assert!(auth.dispose_calls.lock().unwrap().is_empty());
+        assert!(auth.rename_calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn renaming_and_changing_the_kind_disposes_without_moving_the_home() {
+        let config = subscription_config();
+        let mut target = renamed_provider(&config, "codex");
+        target.kind = ProviderKind::CodexSubscription;
+        let auth = RecordingAuth::new();
+        assert_eq!(prepare_provider_auth_change(&config, &auth, &target, Some("grok")).unwrap(), AuthTransition::Disposed);
+        assert_eq!(*auth.dispose_calls.lock().unwrap(), vec!["grok".to_owned()], "跨 kind 必须 dispose 旧授权");
+        assert!(auth.rename_calls.lock().unwrap().is_empty(), "跨 kind 不得迁移 home");
+
+        // 写配置闭包里的重置语义：新 id 的连接世代 +1、未连接、身份与证据清空。
+        let mut config = config;
+        let connection = config.subscriptions.remove("grok").unwrap();
+        config.subscriptions.insert("codex".into(), connection);
+        reset_connection_after_authorization_loss(&mut config, "codex");
+        let connection = config.subscriptions.get("codex").unwrap();
+        assert_eq!(connection.generation, 2);
+        assert_eq!(connection.state, subscription::ConnectionState::NotConnected);
+        assert!(connection.identity.is_none());
+        assert!(connection.evidence.is_none());
+    }
+
+    /// 资源级断言：跨 kind 改名后，旧 kind 路径与两个 id 下都不再留 Grok home。
+    #[test]
+    fn a_cross_kind_change_leaves_no_grok_home_for_either_id() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = subscription_config();
+        let mut target = renamed_provider(&config, "codex");
+        target.kind = ProviderKind::CodexSubscription;
+        let auth = crate::subscription::auth::GrokCliAuth::with_test_helper(
+            directory.path().to_path_buf(),
+            PathBuf::from("/nonexistent-fixture-helper"),
+        );
+        let old_home = crate::subscription::helper::helper_home(&ProviderKind::GrokSubscription, "grok", directory.path()).unwrap();
+        crate::subscription::helper::prepare_home(&old_home).unwrap();
+        std::fs::write(old_home.join("session"), "fixture").unwrap();
+        assert_eq!(prepare_provider_auth_change(&config, &auth, &target, Some("grok")).unwrap(), AuthTransition::Disposed);
+        assert!(old_home.is_dir() && std::fs::read_dir(&old_home).unwrap().count() == 0, "旧 id 的 Grok home 必须清空");
+        let moved_grok_home = crate::subscription::helper::helper_home(&ProviderKind::GrokSubscription, "codex", directory.path()).unwrap();
+        assert!(!moved_grok_home.exists(), "不得把 Grok home 搬到新 id 下");
+        let codex_home = crate::subscription::helper::helper_home(&ProviderKind::CodexSubscription, "codex", directory.path()).unwrap();
+        assert!(!codex_home.exists(), "Codex 路径本来就不该有 Grok 资源");
+    }
+
+    #[test]
+    fn provider_edit_conflicts_are_detected_before_any_authorization_change() {
+        let config = subscription_config();
+        let mut target = renamed_provider(&config, "grok");
+        target.id = "openrouter".into();
+        assert_eq!(provider_edit_conflict(&config, &target, Some("grok"), false), Some("Provider ID already exists"));
+        let target = renamed_provider(&config, "grok");
+        assert_eq!(provider_edit_conflict(&config, &target, Some("grok"), false), None);
+        assert_eq!(provider_edit_conflict(&config, &target, Some("missing"), false), Some("Provider no longer exists"));
     }
 }

@@ -180,10 +180,18 @@ pub trait SubscriptionAuth: Send + Sync {
     /// 上一世代的 `cleared` 记录不得继续显示在新账号上。
     fn begin<'a>(&'a self, provider_id: &'a str, generation: u64) -> BoxFuture<'a, Result<AuthChallenge, String>>;
     fn poll<'a>(&'a self, provider_id: &'a str, generation: u64, attempt: u64) -> BoxFuture<'a, Result<AuthPoll, String>>;
+    /// 取消一次登录。语义固定：只在 session 仍为 Pending 且 attempt 匹配时生效，否则纯 no-op，
+    /// 不得改动任何既有会话状态（已成功的 poll 不会被取消“撤销”）。
     fn cancel<'a>(&'a self, provider_id: &'a str, attempt: u64) -> BoxFuture<'a, Result<(), String>>;
     fn logout<'a>(&'a self, provider_id: &'a str, generation: u64) -> BoxFuture<'a, Result<LogoutEvidence, String>>;
     /// 只回收本应用登记的自有进程，返回 pid 列表；不改配置。
     fn shutdown(&self) -> Vec<u32>;
+    /// 同步丢弃某家服务商的自有资源：回收自有进程 + 丢弃进程内 session 与退出证据 + 清空专用 home。
+    /// 返回清理是否成功；失败时调用方应拒绝继续 teardown（例如删除服务商）。
+    fn dispose(&self, provider_id: &str) -> Result<(), String>;
+    /// 同步迁移某家服务商的自有资源到新 id：session 与退出证据改键，old home 存在时移动到 new home。
+    /// new home 已存在或移动失败返回 Err，绝不覆盖。
+    fn rename(&self, old_id: &str, new_id: &str) -> Result<(), String>;
 }
 
 /// 一次进程内登录会话。事件接收端被取消后即丢弃，迟到的输出不会再被消费。
@@ -229,8 +237,9 @@ impl GrokCliAuth {
     }
 
     /// 测试专用：注入隔离 home 与本地假 helper，绝不触碰真实用户目录或真实 CLI。
+    /// `pub(crate)` 让 config.rs 的载入清理用例也能用真实实现驱动。
     #[cfg(test)]
-    fn with_test_helper(home: PathBuf, program: PathBuf) -> Self {
+    pub(crate) fn with_test_helper(home: PathBuf, program: PathBuf) -> Self {
         Self::from_parts(home, Some(program), Vec::new())
     }
 
@@ -260,6 +269,18 @@ impl GrokCliAuth {
         if let Ok(home) = helper::helper_home(&ProviderKind::GrokSubscription, provider_id, &self.home) {
             let _ = helper::cleanup_home(&home);
         }
+    }
+
+    /// 中途失败的登录尝试统一收尾：回收刚拉起的自有进程并清掉专用 home，
+    /// 避免失败路径留下脏目录（下一次 begin 不得复用）。
+    fn abort_attempt(&self, provider_id: &str) {
+        self.processes.reclaim(provider_id);
+        self.cleanup_provider_home(provider_id);
+    }
+
+    fn provider_home(&self, provider_id: &str) -> Result<PathBuf, String> {
+        helper::helper_home(&ProviderKind::GrokSubscription, provider_id, &self.home)
+            .map_err(|error| helper::redact(&error.to_string()))
     }
 }
 
@@ -338,14 +359,23 @@ impl SubscriptionAuth for GrokCliAuth {
                 return Err(refusal(CODE_HELPER_MISSING, "No Grok CLI helper was found on PATH"));
             };
             let spec = self.spec(provider_id, &program)?;
-            helper::prepare_home(&spec.home)
-                .map_err(|error| refusal(CODE_HELPER_MISSING, &error))?;
+            if let Err(error) = helper::prepare_home(&spec.home) {
+                // 准备 home 失败也可能已经建出目录：同样按失败尝试收尾。
+                self.abort_attempt(provider_id);
+                return Err(refusal(CODE_HELPER_MISSING, &error));
+            }
             // 新尝试取代旧尝试：连接处于 Pending 时重入 begin 会拉起第二个 helper，
             // 因此先回收同一服务商仍存活的自有进程，避免遗留孤儿；只回收本应用登记过的 pid。
             self.processes.reclaim(provider_id);
-            let pid = self.processes.spawn(provider_id, &spec).map_err(|error| helper::redact(&error.to_string()))?;
+            let pid = match self.processes.spawn(provider_id, &spec) {
+                Ok(pid) => pid,
+                Err(error) => {
+                    self.abort_attempt(provider_id);
+                    return Err(helper::redact(&error.to_string()));
+                }
+            };
             let Some(stdout) = self.processes.take_stdout(pid) else {
-                self.processes.reclaim(provider_id);
+                self.abort_attempt(provider_id);
                 return Err(refusal(CODE_HELPER_MISSING, "the helper produced no output stream"));
             };
             let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -369,17 +399,17 @@ impl SubscriptionAuth for GrokCliAuth {
                     Ok(Some(line)) => match parse_event(&line) {
                         Some(HelperEvent::Challenge(challenge)) => break challenge,
                         Some(HelperEvent::Error(error)) => {
-                            self.processes.reclaim(provider_id);
+                            self.abort_attempt(provider_id);
                             return Err(refusal(&error.code, &error.message));
                         }
                         _ => {}
                     },
                     Ok(None) => {
-                        self.processes.reclaim(provider_id);
+                        self.abort_attempt(provider_id);
                         return Err(refusal(CODE_HELPER_EXITED, "the helper exited before returning a challenge"));
                     }
                     Err(_) => {
-                        self.processes.reclaim(provider_id);
+                        self.abort_attempt(provider_id);
                         return Err(refusal(CODE_HELPER_TIMEOUT, "the helper did not return a challenge in time"));
                     }
                 }
@@ -550,6 +580,46 @@ impl SubscriptionAuth for GrokCliAuth {
 
     fn shutdown(&self) -> Vec<u32> {
         self.processes.reclaim_all()
+    }
+
+    fn dispose(&self, provider_id: &str) -> Result<(), String> {
+        self.processes.reclaim(provider_id);
+        {
+            let mut sessions = self.sessions.lock().unwrap();
+            sessions.remove(provider_id);
+        }
+        self.logouts.lock().unwrap().remove(provider_id);
+        let home = self.provider_home(provider_id)?;
+        if home.exists() {
+            // 清理失败必须变成 Err（而不是静默成功），删除／重命名才能据此拒绝继续。
+            helper::cleanup_home(&home).map_err(|error| helper::redact(&error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn rename(&self, old_id: &str, new_id: &str) -> Result<(), String> {
+        if old_id == new_id {
+            return Ok(());
+        }
+        let old_home = self.provider_home(old_id)?;
+        let new_home = self.provider_home(new_id)?;
+        // 先把 home 搬完再迁移内存状态：失败时不会留下半迁移的 session／证据。
+        helper::move_home(&old_home, &new_home).map_err(|error| helper::redact(&error.to_string()))?;
+        // 自有进程登记也要改键，否则新 id 的 reclaim 抓不到旧进程，它会活到应用退出。
+        self.processes.rename_provider(old_id, new_id);
+        {
+            let mut sessions = self.sessions.lock().unwrap();
+            if let Some(session) = sessions.remove(old_id) {
+                sessions.insert(new_id.to_owned(), session);
+            }
+        }
+        {
+            let mut logouts = self.logouts.lock().unwrap();
+            if let Some(evidence) = logouts.remove(old_id) {
+                logouts.insert(new_id.to_owned(), evidence);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -736,11 +806,17 @@ pub async fn cancel(store: &ConfigStore, provider_id: &str) -> Result<AuthView, 
         return Ok(view);
     };
     auth.cancel(provider_id, attempt).await.map_err(|error| helper::redact(&error))?;
+    // 竞态：poll 可能已经赢了这次登录。只有确实取消成功（会话进入 Cancelled 且 attempt 未变）
+    // 才允许归位连接；否则不改写任何状态。
+    let cancelled = auth.view(provider_id, generation);
+    if !(cancelled.phase == AuthPhase::Cancelled && cancelled.attempt == Some(attempt)) {
+        return Ok(cancelled);
+    }
     store
         .update(|config| {
             if let Some(connection) = config.subscriptions.get_mut(provider_id) {
-                // 与 poll/begin 一致：世代已变就什么都不写。
-                if connection.generation == generation {
+                // 与 poll/begin 一致：世代已变或连接已不处于授权中，就什么都不写。
+                if connection.generation == generation && connection.state == ConnectionState::AuthorizationPending {
                     connection.state = ConnectionState::NotConnected;
                 }
             }
@@ -850,6 +926,13 @@ mod lifecycle_tests {
         bump_generation_on_begin: AtomicBool,
         bump_generation_on_cancel: AtomicBool,
         bump_generation_on_logout: AtomicBool,
+        /// cancel 变成 no-op 时模拟“会话已终结/attempt 不匹配”的竞态。
+        cancel_is_noop: AtomicBool,
+        /// dispose/rename 的记录与脚本化失败。
+        dispose_calls: Mutex<Vec<String>>,
+        rename_calls: Mutex<Vec<(String, String)>>,
+        dispose_error: Mutex<Option<String>>,
+        rename_error: Mutex<Option<String>>,
     }
 
     impl StubAuth {
@@ -874,6 +957,11 @@ mod lifecycle_tests {
                 bump_generation_on_begin: AtomicBool::new(false),
                 bump_generation_on_cancel: AtomicBool::new(false),
                 bump_generation_on_logout: AtomicBool::new(false),
+                cancel_is_noop: AtomicBool::new(false),
+                dispose_calls: Mutex::new(Vec::new()),
+                rename_calls: Mutex::new(Vec::new()),
+                dispose_error: Mutex::new(None),
+                rename_error: Mutex::new(None),
             })
         }
 
@@ -1010,9 +1098,14 @@ mod lifecycle_tests {
         fn cancel<'a>(&'a self, provider_id: &'a str, attempt: u64) -> BoxFuture<'a, Result<(), String>> {
             Box::pin(async move {
                 self.cancelled.lock().unwrap().push((provider_id.to_owned(), attempt));
-                if let Some(session) = self.sessions.lock().unwrap().get_mut(provider_id) {
-                    session.phase = AuthPhase::Cancelled;
-                    session.challenge = None;
+                // 语义固定：只在 session 仍为 Pending 且 attempt 匹配时生效，否则 no-op。
+                if !self.cancel_is_noop.load(Ordering::SeqCst) {
+                    if let Some(session) = self.sessions.lock().unwrap().get_mut(provider_id) {
+                        if session.phase == AuthPhase::Pending && session.attempt == Some(attempt) {
+                            session.phase = AuthPhase::Cancelled;
+                            session.challenge = None;
+                        }
+                    }
                 }
                 if self.bump_generation_on_cancel.load(Ordering::SeqCst) {
                     self.bump_generation(provider_id);
@@ -1036,6 +1129,40 @@ mod lifecycle_tests {
         fn shutdown(&self) -> Vec<u32> {
             *self.shutdown_calls.lock().unwrap() += 1;
             self.shutdown_pids.clone()
+        }
+
+        fn dispose(&self, provider_id: &str) -> Result<(), String> {
+            self.dispose_calls.lock().unwrap().push(provider_id.to_owned());
+            if let Some(error) = self.dispose_error.lock().unwrap().clone() {
+                // 脚本化失败：模拟清理失败，调用方必须据此拒绝继续。
+                return Err(error);
+            }
+            self.sessions.lock().unwrap().remove(provider_id);
+            self.logouts.lock().unwrap().remove(provider_id);
+            Ok(())
+        }
+
+        fn rename(&self, old_id: &str, new_id: &str) -> Result<(), String> {
+            self.rename_calls.lock().unwrap().push((old_id.to_owned(), new_id.to_owned()));
+            if let Some(error) = self.rename_error.lock().unwrap().clone() {
+                return Err(error);
+            }
+            if old_id == new_id {
+                return Ok(());
+            }
+            {
+                let mut sessions = self.sessions.lock().unwrap();
+                if let Some(session) = sessions.remove(old_id) {
+                    sessions.insert(new_id.to_owned(), session);
+                }
+            }
+            {
+                let mut logouts = self.logouts.lock().unwrap();
+                if let Some(evidence) = logouts.remove(old_id) {
+                    logouts.insert(new_id.to_owned(), evidence);
+                }
+            }
+            Ok(())
         }
     }
 
@@ -1547,6 +1674,70 @@ mod lifecycle_tests {
         assert!(auth.cancelled.lock().unwrap().is_empty(), "没有进行中的登录时不得执行取消");
     }
 
+    /// M3：poll 已经赢下登录时，cancel 不得改写连接，也不得调用取消。
+    #[tokio::test]
+    async fn cancel_does_not_rewrite_a_connection_whose_login_already_finished() {
+        let auth = StubAuth::new();
+        let (store, _directory) = fixture_store(auth.clone());
+        begin(&store, "grok").await.unwrap();
+        // 真实竞态窗口：会话已经成功，但连接状态还停在授权中。
+        auth.script("grok", AuthPoll::Succeeded { identity: "winner@example.invalid".into() });
+        assert!(matches!(auth.poll("grok", 1, 1).await.unwrap(), AuthPoll::Succeeded { .. }));
+        let before = stored_connection(&store);
+        assert_eq!(before.state, ConnectionState::AuthorizationPending);
+        let view = cancel(&store, "grok").await.unwrap();
+        assert_eq!(view.phase, AuthPhase::Succeeded);
+        let after = stored_connection(&store);
+        assert_eq!(after.state, ConnectionState::AuthorizationPending, "已完成的登录不得被取消改写");
+        assert_eq!(after.generation, before.generation);
+        assert_eq!(after.identity, before.identity);
+        assert!(auth.cancelled.lock().unwrap().is_empty(), "会话已终结时不得调用 cancel");
+    }
+
+    /// M3：auth.cancel 是 no-op 时，生命周期 cancel 不得写任何状态，后续轮询仍可完成。
+    #[tokio::test]
+    async fn a_noop_cancel_never_writes_connection_state() {
+        let auth = StubAuth::new();
+        let (store, _directory) = fixture_store(auth.clone());
+        begin(&store, "grok").await.unwrap();
+        auth.cancel_is_noop.store(true, Ordering::SeqCst);
+        let view = cancel(&store, "grok").await.unwrap();
+        assert_eq!(view.phase, AuthPhase::Pending, "no-op 取消不得把会话标成 Cancelled");
+        let after = stored_connection(&store);
+        assert_eq!(after.state, ConnectionState::AuthorizationPending, "no-op 取消不得改写连接");
+        assert_eq!(after.generation, 1);
+        auth.script("grok", AuthPoll::Succeeded { identity: "later@example.invalid".into() });
+        assert_eq!(poll(&store, "grok").await.unwrap().phase, AuthPhase::Succeeded);
+        assert_eq!(stored_connection(&store).state, ConnectionState::Connected);
+    }
+
+    /// M3：attempt 不匹配时取消是纯 no-op。
+    #[tokio::test]
+    async fn cancel_with_a_mismatched_attempt_is_a_noop() {
+        let auth = StubAuth::new();
+        let (store, _directory) = fixture_store(auth.clone());
+        begin(&store, "grok").await.unwrap();
+        begin(&store, "grok").await.unwrap();
+        assert_eq!(auth.view("grok", 1).attempt, Some(2));
+        auth.cancel("grok", 1).await.unwrap();
+        assert_eq!(auth.view("grok", 1).phase, AuthPhase::Pending, "错 attempt 不得取消会话");
+        assert_eq!(auth.view("grok", 1).attempt, Some(2));
+    }
+
+    /// 替身自身：dispose/rename 会记录调用，并可脚本化失败供 teardown 用例断言。
+    #[test]
+    fn the_stub_auth_records_and_scripts_dispose_and_rename() {
+        let auth = StubAuth::new();
+        auth.dispose("grok").unwrap();
+        auth.rename("grok", "grok-2").unwrap();
+        assert_eq!(*auth.dispose_calls.lock().unwrap(), vec!["grok".to_owned()]);
+        assert_eq!(*auth.rename_calls.lock().unwrap(), vec![("grok".to_owned(), "grok-2".to_owned())]);
+        *auth.dispose_error.lock().unwrap() = Some("fixture dispose failure".into());
+        assert!(auth.dispose("grok").is_err());
+        *auth.rename_error.lock().unwrap() = Some("fixture rename failure".into());
+        assert!(auth.rename("grok", "grok-3").is_err());
+    }
+
     /// 取消写库带世代守卫：调用期间世代已变则什么都不写（与 begin/poll 一致）。
     #[tokio::test]
     async fn cancel_does_not_write_state_when_the_generation_changed_mid_flight() {
@@ -1817,6 +2008,143 @@ mod lifecycle_tests {
         }
         assert_eq!(poll, AuthPoll::Succeeded { identity: identity.clone() }, "长账号标识必须原样保留");
         assert_eq!(auth.view("grok", 1).identity.as_deref(), Some(identity.as_str()));
+    }
+
+    /// H1：失败的登录尝试必须清掉专用 home，下一次 begin 不得复用脏目录。
+    #[tokio::test]
+    async fn a_failed_begin_cleans_the_provider_home_before_the_next_attempt() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = helper::helper_home(&ProviderKind::GrokSubscription, "grok", directory.path()).unwrap();
+        let failing = fake_helper(
+            &directory,
+            "failing-grok.sh",
+            "printf '%s' 'dirty' > \"$GROK_HOME/dirty-session\"\nprintf '%s\\n' '{\"event\":\"challenge\",\"kind\":\"device_code\",\"instructions\":\"Open\"}'\nprintf '%s\\n' '{\"event\":\"error\",\"code\":\"login_failed\",\"message\":\"fixture rejection\"}'\nexec sleep 30",
+        );
+        let auth = GrokCliAuth::with_test_helper(directory.path().to_path_buf(), failing);
+        auth.begin("grok", 1).await.unwrap();
+        assert!(home.join("dirty-session").is_file());
+        // 轮询拿到失败后必须清掉脏 home。
+        let mut poll = AuthPoll::Pending;
+        for _ in 0..200 {
+            poll = auth.poll("grok", 1, 1).await.unwrap();
+            if poll != AuthPoll::Pending {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(matches!(poll, AuthPoll::Failed { .. }), "expected failure, got {poll:?}");
+        assert_eq!(std::fs::read_dir(&home).unwrap().count(), 0, "失败的尝试不得留下脏 home");
+        auth.shutdown();
+
+        // 同一个 home 再次用于一次成功的登录：不得复用上一次的脏内容。
+        let good = fake_helper(
+            &directory,
+            "good-grok.sh",
+            "printf '%s\\n' '{\"event\":\"challenge\",\"kind\":\"device_code\",\"instructions\":\"Open\"}'\nexec sleep 30",
+        );
+        let auth = GrokCliAuth::with_test_helper(directory.path().to_path_buf(), good);
+        auth.begin("grok", 1).await.unwrap();
+        assert!(!home.join("dirty-session").exists(), "新的尝试不得复用脏目录");
+        assert_eq!(auth.view("grok", 1).phase, AuthPhase::Pending);
+        auth.shutdown();
+    }
+
+    /// H1：spawn 失败也要清掉 prepare_home 建出来的目录内容。
+    #[tokio::test]
+    async fn a_spawn_failure_cleans_the_prepared_home() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = helper::helper_home(&ProviderKind::GrokSubscription, "grok", directory.path()).unwrap();
+        let auth = GrokCliAuth::with_test_helper(directory.path().to_path_buf(), directory.path().join("missing-helper"));
+        let error = auth.begin("grok", 1).await.unwrap_err();
+        assert!(!error.is_empty());
+        assert!(home.is_dir(), "prepare_home 已建出目录");
+        assert_eq!(std::fs::read_dir(&home).unwrap().count(), 0, "spawn 失败必须清空专用 home");
+        assert_eq!(auth.view("grok", 1).phase, AuthPhase::Idle);
+    }
+
+    /// H1：读取端在给出 challenge 前关闭，同样不得留下脏 home。
+    #[tokio::test]
+    async fn a_helper_that_exits_without_a_challenge_cleans_the_home() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = helper::helper_home(&ProviderKind::GrokSubscription, "grok", directory.path()).unwrap();
+        let script = fake_helper(&directory, "silent-grok.sh", "printf '%s' 'dirty' > \"$GROK_HOME/dirty-session\"\nexit 0");
+        let auth = GrokCliAuth::with_test_helper(directory.path().to_path_buf(), script);
+        let error = auth.begin("grok", 1).await.unwrap_err();
+        assert!(error.contains(CODE_HELPER_EXITED), "{error}");
+        assert_eq!(std::fs::read_dir(&home).unwrap().count(), 0, "退出前不得留下脏 home");
+        assert_eq!(auth.view("grok", 1).phase, AuthPhase::Idle);
+    }
+
+    /// H2：dispose 丢弃 session 与退出证据、回收进程并清空 home。
+    #[tokio::test]
+    async fn grok_cli_auth_dispose_drops_session_evidence_processes_and_home() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = helper::helper_home(&ProviderKind::GrokSubscription, "grok", directory.path()).unwrap();
+        let script = fake_helper(
+            &directory,
+            "fake-grok.sh",
+            "printf '%s\\n' '{\"event\":\"challenge\",\"kind\":\"device_code\",\"instructions\":\"Wait\"}'\nexec sleep 30",
+        );
+        let auth = GrokCliAuth::with_test_helper(directory.path().to_path_buf(), script);
+        auth.begin("grok", 1).await.unwrap();
+        std::fs::write(home.join("session"), "fixture").unwrap();
+        let _ = auth.logout("grok", 1).await.unwrap();
+        assert_eq!(auth.view("grok", 1).logout.local, LocalLogoutState::Cleared);
+        auth.dispose("grok").unwrap();
+        assert!(auth.shutdown().is_empty(), "dispose 必须回收自有进程");
+        assert_eq!(auth.view("grok", 1).phase, AuthPhase::Idle, "session 必须被丢弃");
+        assert_eq!(auth.view("grok", 1).logout.local, LocalLogoutState::NotAttempted, "退出证据必须被丢弃");
+        assert_eq!(std::fs::read_dir(&home).unwrap().count(), 0, "专用 home 必须清空");
+    }
+
+    /// H2：rename 迁移 home 与 session，目标已存在时拒绝覆盖。
+    #[tokio::test]
+    async fn grok_cli_auth_rename_moves_home_and_session_and_refuses_to_overwrite() {
+        let directory = tempfile::tempdir().unwrap();
+        let old_home = helper::helper_home(&ProviderKind::GrokSubscription, "grok", directory.path()).unwrap();
+        let new_home = helper::helper_home(&ProviderKind::GrokSubscription, "grok-2", directory.path()).unwrap();
+        let script = fake_helper(
+            &directory,
+            "fake-grok.sh",
+            "printf '%s\\n' '{\"event\":\"challenge\",\"kind\":\"device_code\",\"instructions\":\"Wait\"}'\nexec sleep 30",
+        );
+        let auth = GrokCliAuth::with_test_helper(directory.path().to_path_buf(), script);
+        auth.begin("grok", 1).await.unwrap();
+        std::fs::write(old_home.join("session"), "fixture").unwrap();
+        auth.rename("grok", "grok-2").unwrap();
+        assert!(!old_home.exists(), "旧 home 必须已迁走");
+        assert!(new_home.join("session").is_file(), "home 内容必须迁到新 id");
+        assert_eq!(auth.view("grok-2", 1).phase, AuthPhase::Pending, "session 必须改键到新 id");
+        assert_eq!(auth.view("grok-2", 1).attempt, Some(1));
+        assert_eq!(auth.view("grok", 1).phase, AuthPhase::Idle);
+        auth.shutdown();
+
+        // 目标已存在：拒绝覆盖，源与目标都不改动。
+        auth.begin("grok", 1).await.unwrap();
+        std::fs::write(old_home.join("dirty"), "fixture").unwrap();
+        assert!(auth.rename("grok", "grok-2").is_err());
+        assert!(new_home.join("session").is_file(), "拒绝覆盖时目标不得被改动");
+        assert!(old_home.join("dirty").is_file(), "拒绝覆盖时源目录保持不变");
+        assert_eq!(auth.view("grok-2", 1).attempt, Some(1), "失败不得迁移 session");
+        auth.shutdown();
+    }
+
+    /// N2：rename 必须把自有进程登记改到新 key，否则新 id 抓不到旧进程。
+    #[tokio::test]
+    async fn grok_cli_auth_rename_rekeys_the_owned_process_registry() {
+        let directory = tempfile::tempdir().unwrap();
+        let script = fake_helper(
+            &directory,
+            "fake-grok.sh",
+            "printf '%s\\n' '{\"event\":\"challenge\",\"kind\":\"device_code\",\"instructions\":\"Wait\"}'\nexec sleep 30",
+        );
+        let auth = GrokCliAuth::with_test_helper(directory.path().to_path_buf(), script);
+        auth.begin("grok", 1).await.unwrap();
+        auth.rename("grok", "grok-2").unwrap();
+        assert!(auth.processes.reclaim("grok").is_empty(), "旧 key 不得再登记该进程");
+        let reclaimed = auth.processes.reclaim("grok-2");
+        assert_eq!(reclaimed.len(), 1, "rename 后必须能用新 id 回收自有进程");
+        assert!(auth.processes.reclaim_all().is_empty());
     }
 
     /// 对同一服务商再次 begin 必须回收旧尝试的进程，只留下 1 个自有 pid。
