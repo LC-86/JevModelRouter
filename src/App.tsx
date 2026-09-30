@@ -615,7 +615,7 @@ function ModelsPage({ snapshot, onAdd, onEdit, onDelete, onChange, onNotify }: {
     if (!provider) return;
     setTests(previous => ({ ...previous, [model.id]: 'testing' }));
     try {
-      await testProviderDraft({ ...provider, api_type: model.api_type || provider.api_type, test_model: model.model_id });
+      await testProviderDraft({ ...provider, api_type: isSubscriptionProvider(provider) ? '' : model.api_type || provider.api_type, test_model: model.model_id });
       setTests(previous => ({ ...previous, [model.id]: 'success' }));
       onNotify(t('Test request succeeded.'));
     } catch (error) {
@@ -854,6 +854,8 @@ function ProviderDialog({ initial, onClose, onSave, onTestStatus }: { onTestStat
     const subscriptionPreset = isSubscriptionKind(kind);
     setProvider({ ...provider, preset: preset.id, kind, base_url: preset.url, name: id.startsWith('custom-') ? 'Custom' : preset.name, api_type: subscriptionPreset ? '' : id === 'custom-anthropic' ? 'messages' : 'chat_completions', test_model: '' });
     if (!edit) setIdentifier(id.startsWith('custom-') ? 'custom' : id);
+    // 订阅条目没有密钥字段：切到订阅时丢弃已输入的密钥，避免隐藏字段的残留值随保存提交。
+    if (subscriptionPreset) { setApiKey(''); setShowKey(false); }
     setTestResult('');
   };
   const draft = (): Provider => {
@@ -864,7 +866,8 @@ function ProviderDialog({ initial, onClose, onSave, onTestStatus }: { onTestStat
   const submit = async (event: FormEvent) => {
     event.preventDefault(); if (testing) return;
     setTesting(true); setTestResult('');
-    try { await onSave(draft(), apiKey || undefined, !edit && testedFingerprint === fingerprint()); }
+    const next = draft();
+    try { await onSave(next, isSubscriptionKind(next.kind) ? undefined : apiKey || undefined, !edit && testedFingerprint === fingerprint()); }
     catch (error) { setTestFailed(true); setTestResult(t(String(error instanceof Error ? error.message : error))); }
     finally { setTesting(false); }
   };
@@ -932,7 +935,7 @@ function ModelDialog({ initial, providers, onClose, onSave, onTestStatus }: { on
     if (testing || !form.current?.reportValidity() || !provider) return;
     setTesting(true); setResult(''); setFailed(false); onTestStatus(provider.id, 'testing');
     try {
-      await testProviderDraft({ ...provider, api_type: model.api_type, test_model: model.model_id.trim() });
+      await testProviderDraft({ ...provider, api_type: isSubscriptionProvider(provider) ? '' : model.api_type, test_model: model.model_id.trim() });
       setResult(t('Test request succeeded.')); onTestStatus(provider.id, 'success');
     } catch (error) { setFailed(true); setResult(providerTestError(error, t)); onTestStatus(provider.id, 'error'); }
     finally { setTesting(false); }
