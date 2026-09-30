@@ -243,38 +243,64 @@ async fn save_provider(
     provider.has_api_key = false;
     let old_id = original_id.as_deref().unwrap_or(&provider.id).to_owned();
     let old_account = format!("provider:{old_id}");
-    // 订阅资源在改配置之前处理：删除式转换先释放，标识改名先迁移。
-    // 任一步失败就直接返回错误，配置保持不变，绝不半清理。
-    if original_id.is_some() {
-        let old_kind = state
-            .store
-            .read()
-            .providers
-            .iter()
-            .find(|existing| existing.id == old_id)
-            .map(|existing| existing.kind.clone());
-        if old_kind.as_ref().is_some_and(subscription::is_subscription) {
-            if subscription::is_subscription_provider(&provider) {
-                // 仍是订阅类型：只有标识改名才需要迁移适配器自有状态。
-                if old_id != provider.id {
-                    subscription::migrate_helper(&state.store, &old_id, &provider.id, &state.sessions).await?;
-                }
-            } else {
-                // 转成 API 服务商：先释放辅助进程与专用授权目录，再改配置。
-                subscription::dispose(&state.store, &old_id, &state.sessions).await?;
-            }
-        }
-    }
+    // 校验先行、副作用在后：目标标识被占用或旧 provider 已不存在时直接失败，
+    // helper、内存会话与专用授权目录零改动；校验通过后才迁移或释放订阅资源。
+    prepare_subscription_change(&state.store, &state.sessions, &provider, original_id.as_deref(), creating.unwrap_or(false)).await?;
     let new_account = format!("provider:{}", provider.id);
     state.store.update_checked(|config| apply_provider_edit(config, provider, original_id.as_deref(), creating.unwrap_or(false), add_test_model.unwrap_or(false)), Some((&old_account, &new_account, api_key.as_deref().map(str::trim).filter(|key|!key.is_empty())))).map_err(|e|e.to_string())?;
     Ok(snapshot(&state).await)
 }
 
+/// 保存服务商前的订阅资源处置。先做与 [`apply_provider_edit`] 完全相同的只读校验
+/// （失败零副作用），再按 kind 与标识变化决定：
+/// - 同一订阅类型且改名 → [`subscription::migrate_helper`] 迁移适配器自有状态；
+/// - kind 变化（订阅→API、Codex↔Grok 等，适配器的 supports 面随之改变）→ 先
+///   [`subscription::dispose`] 释放旧标识的辅助进程、专用授权目录与会话。
+///
+/// 返回 Ok 才允许改配置；任何一步失败都整体中止，绝不半清理。
+async fn prepare_subscription_change(
+    store: &ConfigStore,
+    sessions: &tokio::sync::Mutex<subscription::SessionState>,
+    provider: &Provider,
+    original_id: Option<&str>,
+    creating: bool,
+) -> Result<(), String> {
+    let Some(old_id) = original_id else { return Ok(()); };
+    let old_kind = {
+        let config = store.read();
+        validate_provider_edit(&config, provider, original_id, creating).map_err(|error| error.to_string())?;
+        config.providers.iter().find(|existing| existing.id == old_id).map(|existing| existing.kind.clone())
+    };
+    let Some(old_kind) = old_kind.filter(|kind| subscription::is_subscription(kind)) else {
+        return Ok(());
+    };
+    if provider.kind == old_kind {
+        // 同一订阅类型：只有改名需要迁移适配器自有状态（辅助进程、专用目录、挂起尝试）。
+        if old_id != provider.id {
+            subscription::migrate_helper(store, old_id, &provider.id, sessions).await?;
+        }
+        return Ok(());
+    }
+    subscription::dispose(store, old_id, sessions).await
+}
+
+/// 存在性与新标识唯一性校验。改配置（[`apply_provider_edit`]）与订阅资源处置
+/// （[`prepare_subscription_change`]）共用同一份，避免两处漂移。
+fn validate_provider_edit(config: &AppConfig, provider: &Provider, original_id: Option<&str>, creating: bool) -> anyhow::Result<()> {
+    let old_id = original_id.unwrap_or(provider.id.as_str());
+    if original_id.is_some() && !config.providers.iter().any(|p| p.id == old_id) {
+        return Err(anyhow!("Provider no longer exists"));
+    }
+    if (creating || old_id != provider.id) && config.providers.iter().any(|p| p.id == provider.id) {
+        return Err(anyhow!("Provider ID already exists"));
+    }
+    Ok(())
+}
+
 fn apply_provider_edit(config: &mut AppConfig, provider: Provider, original_id: Option<&str>, creating: bool, add_test_model: bool) -> anyhow::Result<()> {
     let old_id = original_id.unwrap_or(&provider.id).to_owned();
 
-    if original_id.is_some() && !config.providers.iter().any(|p|p.id==old_id) { return Err(anyhow!("Provider no longer exists")); }
-    if (creating || old_id != provider.id) && config.providers.iter().any(|p|p.id==provider.id) { return Err(anyhow!("Provider ID already exists")); }
+    validate_provider_edit(config, &provider, original_id, creating)?;
     for model in &mut config.models { if model.provider_id==old_id { model.provider_id=provider.id.clone(); } }
     if add_test_model { add_provider_test_model(config, &provider); }
     subscription::rename_provider(config, &old_id, &provider.id);
@@ -1308,5 +1334,116 @@ mod subscription_provider_tests {
         let api = config.providers[0].clone();
         apply_provider_edit(&mut config, api, None, false, false).unwrap();
         assert!(config.subscriptions.is_empty());
+    }
+
+    /// 订阅处置测试装置：真实 `CodexAdapter`（专用目录根在临时目录）+ 已连接的 Codex 订阅服务商
+    /// + 一个挂起会话 + 专用授权目录里的虚构凭据文件；另有一个已占用标识 `taken`。
+    async fn dispose_fixture() -> (Arc<ConfigStore>, Arc<codex_helper::CodexAdapter>, Mutex<subscription::SessionState>, tempfile::TempDir, tempfile::TempDir) {
+        let home = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let adapter = Arc::new(codex_helper::CodexAdapter::with_launch(
+            home.path().to_path_buf(),
+            codex_helper::HelperLaunch { program: std::path::PathBuf::from("/autojev-test-no-such-codex"), args: Vec::new() },
+        ));
+        let store = Arc::new(
+            ConfigStore::load_with_adapters(
+                directory.path().join("autojev.db"),
+                Arc::new(crate::dispatch::ApiDispatcher { loopback_only: true }),
+                adapter.clone(),
+            )
+            .unwrap(),
+        );
+        store
+            .update(|config| {
+                let codex = subscription("codex", ProviderKind::CodexSubscription);
+                config.providers.push(codex.clone());
+                config.providers.push(subscription("taken", ProviderKind::CodexSubscription));
+                subscription::sync_provider(config, &codex.id, &codex.kind);
+                let connection = config.subscriptions.get_mut("codex").unwrap();
+                connection.state = subscription::ConnectionState::Connected;
+                connection.identity = Some("old@example.invalid".into());
+            })
+            .unwrap();
+        let sessions = Mutex::new(subscription::SessionState::default());
+        sessions.lock().await.sessions.insert(
+            "codex".into(),
+            subscription::SubscriptionSession {
+                stage: subscription::LoginStage::Pending,
+                attempt: 1,
+                generation: 1,
+                ..Default::default()
+            },
+        );
+        let auth_home = adapter.auth_home_for("codex");
+        std::fs::create_dir_all(&auth_home).unwrap();
+        std::fs::write(auth_home.join("fictional-auth.json"), "{}").unwrap();
+        (store, adapter, sessions, home, directory)
+    }
+
+    #[tokio::test]
+    async fn a_conflicting_save_never_touches_helper_session_or_home() {
+        let (store, adapter, sessions, _home, _directory) = dispose_fixture().await;
+        let auth_home = adapter.auth_home_for("codex");
+
+        // 目标标识已被占用：与 apply_provider_edit 相同的校验必须先失败，且不搬助手、不清会话。
+        let renamed = subscription("taken", ProviderKind::CodexSubscription);
+        let error = prepare_subscription_change(&store, &sessions, &renamed, Some("codex"), false).await.unwrap_err();
+        assert_eq!(error, "Provider ID already exists");
+        assert!(auth_home.join("fictional-auth.json").is_file(), "helper home must be untouched");
+        assert_eq!(sessions.lock().await.session("codex").unwrap().stage, subscription::LoginStage::Pending);
+        {
+            let config = store.read();
+            assert_eq!(config.subscriptions["codex"].state, subscription::ConnectionState::Connected);
+            assert_eq!(config.subscriptions["codex"].identity.as_deref(), Some("old@example.invalid"));
+            assert_eq!(config.providers.iter().find(|p| p.id == "codex").unwrap().kind, ProviderKind::CodexSubscription);
+        }
+
+        // 旧 provider 已不存在：同样先失败，零副作用。
+        let ghost = subscription("codex", ProviderKind::CodexSubscription);
+        let error = prepare_subscription_change(&store, &sessions, &ghost, Some("missing"), false).await.unwrap_err();
+        assert_eq!(error, "Provider no longer exists");
+        assert!(auth_home.join("fictional-auth.json").is_file());
+        assert_eq!(sessions.lock().await.session("codex").unwrap().stage, subscription::LoginStage::Pending);
+    }
+
+    #[tokio::test]
+    async fn converting_between_subscription_kinds_disposes_the_old_helper() {
+        let (store, adapter, sessions, _home, _directory) = dispose_fixture().await;
+        let auth_home = adapter.auth_home_for("codex");
+
+        // Codex → Grok（同标识）：不是「同 kind 改名」，必须先释放旧 Codex 资源再改配置。
+        let converted = subscription("codex", ProviderKind::GrokSubscription);
+        prepare_subscription_change(&store, &sessions, &converted, Some("codex"), false).await.unwrap();
+
+        assert!(!auth_home.exists(), "the dedicated Codex auth home must be removed");
+        assert!(sessions.lock().await.session("codex").is_none(), "the in-memory session must be dropped");
+        let config = store.read();
+        // 连接按新类型的起点处理：未连接、无 Codex 身份与证据，等待重新登录。
+        let connection = &config.subscriptions["codex"];
+        assert_eq!(connection.state, subscription::ConnectionState::NotConnected);
+        assert!(connection.identity.is_none() && connection.evidence.is_none());
+        // 配置 kind 由随后的 apply_provider_edit 改写；处置阶段不得提前改配置。
+        assert_eq!(config.providers.iter().find(|p| p.id == "codex").unwrap().kind, ProviderKind::CodexSubscription);
+    }
+
+    #[tokio::test]
+    async fn renaming_within_the_same_subscription_kind_migrates_the_helper_home() {
+        let (store, adapter, sessions, _home, _directory) = dispose_fixture().await;
+        let old_home = adapter.auth_home_for("codex");
+        let new_home = adapter.auth_home_for("codex-work");
+
+        // 同 kind 且改名：迁移而不是释放，凭据目录跟随新标识。
+        let renamed = subscription("codex-work", ProviderKind::CodexSubscription);
+        prepare_subscription_change(&store, &sessions, &renamed, Some("codex"), false).await.unwrap();
+
+        assert!(!old_home.exists());
+        assert!(new_home.join("fictional-auth.json").is_file(), "the dedicated home moves with the identifier");
+        // 会话键随标识迁移；在途尝试作废，新标识不得停在 Pending。
+        assert!(sessions.lock().await.session("codex").is_none());
+        assert_eq!(sessions.lock().await.session("codex-work").unwrap().stage, subscription::LoginStage::Idle);
+        // 身份与世代保留，等 apply_provider_edit 完成配置键迁移。
+        let config = store.read();
+        assert_eq!(config.subscriptions["codex"].identity.as_deref(), Some("old@example.invalid"));
+        assert_eq!(config.subscriptions["codex"].generation, 1);
     }
 }

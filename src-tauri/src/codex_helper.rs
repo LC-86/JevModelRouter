@@ -359,11 +359,6 @@ impl CodexAppServer {
         &self.auth_home
     }
 
-    /// 服务商重命名后把自述的专用目录指向新位置；目录搬迁由调用方负责。
-    pub(crate) fn set_auth_home(&mut self, auth_home: PathBuf) {
-        self.auth_home = auth_home;
-    }
-
     pub fn version(&self) -> Option<&str> {
         self.version.as_deref()
     }
@@ -489,7 +484,7 @@ impl CodexAdapter {
     }
 
     /// 该服务商的专用授权目录；测试可换根，生产永远是用户主目录下的自有路径。
-    fn auth_home_for(&self, provider_id: &str) -> PathBuf {
+    pub(crate) fn auth_home_for(&self, provider_id: &str) -> PathBuf {
         match &self.home_root {
             Some(root) => helper_home_in(root, provider_id),
             None => helper_home(provider_id),
@@ -743,13 +738,21 @@ impl SubscriptionAdapter for CodexAdapter {
     /// 退出：无论 RPC 成败都终止自有子进程并删除本服务商的专用授权目录。
     /// 只删 `helper_home(provider_id)` 这一个自有目录，绝不触碰用户的 `~/.codex`；
     /// 没有活动会话时也要清理，`local_cleared` 只在目录确实删除成功时为真。
-    /// 服务商重命名：辅助进程、挂起尝试与专用授权目录整体迁到新标识。
-    /// 目录搬迁只在同一父目录内进行（原子）；搬不动就返回错误，让编排层走退出并逼新标识重登。
+    /// 服务商重命名。有活动辅助进程时**拒绝热迁移**：子进程的 `CODEX_HOME` 在 spawn 后就固定了，
+    /// 搬目录会造成「磁盘已在新路径、进程仍写旧路径」。此时返回错误，由编排层对旧标识走退出
+    /// （杀进程 + 清专用目录），新标识落未连接逼重登——与迁移失败的回退完全一致。
+    /// 没有活动进程时才把专用授权目录与挂起状态整体迁到新标识。
     fn rename<'a>(&'a self, old_id: &'a str, new_id: &'a str) -> futures_util::future::BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             if old_id == new_id {
                 return Ok(());
             }
+            // 全程持有 servers 锁：迁移期间不允许再为旧标识拉起辅助进程（关闭检查-再搬的竞态）。
+            let servers = self.servers.lock().await;
+            anyhow::ensure!(
+                !servers.contains_key(old_id),
+                "The Codex helper is still running for {old_id}; sign out or sign in again after the rename"
+            );
             let old_home = self.auth_home_for(old_id);
             let new_home = self.auth_home_for(new_id);
             if old_home.exists() {
@@ -765,13 +768,7 @@ impl SubscriptionAdapter for CodexAdapter {
                     )
                 })?;
             }
-            {
-                let mut servers = self.servers().await;
-                if let Some(mut server) = servers.remove(old_id) {
-                    server.set_auth_home(new_home.clone());
-                    servers.insert(new_id.to_owned(), server);
-                }
-            }
+            drop(servers);
             if let Some(login) = self.logins.lock().unwrap().remove(old_id) {
                 self.logins.lock().unwrap().insert(new_id.to_owned(), login);
             }
@@ -867,6 +864,7 @@ if [ -n "$env_log" ]; then
 fi
 while IFS= read -r line; do
   id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  if [ -z "$id" ]; then continue; fi
   case "$line" in
     *'"method":"initialize"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"version":"fixture-helper-1.0","codexHome":"%s"}}\n' "$id" "$CODEX_HOME" ;;
     *'"method":"account/read"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"account":{"email":"fixture@example.invalid","planType":"pro"},"requiresAuth":false}}\n' "$id" ;;
@@ -1092,6 +1090,40 @@ done
         std::fs::write(user_codex.join("auth.json"), "fixture").unwrap();
         adapter.logout("codex-fixture", 1).await.unwrap();
         assert!(user_codex.join("auth.json").is_file(), "the user's own ~/.codex must never be touched");
+    }
+
+    #[tokio::test]
+    async fn rename_never_hot_migrates_a_running_helper() {
+        let home = tempfile::tempdir().unwrap();
+        let log = home.path().join("env.log");
+        let adapter = CodexAdapter::with_launch(home.path().to_path_buf(), fixture_launch(home.path(), &log));
+        // 拉起 fixture 辅助进程：旧标识下存在活动 helper。
+        adapter.start_login("codex-fixture", 1).await.unwrap();
+        let old_home = helper_home_in(home.path(), "codex-fixture");
+        let new_home = helper_home_in(home.path(), "codex-renamed");
+        std::fs::write(old_home.join("fictional-auth.json"), "fixture").unwrap();
+
+        let error = adapter.rename("codex-fixture", "codex-renamed").await.unwrap_err();
+        assert!(error.to_string().contains("still running"), "{error}");
+        // 绝不出现「磁盘已在新路径、子进程仍写旧 CODEX_HOME」。
+        assert!(old_home.join("fictional-auth.json").is_file());
+        assert!(!new_home.exists());
+
+        // 回退与迁移失败一致：对旧标识退出（杀进程 + 清专用目录），新标识逼重登。
+        let outcome = adapter.logout("codex-fixture", 1).await.unwrap();
+        assert!(outcome.local_cleared);
+        assert!(!old_home.exists());
+
+        // 没有活动进程后才整体迁移：目录与内容跟随新标识。
+        std::fs::create_dir_all(&old_home).unwrap();
+        std::fs::write(old_home.join("fictional-auth.json"), "fixture").unwrap();
+        adapter.rename("codex-fixture", "codex-renamed").await.unwrap();
+        assert!(!old_home.exists());
+        assert!(new_home.join("fictional-auth.json").is_file());
+        // 清理跟随新标识：退出删的是新目录。
+        let moved = adapter.logout("codex-renamed", 1).await.unwrap();
+        assert!(moved.local_cleared);
+        assert!(!new_home.exists());
     }
 
     #[tokio::test]
