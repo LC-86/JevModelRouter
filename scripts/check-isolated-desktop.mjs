@@ -144,6 +144,16 @@ try {
   const allowedMethods = new Set(['initialize', 'account/login/start', 'account/login/cancel', 'account/read', 'account/logout']);
   assert.ok(allEntries.length > 0, 'The stand-in must have logged its traffic');
   assert.ok(allEntries.some(entry => entry.event === 'request' && entry.method === 'initialize'), 'The stand-in must have been initialized');
+  // 官方 app-server 握手：initialize 必须带客户端自述，响应之后再发一条无 id 的 initialized 通知。
+  const initializeCalls = allEntries.filter(entry => entry.event === 'request' && entry.method === 'initialize');
+  assert.ok(
+    initializeCalls.every(entry => entry.params?.clientInfo?.name === 'autojev' && Boolean(entry.params?.clientInfo?.version)),
+    `Every initialize must carry an AutoJev clientInfo: ${JSON.stringify(initializeCalls)}`,
+  );
+  assert.ok(
+    allEntries.some(entry => entry.event === 'notification-in' && entry.method === 'initialized'),
+    'The app must send the initialized notification after the initialize response',
+  );
   assert.equal(allEntries.filter(entry => entry.event === 'malformed').length, 0, 'The stand-in must never see a malformed frame');
   // 第 7 条：真实生成仍被拒绝 —— 替身只收到契约列出的账号方法，从未收到任何生成请求。
   const unsupported = allEntries.filter(entry => entry.event === 'request' && !allowedMethods.has(entry.method));

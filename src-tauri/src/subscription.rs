@@ -787,7 +787,17 @@ pub async fn await_login(
     };
     let outcome = match store.subscription.login_result(&provider_id, generation).await {
         Ok(Some(outcome)) => outcome,
-        Ok(None) => return Err("No login result was available; nothing was written".to_owned()),
+        // 辅助进程中途退出（stdout 关闭或尝试已不在跟踪）与出错同等处理：结束挂起态并如实报错，
+        // 否则会话会永远停在 Pending，用户既不能登录也不能取消。
+        Ok(None) => {
+            let message = "The Codex helper exited before the sign-in finished; sign in again".to_owned();
+            let mut state = sessions.lock().await;
+            if finish_session(&mut state, &provider_id, generation, attempt, LoginStage::Failed, Some(message.clone())) {
+                drop(state);
+                settle_not_connected(&store, &provider_id, generation)?;
+            }
+            return Err(message);
+        }
         Err(error) => {
             let message = sanitize_error(&error.to_string());
             let mut state = sessions.lock().await;
@@ -893,6 +903,73 @@ pub async fn logout(
     Ok(LogoutOutcome { local_cleared, remote: remote.unwrap_or(RemoteRevocation::Failed) })
 }
 
+/// 该服务商当前的订阅种类；不存在或不是订阅服务商时返回 `None`。
+fn subscription_kind(store: &ConfigStore, provider_id: &str) -> Option<ProviderKind> {
+    store
+        .read()
+        .providers
+        .iter()
+        .find(|provider| provider.id == provider_id)
+        .map(|provider| provider.kind.clone())
+        .filter(is_subscription)
+}
+
+/// 删除服务商或把它转成 API 服务商之前，先释放它占用的订阅资源：
+/// 停掉辅助进程、删除专用授权目录、清空内存会话。
+/// 失败即返回错误，调用方不得继续改配置——不做半清理。
+pub async fn dispose(
+    store: &ConfigStore,
+    provider_id: &str,
+    sessions: &tokio::sync::Mutex<SessionState>,
+) -> Result<(), String> {
+    let Some(kind) = subscription_kind(store, provider_id) else {
+        return Ok(());
+    };
+    if store.subscription.supports(&kind) {
+        logout(store, provider_id, sessions).await.map(|_| ())?;
+    }
+    let mut state = sessions.lock().await;
+    state.sessions.remove(provider_id);
+    Ok(())
+}
+
+/// 服务商在保留订阅类型的前提下改名：把适配器自有状态（辅助进程、挂起尝试、专用授权目录）
+/// 与内存会话迁到新标识。迁移失败时对旧标识走完整退出，配置改名后新标识为未连接，逼用户重新登录；
+/// 绝不只改配置而不碰辅助进程。
+pub async fn migrate_helper(
+    store: &ConfigStore,
+    old_id: &str,
+    new_id: &str,
+    sessions: &tokio::sync::Mutex<SessionState>,
+) -> Result<(), String> {
+    if old_id == new_id {
+        return Ok(());
+    }
+    let Some(kind) = subscription_kind(store, old_id) else {
+        return Ok(());
+    };
+    if store.subscription.supports(&kind) {
+        if let Err(error) = store.subscription.rename(old_id, new_id).await {
+            let message = sanitize_error(&error.to_string());
+            logout(store, old_id, sessions).await.map(|_| ())?;
+            eprintln!("AutoJev subscription rename fell back to sign-out: {message}");
+        }
+    }
+    let mut state = sessions.lock().await;
+    if let Some(mut session) = state.sessions.remove(old_id) {
+        // 在途登录绑定旧标识，改名后不可能再完成：作废它，别让新标识停在 Pending。
+        if session.stage == LoginStage::Pending {
+            session.stage = LoginStage::Idle;
+            session.login_id = None;
+            session.authorization_url = None;
+            session.user_code = None;
+            session.error = None;
+        }
+        state.sessions.insert(new_id.to_owned(), session);
+    }
+    Ok(())
+}
+
 /// 换号 = 退出 + 立即重新登录。退出已清掉旧身份；换号失败不会自动恢复旧账号。
 pub async fn switch_account(
     store: &ConfigStore,
@@ -911,6 +988,11 @@ pub trait SubscriptionAdapter: Send + Sync {
     /// 这个适配器是否能承载该类型的订阅服务商；不支持的 kind 必须被明确拒绝，
     /// 不得借用其它服务商的辅助进程或身份。
     fn supports(&self, kind: &ProviderKind) -> bool;
+    /// 服务商标识重命名：适配器要把自有状态（辅助进程、挂起尝试、专用授权目录）整体迁到新标识。
+    /// 默认实现表示该适配器没有自有状态可迁；绝不静默失败，迁不动必须返回错误。
+    fn rename<'a>(&'a self, _old_id: &'a str, _new_id: &'a str) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
     /// 辅助进程自述状态：解析不到官方 `codex` 时如实报不可用，绝不 panic。
     fn helper_status(&self) -> HelperStatus;
     fn status<'a>(&'a self, provider_id: &'a str, generation: u64) -> BoxFuture<'a, Result<ConnectionStatus>>;
@@ -993,7 +1075,11 @@ pub fn rename_provider(config: &mut AppConfig, old_id: &str, new_id: &str) {
     if old_id == new_id {
         return;
     }
-    if let Some(connection) = config.subscriptions.remove(old_id) {
+    if let Some(mut connection) = config.subscriptions.remove(old_id) {
+        // 在途登录绑定旧标识，重命名后不可能再完成：回到未连接，逼用户在新标识下重新登录。
+        if connection.state == ConnectionState::AuthorizationPending {
+            connection.state = ConnectionState::NotConnected;
+        }
         config.subscriptions.insert(new_id.to_owned(), connection);
     }
 }
@@ -1726,6 +1812,10 @@ mod lifecycle_tests {
         completions: tokio::sync::Mutex<VecDeque<(String, u64, Option<LoginResult>)>>,
         notify: tokio::sync::Notify,
         late_completion_on_cancel: AtomicBool,
+        /// 置位后 `login_result` 立刻返回 `Ok(None)`：模拟辅助进程在授权中途退出。
+        helper_exited: AtomicBool,
+        renames: Mutex<Vec<(String, String)>>,
+        rename_error: Mutex<Option<String>>,
     }
 
     impl LifecycleStub {
@@ -1753,6 +1843,9 @@ mod lifecycle_tests {
                 completions: tokio::sync::Mutex::new(VecDeque::new()),
                 notify: tokio::sync::Notify::new(),
                 late_completion_on_cancel: AtomicBool::new(false),
+                helper_exited: AtomicBool::new(false),
+                renames: Mutex::new(Vec::new()),
+                rename_error: Mutex::new(None),
             })
         }
 
@@ -1817,6 +1910,10 @@ mod lifecycle_tests {
 
         fn login_result<'a>(&'a self, provider_id: &'a str, _generation: u64) -> BoxFuture<'a, Result<Option<LoginResult>>> {
             Box::pin(async move {
+                if self.helper_exited.load(Ordering::SeqCst) {
+                    // 辅助进程中途退出：没有结果可读，如实返回 None。
+                    return Ok(None);
+                }
                 let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
                 loop {
                     {
@@ -1852,6 +1949,16 @@ mod lifecycle_tests {
                     Ok(outcome) => Ok(outcome),
                     Err(message) => bail!("{message}"),
                 }
+            })
+        }
+
+        fn rename<'a>(&'a self, old_id: &'a str, new_id: &'a str) -> BoxFuture<'a, Result<()>> {
+            Box::pin(async move {
+                self.renames.lock().unwrap().push((old_id.to_owned(), new_id.to_owned()));
+                if let Some(error) = self.rename_error.lock().unwrap().clone() {
+                    bail!("{error}");
+                }
+                Ok(())
             })
         }
     }
@@ -2404,5 +2511,117 @@ mod lifecycle_tests {
         assert!(codex.helper.available && codex.helper.version.is_some() && codex.helper.auth_home.is_some());
         assert!(!grok.helper.available && grok.helper.version.is_none() && grok.helper.auth_home.is_none());
         assert_eq!(grok.identity.as_deref(), Some("grok@example.invalid"));
+    }
+
+    #[tokio::test]
+    async fn a_helper_that_exits_mid_sign_in_never_leaves_the_session_pending() {
+        let adapter = LifecycleStub::new();
+        adapter.helper_exited.store(true, Ordering::SeqCst);
+        let (store, _directory, sessions) = fixture(adapter.clone()).await;
+
+        begin_login(&store, "codex", &sessions).await.unwrap();
+        assert_eq!(session(&sessions, "codex").await.stage, LoginStage::Pending);
+
+        // 辅助进程中途退出：与出错同等处理，不得让会话永远停在 Pending。
+        let error = await_login(store.clone(), "codex".into(), sessions.clone()).await.unwrap_err();
+        assert!(error.contains("exited"), "{error}");
+        let settled = session(&sessions, "codex").await;
+        assert_eq!(settled.stage, LoginStage::Failed);
+        assert!(settled.error.is_some());
+        assert_eq!(connection(&store, "codex").state, ConnectionState::NotConnected);
+
+        // 失败后可以再次发起登录，登录入口不会被上一次卡住。
+        begin_login(&store, "codex", &sessions).await.unwrap();
+        assert_eq!(session(&sessions, "codex").await.stage, LoginStage::Pending);
+        assert_eq!(adapter.started.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn disposing_a_subscription_provider_releases_the_helper_before_deletion() {
+        let adapter = LifecycleStub::new();
+        let (store, _directory, sessions) = fixture(adapter.clone()).await;
+        begin_login(&store, "codex", &sessions).await.unwrap();
+
+        dispose(&store, "codex", &sessions).await.unwrap();
+
+        assert_eq!(adapter.logouts.lock().unwrap().len(), 1, "删除订阅服务商必须先退出");
+        assert!(sessions.lock().await.session("codex").is_none(), "内存会话必须一并清除");
+        assert_eq!(connection(&store, "codex").state, ConnectionState::NotConnected);
+
+        // 未知服务商是空操作：不得误伤其它状态或重复退出。
+        dispose(&store, "missing", &sessions).await.unwrap();
+        assert_eq!(adapter.logouts.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn renaming_a_subscription_provider_migrates_the_helper_state() {
+        let adapter = LifecycleStub::new();
+        let (store, _directory, sessions) = fixture(adapter.clone()).await;
+        begin_login(&store, "codex", &sessions).await.unwrap();
+
+        migrate_helper(&store, "codex", "codex-work", &sessions).await.unwrap();
+
+        assert_eq!(
+            adapter.renames.lock().unwrap().as_slice(),
+            [("codex".to_owned(), "codex-work".to_owned())],
+            "改名必须让适配器迁移自有状态，不能只改配置"
+        );
+        assert!(adapter.logouts.lock().unwrap().is_empty(), "成功迁移不得走退出");
+        assert!(sessions.lock().await.session("codex").is_none());
+        // 在途尝试绑定旧标识：迁移后作废，不允许新标识停在 Pending。
+        assert_eq!(session(&sessions, "codex-work").await.stage, LoginStage::Idle);
+    }
+
+    #[tokio::test]
+    async fn a_failed_rename_signs_the_old_provider_out_and_forces_a_new_sign_in() {
+        let adapter = LifecycleStub::new();
+        *adapter.rename_error.lock().unwrap() = Some("the helper home could not be moved".into());
+        let (store, _directory, sessions) = fixture(adapter.clone()).await;
+        store
+            .update(|config| {
+                let connection = config.subscriptions.get_mut("codex").unwrap();
+                connection.state = ConnectionState::Connected;
+                connection.identity = Some("old@example.invalid".into());
+            })
+            .unwrap();
+        begin_login(&store, "codex", &sessions).await.unwrap();
+
+        migrate_helper(&store, "codex", "codex-work", &sessions).await.unwrap();
+
+        assert_eq!(adapter.logouts.lock().unwrap().len(), 1, "迁移失败必须对旧标识走退出");
+        assert_eq!(session(&sessions, "codex-work").await.stage, LoginStage::Idle);
+        // 配置键迁移由 apply_provider_edit 完成；旧身份不得被带到新标识。
+        store.update(|config| rename_provider(config, "codex", "codex-work")).unwrap();
+        let moved = connection(&store, "codex-work");
+        assert_eq!(moved.state, ConnectionState::NotConnected);
+        assert!(moved.identity.is_none() && moved.evidence.is_none());
+    }
+
+    #[test]
+    fn renaming_a_provider_voids_an_in_flight_sign_in() {
+        let mut config = AppConfig::default();
+        let provider = Provider {
+            preset: String::new(),
+            api_type: String::new(),
+            test_model: String::new(),
+            id: "codex".into(),
+            name: "Codex".into(),
+            kind: ProviderKind::CodexSubscription,
+            base_url: String::new(),
+            enabled: true,
+            has_api_key: false,
+        };
+        config.providers.push(provider.clone());
+        sync_provider(&mut config, &provider.id, &provider.kind);
+        config.subscriptions.get_mut("codex").unwrap().state = ConnectionState::AuthorizationPending;
+
+        rename_provider(&mut config, "codex", "codex-work");
+
+        assert!(!config.subscriptions.contains_key("codex"));
+        assert_eq!(
+            config.subscriptions["codex-work"].state,
+            ConnectionState::NotConnected,
+            "在途登录不可能跨标识完成，改名后必须回到未连接"
+        );
     }
 }

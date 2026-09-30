@@ -86,6 +86,17 @@ pub struct HelperLaunch {
     pub args: Vec<String>,
 }
 
+/// 官方辅助进程的子命令：`codex app-server`，默认 stdio 传输。
+const HELPER_SUBCOMMAND: &str = "app-server";
+/// `initialize` 的客户端自述；只用于握手，不含账号或凭据。
+const CLIENT_INFO_NAME: &str = "autojev";
+const CLIENT_INFO_TITLE: &str = "AutoJev";
+
+/// 官方 `codex` 的启动描述。子命令固定在代码里，不由配置或环境决定。
+fn official_launch(program: PathBuf) -> HelperLaunch {
+    HelperLaunch { program, args: vec![HELPER_SUBCOMMAND.to_owned()] }
+}
+
 /// 解析要启动的辅助进程。生产只接受 PATH 或常见安装位置里的官方 `codex`；
 /// 覆盖入口只存在于 `isolation-check` 构建，且必须已经处于隔离模式。
 pub fn resolve_launch() -> Result<HelperLaunch> {
@@ -94,7 +105,7 @@ pub fn resolve_launch() -> Result<HelperLaunch> {
     }
     let program = resolve_official(std::env::var_os("PATH").as_deref(), &common_locations())
         .context("The official Codex executable was not found; install Codex or add it to PATH")?;
-    Ok(HelperLaunch { program, args: Vec::new() })
+    Ok(official_launch(program))
 }
 
 /// 隔离验收专用的覆盖入口。生产构建里它被编译成恒 `None`。
@@ -278,8 +289,15 @@ impl CodexAppServer {
             pending,
             notifications,
         };
-        let initialized = server.call("initialize", json!({})).await?;
+        // 官方 app-server 握手：`initialize` 带客户端自述，收到响应后再发一条无 id 的 `initialized` 通知。
+        let client_info = json!({
+            "name": CLIENT_INFO_NAME,
+            "title": CLIENT_INFO_TITLE,
+            "version": env!("CARGO_PKG_VERSION"),
+        });
+        let initialized = server.call("initialize", json!({ "clientInfo": client_info })).await?;
         server.version = initialized.get("version").and_then(Value::as_str).map(str::to_owned);
+        server.notify("initialized", json!({})).await?;
         Ok(server)
     }
 
@@ -319,6 +337,19 @@ impl CodexAppServer {
         Ok(response.get("result").cloned().unwrap_or(Value::Null))
     }
 
+    /// 发送一条无 id 的通知（例如 `initialized`）：不等响应，只确认写进了子进程 stdin。
+    pub async fn notify(&mut self, method: &str, params: Value) -> Result<()> {
+        let message = json!({"jsonrpc": "2.0", "method": method, "params": params});
+        let stdin = self.stdin.as_mut().context("The Codex helper is not running")?;
+        let mut line = serde_json::to_vec(&message)?;
+        line.push(b'\n');
+        stdin
+            .write_all(&line)
+            .and_then(|_| stdin.flush())
+            .with_context(|| format!("Notify the Codex helper {method} failed"))?;
+        Ok(())
+    }
+
     /// 下一条通知（无 id 的消息）；辅助进程 stdout 关闭时返回 `None`。
     pub async fn next_notification(&mut self) -> Option<Value> {
         self.notifications.recv().await
@@ -326,6 +357,11 @@ impl CodexAppServer {
 
     pub fn auth_home(&self) -> &Path {
         &self.auth_home
+    }
+
+    /// 服务商重命名后把自述的专用目录指向新位置；目录搬迁由调用方负责。
+    pub(crate) fn set_auth_home(&mut self, auth_home: PathBuf) {
+        self.auth_home = auth_home;
     }
 
     pub fn version(&self) -> Option<&str> {
@@ -450,6 +486,14 @@ impl CodexAdapter {
         adapter.launch = Some(launch);
         adapter.home_root = Some(home_root);
         adapter
+    }
+
+    /// 该服务商的专用授权目录；测试可换根，生产永远是用户主目录下的自有路径。
+    fn auth_home_for(&self, provider_id: &str) -> PathBuf {
+        match &self.home_root {
+            Some(root) => helper_home_in(root, provider_id),
+            None => helper_home(provider_id),
+        }
     }
 
     /// 惰性解析官方 `codex`：解析失败返回可读错误，绝不 panic。
@@ -699,6 +743,49 @@ impl SubscriptionAdapter for CodexAdapter {
     /// 退出：无论 RPC 成败都终止自有子进程并删除本服务商的专用授权目录。
     /// 只删 `helper_home(provider_id)` 这一个自有目录，绝不触碰用户的 `~/.codex`；
     /// 没有活动会话时也要清理，`local_cleared` 只在目录确实删除成功时为真。
+    /// 服务商重命名：辅助进程、挂起尝试与专用授权目录整体迁到新标识。
+    /// 目录搬迁只在同一父目录内进行（原子）；搬不动就返回错误，让编排层走退出并逼新标识重登。
+    fn rename<'a>(&'a self, old_id: &'a str, new_id: &'a str) -> futures_util::future::BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            if old_id == new_id {
+                return Ok(());
+            }
+            let old_home = self.auth_home_for(old_id);
+            let new_home = self.auth_home_for(new_id);
+            if old_home.exists() {
+                if let Some(parent) = new_home.parent() {
+                    std::fs::create_dir_all(parent)
+                        .with_context(|| format!("Prepare the helper root {}", parent.display()))?;
+                }
+                std::fs::rename(&old_home, &new_home).with_context(|| {
+                    format!(
+                        "Move the dedicated helper home {} to {}",
+                        old_home.display(),
+                        new_home.display()
+                    )
+                })?;
+            }
+            {
+                let mut servers = self.servers().await;
+                if let Some(mut server) = servers.remove(old_id) {
+                    server.set_auth_home(new_home.clone());
+                    servers.insert(new_id.to_owned(), server);
+                }
+            }
+            if let Some(login) = self.logins.lock().unwrap().remove(old_id) {
+                self.logins.lock().unwrap().insert(new_id.to_owned(), login);
+            }
+            if let Some(queue) = self.deferred.lock().unwrap().remove(old_id) {
+                self.deferred.lock().unwrap().insert(new_id.to_owned(), queue);
+            }
+            let mut state = self.state.lock().unwrap();
+            if state.auth_home.as_deref() == Some(old_home.to_string_lossy().as_ref()) {
+                state.auth_home = Some(new_home.to_string_lossy().into_owned());
+            }
+            Ok(())
+        })
+    }
+
     fn logout<'a>(&'a self, provider_id: &'a str, _generation: u64) -> futures_util::future::BoxFuture<'a, Result<LogoutOutcome>> {
         Box::pin(async move {
             self.logins.lock().unwrap().remove(provider_id);
@@ -826,6 +913,17 @@ done
         assert_eq!(resolve_official(Some(empty_path.as_os_str()), &[]), None);
         assert_eq!(resolve_official(None, &[directory.path().join("missing-codex")]), None);
         assert_eq!(resolve_official(None, &[script.clone()]), Some(script));
+    }
+
+    #[test]
+    fn the_official_helper_is_started_as_a_stdio_app_server() {
+        let launch = official_launch(PathBuf::from("/fixture/bin/codex"));
+        assert_eq!(launch.program, PathBuf::from("/fixture/bin/codex"));
+        assert_eq!(launch.args, vec!["app-server".to_owned()]);
+        // 本机解析到官方 codex 时，真实启动描述也必须带同一子命令。
+        if let Ok(resolved) = resolve_launch() {
+            assert_eq!(resolved.args, vec!["app-server".to_owned()], "production must start codex app-server");
+        }
     }
 
     #[cfg(not(feature = "isolation-check"))]

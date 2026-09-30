@@ -243,6 +243,28 @@ async fn save_provider(
     provider.has_api_key = false;
     let old_id = original_id.as_deref().unwrap_or(&provider.id).to_owned();
     let old_account = format!("provider:{old_id}");
+    // 订阅资源在改配置之前处理：删除式转换先释放，标识改名先迁移。
+    // 任一步失败就直接返回错误，配置保持不变，绝不半清理。
+    if original_id.is_some() {
+        let old_kind = state
+            .store
+            .read()
+            .providers
+            .iter()
+            .find(|existing| existing.id == old_id)
+            .map(|existing| existing.kind.clone());
+        if old_kind.as_ref().is_some_and(subscription::is_subscription) {
+            if subscription::is_subscription_provider(&provider) {
+                // 仍是订阅类型：只有标识改名才需要迁移适配器自有状态。
+                if old_id != provider.id {
+                    subscription::migrate_helper(&state.store, &old_id, &provider.id, &state.sessions).await?;
+                }
+            } else {
+                // 转成 API 服务商：先释放辅助进程与专用授权目录，再改配置。
+                subscription::dispose(&state.store, &old_id, &state.sessions).await?;
+            }
+        }
+    }
     let new_account = format!("provider:{}", provider.id);
     state.store.update_checked(|config| apply_provider_edit(config, provider, original_id.as_deref(), creating.unwrap_or(false), add_test_model.unwrap_or(false)), Some((&old_account, &new_account, api_key.as_deref().map(str::trim).filter(|key|!key.is_empty())))).map_err(|e|e.to_string())?;
     Ok(snapshot(&state).await)
@@ -307,6 +329,9 @@ async fn delete_provider(
     state: State<'_, AppState>,
     id: String,
 ) -> Result<DashboardSnapshot, String> {
+    // 删除订阅服务商前先释放自有资源（辅助进程、专用授权目录、内存会话）；
+    // 失败即中止，不留下半清理状态。非订阅服务商此调用是空操作。
+    subscription::dispose(&state.store, &id, &state.sessions).await?;
     state
         .store
         .update(|config| {
