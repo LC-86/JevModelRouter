@@ -42,6 +42,12 @@ describe('subscription authorization views', () => {
     expect(authErrorLabel(null, t)).toBe('');
   });
 
+  it('localizes logout_superseded instead of surfacing the backend text', () => {
+    expect(authErrorLabel({ code: 'logout_superseded', message: 'logout_superseded: the connection changed while signing out; nothing was cleared', recovery: 'Refresh and retry.' }, t)).toBe('退出过程中连接状态已变化，未清理任何内容。请刷新后查看当前状态并重试。');
+    // 未知 code 仍回退后端原文，不编造文案。
+    expect(authErrorLabel({ code: 'future_failure', message: 'Upstream said no.', recovery: '' }, t)).toBe('Upstream said no.');
+  });
+
   it('never infers a remote revoke from a local clear', () => {
     const locals: SubscriptionLocalLogoutState[] = ['not_attempted', 'cleared', 'failed'];
     const remotes: SubscriptionRemoteRevokeState[] = ['not_attempted', 'failed', 'verified', 'unsupported'];

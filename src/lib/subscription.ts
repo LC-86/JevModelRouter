@@ -116,6 +116,7 @@ export function authErrorLabel(error: SubscriptionAuthError | null | undefined, 
     helper_isolated: 'Sign-in is disabled in the isolated verification environment.',
     helper_missing: 'The Grok helper was not found on this machine.',
     helper_unsupported: 'Only the Grok helper is managed in this build; sign-in, sign-out and account switching are not implemented for this provider.',
+    logout_superseded: 'The connection changed while signing out; nothing was cleared. Refresh to review the current state, then retry.',
   }[error.code] ?? (error.message || error.code));
 }
 

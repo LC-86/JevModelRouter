@@ -28,6 +28,9 @@ pub const CODE_HELPER_MISSING: &str = "helper_missing";
 pub const CODE_HELPER_UNSUPPORTED: &str = "helper_unsupported";
 /// 登录启动期间连接被换号或服务商被删除：新尝试已中止。
 const CODE_LOGIN_SUPERSEDED: &str = "login_superseded";
+/// 退出时更早的世代守卫已经失效（读配置与写配置之间连接被并发登录/换号推进）：
+/// 这次退出既没有写连接状态、也没有回收进程或清理专用 home，界面必须如实告知并允许重试。
+const CODE_LOGOUT_SUPERSEDED: &str = "logout_superseded";
 pub const CODE_NOT_CONNECTED: &str = "not_connected";
 pub const CODE_NOT_SUBSCRIPTION: &str = "not_subscription";
 pub const CODE_HELPER_EXITED: &str = "helper_exited";
@@ -846,20 +849,28 @@ pub async fn logout(store: &ConfigStore, provider_id: &str) -> Result<AuthView, 
     let generation = connection.generation;
     let auth = store.auth.clone();
     // 先写配置（世代守卫）：失败时直接返回错误，磁盘凭据与专用 home 一个都不动。
-    let next_generation = store
-        .update(|config| -> u64 {
+    let (applied, next_generation) = store
+        .update(|config| -> (bool, u64) {
             let connection = config.subscriptions.entry(provider_id.to_owned()).or_default();
             // 与 begin/poll 一致：世代已变就只回报当前世代，不推进、不清身份与证据。
             if connection.generation != generation {
-                return connection.generation;
+                return (false, connection.generation);
             }
             connection.generation += 1;
             connection.state = ConnectionState::NotConnected;
             connection.identity = None;
             connection.evidence = None;
-            connection.generation
+            (true, connection.generation)
         })
         .map_err(|error| helper::redact(&error.to_string()))?;
+    if !applied {
+        // 连接在退出过程中被并发登录/换号推进：这次退出什么都没做，
+        // 绝不能在此基础上回收进程或删除当前世代的专用 home —— 那会留下「已连接但凭据已没」的状态。
+        return Err(refusal(
+            CODE_LOGOUT_SUPERSEDED,
+            format!("{} authorization changed while signing out; nothing was cleared, try again", provider.name),
+        ));
+    }
     // 配置已落地为未连接，之后才做不可逆的本地清理：清理失败如实报错，绝不回退成已连接。
     auth.logout(provider_id, generation).await.map_err(|error| helper::redact(&error))?;
     Ok(auth.view(provider_id, next_generation))
@@ -925,11 +936,8 @@ mod lifecycle_tests {
         shutdown_calls: Mutex<u32>,
         /// 供竞态用例把 store 接进来，在某个调用内部推进世代。
         store: Mutex<Option<Arc<ConfigStore>>>,
-        /// 竞态推进世代时使用的 provider id（由用例设置）。
-        race_provider: Mutex<Option<String>>,
         bump_generation_on_begin: AtomicBool,
         bump_generation_on_cancel: AtomicBool,
-        bump_generation_on_isolated: AtomicBool,
         /// cancel 变成 no-op 时模拟“会话已终结/attempt 不匹配”的竞态。
         cancel_is_noop: AtomicBool,
         /// dispose/rename 的记录与脚本化失败。
@@ -958,10 +966,8 @@ mod lifecycle_tests {
                 shutdown_pids: vec![4242],
                 shutdown_calls: Mutex::new(0),
                 store: Mutex::new(None),
-                race_provider: Mutex::new(None),
                 bump_generation_on_begin: AtomicBool::new(false),
                 bump_generation_on_cancel: AtomicBool::new(false),
-                bump_generation_on_isolated: AtomicBool::new(false),
                 cancel_is_noop: AtomicBool::new(false),
                 dispose_calls: Mutex::new(Vec::new()),
                 rename_calls: Mutex::new(Vec::new()),
@@ -1001,14 +1007,6 @@ mod lifecycle_tests {
         }
 
         fn isolated(&self) -> bool {
-            // 生命周期在 store.read() 之后、store.update 之前调用本方法：此处推进世代
-            // 正好模拟「读配置与写配置之间被别的写入抢先」的竞态。
-            if self.bump_generation_on_isolated.load(Ordering::SeqCst) {
-                let provider_id = self.race_provider.lock().unwrap().clone();
-                if let Some(provider_id) = provider_id {
-                    self.bump_generation(&provider_id);
-                }
-            }
             self.isolated.load(Ordering::SeqCst)
         }
 
@@ -1273,18 +1271,14 @@ mod lifecycle_tests {
         connect_provider_account(store, "grok", "old@example.invalid");
     }
 
-    /// 真实 GrokCliAuth 的生命周期装置：专用 home 根就是临时目录，不拉起任何进程。
-    fn grok_cli_fixture_store(directory: &tempfile::TempDir) -> (Arc<ConfigStore>, Arc<GrokCliAuth>) {
-        let auth = Arc::new(GrokCliAuth::with_test_helper(
-            directory.path().to_path_buf(),
-            directory.path().join("unused-fixture-helper"),
-        ));
+    /// 单个 Grok 订阅服务商的配置装置，授权实现可注入。
+    fn subscription_fixture_store(directory: &tempfile::TempDir, auth: Arc<dyn SubscriptionAuth>) -> Arc<ConfigStore> {
         let store = Arc::new(
             ConfigStore::load_with_adapters_and_auth(
                 directory.path().join("autojev.db"),
                 Arc::new(crate::dispatch::ApiDispatcher { loopback_only: true }),
                 Arc::new(UnavailableAdapter),
-                auth.clone(),
+                auth,
             )
             .unwrap(),
         );
@@ -1305,6 +1299,103 @@ mod lifecycle_tests {
                 sync_provider(config, &provider.id, &provider.kind);
             })
             .unwrap();
+        store
+    }
+
+    /// 真实 GrokCliAuth 的生命周期装置：专用 home 根就是临时目录，不拉起任何进程。
+    fn grok_cli_fixture_store(directory: &tempfile::TempDir) -> (Arc<ConfigStore>, Arc<GrokCliAuth>) {
+        let auth = Arc::new(GrokCliAuth::with_test_helper(
+            directory.path().to_path_buf(),
+            directory.path().join("unused-fixture-helper"),
+        ));
+        let store = subscription_fixture_store(directory, auth.clone());
+        (store, auth)
+    }
+
+    /// 在「读配置与写配置之间」推进世代的真实 GrokCliAuth 包装：只服务 logout 竞态用例，
+    /// 用来证明世代失效时既不写连接状态、也不调用 auth.logout（进程回收、home 清理、退出证据都不发生）。
+    struct SupersedingGrokAuth {
+        inner: GrokCliAuth,
+        store: Mutex<Option<Arc<ConfigStore>>>,
+        logout_calls: Mutex<u32>,
+    }
+
+    impl SupersedingGrokAuth {
+        fn new(directory: &tempfile::TempDir) -> Arc<Self> {
+            Arc::new(Self {
+                inner: GrokCliAuth::with_test_helper(
+                    directory.path().to_path_buf(),
+                    directory.path().join("unused-fixture-helper"),
+                ),
+                store: Mutex::new(None),
+                logout_calls: Mutex::new(0),
+            })
+        }
+
+        /// 模拟并发登录/换号在生命周期中途推进世代。
+        fn bump_generation(&self) {
+            if let Some(store) = self.store.lock().unwrap().clone() {
+                store
+                    .update(|config| {
+                        let connection = config.subscriptions.entry("grok".to_owned()).or_default();
+                        connection.generation += 1;
+                    })
+                    .unwrap();
+            }
+        }
+    }
+
+    impl SubscriptionAuth for SupersedingGrokAuth {
+        fn available(&self) -> bool {
+            self.inner.available()
+        }
+
+        fn isolated(&self) -> bool {
+            // 生命周期在 store.read() 之后、store.update 之前调用本方法：此处推进世代
+            // 正好模拟「读配置与写配置之间被并发写入抢先」。
+            self.bump_generation();
+            self.inner.isolated()
+        }
+
+        fn view(&self, provider_id: &str, generation: u64) -> AuthView {
+            self.inner.view(provider_id, generation)
+        }
+
+        fn begin<'a>(&'a self, provider_id: &'a str, generation: u64) -> BoxFuture<'a, Result<AuthChallenge, String>> {
+            self.inner.begin(provider_id, generation)
+        }
+
+        fn poll<'a>(&'a self, provider_id: &'a str, generation: u64, attempt: u64) -> BoxFuture<'a, Result<AuthPoll, String>> {
+            self.inner.poll(provider_id, generation, attempt)
+        }
+
+        fn cancel<'a>(&'a self, provider_id: &'a str, attempt: u64) -> BoxFuture<'a, Result<(), String>> {
+            self.inner.cancel(provider_id, attempt)
+        }
+
+        fn logout<'a>(&'a self, provider_id: &'a str, generation: u64) -> BoxFuture<'a, Result<LogoutEvidence, String>> {
+            *self.logout_calls.lock().unwrap() += 1;
+            self.inner.logout(provider_id, generation)
+        }
+
+        fn shutdown(&self) -> Vec<u32> {
+            self.inner.shutdown()
+        }
+
+        fn dispose(&self, provider_id: &str) -> Result<(), String> {
+            self.inner.dispose(provider_id)
+        }
+
+        fn rename(&self, old_id: &str, new_id: &str) -> Result<(), String> {
+            self.inner.rename(old_id, new_id)
+        }
+    }
+
+    /// 竞态用例装置：世代会在「读配置与写配置之间」被推进。
+    fn superseding_store(directory: &tempfile::TempDir) -> (Arc<ConfigStore>, Arc<SupersedingGrokAuth>) {
+        let auth = SupersedingGrokAuth::new(directory);
+        let store = subscription_fixture_store(directory, auth.clone());
+        *auth.store.lock().unwrap() = Some(store.clone());
         (store, auth)
     }
 
@@ -1850,21 +1941,46 @@ mod lifecycle_tests {
         assert_eq!(after.state, ConnectionState::AuthorizationPending, "世代已变则取消不得写状态");
     }
 
-    /// 退出写库带世代守卫：调用期间世代已变则不清身份与证据。
+    /// 退出写库带世代守卫：调用期间世代已被并发写入推进时，连接状态、身份证据与专用 home 都不得被清。
     #[tokio::test]
     async fn logout_does_not_clear_identity_when_the_generation_changed_mid_flight() {
-        let auth = StubAuth::new();
-        let (store, _directory) = fixture_store(auth.clone());
+        let directory = tempfile::tempdir().unwrap();
+        let (store, _auth) = superseding_store(&directory);
         connect_old_account(&store);
-        *auth.race_provider.lock().unwrap() = Some("grok".to_owned());
-        auth.bump_generation_on_isolated.store(true, Ordering::SeqCst);
-        let view = logout(&store, "grok").await.unwrap();
-        assert_eq!(view.generation, 2);
+        let home = helper::helper_home(&ProviderKind::GrokSubscription, "grok", directory.path()).unwrap();
+        helper::prepare_home(&home).unwrap();
+        std::fs::write(home.join("session"), "current-generation credential").unwrap();
+
+        let error = logout(&store, "grok").await.unwrap_err();
+        assert!(error.contains(CODE_LOGOUT_SUPERSEDED), "{error}");
         let after = stored_connection(&store);
-        assert_eq!(after.generation, 2, "替身在调用中推进了世代");
+        assert_eq!(after.generation, 2, "并发写入在调用中推进了世代");
         assert_eq!(after.state, ConnectionState::Connected, "世代已变则退出不得清状态");
         assert_eq!(after.identity.as_deref(), Some("old@example.invalid"));
         assert!(after.evidence.is_some(), "世代已变则退出不得清证据");
+        assert!(home.join("session").is_file(), "世代已变则退出不得清理专用 home");
+    }
+
+    /// Bugbot High：世代失效的退出必须什么都不销毁（不调用 auth.logout、home 原样、连接原样）并诚实报错。
+    #[tokio::test]
+    async fn a_superseded_logout_never_destroys_the_current_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        let (store, auth) = superseding_store(&directory);
+        connect_old_account(&store);
+        let home = helper::helper_home(&ProviderKind::GrokSubscription, "grok", directory.path()).unwrap();
+        helper::prepare_home(&home).unwrap();
+        std::fs::write(home.join("session"), "new-generation credential").unwrap();
+
+        let error = logout(&store, "grok").await.unwrap_err();
+        assert!(error.contains(CODE_LOGOUT_SUPERSEDED), "必须返回稳定 code：{error}");
+        assert_eq!(*auth.logout_calls.lock().unwrap(), 0, "世代失效时不得调用 auth.logout（进程回收/清理/退出证据都不发生）");
+        assert!(home.join("session").is_file(), "不得删除当前世代的凭据文件");
+        assert_eq!(std::fs::read_dir(&home).unwrap().count(), 1, "专用 home 必须原样保留");
+        let connection = stored_connection(&store);
+        assert_eq!(connection.generation, 2);
+        assert_eq!(connection.state, ConnectionState::Connected);
+        assert_eq!(connection.identity.as_deref(), Some("old@example.invalid"));
+        assert!(connection.evidence.is_some());
     }
 
     /// begin 世代竞态：启动期间世代变化时，新尝试必须中止回收，且不写任何状态。

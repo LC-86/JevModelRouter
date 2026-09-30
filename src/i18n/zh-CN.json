@@ -874,6 +874,7 @@
   "Sign-in is disabled in the isolated verification environment.": "隔离验证环境中禁用登录。",
   "The Grok helper was not found on this machine.": "本机未找到 Grok 辅助进程。",
   "Only the Grok helper is managed in this build; sign-in, sign-out and account switching are not implemented for this provider.": "本构建只管理 Grok 辅助进程；该订阅服务商的登录、退出与换号尚未实现。",
+  "The connection changed while signing out; nothing was cleared. Refresh to review the current state, then retry.": "退出过程中连接状态已变化，未清理任何内容。请刷新后查看当前状态并重试。",
   "Local clearing not attempted": "未尝试本地清除",
   "Local credentials cleared": "本地凭据已清除",
   "Local clearing failed": "本地清除失败",
