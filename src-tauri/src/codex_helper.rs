@@ -16,11 +16,11 @@ use std::{
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
-use crate::config::ProviderKind;
+use crate::{config::ProviderKind, protocol::Protocol};
 use crate::subscription::{
-    quota_state, CatalogRead, ConnectionState, ConnectionStatus, DiscoveredModel, EvidenceState, GenerationRequest,
-    GenerationStream, HelperStatus, LoginResult, LoginStart, LogoutOutcome, QuotaBucket, QuotaCredits, QuotaEvidence,
-    QuotaPermission, QuotaView, QuotaWindow, RemoteRevocation, SubscriptionAdapter,
+    quota_state, CatalogRead, ConnectionState, ConnectionStatus, DiscoveredModel, EvidenceState, GenerationEvent,
+    GenerationRequest, GenerationStream, HelperStatus, LoginResult, LoginStart, LogoutOutcome, QuotaBucket,
+    QuotaCredits, QuotaEvidence, QuotaPermission, QuotaView, QuotaWindow, RemoteRevocation, SubscriptionAdapter,
 };
 
 /// 用户主目录下由本应用独占的辅助进程根目录。
@@ -249,6 +249,191 @@ pub struct CodexAppServer {
     notifications: tokio::sync::mpsc::UnboundedReceiver<Value>,
 }
 
+/// Text-only subset understood by the official app-server. Fields without an exact app-server
+/// equivalent are rejected before starting a turn instead of being silently dropped.
+#[derive(Default)]
+struct CodexTurnRequest {
+    base_instructions: Option<String>,
+    developer_instructions: Option<String>,
+    input: Vec<Value>,
+    effort: Option<String>,
+    summary: Option<String>,
+    service_tier: Option<String>,
+}
+
+fn unsupported_generation_field(field: &str, reason: &str) -> anyhow::Error {
+    anyhow::anyhow!("Codex app-server cannot preserve `{field}`: {reason}")
+}
+
+fn reject_unknown_fields(body: &Value, allowed: &[&str]) -> Result<()> {
+    if let Some(object) = body.as_object() {
+        if let Some(field) = object.keys().find(|field| !allowed.contains(&field.as_str())) {
+            return Err(unsupported_generation_field(field, "the behavior has not been verified"));
+        }
+    } else {
+        bail!("The request body must be an object");
+    }
+    Ok(())
+}
+
+fn text_content(value: &Value, field: &str) -> Result<String> {
+    if let Some(text) = value.as_str() {
+        return Ok(text.to_owned());
+    }
+    let Some(items) = value.as_array() else {
+        return Err(unsupported_generation_field(field, "only text content is supported"));
+    };
+    let mut text = String::new();
+    for item in items {
+        reject_unknown_fields(item, &["type", "text"])?;
+        if !matches!(item["type"].as_str(), Some("text" | "input_text" | "output_text")) {
+            let kind = item["type"].as_str().unwrap_or("unknown content");
+            return Err(unsupported_generation_field(field, kind));
+        }
+        let Some(part) = item["text"].as_str() else {
+            bail!("Text content blocks must include a string `text` field");
+        };
+        text.push_str(part);
+    }
+    Ok(text)
+}
+
+fn append_instruction(target: &mut Option<String>, text: String) {
+    if text.is_empty() {
+        return;
+    }
+    match target {
+        Some(previous) => {
+            previous.push_str("\n\n");
+            previous.push_str(&text);
+        }
+        None => *target = Some(text),
+    }
+}
+
+/// Convert only the well-defined text subset to app-server's text UserInput values.
+fn codex_turn_request(protocol: Protocol, body: &Value) -> Result<CodexTurnRequest> {
+    let mut request = CodexTurnRequest::default();
+    let input = |text: String| json!({"type":"text","text":text});
+    match protocol {
+        Protocol::Chat => {
+            reject_unknown_fields(body, &["model", "stream", "messages", "reasoning_effort", "service_tier"])?;
+            if body.get("stream").is_some_and(|value| !value.is_boolean()) {
+                bail!("`stream` must be a boolean");
+            }
+            if let Some(effort) = body.get("reasoning_effort") {
+                request.effort = Some(effort.as_str().filter(|value| !value.is_empty()).ok_or_else(|| {
+                    anyhow::anyhow!("`reasoning_effort` must be a non-empty string")
+                })?.to_owned());
+            }
+            if let Some(tier) = body.get("service_tier") {
+                request.service_tier = Some(tier.as_str().filter(|value| !value.is_empty()).ok_or_else(|| {
+                    anyhow::anyhow!("`service_tier` must be a non-empty string")
+                })?.to_owned());
+            }
+            let messages = body["messages"].as_array().context("Chat Completions requires a `messages` array")?;
+            for message in messages {
+                reject_unknown_fields(message, &["role", "content"])?;
+                let role = message["role"].as_str().context("Each message requires a string `role`")?;
+                let content = text_content(&message["content"], "messages[].content")?;
+                match role {
+                    "system" => append_instruction(&mut request.base_instructions, content),
+                    "developer" => append_instruction(&mut request.developer_instructions, content),
+                    "user" => request.input.push(input(content)),
+                    "assistant" => return Err(unsupported_generation_field(
+                        "messages[].role=assistant", "app-server turns accept user input, not assistant history",
+                    )),
+                    _ => return Err(unsupported_generation_field("messages[].role", role)),
+                }
+            }
+        }
+        Protocol::Responses => {
+            reject_unknown_fields(body, &["model", "stream", "input", "instructions", "reasoning", "service_tier"])?;
+            if body.get("stream").is_some_and(|value| !value.is_boolean()) {
+                bail!("`stream` must be a boolean");
+            }
+            if let Some(instructions) = body.get("instructions") {
+                let Some(instructions) = instructions.as_str() else {
+                    return Err(unsupported_generation_field("instructions", "only a string is supported"));
+                };
+                append_instruction(&mut request.developer_instructions, instructions.to_owned());
+            }
+            if let Some(reasoning) = body.get("reasoning") {
+                if !reasoning.is_object() {
+                    bail!("`reasoning` must be an object");
+                }
+                if let Some(value) = reasoning.get("effort") {
+                    request.effort = Some(value.as_str().filter(|value| !value.is_empty()).ok_or_else(|| {
+                        anyhow::anyhow!("`reasoning.effort` must be a non-empty string")
+                    })?.to_owned());
+                }
+                if let Some(value) = reasoning.get("summary") {
+                    request.summary = Some(value.as_str().filter(|value| !value.is_empty()).ok_or_else(|| {
+                        anyhow::anyhow!("`reasoning.summary` must be a non-empty string")
+                    })?.to_owned());
+                }
+                if let Some(field) = reasoning.as_object().and_then(|object| {
+                    object.keys().find(|field| !["effort", "summary"].contains(&field.as_str()))
+                }) {
+                    return Err(unsupported_generation_field(&format!("reasoning.{field}"), "the behavior has not been verified"));
+                }
+            }
+            if let Some(tier) = body.get("service_tier") {
+                request.service_tier = Some(tier.as_str().filter(|value| !value.is_empty()).ok_or_else(|| {
+                    anyhow::anyhow!("`service_tier` must be a non-empty string")
+                })?.to_owned());
+            }
+            match &body["input"] {
+                Value::String(text) => request.input.push(input(text.clone())),
+                Value::Array(items) => for item in items {
+                    reject_unknown_fields(item, &["type", "role", "content"])?;
+                    if !matches!(item["type"].as_str(), None | Some("message")) {
+                        return Err(unsupported_generation_field("input[].type", item["type"].as_str().unwrap_or("unknown")));
+                    }
+                    let role = item["role"].as_str().context("Each Responses message requires a string `role`")?;
+                    if role != "user" {
+                        return Err(unsupported_generation_field(
+                            "input[].role", "app-server turns accept user input, not assistant history",
+                        ));
+                    }
+                    request.input.push(input(text_content(&item["content"], "input[].content")?));
+                },
+                _ => bail!("Responses requires text `input`"),
+            }
+        }
+        Protocol::Messages => {
+            reject_unknown_fields(body, &["model", "stream", "system", "messages"])?;
+            if body.get("stream").is_some_and(|value| !value.is_boolean()) {
+                bail!("`stream` must be a boolean");
+            }
+            if body.get("system").is_some_and(|value| !value.is_null()) {
+                append_instruction(&mut request.base_instructions, text_content(&body["system"], "system")?);
+            }
+            let messages = body["messages"].as_array().context("Messages requires a `messages` array")?;
+            for message in messages {
+                reject_unknown_fields(message, &["role", "content"])?;
+                let role = message["role"].as_str().context("Each message requires a string `role`")?;
+                if role != "user" {
+                    return Err(unsupported_generation_field(
+                        "messages[].role", "app-server turns accept user input, not assistant history",
+                    ));
+                }
+                request.input.push(input(text_content(&message["content"], "messages[].content")?));
+            }
+        }
+    }
+    if request.input.is_empty() {
+        bail!("Codex app-server requires at least one text user message");
+    }
+    Ok(request)
+}
+
+/// Validate the same strict text subset before the gateway creates an HTTP response. The
+/// adapter repeats conversion at its own boundary so direct callers cannot bypass it.
+pub(crate) fn validate_generation_request(protocol: Protocol, body: &Value) -> Result<()> {
+    codex_turn_request(protocol, body).map(|_| ())
+}
+
 impl CodexAppServer {
     /// 启动辅助进程并完成 `initialize` 握手。子进程的 `CODEX_HOME` 只能是专用目录。
     pub async fn start(provider_id: &str, launch: HelperLaunch) -> Result<CodexAppServer> {
@@ -442,10 +627,73 @@ struct AdapterState {
     auth_home: Option<String>,
 }
 
+const GENERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+const MAX_GENERATION_INPUT_BYTES: usize = 32 * 1024;
+
+struct TurnCancellation {
+    servers: Arc<tokio::sync::Mutex<HashMap<String, CodexAppServer>>>,
+    provider_id: String,
+    thread_id: String,
+    turn_id: String,
+    workspace: Option<PathBuf>,
+    armed: bool,
+}
+
+impl Drop for TurnCancellation {
+    fn drop(&mut self) {
+        let Some(workspace) = self.workspace.take() else { return };
+        if !self.armed {
+            let _ = std::fs::remove_dir_all(workspace);
+            return;
+        }
+        let servers = self.servers.clone();
+        let provider_id = self.provider_id.clone();
+        let thread_id = self.thread_id.clone();
+        let turn_id = self.turn_id.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            // Dropping an HTTP body drops this guard synchronously. Schedule interruption on
+            // the helper's own app-server and retain the isolated workspace until it replies.
+            runtime.spawn(async move {
+                let mut servers = servers.lock().await;
+                if let Some(server) = servers.get_mut(&provider_id) {
+                    let _ = server.call("turn/interrupt", json!({"threadId":thread_id,"turnId":turn_id})).await;
+                }
+                let _ = std::fs::remove_dir_all(workspace);
+            });
+        } else {
+            let _ = std::fs::remove_dir_all(workspace);
+        }
+    }
+}
+
+struct GenerationState {
+    servers: Arc<tokio::sync::Mutex<HashMap<String, CodexAppServer>>>,
+    provider_id: String,
+    thread_id: String,
+    turn_id: String,
+    generation: u64,
+    started: bool,
+    terminal: bool,
+    deadline: tokio::time::Instant,
+    _generation_guard: tokio::sync::OwnedMutexGuard<()>,
+    cancellation: TurnCancellation,
+}
+
+fn generation_workspace() -> Result<PathBuf> {
+    let workspace = std::env::temp_dir().join(format!("autojev-codex-turn-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir(&workspace).context("Create an isolated Codex request workspace")?;
+    #[cfg(unix)] {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&workspace, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(workspace)
+}
+
 /// 真实订阅适配器：每个订阅服务商一个由本应用管理的官方 Codex 辅助进程。
-/// 生成能力仍然拒绝；本应用拥有连接状态、账号绑定与准入。
+/// 网关只会在共享准入通过后交接文本生成；本适配器仍拥有连接状态与账号隔离。
 pub struct CodexAdapter {
-    servers: tokio::sync::Mutex<HashMap<String, CodexAppServer>>,
+    servers: Arc<tokio::sync::Mutex<HashMap<String, CodexAppServer>>>,
+    generation_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     logins: Mutex<HashMap<String, ActiveLogin>>,
     /// 已被某个等待者取走、但属于另一次尝试的完成通知；由对应等待者领回，避免串线丢失。
     deferred: Mutex<HashMap<String, VecDeque<(String, Value)>>>,
@@ -466,7 +714,8 @@ impl Default for CodexAdapter {
 impl CodexAdapter {
     pub fn new() -> Self {
         Self {
-            servers: tokio::sync::Mutex::new(HashMap::new()),
+            servers: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            generation_locks: Mutex::new(HashMap::new()),
             logins: Mutex::new(HashMap::new()),
             deferred: Mutex::new(HashMap::new()),
             state: Mutex::new(AdapterState::default()),
@@ -498,6 +747,15 @@ impl CodexAdapter {
             Some(launch) => Ok(launch.clone()),
             None => resolve_launch(),
         }
+    }
+
+    fn generation_lock(&self, provider_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.generation_locks
+            .lock()
+            .unwrap()
+            .entry(provider_id.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     /// 保证该服务商有一个已握手的辅助进程，并把整个会话交给调用方使用。
@@ -827,9 +1085,193 @@ impl SubscriptionAdapter for CodexAdapter {
         })
     }
 
-    /// 生成仍然默认拒绝：登录成功不改变任何准入，真实传输不属于本票。
-    fn generate<'a>(&'a self, _request: GenerationRequest<'a>) -> futures_util::future::BoxFuture<'a, Result<GenerationStream<'a>>> {
-        Box::pin(async { bail!("Codex subscription generation is not implemented; this build keeps it denied") })
+    /// Each admitted HTTP request receives a fresh ephemeral thread. A per-account mutex
+    /// serializes this adapter's single notification reader; distinct accounts stay isolated.
+    fn generate<'a>(&'a self, request: GenerationRequest<'a>) -> futures_util::future::BoxFuture<'a, Result<GenerationStream<'a>>> {
+        let turn = match codex_turn_request(request.protocol, &request.body) {
+            Ok(turn) => turn,
+            Err(error) => return Box::pin(async move { Err(error) }),
+        };
+        let mut input_bytes = turn.input.iter().map(Value::to_string).map(|text| text.len()).sum::<usize>();
+        input_bytes += turn.base_instructions.as_ref().map_or(0, String::len);
+        input_bytes += turn.developer_instructions.as_ref().map_or(0, String::len);
+        if input_bytes > MAX_GENERATION_INPUT_BYTES {
+            return Box::pin(async {
+                Err(anyhow::anyhow!("Codex text input exceeds the 32 KiB limit; context compaction is not enabled"))
+            });
+        }
+
+        let provider_id = request.provider_id.to_owned();
+        let generation = request.generation;
+        let model_id = request.model_id.to_owned();
+        Box::pin(async move {
+            let generation_guard = self.generation_lock(&provider_id).lock_owned().await;
+            let workspace = generation_workspace()?;
+            let mut servers = self.server_for(&provider_id).await?;
+            let server = servers.get_mut(&provider_id).expect("server_for inserted the Codex helper");
+            let mut developer_instructions = String::from(
+                "Use only the request text and instructions below. Do not inspect files, use tools, browse, delegate, or continue with follow-up turns. Return assistant text only.",
+            );
+            if let Some(user_instructions) = turn.developer_instructions.as_deref() {
+                developer_instructions.push_str("\n\n");
+                developer_instructions.push_str(user_instructions);
+            }
+            let mut thread_params = json!({
+                "model": model_id,
+                "ephemeral": true,
+                "cwd": workspace.to_string_lossy(),
+                "approvalPolicy": "untrusted",
+                "sandbox": "read-only",
+                "baseInstructions": turn.base_instructions,
+                "developerInstructions": developer_instructions,
+                "config": {"features": {
+                    "shell_tool": false,
+                    "view_image": false,
+                    "sleep_tool": false,
+                    "unified_exec": false,
+                    "web_search_request": false,
+                    "web_search_cached": false,
+                    "standalone_web_search": false,
+                    "code_mode": false,
+                    "code_mode_host": false,
+                    "multi_agent_v2": false,
+                    "request_permissions_tool": false
+                }}
+            });
+            if let Some(tier) = turn.service_tier.as_deref() {
+                thread_params["serviceTier"] = tier.into();
+            }
+            let thread_result = server.call("thread/start", thread_params).await?;
+            let thread_id = thread_result.pointer("/thread/id").and_then(Value::as_str)
+                .context("The Codex helper did not return a thread id")?.to_owned();
+            let mut turn_params = json!({
+                "threadId": thread_id,
+                "model": model_id,
+                "input": turn.input,
+                "approvalPolicy": "untrusted",
+                "sandboxPolicy": {"type":"readOnly","networkAccess":false}
+            });
+            if let Some(effort) = turn.effort.as_deref() {
+                turn_params["effort"] = effort.into();
+            }
+            if let Some(summary) = turn.summary.as_deref() {
+                turn_params["summary"] = summary.into();
+            }
+            if let Some(tier) = turn.service_tier.as_deref() {
+                turn_params["serviceTierForTurn"] = tier.into();
+            }
+            let turn_result = server.call("turn/start", turn_params).await?;
+            let turn_id = turn_result.pointer("/turn/id").and_then(Value::as_str)
+                .context("The Codex helper did not return a turn id")?.to_owned();
+            drop(servers);
+
+            let servers = self.servers.clone();
+            let state = GenerationState {
+                servers: servers.clone(),
+                provider_id: provider_id.clone(),
+                thread_id: thread_id.clone(),
+                turn_id: turn_id.clone(),
+                generation,
+                started: false,
+                terminal: false,
+                deadline: tokio::time::Instant::now() + GENERATION_TIMEOUT,
+                _generation_guard: generation_guard,
+                cancellation: TurnCancellation {
+                    servers,
+                    provider_id,
+                    thread_id,
+                    turn_id,
+                    workspace: Some(workspace),
+                    armed: true,
+                },
+            };
+            let stream = futures_util::stream::unfold(state, |mut state| async move {
+                if state.terminal {
+                    return None;
+                }
+                if !state.started {
+                    state.started = true;
+                    return Some((GenerationEvent::Started { generation: state.generation }, state));
+                }
+                loop {
+                    if tokio::time::Instant::now() >= state.deadline {
+                        interrupt_active_turn(&state.servers, &state.provider_id, &state.thread_id, &state.turn_id).await;
+                        state.cancellation.armed = false;
+                        state.terminal = true;
+                        return Some((GenerationEvent::Failed { message: "The Codex turn timed out".into() }, state));
+                    }
+                    let next = {
+                        let mut servers = state.servers.lock().await;
+                        match servers.get_mut(&state.provider_id) {
+                            Some(server) => Some(tokio::time::timeout(POLL_SLICE, server.next_notification()).await),
+                            None => None,
+                        }
+                    };
+                    let Some(next) = next else {
+                        state.cancellation.armed = false;
+                        state.terminal = true;
+                        return Some((GenerationEvent::Failed { message: "The Codex helper exited during generation".into() }, state));
+                    };
+                    let value = match next {
+                        Err(_) => continue,
+                        Ok(Some(value)) => value,
+                        Ok(None) => {
+                            state.cancellation.armed = false;
+                            state.terminal = true;
+                            return Some((GenerationEvent::Failed { message: "The Codex helper stopped before completing the turn".into() }, state));
+                        }
+                    };
+                    let params = &value["params"];
+                    if params["threadId"].as_str() != Some(state.thread_id.as_str()) {
+                        continue;
+                    }
+                    match value["method"].as_str().unwrap_or("") {
+                        "item/agentMessage/delta" if params["turnId"].as_str() == Some(state.turn_id.as_str()) => {
+                            if let Some(delta) = params["delta"].as_str().filter(|delta| !delta.is_empty()) {
+                                return Some((GenerationEvent::Chunk(delta.to_owned()), state));
+                            }
+                        }
+                        "turn/completed" if params.pointer("/turn/id").and_then(Value::as_str) == Some(state.turn_id.as_str()) => {
+                            let turn = &params["turn"];
+                            state.cancellation.armed = false;
+                            state.terminal = true;
+                            let event = match turn["status"].as_str() {
+                                Some("completed") => GenerationEvent::Finished { status: 200 },
+                                Some("interrupted") => GenerationEvent::Cancelled,
+                                Some("failed") => {
+                                    let message = turn.pointer("/error/message").and_then(Value::as_str)
+                                        .map(redact).unwrap_or_else(|| "The Codex turn failed".into());
+                                    GenerationEvent::Failed { message }
+                                }
+                                _ => GenerationEvent::Failed { message: "The Codex helper returned an unknown turn status".into() },
+                            };
+                            return Some((event, state));
+                        }
+                        method if method.starts_with("item/") && params["turnId"].as_str() == Some(state.turn_id.as_str()) => {
+                            interrupt_active_turn(&state.servers, &state.provider_id, &state.thread_id, &state.turn_id).await;
+                            state.cancellation.armed = false;
+                            state.terminal = true;
+                            return Some((GenerationEvent::Failed { message: "Codex tool activity is not accepted by this gateway".into() }, state));
+                        }
+                        _ => continue,
+                    }
+                }
+            });
+            let stream: GenerationStream<'a> = Box::pin(stream);
+            Ok(stream)
+        })
+    }
+}
+
+async fn interrupt_active_turn(
+    servers: &Arc<tokio::sync::Mutex<HashMap<String, CodexAppServer>>>,
+    provider_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+) {
+    let mut servers = servers.lock().await;
+    if let Some(server) = servers.get_mut(provider_id) {
+        let _ = server.call("turn/interrupt", json!({"threadId":thread_id,"turnId":turn_id})).await;
     }
 }
 
@@ -1146,6 +1588,7 @@ fn quota_missing_fields(view: QuotaView, state: EvidenceState, buckets: &[QuotaB
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use futures_util::StreamExt;
     use std::os::unix::fs::PermissionsExt;
 
     /// 只存在于 Rust 单测临时目录的假 Codex 辅助进程：不联网、不读任何真实凭据。
@@ -1158,7 +1601,7 @@ if [ -n "$env_log" ]; then
   {
     printf 'CODEX_HOME=%s\n' "$CODEX_HOME"
     printf 'OPENAI_API_KEY=%s\n' "${OPENAI_API_KEY:-<unset>}"
-  } > "$env_log"
+  } >> "$env_log"
 fi
 next_scenario() {
   file="$1"
@@ -1172,6 +1615,9 @@ next_scenario() {
 while IFS= read -r line; do
   id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
   if [ -z "$id" ]; then continue; fi
+  method=$(printf '%s' "$line" | sed -n 's/.*"method":"\([^"]*\)".*/\1/p')
+  printf '%s\n' "$method" >> "$queue.calls"
+  printf '%s\n' "$line" >> "$queue.rpc"
   case "$line" in
     *'"method":"initialize"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"version":"fixture-helper-1.0","codexHome":"%s"}}\n' "$id" "$CODEX_HOME" ;;
     *'"method":"account/read"'*)
@@ -1207,6 +1653,40 @@ while IFS= read -r line; do
     *'"method":"account/login/start"'*) n=0; if [ -f "$1.counter" ]; then n=$(cat "$1.counter"); fi; n=$((n+1)); printf '%s' "$n" > "$1.counter"; printf '{"jsonrpc":"2.0","id":%s,"result":{"loginId":"fixture-login-%s","authorizationUrl":"https://example.invalid/auth"}}\n' "$id" "$n"; ( sleep 0.2; printf '{"jsonrpc":"2.0","method":"account/login/completed","params":{"loginId":"fixture-login-%s","ok":true,"account":{"email":"fixture@example.invalid","planType":"pro"}}}\n' "$n" ) & ;;
     *'"method":"account/login/cancel"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"cancelled":true}}\n' "$id" ;;
     *'"method":"account/logout"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"local":"cleared","remote":"revoked"}}\n' "$id" ;;
+    *'"method":"thread/start"'*)
+      n=0; if [ -f "$queue.thread.counter" ]; then n=$(cat "$queue.thread.counter"); fi; n=$((n+1)); printf '%s' "$n" > "$queue.thread.counter"
+      thread_id="fixture-thread-$n"
+      case "$line" in *'"ephemeral":true'*) ephemeral=true ;; *) ephemeral=false ;; esac
+      model=$(printf '%s' "$line" | sed -n 's/.*"model":"\([^"]*\)".*/\1/p')
+      sandbox=$(printf '%s' "$line" | sed -n 's/.*"sandbox":"\([^"]*\)".*/\1/p')
+      printf 'thread ephemeral=%s model=%s sandbox=%s\n' "$ephemeral" "$model" "$sandbox" >> "$queue.generation-params"
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"thread":{"id":"%s"}}}\n' "$id" "$thread_id" ;;
+    *'"method":"turn/start"'*)
+      thread_id=$(printf '%s' "$line" | sed -n 's/.*"threadId":"\([^"]*\)".*/\1/p')
+      turn_id="$thread_id-turn"
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"turn":{"id":"%s","status":"inProgress"}}}\n' "$id" "$turn_id"
+      scenario=success; if [ -f "$queue.generation" ]; then scenario=$(sed -n '1p' "$queue.generation"); fi
+      (
+        sleep 0.05
+        printf '{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"%s","turnId":"%s","itemId":"fixture-item","delta":"fixture"}}\n' "$thread_id" "$turn_id"
+        if [ "$scenario" = slow-success ]; then sleep 0.25; fi
+        if [ "$scenario" = hold ]; then sleep 5; fi
+        if [ "$scenario" = partial-failure ]; then
+          printf '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"%s","turn":{"id":"%s","status":"failed","error":{"message":"fixture turn failure"}}}}\n' "$thread_id" "$turn_id"
+        else
+          status=completed
+          if [ "$scenario" = hold ]; then status=interrupted; fi
+          printf '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"%s","turn":{"id":"%s","status":"%s"}}}\n' "$thread_id" "$turn_id" "$status"
+          if [ "$scenario" = slow-success ]; then printf 'completed\n' >> "$queue.generation.done"; fi
+        fi
+      ) &
+      generation_pid=$! ;;
+    *'"method":"turn/interrupt"'*)
+      thread_id=$(printf '%s' "$line" | sed -n 's/.*"threadId":"\([^"]*\)".*/\1/p')
+      turn_id=$(printf '%s' "$line" | sed -n 's/.*"turnId":"\([^"]*\)".*/\1/p')
+      if [ -n "$generation_pid" ]; then kill "$generation_pid" 2>/dev/null; fi
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"interrupted":true}}\n' "$id"
+      printf '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"%s","turn":{"id":"%s","status":"interrupted"}}}\n' "$thread_id" "$turn_id" ;;
     *) printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"no such method; authorization_code=SUPERSECRET1234567890 refresh_token=abcdef0123456789abcdef0123456789"}}\n' "$id" ;;
   esac
 done
@@ -1217,6 +1697,137 @@ done
         std::fs::write(&script, FIXTURE_HELPER).unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         HelperLaunch { program: script, args: vec![env_log.to_string_lossy().into_owned()] }
+    }
+
+    #[derive(Clone, Debug)]
+    struct ApiDispatchSeen {
+        provider_id: String,
+        model_id: String,
+        protocol: Protocol,
+        url: String,
+        authorization: String,
+        body: Value,
+    }
+
+    struct RecordingDispatcher(Arc<Mutex<Vec<ApiDispatchSeen>>>);
+
+    impl crate::dispatch::Dispatcher for RecordingDispatcher {
+        fn send<'a>(
+            &'a self,
+            target: crate::dispatch::Target<'a>,
+            request: reqwest::RequestBuilder,
+        ) -> futures_util::future::BoxFuture<'a, anyhow::Result<reqwest::Response>> {
+            let seen = self.0.clone();
+            let provider_id = target.provider.id.clone();
+            let model_id = target.model_id.to_owned();
+            let protocol = target.protocol;
+            Box::pin(async move {
+                let request = request.build()?;
+                let authorization = request.headers().get(reqwest::header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok()).unwrap_or("").to_owned();
+                let body = request.body().and_then(reqwest::Body::as_bytes)
+                    .and_then(|bytes| serde_json::from_slice(bytes).ok()).unwrap_or(Value::Null);
+                seen.lock().unwrap().push(ApiDispatchSeen {
+                    provider_id, model_id, protocol, url: request.url().to_string(), authorization, body,
+                });
+                anyhow::bail!("controlled dispatcher stopped at the API boundary")
+            })
+        }
+    }
+
+    fn admitted_gateway_store(
+        database: &Path,
+        adapter: Arc<CodexAdapter>,
+        api_base_url: &str,
+    ) -> Arc<crate::config::ConfigStore> {
+        admitted_gateway_store_with_dispatcher(
+            database,
+            adapter,
+            Arc::new(crate::dispatch::ApiDispatcher { loopback_only: false }),
+            api_base_url,
+        )
+    }
+
+    fn admitted_gateway_store_with_dispatcher(
+        database: &Path,
+        adapter: Arc<CodexAdapter>,
+        dispatcher: Arc<dyn crate::dispatch::Dispatcher>,
+        api_base_url: &str,
+    ) -> Arc<crate::config::ConfigStore> {
+        use crate::subscription::{
+            Capability, CapabilityStatus, CatalogEvidence, ConnectionState, Evidence, EvidenceState,
+            QuotaBucket, QuotaCredits, QuotaEvidence, QuotaPermission, QuotaView, QuotaWindow,
+        };
+        let store = Arc::new(crate::config::ConfigStore::load_with_adapters(
+            database.to_path_buf(),
+            dispatcher,
+            adapter,
+        ).unwrap());
+        store.update(|config| {
+            config.port = 0;
+            config.gateway.proxy_mode = "direct".into();
+            config.providers[0].base_url = api_base_url.into();
+            let provider = crate::config::Provider {
+                preset: String::new(), api_type: String::new(), test_model: String::new(),
+                id: "codex-fixture".into(), name: "Codex fixture".into(),
+                kind: crate::config::ProviderKind::CodexSubscription,
+                base_url: String::new(), enabled: true, has_api_key: false,
+            };
+            config.providers.push(provider.clone());
+            let mut model = config.models[0].clone();
+            model.id = "codex-fixture-binding".into();
+            model.provider_id = provider.id.clone();
+            model.model_id = "codex-fixture-model".into();
+            model.name = "Codex fixture model".into();
+            model.enabled = true;
+            model.selected = true;
+            model.supports_vision = false;
+            config.models.push(model.clone());
+
+            crate::subscription::sync_provider(config, &provider.id, &provider.kind);
+            let connection = config.subscriptions.get_mut(&provider.id).unwrap();
+            connection.state = ConnectionState::Connected;
+            connection.identity = Some("fixture@example.invalid".into());
+            connection.evidence = Some(Evidence {
+                generation: connection.generation,
+                account: connection.identity.clone(),
+                helper_version: Some("fixture-helper-1.0".into()),
+                account_path: Some("isolated-fixture".into()),
+                models: vec![],
+                capabilities: [Protocol::Chat, Protocol::Responses, Protocol::Messages]
+                    .into_iter()
+                    .map(|protocol| Capability {
+                        model_id: model.model_id.clone(),
+                        protocol: crate::subscription::protocol_key(protocol).into(),
+                        status: CapabilityStatus::Verified,
+                    })
+                    .collect(),
+                quota: QuotaEvidence {
+                    state: EvidenceState::Available,
+                    source: Some("controlled fixture".into()),
+                    view: QuotaView::RateLimits,
+                    buckets: vec![QuotaBucket {
+                        limit_id: "included".into(),
+                        permission: QuotaPermission::Allowed,
+                        windows: vec![QuotaWindow { label: "primary".into(), used_percent: Some(10.0), window_minutes: Some(60), ..Default::default() }],
+                        credits: Some(QuotaCredits { permission: QuotaPermission::Denied, ..Default::default() }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                catalog: CatalogEvidence { state: EvidenceState::Available, source: Some("controlled fixture".into()), ..Default::default() },
+            });
+            config.subscription_catalogs.insert(provider.id.clone(), crate::subscription_catalog::ProviderCatalog {
+                entries: vec![crate::subscription_catalog::CatalogEntry {
+                    model_id: model.model_id.clone(), name: Some(model.name.clone()), internal_id: model.id.clone(),
+                    availability: crate::subscription_catalog::Availability::Available,
+                    first_seen: Some("fixture".into()), last_confirmed: Some("fixture".into()),
+                    confirmed_generation: Some(connection.generation), account: connection.identity.clone(),
+                }],
+            });
+        }).unwrap();
+        store.write_secret("provider:openrouter", "fixture-api-key").unwrap();
+        store
     }
 
     /// 写入只读场景队列：每个方法一行一个场景名，按顺序消费（没有文件时走默认场景）。
@@ -1472,7 +2083,7 @@ done
     }
 
     #[tokio::test]
-    async fn adapter_login_verify_logout_and_generation_denied() {
+    async fn adapter_login_verify_logout_and_generates_text() {
         let home = tempfile::tempdir().unwrap();
         let log = home.path().join("env.log");
         let adapter = CodexAdapter::with_launch(home.path().to_path_buf(), fixture_launch(home.path(), &log));
@@ -1489,22 +2100,26 @@ done
         let read = adapter.status("codex-fixture", 1).await.unwrap();
         assert_eq!(read.state, ConnectionState::Connected);
         assert_eq!(read.identity.as_deref(), Some("fixture@example.invalid"));
-        // 真实生成仍然默认拒绝：登录成功不改变生成入口。
-        let error = match adapter
+        // A controlled app-server fixture drives the real adapter generation path.
+        let mut events = adapter
             .generate(GenerationRequest {
                 provider_id: "codex-fixture",
                 generation: 1,
                 model_id: "fixture-model",
                 protocol: crate::protocol::Protocol::Chat,
-                body: json!({}),
-                streaming: false,
+                body: json!({"model":"fixture-model","messages":[{"role":"user","content":"hello"}]}),
             })
             .await
-        {
-            Ok(_) => panic!("generation must stay denied"),
-            Err(error) => error,
-        };
-        assert!(error.to_string().contains("keeps it denied"), "{error}");
+            .unwrap();
+        let mut observed = Vec::new();
+        while let Some(event) = events.next().await {
+            observed.push(event);
+        }
+        assert_eq!(observed, vec![
+            crate::subscription::GenerationEvent::Started { generation: 1 },
+            crate::subscription::GenerationEvent::Chunk("fixture".into()),
+            crate::subscription::GenerationEvent::Finished { status: 200 },
+        ]);
         let outcome = adapter.logout("codex-fixture", 1).await.unwrap();
         assert!(outcome.local_cleared);
         assert_eq!(outcome.remote, RemoteRevocation::Revoked);
@@ -1512,6 +2127,339 @@ done
         let again = adapter.logout("codex-fixture", 1).await.unwrap();
         assert!(again.local_cleared);
         assert_eq!(again.remote, RemoteRevocation::Failed);
+    }
+
+    #[tokio::test]
+    async fn generation_keeps_partial_failure_terminal() {
+        let home = tempfile::tempdir().unwrap();
+        let log = home.path().join("env.log");
+        std::fs::write(format!("{}.generation", log.to_string_lossy()), "partial-failure").unwrap();
+        let adapter = CodexAdapter::with_launch(home.path().to_path_buf(), fixture_launch(home.path(), &log));
+        let mut events = adapter.generate(GenerationRequest {
+            provider_id: "codex-partial",
+            generation: 4,
+            model_id: "fixture-model",
+            protocol: Protocol::Chat,
+            body: json!({"model":"fixture-model","messages":[{"role":"user","content":"hello"}]}),
+        }).await.unwrap();
+        let mut observed = Vec::new();
+        while let Some(event) = events.next().await { observed.push(event); }
+        assert_eq!(observed, vec![
+            GenerationEvent::Started { generation: 4 },
+            GenerationEvent::Chunk("fixture".into()),
+            GenerationEvent::Failed { message: "fixture turn failure".into() },
+        ]);
+    }
+
+    #[tokio::test]
+    async fn dropping_generation_stream_interrupts_its_owned_helper_turn() {
+        let home = tempfile::tempdir().unwrap();
+        let log = home.path().join("env.log");
+        std::fs::write(format!("{}.generation", log.to_string_lossy()), "hold").unwrap();
+        let adapter = CodexAdapter::with_launch(home.path().to_path_buf(), fixture_launch(home.path(), &log));
+        let mut events = adapter.generate(GenerationRequest {
+            provider_id: "codex-cancel",
+            generation: 9,
+            model_id: "fixture-model",
+            protocol: Protocol::Responses,
+            body: json!({"model":"fixture-model","input":"hello"}),
+        }).await.unwrap();
+        assert_eq!(events.next().await, Some(GenerationEvent::Started { generation: 9 }));
+        assert_eq!(events.next().await, Some(GenerationEvent::Chunk("fixture".into())));
+        drop(events);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let calls = std::fs::read_to_string(format!("{}.calls", log.to_string_lossy())).unwrap_or_default();
+                if calls.lines().any(|method| method == "turn/interrupt") { break; }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }).await.expect("dropping the downstream stream must interrupt the helper turn");
+    }
+
+    #[tokio::test]
+    async fn separate_subscription_accounts_use_separate_helper_homes_and_threads() {
+        let home = tempfile::tempdir().unwrap();
+        let log = home.path().join("env.log");
+        let adapter = CodexAdapter::with_launch(home.path().to_path_buf(), fixture_launch(home.path(), &log));
+        for provider_id in ["codex-account-a", "codex-account-b"] {
+            let mut events = adapter.generate(GenerationRequest {
+                provider_id,
+                generation: 1,
+                model_id: "fixture-model",
+                protocol: Protocol::Messages,
+                body: json!({"model":"fixture-model","system":"system","messages":[{"role":"user","content":"hello"}]}),
+            }).await.unwrap();
+            while events.next().await.is_some() {}
+        }
+        let recorded = std::fs::read_to_string(&log).unwrap();
+        assert!(recorded.contains(&format!("CODEX_HOME={}", helper_home_in(home.path(), "codex-account-a").display())));
+        assert!(recorded.contains(&format!("CODEX_HOME={}", helper_home_in(home.path(), "codex-account-b").display())));
+        let params = std::fs::read_to_string(format!("{}.generation-params", log.to_string_lossy())).unwrap();
+        assert_eq!(params.lines().filter(|line| line.contains("thread ephemeral=true")).count(), 2);
+        let calls = std::fs::read_to_string(format!("{}.calls", log.to_string_lossy())).unwrap();
+        assert_eq!(calls.lines().filter(|method| *method == "thread/start").count(), 2);
+        assert_eq!(calls.lines().filter(|method| *method == "turn/start").count(), 2);
+    }
+
+    fn gateway_text_request(protocol: Protocol, model: &str, streaming: bool) -> Value {
+        match protocol {
+            Protocol::Chat => json!({"model":model,"stream":streaming,"reasoning_effort":"medium","service_tier":"priority","messages":[
+                {"role":"system","content":"chat system instruction"},
+                {"role":"developer","content":"chat developer instruction"},
+                {"role":"user","content":"chat user text"}
+            ]}),
+            Protocol::Responses => json!({"model":model,"stream":streaming,"instructions":"responses developer instruction","service_tier":"priority","reasoning":{"effort":"high","summary":"auto"},"input":"responses user text"}),
+            Protocol::Messages => json!({"model":model,"stream":streaming,"system":"messages system instruction","messages":[{"role":"user","content":"messages user text"}]}),
+        }
+    }
+
+    fn gateway_endpoint(protocol: Protocol) -> &'static str {
+        crate::subscription::protocol_key(protocol)
+    }
+
+    #[tokio::test]
+    async fn gateway_bridges_text_and_incremental_sse_for_all_three_protocols() {
+        let home = tempfile::tempdir().unwrap();
+        let log = home.path().join("gateway-helper.log");
+        let adapter = Arc::new(CodexAdapter::with_launch(home.path().to_path_buf(), fixture_launch(home.path(), &log)));
+        let store = admitted_gateway_store(home.path().join("gateway.db").as_path(), adapter, "http://127.0.0.1:9");
+        let model = "autojev/model/codex-fixture-binding";
+
+        for protocol in [Protocol::Chat, Protocol::Responses, Protocol::Messages] {
+            let reply = crate::proxy::forward_test_request(store.clone(), gateway_text_request(protocol, model, false), gateway_endpoint(protocol)).await;
+            assert_eq!(reply.status(), axum::http::StatusCode::OK, "{protocol:?}");
+            let bytes = axum::body::to_bytes(reply.into_body(), 1024 * 1024).await.unwrap();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            let output = match protocol {
+                Protocol::Chat => body.pointer("/choices/0/message/content"),
+                Protocol::Responses => body.pointer("/output/0/content/0/text"),
+                Protocol::Messages => body.pointer("/content/0/text"),
+            }.and_then(Value::as_str);
+            assert_eq!(output, Some("fixture"), "{protocol:?}: {body}");
+        }
+
+        std::fs::write(format!("{}.generation", log.to_string_lossy()), "slow-success").unwrap();
+        for protocol in [Protocol::Chat, Protocol::Responses, Protocol::Messages] {
+            let done = format!("{}.generation.done", log.to_string_lossy());
+            let _ = std::fs::remove_file(&done);
+            let reply = crate::proxy::forward_test_request(store.clone(), gateway_text_request(protocol, model, true), gateway_endpoint(protocol)).await;
+            assert_eq!(reply.status(), axum::http::StatusCode::OK, "{protocol:?}");
+            assert!(reply.headers().get("content-type").unwrap().to_str().unwrap().starts_with("text/event-stream"));
+            let mut stream = reply.into_body().into_data_stream();
+            let mut wire = String::new();
+            loop {
+                let chunk = tokio::time::timeout(std::time::Duration::from_secs(3), stream.next()).await
+                    .expect("first output must arrive before terminal completion")
+                    .expect("stream must contain a response frame").unwrap();
+                wire.push_str(std::str::from_utf8(&chunk).unwrap());
+                if wire.contains("fixture") { break; }
+            }
+            assert!(!std::path::Path::new(&done).exists(), "first text should be delivered before helper completion ({protocol:?})");
+            while let Some(chunk) = stream.next().await { wire.push_str(std::str::from_utf8(&chunk.unwrap()).unwrap()); }
+            match protocol {
+                Protocol::Chat => { assert!(wire.contains("\"finish_reason\":\"stop\""), "{wire}"); assert!(wire.contains("data: [DONE]"), "{wire}"); }
+                Protocol::Responses => assert!(wire.contains("event: response.completed"), "{wire}"),
+                Protocol::Messages => assert!(wire.contains("event: message_stop"), "{wire}"),
+            }
+        }
+
+        let rpc: Vec<Value> = std::fs::read_to_string(format!("{}.rpc", log.to_string_lossy())).unwrap()
+            .lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        let threads: Vec<_> = rpc.iter().filter(|call| call["method"] == "thread/start").collect();
+        let turns: Vec<_> = rpc.iter().filter(|call| call["method"] == "turn/start").collect();
+        assert_eq!(threads.len(), 6);
+        assert_eq!(turns.len(), 6);
+        assert!(threads.iter().all(|call| call["params"]["ephemeral"] == true));
+        assert!(threads.iter().all(|call| call["params"]["model"] == "codex-fixture-model"));
+        assert!(threads.iter().all(|call| !call["params"]["cwd"].as_str().unwrap_or("").is_empty()));
+        let workspaces: std::collections::HashSet<_> = threads
+            .iter()
+            .filter_map(|call| call["params"]["cwd"].as_str())
+            .collect();
+        assert_eq!(workspaces.len(), threads.len(), "every request must receive its own workspace");
+        assert!(turns.iter().any(|call| call["params"]["input"][0]["text"] == "chat user text" && call["params"]["effort"] == "medium"));
+        assert!(turns.iter().any(|call| call["params"]["input"][0]["text"] == "responses user text" && call["params"]["effort"] == "high" && call["params"]["summary"] == "auto"));
+        assert!(turns.iter().any(|call| call["params"]["input"][0]["text"] == "messages user text"));
+        assert!(threads.iter().any(|call| call["params"]["baseInstructions"] == "chat system instruction"));
+        assert!(threads.iter().any(|call| call["params"]["developerInstructions"].as_str().unwrap_or("").contains("chat developer instruction")));
+        assert!(threads.iter().any(|call| call["params"]["baseInstructions"] == "messages system instruction"));
+
+        // Codex supports only the subset the app-server can preserve. The response limit and tools
+        // are rejected before a helper turn is started, never silently discarded.
+        let before = turns.len();
+        for (protocol, body) in [
+            (Protocol::Chat, json!({"model":model,"messages":[{"role":"user","content":"x"}],"temperature":0.2})),
+            (Protocol::Responses, json!({"model":model,"max_output_tokens":20,"input":"x"})),
+            (Protocol::Messages, json!({"model":model,"max_tokens":20,"system":"instructions","messages":[{"role":"user","content":"x"}]})),
+            (Protocol::Chat, json!({"model":model,"tools":[],"messages":[{"role":"user","content":"x"}]})),
+            (Protocol::Chat, json!({"model":model,"messages":[{"role":"user","name":"Ada","content":"x"}]})),
+            (Protocol::Responses, json!({"model":model,"input":[{"type":"message","role":"user","metadata":{"source":"x"},"content":"x"}]})),
+            (Protocol::Messages, json!({"model":model,"messages":[{"role":"user","content":[{"type":"text","text":"x","annotations":[]}]}]})),
+            (Protocol::Chat, json!({"model":model,"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}]}]})),
+            (Protocol::Responses, json!({"model":model,"previous_response_id":"resp_fixture","input":"x"})),
+        ] {
+            let reply = crate::proxy::forward_test_request(store.clone(), body, gateway_endpoint(protocol)).await;
+            assert_eq!(reply.status(), axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+            let _ = axum::body::to_bytes(reply.into_body(), 4096).await.unwrap();
+        }
+        let calls = std::fs::read_to_string(format!("{}.calls", log.to_string_lossy())).unwrap();
+        assert_eq!(calls.lines().filter(|method| *method == "turn/start").count(), before);
+        let request_logs = store.request_logs("").unwrap();
+        let streaming_logs: Vec<_> = request_logs.iter().filter(|entry| entry.streaming).collect();
+        assert_eq!(streaming_logs.len(), 3);
+        assert!(streaming_logs.iter().all(|entry| entry.status == "success"), "stream terminals must be understood by debug capture: {streaming_logs:?}");
+    }
+
+    #[tokio::test]
+    async fn dropping_gateway_sse_interrupts_only_its_codex_turn() {
+        let home = tempfile::tempdir().unwrap();
+        let log = home.path().join("cancel-helper.log");
+        std::fs::write(format!("{}.generation", log.to_string_lossy()), "hold").unwrap();
+        let adapter = Arc::new(CodexAdapter::with_launch(home.path().to_path_buf(), fixture_launch(home.path(), &log)));
+        let store = admitted_gateway_store(home.path().join("gateway.db").as_path(), adapter, "http://127.0.0.1:9");
+        let response = crate::proxy::forward_test_request(store, gateway_text_request(Protocol::Responses, "autojev/model/codex-fixture-binding", true), gateway_endpoint(Protocol::Responses)).await;
+        let mut stream = response.into_body().into_data_stream();
+        let mut text = String::new();
+        loop {
+            let chunk = tokio::time::timeout(std::time::Duration::from_secs(3), stream.next()).await.unwrap().unwrap().unwrap();
+            text.push_str(std::str::from_utf8(&chunk).unwrap());
+            if text.contains("fixture") { break; }
+        }
+        drop(stream);
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let calls = std::fs::read_to_string(format!("{}.calls", log.to_string_lossy())).unwrap_or_default();
+                if calls.lines().any(|method| method == "turn/interrupt") { break; }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }).await.expect("dropping the gateway response must interrupt the helper turn");
+    }
+
+    #[tokio::test]
+    async fn gemini_protocol_rejects_codex_subscription_before_helper_dispatch() {
+        let home = tempfile::tempdir().unwrap();
+        let log = home.path().join("gemini-helper.log");
+        let adapter = Arc::new(CodexAdapter::with_launch(home.path().to_path_buf(), fixture_launch(home.path(), &log)));
+        let store = admitted_gateway_store(home.path().join("gateway.db").as_path(), adapter, "http://127.0.0.1:9");
+        let reply = crate::proxy::gemini_test_request(
+            store,
+            "autojev/model/codex-fixture-binding:generateContent",
+            json!({"contents":[{"role":"user","parts":[{"text":"hello"}]}]}),
+        ).await;
+        assert_eq!(reply.status(), axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(reply.headers().get("x-should-retry").and_then(|value| value.to_str().ok()), Some("false"));
+        let _ = axum::body::to_bytes(reply.into_body(), 4096).await.unwrap();
+        assert!(!std::path::Path::new(&format!("{}.calls", log.to_string_lossy())).exists(),
+            "unsupported Gemini subscription calls must be rejected before starting the helper");
+    }
+
+    #[tokio::test]
+    async fn existing_api_requests_keep_their_http_dispatch_and_credentials() {
+        let home = tempfile::tempdir().unwrap();
+        let log = home.path().join("api-isolation-helper.log");
+        let adapter = Arc::new(CodexAdapter::with_launch(home.path().to_path_buf(), fixture_launch(home.path(), &log)));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let dispatcher = Arc::new(RecordingDispatcher(seen.clone()));
+        let store = admitted_gateway_store_with_dispatcher(
+            home.path().join("gateway.db").as_path(), adapter, dispatcher, "http://127.0.0.1:9",
+        );
+        let api_model = store.read().models.iter().find(|model| model.provider_id == "openrouter").unwrap().clone();
+        let response = crate::proxy::forward_test_request(
+            store,
+            json!({"model":format!("autojev/model/{}",api_model.id),"messages":[{"role":"user","content":"api isolation"}]}),
+            gateway_endpoint(Protocol::Chat),
+        ).await;
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_GATEWAY);
+        let _ = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+
+        let calls = seen.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].provider_id, "openrouter");
+        assert_eq!(calls[0].model_id, api_model.model_id);
+        assert_eq!(calls[0].protocol, Protocol::Chat);
+        assert_eq!(calls[0].url, "http://127.0.0.1:9/v1/chat/completions");
+        assert_eq!(calls[0].authorization, "Bearer fixture-api-key");
+        assert_eq!(calls[0].body["messages"][0]["content"], "api isolation");
+        assert!(!std::path::Path::new(&format!("{}.calls", log.to_string_lossy())).exists(),
+            "API requests must not start or borrow the Codex helper");
+    }
+
+    #[tokio::test]
+    async fn partial_codex_failure_does_not_retry_into_an_api_model() {
+        let home = tempfile::tempdir().unwrap();
+        let log = home.path().join("partial-helper.log");
+        std::fs::write(format!("{}.generation", log.to_string_lossy()), "partial-failure").unwrap();
+        let adapter = Arc::new(CodexAdapter::with_launch(home.path().to_path_buf(), fixture_launch(home.path(), &log)));
+        let store = admitted_gateway_store(home.path().join("gateway.db").as_path(), adapter, "http://127.0.0.1:9");
+        let (api_id, codex_id) = {
+            let config = store.read();
+            (
+                config.models.iter().find(|model| model.provider_id == "openrouter").unwrap().id.clone(),
+                config.models.iter().find(|model| model.provider_id == "codex-fixture").unwrap().id.clone(),
+            )
+        };
+        store.update(|config| {
+            config.gateway.max_attempts = 4;
+            config.routes.push(crate::config::RouteRule {
+                all_models: false,
+                id: "codex-first".into(), name: "Codex first".into(), strategy: "round_robin".into(), enabled: true,
+                model_ids: vec![codex_id.clone(), api_id.clone()],
+                model_settings: std::collections::HashMap::from([
+                    (codex_id.clone(), crate::config::RouteModelSettings { priority: 10, weight: 1 }),
+                    (api_id.clone(), crate::config::RouteModelSettings { priority: 1, weight: 1 }),
+                ]),
+                automatic_policy: None,
+            });
+        }).unwrap();
+        let reply = crate::proxy::forward_test_request(store.clone(), gateway_text_request(Protocol::Chat, "autojev/codex-first", false), gateway_endpoint(Protocol::Chat)).await;
+        assert_eq!(reply.status(), axum::http::StatusCode::BAD_GATEWAY);
+        let bytes = axum::body::to_bytes(reply.into_body(), 4096).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(body.pointer("/error/message").and_then(Value::as_str).unwrap_or("").contains("Codex generation failed"), "{body}");
+        let calls = std::fs::read_to_string(format!("{}.calls", log.to_string_lossy())).unwrap();
+        assert_eq!(calls.lines().filter(|method| *method == "turn/start").count(), 1);
+        assert_eq!(store.request_logs("").unwrap()[0].attempts.len(), 1);
+        assert!(!store.read().events[0].success, "a failed non-stream Codex turn must not be recorded as a successful route");
+    }
+
+    #[test]
+    fn codex_turn_request_preserves_text_instructions_and_rejects_unenforceable_fields() {
+        let chat = codex_turn_request(
+            crate::protocol::Protocol::Chat,
+            &json!({"model":"requested","stream":true,"messages":[
+                {"role":"system","content":"system prompt"},
+                {"role":"developer","content":"developer prompt"},
+                {"role":"user","content":"question"}
+            ]}),
+        ).unwrap();
+        assert_eq!(chat.base_instructions.as_deref(), Some("system prompt"));
+        assert_eq!(chat.developer_instructions.as_deref(), Some("developer prompt"));
+        assert_eq!(chat.input, vec![json!({"type":"text","text":"question"})]);
+
+        let responses = codex_turn_request(
+            crate::protocol::Protocol::Responses,
+            &json!({"model":"requested","stream":false,"instructions":"answer briefly","input":"question"}),
+        ).unwrap();
+        assert_eq!(responses.developer_instructions.as_deref(), Some("answer briefly"));
+        assert_eq!(responses.input, vec![json!({"type":"text","text":"question"})]);
+
+        let messages = codex_turn_request(
+            crate::protocol::Protocol::Messages,
+            &json!({"model":"requested","stream":false,"system":"instructions","messages":[{"role":"user","content":"question"}]}),
+        ).unwrap();
+        assert_eq!(messages.base_instructions.as_deref(), Some("instructions"));
+        assert_eq!(messages.input, vec![json!({"type":"text","text":"question"})]);
+
+        for (protocol, body) in [
+            (crate::protocol::Protocol::Chat, json!({"max_tokens":16,"messages":[{"role":"user","content":"x"}]})),
+            (crate::protocol::Protocol::Responses, json!({"max_output_tokens":16,"input":"x"})),
+            (crate::protocol::Protocol::Messages, json!({"max_tokens":16,"messages":[{"role":"user","content":"x"}]})),
+            (crate::protocol::Protocol::Chat, json!({"tools":[],"messages":[{"role":"user","content":"x"}]})),
+            (crate::protocol::Protocol::Responses, json!({"previous_response_id":"resp-old","input":"x"})),
+            (crate::protocol::Protocol::Messages, json!({"messages":[{"role":"assistant","content":"history"},{"role":"user","content":"x"}]})),
+        ] {
+            assert!(codex_turn_request(protocol, &body).is_err(), "{protocol:?}: {body}");
+        }
     }
 
     #[tokio::test]
