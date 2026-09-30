@@ -63,7 +63,11 @@ export interface ProxyStatus {
 
 export type SubscriptionConnectionState = 'not_connected' | 'authorization_pending' | 'connected' | 'expired';
 export type SubscriptionCapabilityStatus = 'unverified' | 'verified' | 'unsupported';
-export type SubscriptionEvidenceState = 'unknown' | 'available' | 'stale' | 'failed' | 'unsupported';
+export type SubscriptionEvidenceState = 'unknown' | 'available' | 'stale' | 'failed' | 'unsupported' | 'denied';
+/** 额度许可：缺失、null 或非布尔一律是 unknown，不得当成“已关闭”。 */
+export type SubscriptionQuotaPermission = 'unknown' | 'allowed' | 'denied';
+/** 额度来源视图：多桶优先，其次旧版单桶，都没有就是 unknown。 */
+export type SubscriptionQuotaView = 'unknown' | 'rate_limits_by_limit_id' | 'rate_limits';
 
 export type SubscriptionLoginStage = 'idle' | 'pending' | 'completed' | 'failed' | 'cancelled';
 export type SubscriptionLocalClearing = 'cleared' | 'retained';
@@ -95,7 +99,50 @@ export interface SubscriptionHelperView {
 
 export interface SubscriptionModel { model_id: string; name?: string | null; eligible: boolean }
 export interface SubscriptionCapability { model_id: string; protocol: string; status: SubscriptionCapabilityStatus }
-export interface SubscriptionQuota { state: SubscriptionEvidenceState; source?: string | null; observed_at?: string | null }
+/** 单个额度窗口；越界或类型不符的字段是 null，并记入 invalid_fields，绝不改写成合法值。 */
+export interface SubscriptionQuotaWindow {
+  label: string;                // "primary" | "secondary" | "single"
+  used_percent?: number | null;
+  window_minutes?: number | null;
+  resets_at?: number | null;    // Unix 秒
+  missing_fields?: string[];
+  invalid_fields?: string[];
+}
+/** 原始余额文本；不解析为金额、不推断单位，缺单位时必须由界面说明。 */
+export interface SubscriptionQuotaCredits {
+  has_credits?: boolean | null;
+  unlimited?: boolean | null;
+  balance?: string | null;
+  missing_fields?: string[];
+}
+export interface SubscriptionQuotaBucket {
+  limit_id: string;
+  name?: string | null;
+  plan_type?: string | null;
+  windows?: SubscriptionQuotaWindow[];
+  credits?: SubscriptionQuotaCredits | null;
+  permission?: SubscriptionQuotaPermission;
+  missing_fields?: string[];
+  invalid_fields?: string[];
+}
+/** 额度只读证据；history=true 表示 buckets 是失败后保留的历史数字。 */
+export interface SubscriptionQuota {
+  state: SubscriptionEvidenceState;
+  source?: string | null;
+  observed_at?: string | null;
+  view?: SubscriptionQuotaView;
+  buckets?: SubscriptionQuotaBucket[];
+  missing_fields?: string[];
+  history?: boolean;
+}
+/** 模型目录只读证据；失败时保留上次已核实的目录并标记 stale。 */
+export type SubscriptionCatalogState = 'unknown' | 'available' | 'stale' | 'failed';
+export interface SubscriptionCatalogEvidence {
+  state: SubscriptionCatalogState;
+  source?: string | null;
+  observed_at?: string | null;
+  missing_fields?: string[];
+}
 
 /** 上游目录项的可用性：权威读取、读取失败、移除、撤销与未知互相区分。 */
 export type SubscriptionCatalogAvailability = 'available' | 'stale' | 'removed' | 'revoked' | 'unknown';
@@ -134,9 +181,11 @@ export interface SubscriptionView {
   account_path?: string | null;
   models: SubscriptionModel[];
   /** 已发现模型的目录投影；目录失败时保留已核实项。API 服务商不出现。 */
-  catalog?: SubscriptionCatalogEntry[];
+  catalog_entries?: SubscriptionCatalogEntry[];
   capabilities: SubscriptionCapability[];
   quota: SubscriptionQuota;
+  /** 目录证据；旧快照可能没有该字段，缺失即 unknown。 */
+  catalog?: SubscriptionCatalogEvidence | null;
   denial?: SubscriptionDenial | null;
   adapter_available: boolean;
   login?: SubscriptionLoginView | null;

@@ -116,16 +116,17 @@ impl Eligibility {
         }
     }
 
-    /// 给界面与错误使用的单行原因。
+    /// 给界面与错误使用的单行原因。不可用的各项都明确说明「不具备调用资格」及其依据，
+    /// 免得客户端把「资格未知」误读成别的失败类别。
     pub fn reason(self) -> &'static str {
         match self {
             Eligibility::Eligible => "the current account can use this model",
             Eligibility::Stale => "the directory read failed; the last confirmed qualification is kept",
-            Eligibility::NotDiscovered => "the current account directory does not list this model",
-            Eligibility::Removed => "the upstream directory no longer lists this model",
-            Eligibility::Revoked => "the upstream account is not permitted to use this model",
-            Eligibility::AccountChanged => "qualification has not been re-verified for the current account and connection",
-            Eligibility::Unknown => "no directory qualification has been read for this connection",
+            Eligibility::NotDiscovered => "not eligible — the current account directory does not list this model",
+            Eligibility::Removed => "not eligible — the upstream directory no longer lists this model",
+            Eligibility::Revoked => "not eligible — the upstream account is not permitted to use this model",
+            Eligibility::AccountChanged => "not eligible — qualification has not been re-verified for the current account and connection",
+            Eligibility::Unknown => "not eligible — no directory qualification has been read for this connection",
         }
     }
 }
@@ -173,7 +174,10 @@ pub fn reconcile(
             (
                 model.model_id.trim().to_owned(),
                 model.name.clone(),
-                if model.eligible { Availability::Available } else { Availability::Revoked },
+                // #31 契约：`eligible` 只表达适配器「该账号确实可以用这个模型」，发现本身不构成资格。
+                // Codex 适配器固定报告 false（发现 ≠ 资格），所以这里只降级为「无资格依据」，
+                // 绝不据此断言权限被撤销；`Revoked` 保留给能明确报告权限拒绝的适配器。
+                if model.eligible { Availability::Available } else { Availability::Unknown },
                 model.model_id.clone(),
             )
         })
@@ -599,21 +603,42 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_records_account_revocation_without_losing_the_row() {
+    fn a_listed_model_without_a_permission_verdict_has_no_qualification() {
         let mut config = config_with_connection();
+        // #31 契约：Codex 适配器报告的是「发现」，不是「该账号可用」。发现本身不得构成调用资格，
+        // 也不得被显示成「权限被撤销」——那是另一个事实。
         reconcile(&mut config, PROVIDER, ACCOUNT, 1, &[discovery("grok-4", None, false)], Some("t1"));
-        assert_eq!(entry(&config, "grok-4").availability, Availability::Revoked);
-        assert_eq!(eligibility(&config, PROVIDER, "grok-4"), Eligibility::Revoked);
-        assert_eq!(eligibility(&config, PROVIDER, "grok-4").code(), Some("model_revoked"));
+        assert_eq!(entry(&config, "grok-4").availability, Availability::Unknown);
+        assert_eq!(eligibility(&config, PROVIDER, "grok-4"), Eligibility::Unknown);
+        assert_eq!(eligibility(&config, PROVIDER, "grok-4").code(), Some("model_unqualified"));
         assert!(!eligibility(&config, PROVIDER, "grok-4").is_eligible());
-        assert!(model_row(&config, "grok-4").enabled, "资格撤销不是用户停用");
-        assert_eq!(config.models.len(), 1, "撤销权限仍保留模型行与配置");
+        assert!(model_row(&config, "grok-4").enabled, "缺资格依据不是用户停用");
+        assert_eq!(config.models.len(), 1, "缺资格依据仍保留模型行与配置");
 
         set_user_state(&mut config, "grok-4", true, true);
         reconcile(&mut config, PROVIDER, ACCOUNT, 1, &[discovery("grok-4", None, true)], Some("t2"));
         assert_eq!(entry(&config, "grok-4").availability, Availability::Available);
         assert_eq!(eligibility(&config, PROVIDER, "grok-4"), Eligibility::Eligible);
-        assert!(model_row(&config, "grok-4").selected, "权限恢复保留用户选择");
+        assert!(model_row(&config, "grok-4").selected, "资格恢复保留用户选择");
+    }
+
+    #[test]
+    fn an_explicit_revocation_stays_unavailable() {
+        let mut config = config_with_connection();
+        reconcile(&mut config, PROVIDER, ACCOUNT, 1, &[discovery("grok-4", None, true)], Some("t1"));
+        set_user_state(&mut config, "grok-4", true, true);
+        // 上游明确报告权限拒绝时才标 Revoked（当前 Codex 适配器不产生该状态）。
+        config
+            .subscription_catalogs
+            .get_mut(PROVIDER)
+            .unwrap()
+            .entry_mut("grok-4")
+            .unwrap()
+            .availability = Availability::Revoked;
+        assert_eq!(eligibility(&config, PROVIDER, "grok-4"), Eligibility::Revoked);
+        assert_eq!(eligibility(&config, PROVIDER, "grok-4").code(), Some("model_revoked"));
+        assert!(!eligibility(&config, PROVIDER, "grok-4").is_eligible());
+        assert!(model_row(&config, "grok-4").selected && model_row(&config, "grok-4").enabled, "撤销不改用户配置");
     }
 
     #[test]
@@ -633,7 +658,7 @@ mod tests {
 
         mark_stale(&mut config, PROVIDER);
         assert_eq!(entry(&config, "a").availability, Availability::Stale);
-        assert_eq!(entry(&config, "b").availability, Availability::Revoked, "只把 Available 标为陈旧");
+        assert_eq!(entry(&config, "b").availability, Availability::Unknown, "只把 Available 标为陈旧");
         assert_eq!(catalog(&config, PROVIDER).unwrap().entries.len(), 2, "读取失败不删项");
         let row = model_row(&config, "a");
         assert!(row.selected && row.enabled && row.id == internal, "读取失败不改选择、停用与标识");

@@ -366,6 +366,10 @@ input, select, textarea { width: 100%; border: 1px solid var(--line-light); back
 .provider-subscription-logout { color: var(--muted); font-size: 11px; line-height: 1.5; }
 .subscription-action { font-size: 11px; margin-left: 4px; }
 .provider-subscription-reason { color: var(--muted); font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
+.provider-subscription-catalog, .provider-subscription-quota { font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; font-family: var(--mono); }
+.provider-subscription-catalog-human, .provider-subscription-quota-human, .provider-subscription-quota-history { color: var(--muted); font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
+.provider-subscription-quota-bucket { display: inline-flex; align-items: center; gap: 4px; color: var(--muted); font-size: 11px; line-height: 1.5; }
+.provider-subscription-quota-bucket code { font-size: 11px; }
 .subscription-provider-note { display: flex; align-items: flex-start; gap: 8px; color: var(--muted); }
 .subscription-provider-note svg { flex-shrink: 0; margin-top: 2px; }
 .subscription-provider-note .provider-test-help { margin: 0; }

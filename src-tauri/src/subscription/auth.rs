@@ -1285,6 +1285,7 @@ mod lifecycle_tests {
                     models: Vec::new(),
                     capabilities: Vec::new(),
                     quota: Default::default(),
+                    catalog: Default::default(),
                 });
             })
             .unwrap();

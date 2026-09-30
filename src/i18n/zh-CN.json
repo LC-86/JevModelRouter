@@ -933,5 +933,19 @@
   "{count} models are not selected": "{count} 个模型未选择",
   "Not selected models stay out of the model list, counts, speed tests and agent catalogs. Direct calls by the original model ID still work.": "未选择的模型不会进入模型列表、计数、测速候选和 Agent 目录，但仍可按原模型 ID 直接调用。",
   "Pending sync: the saved catalog differs from the current selection. Reconnect to update the agent configuration.": "待同步：保存目录与当前选择不一致，重新连接后才会刷新该 Agent 配置。",
-  "Removals and revocations apply in the backend immediately; no external configuration refresh is needed.": "后端的移除与撤销立即生效，无需等待外部配置刷新。"
+  "Removals and revocations apply in the backend immediately; no external configuration refresh is needed.": "后端的移除与撤销立即生效，无需等待外部配置刷新。",
+  "Quota access denied": "额度访问被拒绝",
+  "Quota usage allowed": "允许使用额度",
+  "Quota usage denied": "额度使用被拒绝",
+  "Quota permission unknown": "额度许可未知",
+  "Multiple quota buckets": "多桶额度",
+  "Legacy single quota bucket": "旧版单桶额度",
+  "Quota view unknown": "额度视图未知",
+  "Historical data · last successful update {time}": "历史数据 · 最后成功更新 {time}",
+  "Model catalog": "模型目录",
+  "Catalog unknown": "目录未知",
+  "Catalog available": "目录可用",
+  "Catalog stale": "目录已陈旧",
+  "Catalog read failed": "目录读取失败",
+  "Raw balance text as reported; the unit is not inferred.": "原样显示的余额文本，不推断单位。"
 }

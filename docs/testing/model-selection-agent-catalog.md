@@ -4,7 +4,7 @@
 
 ## 界面契约（冻结）
 
-`DashboardSnapshot.subscriptions[].catalog`（由 `subscription::SubscriptionCatalogView` 提供，`lib.rs` 只透传）：
+`DashboardSnapshot.subscriptions[].catalog_entries`（由 `subscription::SubscriptionCatalogView` 提供，`lib.rs` 只透传）。注意与同级的 `subscriptions[].catalog` 区分：后者是 #15 的只读目录证据（`{ state, source, observed_at, missing_fields }`），前者是逐模型的用户配置与账号资格投影。
 
 ```jsonc
 {
@@ -23,11 +23,17 @@
 
 准入拒绝码（稳定，出现在网关响应头 `x-autojev-subscription-denial` 与错误体 `error.code`）：`model_disabled`、`model_not_discovered`、`model_removed`、`model_revoked`、`model_unqualified`，以及既有的连接、能力与额度码。
 
+## 与 #15 目录/额度证据的衔接
+
+- 一次成功的 `models()` 读取就是该账号的完整权威目录：`subscription_catalog::reconcile` 据此整体重核资格，模型行按上游 ID 建档且默认未选。发现本身**不构成**调用资格：适配器报告 `eligible=false`（Codex 契约固定如此：发现 ≠ 资格）时只记为 `unknown`（无资格依据，退出码 `model_unqualified`），不会被显示成「权限已撤销」。`revoked` 保留给能明确报告权限拒绝的适配器；当前两家适配器都不产生该状态。
+- 目录读取失败走 #15 的证据保留路径（`catalog.state = stale`、模型列表与时间原样保留），同时 `subscription_catalog::mark_stale` 把该账号同世代的已核实项标陈旧——网络失败不等于模型被移除，资格仍成立。
+- 身份不完整（helper 无法确认账号）与明确退出：除 #15 的状态落盘与历史保留外，还会 `invalidate_account`，把目录资格整体作废（`unavailable`／`account_changed`），绝不留下可用的旧账号资格。换号与退出同样递增世代并作废资格，保留用户的选择与停用。
+
 ## 证据分层
 
 | 层 | 覆盖 | 不覆盖 |
 | --- | --- | --- |
-| 隔离替身（`pnpm test:isolated` 的 `catalog` 场景） | 发现／建档、未选、勾选、取消选择、停用零派发、同账号目录失败标陈旧、权威移除、换号重核、删行重建、Agent 待同步 | 真实上游目录、真实 OAuth 身份、真实额度 |
+| 隔离替身（`pnpm test:isolated` 的 `model-selection` 运行） | 发现／建档、未选、勾选、取消选择、停用零派发、同账号目录失败标陈旧、权威移除、换号重核、删行重建、Agent 待同步 | 真实上游目录、真实 OAuth 身份、真实额度 |
 | Rust 单元测试（`cargo test`） | 目录状态机（`subscription_catalog`）、准入与候选（`subscription`/`router`/`proxy`/`agent_catalog`）、装配层（`lib.rs`/`agents.rs`） | 原生窗口与真实 IPC 组合 |
 | Leo 手测 | 两家真实目录、真实账号资格与额度、界面观感 | — |
 
@@ -53,7 +59,7 @@ cargo check --manifest-path src-tauri/Cargo.toml --all-targets
 pnpm test:isolated          # 构建前端与 --features isolation-check 的开发二进制，再跑原生桌面验收
 ```
 
-`pnpm test:isolated` 的 `catalog` 运行把受控目录写入隔离根目录的 `catalog-catalog.json`，并以 `--autojev-catalog-fixture` 交给目录替身；替身按读取顺序前进，顺序与 `isolation-check.js::catalogLifecycle` 的步骤一一对应（发现 → 同账号失败 → 权威移除 → 换号重核 → 删行重建），最后以生产路径注销（专用授权目录随之清空）。每一次原 ID 直调都经真实网关（Debug 入口），断言拒绝码与上游零派发；公共目录由验收替身的 Node 侧代取真实网关 `/v1/models`（页面直接读回环网关会被同源策略挡下），不经过任何应用旁路。
+`pnpm test:isolated` 的 `model-selection` 运行（`loginMode=model-selection`，与 #15 的 `catalog` 运行分开，互不冒充）把受控目录写入隔离根目录的 `catalog-model-selection.json`，并以 `--autojev-catalog-fixture` 交给目录替身；替身按读取顺序前进，顺序与 `isolation-check.js::modelSelectionLifecycle` 的步骤一一对应（发现 → 同账号失败 → 权威移除 → 换号重核 → 删行重建），最后以生产路径注销（专用授权目录随之清空）。每一次原 ID 直调都经真实网关（Debug 入口），断言拒绝码与上游零派发；公共目录由验收替身的 Node 侧代取真实网关 `/v1/models`（页面直接读回环网关会被同源策略挡下），不经过任何应用旁路。#15 的 `catalog` 运行仍只用替身自己的目录/额度队列（`AUTOJEV_FAKE_HELPER_CATALOG`／`READS`），不会启用这个受控目录替身。
 
 证据留在 `mktemp` 生成的临时隔离目录：`catalog.report.json`（含每一步观察值）、`helper-catalog.jsonl`（替身收到的方法）、`requests.json`（真实上游收到的请求）。目录被替换的替身不会出现在普通开发／发布构建里：`isolation-check` 特性与 `--autojev-catalog-fixture` 开关都只在隔离验收构建中存在，且目录文件必须位于隔离根目录内。
 

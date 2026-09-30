@@ -90,14 +90,21 @@ impl crate::subscription::SubscriptionAdapter for CatalogStandInAdapter {
     }
 
     /// 目录内容来自受控文件，其余证据仍然来自真实适配器。
-    fn models<'a>(&'a self, _provider_id: &'a str, _generation: u64) -> futures_util::future::BoxFuture<'a, anyhow::Result<Vec<crate::subscription::DiscoveredModel>>> {
+    /// 返回 #15 的 `CatalogRead`：失败（`fail: true`）时必须返回 `Err`，让调用方走「保留已核实项并标陈旧」，
+    /// 不得用不完整的列表冒充权威目录。
+    fn models<'a>(&'a self, _provider_id: &'a str, _generation: u64) -> futures_util::future::BoxFuture<'a, anyhow::Result<crate::subscription::CatalogRead>> {
         Box::pin(async move {
             let read = self.next_read()?;
-            Ok(read
-                .models
-                .into_iter()
-                .map(|model| crate::subscription::DiscoveredModel { model_id: model.model_id, name: model.name, eligible: model.eligible })
-                .collect())
+            Ok(crate::subscription::CatalogRead {
+                models: read
+                    .models
+                    .into_iter()
+                    .map(|model| crate::subscription::DiscoveredModel { model_id: model.model_id, name: model.name, eligible: model.eligible })
+                    .collect(),
+                source: Some("isolation-catalog-fixture:model/list".into()),
+                observed_at: Some(chrono::Utc::now().to_rfc3339()),
+                missing_fields: Vec::new(),
+            })
         })
     }
 
@@ -112,7 +119,12 @@ impl crate::subscription::SubscriptionAdapter for CatalogStandInAdapter {
                 Some("unsupported") | None => crate::subscription::EvidenceState::Unsupported,
                 Some(other) => anyhow::bail!("Unknown catalog fixture quota state: {other}"),
             };
-            Ok(crate::subscription::QuotaEvidence { state, source: Some("isolation-catalog-fixture".into()), observed_at: None })
+            Ok(crate::subscription::QuotaEvidence {
+                state,
+                source: Some("isolation-catalog-fixture".into()),
+                observed_at: None,
+                ..crate::subscription::QuotaEvidence::default()
+            })
         })
     }
 
@@ -172,6 +184,8 @@ pub fn script() -> anyhow::Result<Option<String>> {
     )?;
     crate::dispatch::ensure_loopback(&url)?;
     // Optional login-lifecycle mode: the acceptance driver only rehearses one scenario per run.
+    // `catalog` is the #15 read-only directory/quota acceptance path; it signs in first and then
+    // rehearses one catalog + quota scenario queue per refresh.
     let login_mode = args
         .iter()
         .position(|s| s == "--autojev-login-check")
@@ -179,7 +193,7 @@ pub fn script() -> anyhow::Result<Option<String>> {
         .cloned();
     if let Some(mode) = &login_mode {
         anyhow::ensure!(
-            matches!(mode.as_str(), "success" | "late" | "failed" | "grok" | "catalog"),
+            matches!(mode.as_str(), "success" | "late" | "failed" | "grok" | "catalog" | "model-selection"),
             "Unknown login check mode: {mode}"
         );
     }
