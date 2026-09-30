@@ -709,11 +709,19 @@ pub enum GenerationEvent {
     Started { generation: u64 },
     Chunk(String),
     Finished { status: u16 },
+    /// The helper completed at an API-visible limit that callers need to preserve.
+    #[allow(dead_code)]
+    FinishedWithReason { status: u16, reason: GenerationFinishReason },
     /// The helper reported a failed turn. Once any text was sent, callers must terminate this
     /// response in place and must not append output from another provider.
     Failed { message: String },
     /// The helper reported an interrupted turn (including client disconnect cancellation).
     Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GenerationFinishReason {
+    MaxTokens,
 }
 
 pub type GenerationStream<'a> =
@@ -1157,6 +1165,8 @@ pub async fn logout(
 ) -> Result<LogoutOutcome, String> {
     let provider = require_subscription_provider(store, provider_id)?;
     require_supported(store, &provider, "sign-out")?;
+    let current_generation = store.read().subscriptions.get(provider_id).map(|connection| connection.generation).unwrap_or(1);
+    store.subscription.cancel_generation(&provider.kind, provider_id, current_generation);
     let generation = store
         .update(|config| {
             if !config.subscriptions.contains_key(provider_id) {
@@ -1227,7 +1237,12 @@ pub async fn dispose(
         return Ok(());
     };
     if store.subscription.supports(&kind) {
-        logout(store, provider_id, sessions).await.map(|_| ())?;
+        if kind == ProviderKind::GrokSubscription {
+            let generation = store.read().subscriptions.get(provider_id).map(|connection| connection.generation).unwrap_or(1);
+            store.subscription.cancel_generation(&kind, provider_id, generation);
+        } else {
+            logout(store, provider_id, sessions).await.map(|_| ())?;
+        }
     }
     let mut state = sessions.lock().await;
     state.sessions.remove(provider_id);
@@ -1250,6 +1265,8 @@ pub async fn migrate_helper(
         return Ok(());
     };
     if store.subscription.supports(&kind) {
+        let generation = store.read().subscriptions.get(old_id).map(|connection| connection.generation).unwrap_or(1);
+        store.subscription.cancel_generation(&kind, old_id, generation);
         if let Err(error) = store.subscription.rename_all(old_id, new_id).await {
             let message = sanitize_error(&error.to_string());
             logout(store, old_id, sessions).await.map(|_| ())?;
@@ -1300,6 +1317,8 @@ pub trait SubscriptionAdapter: Send + Sync {
     fn models<'a>(&'a self, provider_id: &'a str, generation: u64) -> BoxFuture<'a, Result<CatalogRead>>;
     fn quota<'a>(&'a self, provider_id: &'a str, generation: u64) -> BoxFuture<'a, Result<QuotaEvidence>>;
     fn generate<'a>(&'a self, request: GenerationRequest<'a>) -> BoxFuture<'a, Result<GenerationStream<'a>>>;
+    /// Signal one connection generation to stop before its identity or provider-owned home changes.
+    fn cancel_generation(&self, _provider_id: &str, _generation: u64) {}
     /// 发起一次浏览器登录；世代与尝试一起绑定，结果迟到即整体丢弃。
     fn start_login<'a>(&'a self, provider_id: &'a str, generation: u64) -> BoxFuture<'a, Result<LoginStart>>;
     /// 等待该登录尝试的终态；世代或尝试已变时返回 `Ok(None)`。
@@ -1409,6 +1428,13 @@ impl SubscriptionAdapters {
     /// per-kind helper 自述状态：Grok 行永远拿不到 Codex 适配器的版本或授权目录。
     pub fn helper_status(&self, kind: &ProviderKind) -> HelperStatus {
         self.for_kind(kind).map(|adapter| adapter.helper_status()).unwrap_or_default()
+    }
+
+    /// Cancel requests bound to a connection generation that is being retired.
+    pub fn cancel_generation(&self, kind: &ProviderKind, provider_id: &str, generation: u64) {
+        if let Some(adapter) = self.for_kind(kind) {
+            adapter.cancel_generation(provider_id, generation);
+        }
     }
 }
 
