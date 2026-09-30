@@ -31,13 +31,15 @@ use crate::subscription::{
 
 #[cfg(test)]
 const CALL_TIMEOUT: Duration = Duration::from_secs(15);
+#[cfg(test)]
+const CANCEL_NOTIFY_TIMEOUT: Duration = Duration::from_millis(250);
 const MAX_INPUT_BYTES: usize = 64 * 1024;
 #[cfg(test)]
 const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug)]
 struct TextTurn {
-    text: String,
+    text: Vec<String>,
     max_tokens: Option<u64>,
 }
 
@@ -148,11 +150,14 @@ fn parse_text_turn(protocol: Protocol, body: &Value, model_id: &str) -> Result<T
         };
     let text = text_value(messages)?;
     ensure!(
-        !text.trim().is_empty(),
+        text.iter().any(|part| !part.trim().is_empty()),
         "Grok ACP requires non-empty user text"
     );
+    let text_bytes = text
+        .iter()
+        .fold(0usize, |total, part| total.saturating_add(part.len()));
     ensure!(
-        text.len() <= MAX_INPUT_BYTES,
+        text_bytes <= MAX_INPUT_BYTES,
         "Grok input exceeded the 64 KiB text limit"
     );
     Ok(TextTurn { text, max_tokens })
@@ -191,12 +196,12 @@ pub(crate) fn validate_generation_request(
     parse_text_turn(protocol, body, model_id).map(|_| ())
 }
 
-fn text_value(value: &Value) -> Result<String> {
+fn text_value(value: &Value) -> Result<Vec<String>> {
     match value {
-        Value::String(text) => Ok(text.clone()),
+        Value::String(text) => Ok(vec![text.clone()]),
         Value::Array(blocks) => {
             ensure!(!blocks.is_empty(), "Text content cannot be empty");
-            let mut text = String::new();
+            let mut text = Vec::with_capacity(blocks.len());
             for block in blocks {
                 let object = block
                     .as_object()
@@ -215,10 +220,7 @@ fn text_value(value: &Value) -> Result<String> {
                     .get("text")
                     .and_then(Value::as_str)
                     .context("Text blocks require string `text`")?;
-                if !text.is_empty() {
-                    text.push('\n');
-                }
-                text.push_str(part);
+                text.push(part.to_owned());
             }
             Ok(text)
         }
@@ -295,61 +297,77 @@ pub(super) async fn generate<'a>(
         stdout: BufReader::new(stdout),
         next_id: 0,
     };
-    let init = call_cancellable(&mut rpc, "initialize", json!({
-        "protocolVersion": 1,
-        "clientInfo": {"name":"autojev","title":"AutoJev","version":env!("CARGO_PKG_VERSION")},
-        "clientCapabilities": {"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false}
-    }), &mut cancel_rx).await?;
-    let cached = init
-        .get("authMethods")
-        .and_then(Value::as_array)
-        .is_some_and(|methods| {
-            methods
-                .iter()
-                .any(|method| method.get("id").and_then(Value::as_str) == Some("cached_token"))
-        });
-    ensure!(
-        cached,
-        "Grok ACP did not advertise cached account authentication"
-    );
-    call_cancellable(
-        &mut rpc,
-        "authenticate",
-        json!({"methodId":"cached_token","_meta":{"headless":true}}),
-        &mut cancel_rx,
-    )
-    .await?;
-    let session = call_cancellable(
-        &mut rpc,
-        "session/new",
-        json!({"cwd":workspace.path(),"mcpServers":[]}),
-        &mut cancel_rx,
-    )
-    .await?;
-    let session_id = session
-        .get("sessionId")
-        .and_then(Value::as_str)
-        .filter(|session| !session.trim().is_empty())
-        .context("Grok ACP returned no session id")?
-        .to_owned();
-    if let Some(max_tokens) = turn.max_tokens {
-        set_max_tokens(&mut rpc, &session_id, &session, max_tokens, &mut cancel_rx).await?;
-    }
-    (request.pre_dispatch_check)().map_err(anyhow::Error::msg)?;
-
-    let prompt_id = rpc
-        .send_request(
-            "session/prompt",
-            json!({
-                "sessionId": session_id,
-                "prompt": [{"type":"text","text":turn.text}]
-            }),
+    let prompt_content: Vec<_> = turn
+        .text
+        .iter()
+        .map(|text| json!({"type":"text","text":text}))
+        .collect();
+    let turn_timeout = adapter.generation_timeout;
+    let prepared = async {
+        let init = call_cancellable(&mut rpc, "initialize", json!({
+            "protocolVersion": 1,
+            "clientInfo": {"name":"autojev","title":"AutoJev","version":env!("CARGO_PKG_VERSION")},
+            "clientCapabilities": {"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false}
+        }), &mut cancel_rx).await?;
+        let cached = init
+            .get("authMethods")
+            .and_then(Value::as_array)
+            .is_some_and(|methods| {
+                methods
+                    .iter()
+                    .any(|method| method.get("id").and_then(Value::as_str) == Some("cached_token"))
+            });
+        ensure!(
+            cached,
+            "Grok ACP did not advertise cached account authentication"
+        );
+        call_cancellable(
+            &mut rpc,
+            "authenticate",
+            json!({"methodId":"cached_token","_meta":{"headless":true}}),
+            &mut cancel_rx,
         )
         .await?;
+        let session = call_cancellable(
+            &mut rpc,
+            "session/new",
+            json!({"cwd":workspace.path(),"mcpServers":[]}),
+            &mut cancel_rx,
+        )
+        .await?;
+        let session_id = session
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .filter(|session| !session.trim().is_empty())
+            .context("Grok ACP returned no session id")?
+            .to_owned();
+        if let Some(max_tokens) = turn.max_tokens {
+            set_max_tokens(&mut rpc, &session_id, &session, max_tokens, &mut cancel_rx).await?;
+        }
+        (request.pre_dispatch_check)().map_err(anyhow::Error::msg)?;
+
+        let turn_deadline = tokio::time::Instant::now() + turn_timeout;
+        let prompt_id = rpc
+            .send_request_cancellable(
+                "session/prompt",
+                json!({"sessionId":session_id,"prompt":prompt_content}),
+                &mut cancel_rx,
+                turn_deadline,
+            )
+            .await?;
+        Ok::<_, anyhow::Error>((prompt_id, session_id, turn_deadline))
+    }
+    .await;
+    let (prompt_id, session_id, turn_deadline) = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            rpc.stop().await;
+            return Err(error);
+        }
+    };
     let (tx, rx) = mpsc::unbounded_channel::<GenerationEvent>();
     let provider_id = request.provider_id.to_owned();
     let model_id = request.model_id.to_owned();
-    let turn_timeout = adapter.generation_timeout;
     let protocol_check = request.pre_dispatch_check.clone();
     tokio::spawn(async move {
         let _request_guard = guard;
@@ -363,9 +381,10 @@ pub(super) async fn generate<'a>(
             tx.clone(),
             &mut cancel_rx,
             protocol_check,
-            turn_timeout,
+            turn_deadline,
         )
         .await;
+        rpc.stop().await;
         match outcome {
             PromptOutcome::Finished => {
                 let _ = tx.send(GenerationEvent::Finished { status: 200 });
@@ -383,7 +402,6 @@ pub(super) async fn generate<'a>(
                 let _ = tx.send(GenerationEvent::Failed { message });
             }
         }
-        rpc.stop().await;
         let _ = (&provider_id, &model_id);
     });
     let stream = futures_util::stream::unfold(rx, |mut receiver| async move {
@@ -421,17 +439,35 @@ struct RpcProcess {
 
 #[cfg(test)]
 impl RpcProcess {
-    async fn send_request(&mut self, method: &str, params: Value) -> Result<u64> {
+    async fn send_request_cancellable(
+        &mut self,
+        method: &str,
+        params: Value,
+        cancel: &mut watch::Receiver<bool>,
+        deadline: tokio::time::Instant,
+    ) -> Result<u64> {
         self.next_id += 1;
         let id = self.next_id;
-        self.write(&json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))
-            .await?;
+        self.write_cancellable(
+            &json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}),
+            cancel,
+            deadline,
+        )
+        .await?;
         Ok(id)
     }
 
-    async fn notify(&mut self, method: &str, params: Value) -> Result<()> {
-        self.write(&json!({"jsonrpc":"2.0","method":method,"params":params}))
-            .await
+    async fn notify_until(
+        &mut self,
+        method: &str,
+        params: Value,
+        deadline: tokio::time::Instant,
+    ) -> Result<()> {
+        self.write_until(
+            &json!({"jsonrpc":"2.0","method":method,"params":params}),
+            deadline,
+        )
+        .await
     }
 
     async fn write(&mut self, value: &Value) -> Result<()> {
@@ -445,6 +481,29 @@ impl RpcProcess {
             .flush()
             .await
             .context("Flush the Grok ACP helper request")
+    }
+
+    async fn write_cancellable(
+        &mut self,
+        value: &Value,
+        cancel: &mut watch::Receiver<bool>,
+        deadline: tokio::time::Instant,
+    ) -> Result<()> {
+        tokio::select! {
+            biased;
+            _ = cancel.changed() => bail!("Grok ACP request was cancelled during write"),
+            result = tokio::time::timeout_at(deadline, self.write(value)) => {
+                result.context("Grok ACP request write timed out")??;
+            }
+        }
+        Ok(())
+    }
+
+    async fn write_until(&mut self, value: &Value, deadline: tokio::time::Instant) -> Result<()> {
+        tokio::time::timeout_at(deadline, self.write(value))
+            .await
+            .context("Grok ACP notification write timed out")??;
+        Ok(())
     }
 
     async fn read(&mut self) -> Result<Option<Value>> {
@@ -475,10 +534,13 @@ async fn call_cancellable(
     params: Value,
     cancel: &mut watch::Receiver<bool>,
 ) -> Result<Value> {
-    let id = rpc.send_request(method, params).await?;
     let deadline = tokio::time::Instant::now() + CALL_TIMEOUT;
+    let id = rpc
+        .send_request_cancellable(method, params, cancel, deadline)
+        .await?;
     loop {
         let value = tokio::select! {
+            biased;
             _ = cancel.changed() => bail!("Grok ACP request was cancelled"),
             result = tokio::time::timeout_at(deadline, rpc.read()) => {
                 result.context("Grok ACP request timed out")??
@@ -495,7 +557,7 @@ async fn call_cancellable(
             return Ok(value.get("result").cloned().unwrap_or_else(|| json!({})));
         }
         if value.get("method").and_then(Value::as_str) == Some("session/request_permission") {
-            deny_permission(rpc, &value).await?;
+            deny_permission(rpc, &value, cancel, deadline).await?;
             bail!("Grok ACP requested unsupported tool or permission access");
         }
     }
@@ -572,26 +634,29 @@ async fn prompt_loop(
     tx: mpsc::UnboundedSender<GenerationEvent>,
     cancel: &mut watch::Receiver<bool>,
     pre_dispatch_check: Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
-    turn_timeout: Duration,
+    deadline: tokio::time::Instant,
 ) -> PromptOutcome {
-    let deadline = tokio::time::Instant::now() + turn_timeout;
     let mut output_bytes = 0usize;
     loop {
         let line = tokio::select! {
+            biased;
             _ = tx.closed() => {
-                let _ = rpc.notify("session/cancel", json!({"sessionId":session_id})).await;
+                notify_session_cancel(rpc, session_id).await;
                 return PromptOutcome::Cancelled;
             }
             changed = cancel.changed() => {
                 let _ = changed;
-                let _ = rpc.notify("session/cancel", json!({"sessionId":session_id})).await;
+                notify_session_cancel(rpc, session_id).await;
                 return PromptOutcome::Cancelled;
             }
             result = tokio::time::timeout_at(deadline, rpc.read()) => match result {
                 Ok(Ok(Some(value))) => value,
                 Ok(Ok(None)) => return PromptOutcome::Failed("Grok ACP exited before reporting a terminal status".into()),
                 Ok(Err(_)) => return PromptOutcome::Failed("Grok ACP returned an invalid stream event".into()),
-                Err(_) => return PromptOutcome::Failed("Grok generation exceeded its turn timeout".into()),
+                Err(_) => {
+                    notify_session_cancel(rpc, session_id).await;
+                    return PromptOutcome::Failed("Grok generation exceeded its turn timeout".into());
+                }
             }
         };
         if value_id(&line) == Some(prompt_id) {
@@ -610,7 +675,7 @@ async fn prompt_loop(
             }
         }
         if line.get("method").and_then(Value::as_str) == Some("session/request_permission") {
-            if deny_permission(rpc, &line).await.is_err() {
+            if deny_permission(rpc, &line, cancel, deadline).await.is_err() {
                 return PromptOutcome::Failed(
                     "Grok ACP requested unsupported tool or permission access".into(),
                 );
@@ -643,22 +708,16 @@ async fn prompt_loop(
                     );
                 }
                 if pre_dispatch_check().is_err() {
-                    let _ = rpc
-                        .notify("session/cancel", json!({"sessionId":session_id}))
-                        .await;
+                    notify_session_cancel(rpc, session_id).await;
                     return PromptOutcome::Cancelled;
                 }
                 if !text.is_empty() && tx.send(GenerationEvent::Chunk(text.to_owned())).is_err() {
-                    let _ = rpc
-                        .notify("session/cancel", json!({"sessionId":session_id}))
-                        .await;
+                    notify_session_cancel(rpc, session_id).await;
                     return PromptOutcome::Cancelled;
                 }
             }
             Some("tool_call" | "tool_call_update") => {
-                let _ = rpc
-                    .notify("session/cancel", json!({"sessionId":session_id}))
-                    .await;
+                notify_session_cancel(rpc, session_id).await;
                 return PromptOutcome::Failed("Grok ACP attempted unsupported tool use".into());
             }
             _ => {}
@@ -672,13 +731,30 @@ fn value_id(value: &Value) -> Option<u64> {
 }
 
 #[cfg(test)]
-async fn deny_permission(rpc: &mut RpcProcess, message: &Value) -> Result<()> {
+async fn notify_session_cancel(rpc: &mut RpcProcess, session_id: &str) {
+    let deadline = tokio::time::Instant::now() + CANCEL_NOTIFY_TIMEOUT;
+    let _ = rpc
+        .notify_until("session/cancel", json!({"sessionId":session_id}), deadline)
+        .await;
+}
+
+#[cfg(test)]
+async fn deny_permission(
+    rpc: &mut RpcProcess,
+    message: &Value,
+    cancel: &mut watch::Receiver<bool>,
+    deadline: tokio::time::Instant,
+) -> Result<()> {
     let id = message
         .get("id")
         .cloned()
         .context("Permission request has no id")?;
-    rpc.write(&json!({"jsonrpc":"2.0","id":id,"result":{"outcome":{"outcome":"cancelled"}}}))
-        .await
+    rpc.write_cancellable(
+        &json!({"jsonrpc":"2.0","id":id,"result":{"outcome":{"outcome":"cancelled"}}}),
+        cancel,
+        deadline,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -750,6 +826,123 @@ mod tests {
             std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         helper
+    }
+
+    async fn blocked_prompt_write_cleans_up_helper(cancel_request: bool) {
+        let temp = tempfile::tempdir().unwrap();
+        let pid_file = temp.path().join("helper.pid");
+        let ready_file = temp.path().join("helper.ready");
+        let pid_path = serde_json::to_string(pid_file.to_str().unwrap()).unwrap();
+        let ready_path = serde_json::to_string(ready_file.to_str().unwrap()).unwrap();
+        let script = format!(
+            r##"#!/usr/bin/env python3
+import json, os, sys, time
+session = "blocked-prompt-session"
+for line in sys.stdin:
+    req = json.loads(line); method = req.get("method"); ident = req.get("id")
+    if method == "initialize": result = {{"protocolVersion":1,"authMethods":[{{"id":"cached_token"}}]}}
+    elif method == "authenticate": result = {{}}
+    elif method == "session/new": result = {{"sessionId":session}}
+    else: result = {{}}
+    sys.stdout.write(json.dumps({{"jsonrpc":"2.0","id":ident,"result":result}}) + "\n"); sys.stdout.flush()
+    if method == "session/new":
+        with open({pid_path}, "w") as pid: pid.write(str(os.getpid()))
+        with open({ready_path}, "w") as ready: ready.write("ready")
+        time.sleep(30)
+        break
+"##
+        );
+        let helper = install_fake_acp(temp.path(), &script);
+        let mut adapter =
+            GrokSubscriptionAdapter::with_test_helper(temp.path().to_path_buf(), helper);
+        adapter.generation_timeout = if cancel_request {
+            Duration::from_secs(5)
+        } else {
+            Duration::from_millis(100)
+        };
+        let adapter = Arc::new(adapter);
+        let request_adapter = adapter.clone();
+        let provider_id = if cancel_request {
+            "grok-blocked-write-cancel"
+        } else {
+            "grok-blocked-write-timeout"
+        };
+        let body = json!({
+            "model":"grok-test",
+            "messages":[{"role":"user","content":"x".repeat(MAX_INPUT_BYTES)}]
+        });
+        let request_task = tokio::spawn(async move {
+            let mut events = request_adapter
+                .generate(GenerationRequest {
+                    provider_id,
+                    generation: 77,
+                    model_id: "grok-test",
+                    protocol: Protocol::Chat,
+                    body,
+                    pre_dispatch_check: Arc::new(|| Ok(())),
+                })
+                .await?;
+            while events.next().await.is_some() {}
+            Ok::<_, anyhow::Error>(())
+        });
+
+        let ready = tokio::time::timeout(Duration::from_secs(10), async {
+            while !ready_file.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        if ready.is_err() {
+            let task_result = if request_task.is_finished() {
+                format!("; generation completed early: {:?}", request_task.await)
+            } else {
+                "; generation still pending".to_owned()
+            };
+            panic!("fake helper did not reach the blocked prompt write{task_result}");
+        }
+
+        if cancel_request {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            adapter.cancel_generation(provider_id, 77);
+        }
+        let started = tokio::time::Instant::now();
+        let result = tokio::time::timeout(Duration::from_secs(3), request_task)
+            .await
+            .expect("blocked prompt write must remain bounded")
+            .unwrap();
+        let error = match result {
+            Ok(_) => panic!("blocked prompt write must fail"),
+            Err(error) => error,
+        };
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "write cancellation or timeout took {:?}",
+            started.elapsed()
+        );
+        assert!(
+            error.to_string().contains(if cancel_request {
+                "cancelled"
+            } else {
+                "timed out"
+            }),
+            "unexpected blocked-write failure: {error:#}"
+        );
+
+        #[cfg(unix)]
+        {
+            let pid = std::fs::read_to_string(pid_file).unwrap();
+            let status = std::process::Command::new("kill")
+                .arg("-0")
+                .arg(pid.trim())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap();
+            assert!(
+                !status.success(),
+                "failed Grok ACP helper {pid} was not reaped"
+            );
+        }
     }
 
     fn admitted_grok_store(
@@ -883,9 +1076,64 @@ mod tests {
         for (protocol, body) in cases {
             assert_eq!(
                 parse_text_turn(protocol, &body, "grok-test").unwrap().text,
-                "hello"
+                vec!["hello".to_owned()]
             );
         }
+    }
+
+    #[tokio::test]
+    async fn grok_acp_preserves_text_block_boundaries_without_inserting_separators() {
+        let temp = tempfile::tempdir().unwrap();
+        let captured_prompt = temp.path().join("captured-prompt.json");
+        let captured_prompt_literal =
+            serde_json::to_string(captured_prompt.to_str().unwrap()).unwrap();
+        let script = format!(
+            r##"#!/usr/bin/env python3
+import json, sys
+session = "text-block-session"
+for line in sys.stdin:
+    req = json.loads(line); method = req.get("method"); ident = req.get("id")
+    if method == "initialize": result = {{"protocolVersion":1,"authMethods":[{{"id":"cached_token"}}]}}
+    elif method == "authenticate": result = {{}}
+    elif method == "session/new": result = {{"sessionId":session}}
+    elif method == "session/prompt":
+        with open({captured_prompt_literal}, "w") as capture: json.dump(req["params"]["prompt"], capture)
+        result = {{"stopReason":"end_turn"}}
+    else: result = {{}}
+    sys.stdout.write(json.dumps({{"jsonrpc":"2.0","id":ident,"result":result}}) + "\n"); sys.stdout.flush()
+    if method == "session/prompt": break
+"##
+        );
+        let helper = install_fake_acp(temp.path(), &script);
+        let adapter = GrokSubscriptionAdapter::with_test_helper(temp.path().to_path_buf(), helper);
+        let mut events = adapter
+            .generate(GenerationRequest {
+                provider_id: "grok-text-blocks",
+                generation: 1,
+                model_id: "grok-test",
+                protocol: Protocol::Chat,
+                body: json!({
+                    "model":"grok-test",
+                    "messages":[{"role":"user","content":[
+                        {"type":"text","text":"Reply exactly: AB"},
+                        {"type":"text","text":"CD"}
+                    ]}]
+                }),
+                pre_dispatch_check: Arc::new(|| Ok(())),
+            })
+            .await
+            .unwrap();
+        while events.next().await.is_some() {}
+
+        let captured: Value =
+            serde_json::from_str(&std::fs::read_to_string(captured_prompt).unwrap()).unwrap();
+        assert_eq!(
+            captured,
+            json!([
+                {"type":"text","text":"Reply exactly: AB"},
+                {"type":"text","text":"CD"}
+            ])
+        );
     }
 
     #[test]
@@ -1403,5 +1651,15 @@ for line in sys.stdin:
             Some(GenerationEvent::Failed { .. })
         ));
         assert!(events.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_backpressured_prompt_write_stops_and_reaps_the_helper() {
+        blocked_prompt_write_cleans_up_helper(true).await;
+    }
+
+    #[tokio::test]
+    async fn a_backpressured_prompt_write_obeys_the_turn_deadline_and_reaps_the_helper() {
+        blocked_prompt_write_cleans_up_helper(false).await;
     }
 }
