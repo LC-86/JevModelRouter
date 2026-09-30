@@ -240,6 +240,7 @@ const CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// stdio 换行分隔 JSON-RPC 2.0 客户端：一个辅助进程一个实例，只读写自己 spawn 的子进程。
 pub struct CodexAppServer {
+    instance_id: String,
     child: Option<Child>,
     stdin: Option<ChildStdin>,
     auth_home: PathBuf,
@@ -467,6 +468,7 @@ impl CodexAppServer {
         let (sender, notifications) = tokio::sync::mpsc::unbounded_channel();
         spawn_reader(stdout, pending.clone(), sender);
         let mut server = CodexAppServer {
+            instance_id: uuid::Uuid::new_v4().to_string(),
             child: Some(child),
             stdin: Some(stdin),
             auth_home,
@@ -547,6 +549,10 @@ impl CodexAppServer {
 
     pub fn version(&self) -> Option<&str> {
         self.version.as_deref()
+    }
+
+    fn instance_id(&self) -> &str {
+        &self.instance_id
     }
 
     /// 只终止并回收自己 spawn 的子进程：kill + wait，绝不广域杀进程。
@@ -630,47 +636,148 @@ struct AdapterState {
 const GENERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 const MAX_GENERATION_INPUT_BYTES: usize = 32 * 1024;
 
+type GenerationGuardCell = Arc<Mutex<Option<tokio::sync::OwnedMutexGuard<()>>>>;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TurnCancelStatus {
+    Running,
+    Requested,
+    Complete,
+}
+
+#[derive(Clone)]
+struct ActiveTurnControl {
+    request_id: String,
+    cancel: tokio::sync::watch::Sender<TurnCancelStatus>,
+    helper_instance_id: Option<String>,
+    thread_id: Option<String>,
+    turn_id: Option<String>,
+    armed: Arc<std::sync::atomic::AtomicBool>,
+    generation_guard: GenerationGuardCell,
+}
+
+struct ActiveTurnRegistration {
+    active_turns: Arc<Mutex<HashMap<String, ActiveTurnControl>>>,
+    provider_id: String,
+    request_id: String,
+}
+
+impl ActiveTurnRegistration {
+    fn update(&self, update: impl FnOnce(&mut ActiveTurnControl)) {
+        let mut active_turns = self.active_turns.lock().unwrap();
+        if let Some(active) = active_turns.get_mut(&self.provider_id) {
+            if active.request_id == self.request_id {
+                update(active);
+            }
+        }
+    }
+
+    fn set_helper_instance(&self, instance_id: String) {
+        self.update(|active| active.helper_instance_id = Some(instance_id));
+    }
+
+    fn set_thread(&self, thread_id: String) {
+        self.update(|active| active.thread_id = Some(thread_id));
+    }
+
+    fn set_turn(&self, turn_id: String) {
+        self.update(|active| active.turn_id = Some(turn_id));
+    }
+}
+
+impl Drop for ActiveTurnRegistration {
+    fn drop(&mut self) {
+        let mut active_turns = self.active_turns.lock().unwrap();
+        if active_turns
+            .get(&self.provider_id)
+            .is_some_and(|active| active.request_id == self.request_id)
+        {
+            active_turns.remove(&self.provider_id);
+        }
+    }
+}
+
+#[cfg(test)]
+struct CancellationCleanupGate {
+    started: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+
 struct TurnCancellation {
     servers: Arc<tokio::sync::Mutex<HashMap<String, CodexAppServer>>>,
     provider_id: String,
+    helper_instance_id: Option<String>,
     thread_id: Option<String>,
     turn_id: Option<String>,
     workspace: Option<PathBuf>,
-    armed: bool,
+    armed: Arc<std::sync::atomic::AtomicBool>,
+    generation_guard: GenerationGuardCell,
+    active_registration: ActiveTurnRegistration,
+    #[cfg(test)]
+    cleanup_gate: Option<CancellationCleanupGate>,
+}
+
+impl TurnCancellation {
+    fn disarm_and_release(&mut self) {
+        self.armed.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.generation_guard.lock().unwrap().take();
+    }
 }
 
 impl Drop for TurnCancellation {
     fn drop(&mut self) {
         let Some(workspace) = self.workspace.take() else { return };
-        if !self.armed {
+        let armed = self.armed.swap(false, std::sync::atomic::Ordering::SeqCst);
+        if !armed {
+            self.generation_guard.lock().unwrap().take();
             let _ = std::fs::remove_dir_all(workspace);
             return;
         }
         let servers = self.servers.clone();
         let provider_id = self.provider_id.clone();
+        let helper_instance_id = self.helper_instance_id.clone();
         let thread_id = self.thread_id.clone();
         let turn_id = self.turn_id.clone();
+        let generation_guard = self.generation_guard.lock().unwrap().take();
+        #[cfg(test)]
+        let cleanup_gate = self.cleanup_gate.take();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             // Before turn/start returns an id, interrupt cannot address the accepted work. Reap
-            // this app-owned helper instead; the per-account generation lock guarantees it owns
-            // no other active turn. Keep the workspace until either cleanup action completes.
+            // this app-owned helper instead. Transfer the generation guard into this task so the
+            // provider cannot reuse the helper until its exact instance has been interrupted or
+            // reaped. Keep the workspace until cleanup completes.
             runtime.spawn(async move {
+                let _generation_guard = generation_guard;
+                #[cfg(test)]
+                if let Some(gate) = cleanup_gate {
+                    let _ = gate.started.send(());
+                    let _ = gate.release.await;
+                }
                 match (thread_id, turn_id) {
                     (Some(thread_id), Some(turn_id)) => {
-                        interrupt_active_turn(&servers, &provider_id, &thread_id, &turn_id).await;
+                        if let Some(helper_instance_id) = helper_instance_id.as_deref() {
+                            if !interrupt_active_turn(&servers, &provider_id, helper_instance_id, &thread_id, &turn_id).await {
+                                reap_owned_helper(&servers, &provider_id, helper_instance_id).await;
+                            }
+                        }
                     }
-                    _ => reap_owned_helper(&servers, &provider_id).await,
+                    _ => {
+                        if let Some(helper_instance_id) = helper_instance_id.as_deref() {
+                            reap_owned_helper(&servers, &provider_id, helper_instance_id).await;
+                        }
+                    }
                 }
                 let _ = std::fs::remove_dir_all(workspace);
             });
         } else {
-            if self.turn_id.is_none() {
-                if let Ok(mut servers) = self.servers.try_lock() {
+            if let (Some(helper_instance_id), Ok(mut servers)) = (self.helper_instance_id.as_deref(), self.servers.try_lock()) {
+                if servers.get(&self.provider_id).is_some_and(|server| server.instance_id() == helper_instance_id) {
                     if let Some(mut server) = servers.remove(&self.provider_id) {
                         server.shutdown();
                     }
                 }
             }
+            drop(generation_guard);
             let _ = std::fs::remove_dir_all(workspace);
         }
     }
@@ -685,7 +792,7 @@ struct GenerationState {
     started: bool,
     terminal: bool,
     deadline: tokio::time::Instant,
-    _generation_guard: tokio::sync::OwnedMutexGuard<()>,
+    cancel: tokio::sync::watch::Receiver<TurnCancelStatus>,
     cancellation: TurnCancellation,
 }
 
@@ -704,6 +811,7 @@ fn generation_workspace() -> Result<PathBuf> {
 pub struct CodexAdapter {
     servers: Arc<tokio::sync::Mutex<HashMap<String, CodexAppServer>>>,
     generation_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    active_turns: Arc<Mutex<HashMap<String, ActiveTurnControl>>>,
     logins: Mutex<HashMap<String, ActiveLogin>>,
     /// 已被某个等待者取走、但属于另一次尝试的完成通知；由对应等待者领回，避免串线丢失。
     deferred: Mutex<HashMap<String, VecDeque<(String, Value)>>>,
@@ -713,6 +821,8 @@ pub struct CodexAdapter {
     /// 仅在测试构建里可替换专用目录根；生产永远是用户主目录。
     #[cfg_attr(not(test), allow(dead_code))]
     home_root: Option<PathBuf>,
+    #[cfg(test)]
+    cleanup_gate: Mutex<Option<CancellationCleanupGate>>,
 }
 
 impl Default for CodexAdapter {
@@ -726,11 +836,14 @@ impl CodexAdapter {
         Self {
             servers: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             generation_locks: Mutex::new(HashMap::new()),
+            active_turns: Arc::new(Mutex::new(HashMap::new())),
             logins: Mutex::new(HashMap::new()),
             deferred: Mutex::new(HashMap::new()),
             state: Mutex::new(AdapterState::default()),
             launch: None,
             home_root: None,
+            #[cfg(test)]
+            cleanup_gate: Mutex::new(None),
         }
     }
 
@@ -1063,7 +1176,41 @@ impl SubscriptionAdapter for CodexAdapter {
         Box::pin(async move {
             // The subscription layer has already invalidated this generation. Serialize helper
             // revocation with generation so queued old requests recheck and fail before dispatch.
-            let _generation_guard = self.generation_lock(provider_id).lock_owned().await;
+            // Signal and interrupt the active turn before waiting for the lock: the stream consumer
+            // may be backpressured and unable to poll its cancellation event itself.
+            let active = self.active_turns.lock().unwrap().get(provider_id).cloned()
+                .filter(|active| active.armed.load(std::sync::atomic::Ordering::SeqCst) || active.turn_id.is_none());
+            let mut transferred_generation_guard = None;
+            if let Some(active) = active {
+                let _ = active.cancel.send(TurnCancelStatus::Requested);
+                let helper_instance_id = active.helper_instance_id.as_deref();
+                let stopped = match (helper_instance_id, active.thread_id.as_deref(), active.turn_id.as_deref()) {
+                    (Some(instance_id), Some(thread_id), Some(turn_id)) => {
+                        if interrupt_active_turn(&self.servers, provider_id, instance_id, thread_id, turn_id).await {
+                            true
+                        } else {
+                            matches!(
+                                reap_owned_helper(&self.servers, provider_id, instance_id).await,
+                                ReapResult::Removed | ReapResult::AlreadyAbsent
+                            )
+                        }
+                    }
+                    (Some(instance_id), _, _) => matches!(
+                        reap_owned_helper(&self.servers, provider_id, instance_id).await,
+                        ReapResult::Removed | ReapResult::AlreadyAbsent
+                    ),
+                    (None, _, _) => false,
+                };
+                if stopped {
+                    active.armed.store(false, std::sync::atomic::Ordering::SeqCst);
+                    let _ = active.cancel.send(TurnCancelStatus::Complete);
+                    transferred_generation_guard = active.generation_guard.lock().unwrap().take();
+                }
+            }
+            let _generation_guard = match transferred_generation_guard {
+                Some(guard) => guard,
+                None => self.generation_lock(provider_id).lock_owned().await,
+            };
             self.logins.lock().unwrap().remove(provider_id);
             self.deferred.lock().unwrap().remove(provider_id);
             let auth_home = match &self.home_root {
@@ -1123,17 +1270,46 @@ impl SubscriptionAdapter for CodexAdapter {
             pre_dispatch_check().map_err(anyhow::Error::msg)?;
             let workspace = generation_workspace()?;
             let servers_ref = self.servers.clone();
+            let generation_guard = Arc::new(Mutex::new(Some(generation_guard)));
+            let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let request_id = uuid::Uuid::new_v4().to_string();
+            let (cancel, mut cancel_receiver) = tokio::sync::watch::channel(TurnCancelStatus::Running);
+            self.active_turns.lock().unwrap().insert(provider_id.clone(), ActiveTurnControl {
+                request_id: request_id.clone(),
+                cancel,
+                helper_instance_id: None,
+                thread_id: None,
+                turn_id: None,
+                armed: armed.clone(),
+                generation_guard: generation_guard.clone(),
+            });
+            let active_registration = ActiveTurnRegistration {
+                active_turns: self.active_turns.clone(),
+                provider_id: provider_id.clone(),
+                request_id,
+            };
             let mut cancellation = TurnCancellation {
                 servers: servers_ref.clone(),
                 provider_id: provider_id.clone(),
+                helper_instance_id: None,
                 thread_id: None,
                 turn_id: None,
                 workspace: Some(workspace.clone()),
-                armed: false,
+                armed,
+                generation_guard: generation_guard.clone(),
+                active_registration,
+                #[cfg(test)]
+                cleanup_gate: self.cleanup_gate.lock().unwrap().take(),
             };
             let mut servers = self.server_for(&provider_id).await?;
             let server = servers.get_mut(&provider_id).expect("server_for inserted the Codex helper");
+            let helper_instance_id = server.instance_id().to_owned();
+            cancellation.helper_instance_id = Some(helper_instance_id.clone());
+            cancellation.active_registration.set_helper_instance(helper_instance_id);
             pre_dispatch_check().map_err(anyhow::Error::msg)?;
+            if *cancel_receiver.borrow() != TurnCancelStatus::Running {
+                anyhow::bail!("The Codex generation was cancelled before thread start");
+            }
             let mut developer_instructions = String::from(
                 "Use only the request text and instructions below. Do not inspect files, use tools, browse, delegate, or continue with follow-up turns. Return assistant text only.",
             );
@@ -1163,7 +1339,8 @@ impl SubscriptionAdapter for CodexAdapter {
                     "code_mode": false,
                     "code_mode_host": false,
                     "multi_agent_v2": false,
-                    "request_permissions_tool": false
+                    "request_permissions_tool": false,
+                    "unbounded_connection_retries": false
                 }}
             });
             let mut retry_providers = serde_json::Map::new();
@@ -1179,10 +1356,16 @@ impl SubscriptionAdapter for CodexAdapter {
             if let Some(tier) = turn.service_tier.as_deref() {
                 thread_params["serviceTier"] = tier.into();
             }
-            let thread_result = server.call("thread/start", thread_params).await?;
+            let thread_result = tokio::select! {
+                result = server.call("thread/start", thread_params) => result?,
+                _ = wait_for_turn_cancellation(&mut cancel_receiver) => {
+                    anyhow::bail!("The Codex generation was cancelled while starting its thread");
+                }
+            };
             let thread_id = thread_result.pointer("/thread/id").and_then(Value::as_str)
                 .context("The Codex helper did not return a thread id")?.to_owned();
             cancellation.thread_id = Some(thread_id.clone());
+            cancellation.active_registration.set_thread(thread_id.clone());
             anyhow::ensure!(
                 thread_result.get("modelProvider").and_then(Value::as_str) == Some(retry_provider_id.as_str()),
                 "The Codex helper did not apply the request's zero-retry model provider"
@@ -1206,11 +1389,17 @@ impl SubscriptionAdapter for CodexAdapter {
             }
             // Arm before the RPC write: a lost or delayed acknowledgement cannot leave work running
             // without a guard; without turnId, cancel by reaping this application's owned helper.
-            cancellation.armed = true;
-            let turn_result = server.call("turn/start", turn_params).await?;
+            cancellation.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+            let turn_result = tokio::select! {
+                result = server.call("turn/start", turn_params) => result?,
+                _ = wait_for_turn_cancellation(&mut cancel_receiver) => {
+                    anyhow::bail!("The Codex generation was cancelled while starting its turn");
+                }
+            };
             let turn_id = turn_result.pointer("/turn/id").and_then(Value::as_str)
                 .context("The Codex helper did not return a turn id")?.to_owned();
             cancellation.turn_id = Some(turn_id.clone());
+            cancellation.active_registration.set_turn(turn_id.clone());
             drop(servers);
 
             let state = GenerationState {
@@ -1222,7 +1411,7 @@ impl SubscriptionAdapter for CodexAdapter {
                 started: false,
                 terminal: false,
                 deadline: tokio::time::Instant::now() + GENERATION_TIMEOUT,
-                _generation_guard: generation_guard,
+                cancel: cancel_receiver,
                 cancellation,
             };
             let stream = futures_util::stream::unfold(state, |mut state| async move {
@@ -1234,21 +1423,43 @@ impl SubscriptionAdapter for CodexAdapter {
                     return Some((GenerationEvent::Started { generation: state.generation }, state));
                 }
                 loop {
+                    if *state.cancel.borrow() != TurnCancelStatus::Running {
+                        wait_for_cancel_completion(&mut state.cancel).await;
+                        state.cancellation.disarm_and_release();
+                        state.terminal = true;
+                        return Some((GenerationEvent::Cancelled, state));
+                    }
                     if tokio::time::Instant::now() >= state.deadline {
-                        interrupt_active_turn(&state.servers, &state.provider_id, &state.thread_id, &state.turn_id).await;
-                        state.cancellation.armed = false;
+                        if let Some(helper_instance_id) = state.cancellation.helper_instance_id.as_deref() {
+                            let _ = interrupt_active_turn(
+                                &state.servers,
+                                &state.provider_id,
+                                helper_instance_id,
+                                &state.thread_id,
+                                &state.turn_id,
+                            ).await;
+                        }
+                        state.cancellation.disarm_and_release();
                         state.terminal = true;
                         return Some((GenerationEvent::Failed { message: "The Codex turn timed out".into() }, state));
                     }
-                    let next = {
-                        let mut servers = state.servers.lock().await;
-                        match servers.get_mut(&state.provider_id) {
-                            Some(server) => Some(tokio::time::timeout(POLL_SLICE, server.next_notification()).await),
-                            None => None,
+                    let next = tokio::select! {
+                        _ = wait_for_turn_cancellation(&mut state.cancel) => {
+                            wait_for_cancel_completion(&mut state.cancel).await;
+                            state.cancellation.disarm_and_release();
+                            state.terminal = true;
+                            return Some((GenerationEvent::Cancelled, state));
                         }
+                        next = async {
+                            let mut servers = state.servers.lock().await;
+                            match servers.get_mut(&state.provider_id) {
+                                Some(server) => Some(tokio::time::timeout(POLL_SLICE, server.next_notification()).await),
+                                None => None,
+                            }
+                        } => next,
                     };
                     let Some(next) = next else {
-                        state.cancellation.armed = false;
+                        state.cancellation.disarm_and_release();
                         state.terminal = true;
                         return Some((GenerationEvent::Failed { message: "The Codex helper exited during generation".into() }, state));
                     };
@@ -1256,7 +1467,7 @@ impl SubscriptionAdapter for CodexAdapter {
                         Err(_) => continue,
                         Ok(Some(value)) => value,
                         Ok(None) => {
-                            state.cancellation.armed = false;
+                            state.cancellation.disarm_and_release();
                             state.terminal = true;
                             return Some((GenerationEvent::Failed { message: "The Codex helper stopped before completing the turn".into() }, state));
                         }
@@ -1273,7 +1484,7 @@ impl SubscriptionAdapter for CodexAdapter {
                         }
                         "turn/completed" if params.pointer("/turn/id").and_then(Value::as_str) == Some(state.turn_id.as_str()) => {
                             let turn = &params["turn"];
-                            state.cancellation.armed = false;
+                            state.cancellation.disarm_and_release();
                             state.terminal = true;
                             let event = match turn["status"].as_str() {
                                 Some("completed") => GenerationEvent::Finished { status: 200 },
@@ -1299,8 +1510,16 @@ impl SubscriptionAdapter for CodexAdapter {
                             if ordinary_lifecycle || reasoning_notification || method == "item/plan/delta" {
                                 continue;
                             }
-                            interrupt_active_turn(&state.servers, &state.provider_id, &state.thread_id, &state.turn_id).await;
-                            state.cancellation.armed = false;
+                            if let Some(helper_instance_id) = state.cancellation.helper_instance_id.as_deref() {
+                                let _ = interrupt_active_turn(
+                                    &state.servers,
+                                    &state.provider_id,
+                                    helper_instance_id,
+                                    &state.thread_id,
+                                    &state.turn_id,
+                                ).await;
+                            }
+                            state.cancellation.disarm_and_release();
                             state.terminal = true;
                             return Some((GenerationEvent::Failed { message: "Codex tool activity or unknown item activity is not accepted by this gateway".into() }, state));
                         }
@@ -1314,25 +1533,59 @@ impl SubscriptionAdapter for CodexAdapter {
     }
 }
 
+async fn wait_for_turn_cancellation(receiver: &mut tokio::sync::watch::Receiver<TurnCancelStatus>) {
+    loop {
+        if *receiver.borrow_and_update() != TurnCancelStatus::Running || receiver.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+async fn wait_for_cancel_completion(receiver: &mut tokio::sync::watch::Receiver<TurnCancelStatus>) {
+    loop {
+        if *receiver.borrow_and_update() == TurnCancelStatus::Complete || receiver.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReapResult {
+    Removed,
+    AlreadyAbsent,
+    DifferentInstance,
+}
+
 async fn interrupt_active_turn(
     servers: &Arc<tokio::sync::Mutex<HashMap<String, CodexAppServer>>>,
     provider_id: &str,
+    helper_instance_id: &str,
     thread_id: &str,
     turn_id: &str,
-) {
+) -> bool {
     let mut servers = servers.lock().await;
-    if let Some(server) = servers.get_mut(provider_id) {
-        let _ = server.call("turn/interrupt", json!({"threadId":thread_id,"turnId":turn_id})).await;
+    let Some(server) = servers.get_mut(provider_id) else { return false };
+    if server.instance_id() != helper_instance_id {
+        return false;
     }
+    server.call("turn/interrupt", json!({"threadId":thread_id,"turnId":turn_id})).await.is_ok()
 }
 
 async fn reap_owned_helper(
     servers: &Arc<tokio::sync::Mutex<HashMap<String, CodexAppServer>>>,
     provider_id: &str,
-) {
+    helper_instance_id: &str,
+) -> ReapResult {
     let mut servers = servers.lock().await;
-    if let Some(mut server) = servers.remove(provider_id) {
-        server.shutdown();
+    match servers.get(provider_id) {
+        Some(server) if server.instance_id() != helper_instance_id => ReapResult::DifferentInstance,
+        Some(_) => {
+            if let Some(mut server) = servers.remove(provider_id) {
+                server.shutdown();
+            }
+            ReapResult::Removed
+        }
+        None => ReapResult::AlreadyAbsent,
     }
 }
 
@@ -2393,7 +2646,7 @@ done
     }
 
     #[tokio::test]
-    async fn logout_waits_for_active_generation_before_revoking_the_helper() {
+    async fn logout_interrupts_an_active_backpressured_generation_before_revoking_the_helper() {
         let home = tempfile::tempdir().unwrap();
         let log = home.path().join("logout-generation-lock.log");
         std::fs::write(format!("{}.generation", log.to_string_lossy()), "hold").unwrap();
@@ -2425,14 +2678,6 @@ done
             let adapter = adapter.clone();
             tokio::spawn(async move { adapter.logout("codex-logout-lock", 0).await })
         };
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let calls = std::fs::read_to_string(format!("{}.calls", log.to_string_lossy())).unwrap();
-        assert!(
-            !calls.lines().any(|method| method == "account/logout"),
-            "logout must wait for the account's active generation lock"
-        );
-
-        drop(events);
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(3), logout)
             .await
             .unwrap()
@@ -2440,7 +2685,16 @@ done
             .unwrap();
         assert!(outcome.local_cleared);
         let calls = std::fs::read_to_string(format!("{}.calls", log.to_string_lossy())).unwrap();
+        assert!(
+            calls.lines().any(|method| method == "turn/interrupt"),
+            "logout must actively interrupt the held stream without relying on downstream polling"
+        );
         assert!(calls.lines().any(|method| method == "account/logout"));
+        assert_eq!(
+            events.next().await,
+            Some(GenerationEvent::Cancelled),
+            "the retained stream must observe logout cancellation after it is polled again"
+        );
     }
 
     #[tokio::test]
@@ -2487,6 +2741,12 @@ done
             "lost-start-ack",
         )
         .unwrap();
+        let (cleanup_started_tx, cleanup_started_rx) = tokio::sync::oneshot::channel();
+        let (cleanup_release_tx, cleanup_release_rx) = tokio::sync::oneshot::channel();
+        *adapter.cleanup_gate.lock().unwrap() = Some(CancellationCleanupGate {
+            started: cleanup_started_tx,
+            release: cleanup_release_rx,
+        });
         let adapter_for_call = adapter.clone();
         let request = GenerationRequest {
             provider_id: "codex-lost-ack",
@@ -2507,18 +2767,34 @@ done
         })
         .await
         .expect("fixture must record that turn/start was accepted before withholding its response");
+        let helper_a_id = adapter.active_turns.lock().unwrap()["codex-lost-ack"]
+            .helper_instance_id
+            .clone()
+            .expect("the cancellation guard must bind to the helper that accepted turn/start");
         pending.abort();
         let _ = pending.await;
-        tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            loop {
-                if !adapter.servers.lock().await.contains_key("codex-lost-ack") {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("cancellation before turnId must reap this application's owned helper");
+        tokio::time::timeout(std::time::Duration::from_secs(3), cleanup_started_rx)
+            .await
+            .expect("cancellation cleanup must start")
+            .expect("cleanup task must report that it is holding the generation lock");
+
+        std::fs::write(format!("{}.generation", log.to_string_lossy()), "success").unwrap();
+        let request_b = GenerationRequest {
+            provider_id: "codex-lost-ack",
+            generation: 3,
+            model_id: "fixture-model",
+            protocol: Protocol::Responses,
+            body: json!({"model":"fixture-model","input":"B"}),
+            pre_dispatch_check: Arc::new(|| Ok(())),
+        };
+        let b_start = adapter.generate(request_b);
+        tokio::pin!(b_start);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut b_start)
+                .await
+                .is_err(),
+            "B must remain queued while A's accepted but unacknowledged turn is being reaped"
+        );
         let calls = std::fs::read_to_string(format!("{}.calls", log.to_string_lossy())).unwrap();
         assert_eq!(
             calls
@@ -2526,7 +2802,35 @@ done
                 .filter(|method| *method == "turn/start")
                 .count(),
             2,
-            "the lost acknowledgement must not trigger another generation attempt"
+            "B must not be dispatched through A's still-owned helper"
+        );
+        cleanup_release_tx.send(()).unwrap();
+        let mut b_events = tokio::time::timeout(std::time::Duration::from_secs(3), b_start)
+            .await
+            .expect("B must proceed once A's helper is reaped")
+            .unwrap();
+        let mut b_observed = Vec::new();
+        while let Some(event) = b_events.next().await {
+            b_observed.push(event);
+        }
+        assert_eq!(
+            b_observed,
+            vec![
+                GenerationEvent::Started { generation: 3 },
+                GenerationEvent::Chunk("fixture".into()),
+                GenerationEvent::Finished { status: 200 },
+            ]
+        );
+        let helper_b_id = adapter.servers.lock().await["codex-lost-ack"].instance_id().to_owned();
+        assert_ne!(helper_a_id, helper_b_id, "B must use a new owned helper after A's reaper");
+        assert_eq!(
+            reap_owned_helper(&adapter.servers, "codex-lost-ack", &helper_a_id).await,
+            ReapResult::DifferentInstance,
+            "a late cleanup for A must not remove B's helper instance"
+        );
+        assert_eq!(
+            adapter.servers.lock().await["codex-lost-ack"].instance_id(),
+            helper_b_id
         );
     }
 
@@ -2581,6 +2885,7 @@ done
         assert_eq!(provider["stream_max_retries"], 0);
         assert_eq!(provider["requires_openai_auth"], true);
         assert_eq!(provider["supports_websockets"], false);
+        assert_eq!(thread_start["params"]["config"]["features"]["unbounded_connection_retries"], false);
         assert_eq!(thread_start["params"]["model"], "fixture-model");
         assert_eq!(
             rpc.iter()
