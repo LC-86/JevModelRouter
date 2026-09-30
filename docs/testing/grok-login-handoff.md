@@ -16,7 +16,7 @@
 
 | 命令 | 实际结果 |
 | --- | --- |
-| `cargo test --locked --manifest-path src-tauri/Cargo.toml --lib` | 231 passed；0 failed（基线 187，本票新增 44 条：`subscription::auth::lifecycle_tests` 35 + `subscription::helper::tests` 8 + `config::storage_tests` 1） |
+| `cargo test --locked --manifest-path src-tauri/Cargo.toml --lib` | 232 passed；0 failed（基线 187，本票新增 45 条：`subscription::auth::lifecycle_tests` 35 + `subscription::helper::tests` 9 + `config::storage_tests` 1） |
 | `cargo build --lib` | 完成，0 warning |
 | `cargo build --features isolation-check` | 构建通过 |
 | `pnpm test` | 12 个测试文件 / 48 条用例全部通过 |
@@ -51,11 +51,13 @@ JSON 事件（`challenge` / `identity` / `done` / `error`）。以上命令已�
 5. `switch_account`：先退出（新世代）再登录；登录失败时保持未连接且身份为空，**不恢复旧账号身份或证据**。
 6. 重启后待授权登录不存活：载入配置时把 `AuthorizationPending` 归位为未连接（登录会话是进程内的）。
 7. 辅助进程：解析顺序为 `AUTOJEV_GROK_HELPER` 再 `PATH` 中的 `grok`，找不到即不可用，**不下载、不安装**；
-   环境在白名单内重建（`PATH`／`TMPDIR`／`LANG`／`TERM` + 显式 `AUTOJEV_*`），`GROK_HOME` 与 `HOME`
+   环境在白名单内重建（`PATH`／`TMPDIR`／`LANG`／`TERM` + 显式 `AUTOJEV_GROK_*`（只透传该前缀，见
+   `is_helper_override`）），`GROK_HOME` 与 `HOME`
    都显式注入并指向应用自有 home（`ENV_WHITELIST` 已移除 `HOME`，不再沿用进程的日常 home）；隔离环境下
    `spawn` 直接报错（错误含 `isolated`）。
 8. 专用存储：`prepare_home` 创建目录并设 `0700`、拒绝 symlink；`cleanup_home` 只清空自家 home 内容
-   并保留目录本身；`redact` 供全部错误与详情使用，`AuthView` 不含凭据、token 或辅助进程输出原文。
+   并保留目录本身；错误、详情与日志都经过 `redact`，不含凭据、token 或辅助进程输出原文（`identity` 与
+   `challenge` 按设计原样保留，见第 12 条，用于身份与授权地址核对）。
 9. 界面侧纯函数单测：阶段标签、未知错误码回退原文，以及**远端撤销状态不得由本地清除推断**。
 10. 稳定 code `helper_unsupported`：本构建只管理 Grok CLI 辅助进程；非 Grok 订阅（Codex）的登录、轮询、
     取消、退出与换号一律以该 code 诚实拒绝，且**零副作用**（不推进世代、不清身份或证据、不写退出证据）；

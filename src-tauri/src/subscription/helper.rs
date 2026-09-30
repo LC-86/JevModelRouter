@@ -99,20 +99,26 @@ pub(crate) fn spec_with_program(
     Ok(HelperSpec { program: program.to_path_buf(), args, env: helper_env(&home), home })
 }
 
-/// `env_clear()` 之后唯一允许进入辅助进程的环境：基础运行变量 + `AUTOJEV_*` + `GROK_HOME`/`HOME`。
+/// `env_clear()` 之后唯一允许进入辅助进程的环境：基础运行变量 + `AUTOJEV_GROK_*` + `GROK_HOME`/`HOME`。
 /// `HOME` 也指向应用自有 home：即使真实 CLI 只认 `HOME`，也不会落到日常 `~/.grok`。
+/// 只透传本应用为该辅助进程显式定义的前缀：任意 `AUTOJEV_*` 都可能把真实 home 或其它来源带进辅助进程。
 fn helper_env(home: &Path) -> Vec<(String, String)> {
     let mut env: Vec<(String, String)> = ENV_WHITELIST
         .iter()
         .filter_map(|key| std::env::var(key).ok().map(|value| ((*key).to_owned(), value)))
         .collect();
-    let mut overrides: Vec<(String, String)> = std::env::vars().filter(|(key, _)| key.starts_with("AUTOJEV_")).collect();
+    let mut overrides: Vec<(String, String)> = std::env::vars().filter(|(key, _)| is_helper_override(key)).collect();
     overrides.sort();
     env.extend(overrides);
     let home = home.display().to_string();
     env.push(("GROK_HOME".into(), home.clone()));
     env.push(("HOME".into(), home));
     env
+}
+
+/// 只有本应用为辅助进程定义的前缀可以透传；其它 `AUTOJEV_*` 一律不进辅助进程环境。
+fn is_helper_override(key: &str) -> bool {
+    key.starts_with("AUTOJEV_GROK_")
 }
 
 const REDACTED: &str = "[redacted]";
@@ -127,10 +133,13 @@ const SECRET_KEY_HINTS: &[&str] = &[
 /// 常见凭据前缀：即使长度不够门限也一律抹掉。
 const SECRET_PREFIXES: &[&str] = &["sk-", "xai-", "gsk_", "ghp_", "gho_", "ghs_", "aiza", "bearer"];
 
-/// 长得像随机串的连续片段门限：24 已足以覆盖常见 token，同时不误伤普通路径片段（如 subscription-helpers）。
-const RANDOM_RUN_THRESHOLD: usize = 24;
+/// 自由文本里连续片段的门限。长标识（如 codex-subscription-openai、claude-3-5-sonnet-20241022）
+/// 会出现在登录错误文本里，因此只有 >= 32 个连续 run 字符才算长随机串；赋值形式的凭据键不受此限。
+const RANDOM_RUN_THRESHOLD: usize = 32;
 
-/// 去掉 token/secret/长随机串。所有错误、详情与视图字段都必须先经过它。
+/// 去掉凭据：赋值形式（`key=value`/`key:value`）的键命中凭据片段时，值无论多短都遮盖；
+/// 自由文本里只有 >= [`RANDOM_RUN_THRESHOLD`] 的连续随机串被遮盖；`Bearer` 后面的一个片段同样遮盖。
+/// 所有错误、详情与日志都必须先经过它。事件字段（身份、挑战、地址）原样保留，不经过它。
 pub fn redact(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
     let mut redact_next = false;
@@ -455,32 +464,53 @@ mod tests {
     }
 
     #[test]
-    fn redact_removes_credentials_and_keeps_plain_text() {
+    fn redact_removes_credentials_and_keeps_identifiers() {
+        // ① 合法长标识、普通路径、邮箱与普通文本原样保留（自由文本门限是 >= 32 连续 run 字符）。
+        for kept in [
+            "codex-subscription-openai",
+            "claude-3-5-sonnet-20241022",
+            "fixture@example.invalid",
+            "/tmp/fixture/subscription-helpers/home",
+            "Grok helper is missing",
+            "abcdefghij0123456789klm",          // 23
+            "abcdefghij0123456789klmnopqrstu",  // 31
+        ] {
+            assert_eq!(redact(kept), kept, "{kept} must stay untouched");
+        }
+        // ② 赋值形式：键命中凭据片段时，值无论多短都遮盖。
+        assert_eq!(redact("device_code=ABCD1234EFGH"), "device_code=[redacted]");
+        assert_eq!(redact("access_token=short"), "access_token=[redacted]");
         assert_eq!(redact("token=fixture-secret-value"), "token=[redacted]");
         assert_eq!(redact("XAI_API_KEY=fixture"), "XAI_API_KEY=[redacted]");
+        assert_eq!(redact("device_code=ABCD-EFGH"), "device_code=[redacted]");
+        assert_eq!(redact("id_token=fixture"), "id_token=[redacted]");
+        assert_eq!(redact("client_secret:fixture"), "client_secret:[redacted]");
+        assert_eq!(redact("\"refresh_token\":\"fixture\""), "\"refresh_token\":[redacted]");
+        // ③ 自由文本里的 >= 32 连续随机串仍遮盖（31 与 23 见 ①）。
+        let long_run = "a".repeat(32);
+        assert_eq!(redact(&format!("helper said {long_run}")), "helper said [redacted]");
+        let long = "xai-".to_owned() + &"a1b2c3d4e5".repeat(5);
+        assert_eq!(redact(&format!("helper said {long}")), "helper said [redacted]");
+        let with_space = redact(&format!("client_secret: {long_run}"));
+        assert!(!with_space.contains(&long_run), "{with_space}");
+        assert!(with_space.contains("[redacted]"), "{with_space}");
+        // ④ 错误文本里的 token= 与 Bearer 仍遮盖（Bearer 后面的片段不看长度）。
+        assert_eq!(redact("login failed: token=abc Bearer xyz"), "login failed: token=[redacted] Bearer [redacted]");
         assert_eq!(
             redact("Authorization: Bearer fixture-credential"),
             "Authorization:[redacted] Bearer [redacted]"
         );
-        let long = "xai-".to_owned() + &"a1b2c3d4e5".repeat(5);
-        assert_eq!(redact(&format!("helper said {long}")), "helper said [redacted]");
-        // 新增的凭据键名（OAuth 交换用的字段）同样抹掉。
-        assert_eq!(redact("device_code=ABCD-EFGH"), "device_code=[redacted]");
-        assert_eq!(redact("client_secret:fixture"), "client_secret:[redacted]");
-        // 冒号后带空格时，值本身是独立片段：同样不得留下长随机串。
-        let with_space = redact("client_secret: abcdefghij0123456789klmn");
-        assert!(!with_space.contains("abcdefghij0123456789klmn"), "{with_space}");
-        assert!(with_space.contains("[redacted]"), "{with_space}");
-        assert_eq!(redact("\"refresh_token\":\"fixture\""), "\"refresh_token\":[redacted]");
-        assert_eq!(redact("access_token=fixture"), "access_token=[redacted]");
-        assert_eq!(redact("id_token=fixture"), "id_token=[redacted]");
-        // 24 字符起算随机串；23 字符不误伤。
-        assert_eq!(redact("abcdefghij0123456789klmn"), "[redacted]");
-        assert_eq!(redact("abcdefghij0123456789klm"), "abcdefghij0123456789klm");
-        // 普通文本、账号标识与普通路径不得被误伤。
-        assert_eq!(redact("Grok helper is missing"), "Grok helper is missing");
-        assert_eq!(redact("fixture@example.invalid"), "fixture@example.invalid");
-        assert_eq!(redact("/tmp/fixture/subscription-helpers/home"), "/tmp/fixture/subscription-helpers/home");
+    }
+
+    #[test]
+    fn only_the_grok_override_prefix_is_passed_through() {
+        assert!(is_helper_override("AUTOJEV_GROK_HELPER"));
+        assert!(is_helper_override("AUTOJEV_GROK_HOME"));
+        assert!(!is_helper_override("AUTOJEV_GROK"));
+        assert!(!is_helper_override("AUTOJEV_HOME"));
+        assert!(!is_helper_override("AUTOJEV_CLOUD_KEY"));
+        assert!(!is_helper_override("XAI_API_KEY"));
+        assert!(!is_helper_override("PATH"));
     }
 
     #[test]
