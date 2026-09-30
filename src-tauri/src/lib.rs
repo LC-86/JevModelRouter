@@ -1008,17 +1008,16 @@ async fn connect_agent(
             .ok_or("Route is unavailable")?;
         router::validate_available_rule(&config, route).map_err(|e| e.to_string())?;
     }
-    let candidates: Vec<_> = if let Some(model_id) = route_id.strip_prefix("model/") {
-        config.models.iter().filter(|m| m.id == model_id).collect()
+    // 路由候选与上面的连接校验使用同一套判断（作用域 + 选择 + 停用 + 服务商启用 + 协议兼容），
+    // 避免「连接成功、实际请求没有候选」。直调绑定 model/<标识> 不要求 selected：取消选择只影响
+    // 列表与自动候选，只有停用才禁止调用（保留原 ID 直调语义）。
+    let has_candidate = if let Some(model_id) = route_id.strip_prefix("model/") {
+        config.models.iter().any(|m| m.id == model_id && m.enabled
+            && config.providers.iter().any(|p| p.id == m.provider_id && p.enabled))
     } else {
         let route = config.routes.iter().find(|r| r.id == route_id).ok_or("Route is unavailable")?;
-        // #17 / US 49：`all_models` 只覆盖 API 模型，订阅模型只能通过显式 model_ids 参与路由。
-        config.models.iter().filter(|m| router::rule_includes_model(&config, route, m)).collect()
+        router::route_has_candidate(&config, route)
     };
-    let has_candidate = candidates.iter().filter(|m| m.enabled).any(|model| {
-        config.providers.iter().any(|provider| provider.id == model.provider_id && provider.enabled
-            && protocol::Protocol::upstream(model, provider).is_ok())
-    });
     if !has_candidate { return Err("No compatible enabled candidate for this route".into()); }
     let mut service=state.proxy.lock().await;
     let config_lock=ownership::config_lock(&crate::runtime::home_dir().unwrap_or_default()).map_err(|e|e.to_string())?;

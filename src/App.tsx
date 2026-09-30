@@ -66,10 +66,11 @@ import {
   agentCatalogPendingSync, agentSelectableModels, availabilityLabel, capabilityLabel,
   catalogModelRow, connectionStateLabel, connectionStateTone, denialLabel, eligibilityLabel, identityLabel,
   isSubscriptionKind, isSubscriptionProvider, localLogoutLabel, loginStageLabel, loginStageTone, modelCapability,
-  modelListMembers, modelSelected, protocolKey, quotaLabel, remoteRevocationLabel, speedTestCandidates,
+  modelListMembers, protocolKey, quotaLabel, remoteRevocationLabel, speedTestCandidates,
   subscriptionActions, subscriptionAuthView, subscriptionCatalog, subscriptionReason, subscriptionStatusText,
   subscriptionView, unselectedModels,
 } from './lib/subscription';
+import { connectableRoutes } from './lib/route-candidates';
 import {
   beginSubscriptionLogin,
   cancelSubscriptionLogin,
@@ -817,7 +818,8 @@ function AgentsPage({ snapshot, onRefresh, onConnect, onRestore, onChange, onMan
     catch { setError(t('Could not save model and route selections.')); }
   }, [selections, t]);
   const agents = snapshot.agents.filter(agent => agent.custom || (agent.installed && agent.can_connect !== false));
-  const availableRoutes = snapshot.routes.filter(route => route.enabled && snapshot.models.some(m => ((route.strategy === 'jev' && route.all_models) || route.model_ids.includes(m.id)) && m.enabled && modelSelected(m) && snapshot.providers.some(p => p.id === m.provider_id && p.enabled))).sort((a, b) => a.id.localeCompare(b.id, 'en'));
+  // 路由可用性与后端连接校验同一套规则：作用域（all_models 只自动包含 API 模型）+ 选择 + 停用 + 服务商 + 协议。
+  const availableRoutes = connectableRoutes(snapshot.routes, snapshot.models, snapshot.providers).sort((a, b) => a.id.localeCompare(b.id, 'en'));
   const detect = async () => {
     setDetecting(true); setError('');
     try { await onRefresh(); } catch { setError(t('Could not detect agents. Try again.')); }

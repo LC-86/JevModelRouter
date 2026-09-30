@@ -94,6 +94,29 @@ pub(crate) fn rule_includes_model(
     rule.strategy == "jev" && rule.all_models && !is_subscription_model(config, model)
 }
 
+/// 一条路由的完整候选判定：把「作用域 + 用户选择 + 停用 + 服务商启用 + 协议兼容」放在同一处。
+///
+/// 连接校验（`validate_available_rule`、`connect_agent`）与运行时自动选路必须用同一套条件，
+/// 否则会出现「连接成功、实际请求没有候选」。账号资格、能力与额度属于派发准入，不在这里判定：
+/// 显式加入的订阅候选可以连接，但真正生成仍要过 `subscription::generation_ready`。
+///
+/// 取消选择只影响这个集合；按原模型标识直调不经过这里，停用才禁止所有调用。
+pub(crate) fn route_candidate(config: &AppConfig, rule: &crate::config::RouteRule, model: &Model) -> bool {
+    model.selected
+        && model.enabled
+        && rule_includes_model(config, rule, model)
+        && config.providers.iter().any(|provider| {
+            provider.id == model.provider_id
+                && provider.enabled
+                && crate::protocol::Protocol::upstream(model, provider).is_ok()
+        })
+}
+
+/// 路由是否至少有一个当前可用的候选：连接校验与界面可用性都用它。
+pub(crate) fn route_has_candidate(config: &AppConfig, rule: &crate::config::RouteRule) -> bool {
+    config.models.iter().any(|model| route_candidate(config, rule, model))
+}
+
 /// 显式固定直调的目标：`autojev/model/<标识>`、`model/<标识>`、`<provider>/<model_id>` 或内部标识。
 /// 这些路径不因取消选择被拒；只有自动候选集合要求 `selected`。
 fn pinned_model<'a>(config: &'a AppConfig, input: &RoutePreviewInput) -> Option<&'a Model> {
@@ -129,9 +152,7 @@ pub fn validate_available_rule(config: &AppConfig, rule: &crate::config::RouteRu
     let mut seen = std::collections::HashSet::new();
     effective.model_ids.retain(|id| config.models.iter().any(|m| &m.id == id) && seen.insert(id.clone()));
     effective.model_settings.retain(|id, _| effective.model_ids.contains(id));
-    if !rule.enabled || !config.models.iter().any(|model| model.enabled && rule_includes_model(config, &effective, model)
-        && config.providers.iter().any(|provider| provider.id == model.provider_id && provider.enabled
-            && crate::protocol::Protocol::upstream(model, provider).is_ok())) {
+    if !rule.enabled || !route_has_candidate(config, &effective) {
         return Err(anyhow!("No compatible enabled candidate for this route"));
     }
     validate_rule(config, &effective)
@@ -967,6 +988,35 @@ mod rule_tests {
         // 候选全部取消选择时，路由没有可派发候选。
         config.models[0].selected = false;
         assert!(decide(&config, &input, &Client::new(), None).await.is_err());
+    }
+
+    /// Bugbot High：连接校验必须与运行时用同一套候选判断。运行时要求 `selected`，
+    /// 所以「已启用但未选」的模型不能让路由看起来可连接（否则连接成功、请求却无候选）。
+    /// 同时保持既定语义：取消选择不影响按原 ID 直调，停用才禁止所有调用。
+    #[test]
+    fn route_connection_validation_uses_the_same_candidate_rules_as_runtime() {
+        let mut config = AppConfig::default();
+        let route = RouteRule { all_models: false, automatic_policy: None, model_settings: Default::default(),
+            id: "explicit".into(), name: "Explicit".into(), strategy: "round_robin".into(),
+            model_ids: vec![config.models[0].id.clone()], enabled: true };
+        config.routes = vec![route];
+        // 已选且启用：连接校验通过，候选判定同样为真。
+        assert!(validate_available_rule(&config, &config.routes[0]).is_ok());
+        assert!(route_has_candidate(&config, &config.routes[0]));
+        // 取消选择：运行时不再把该模型当候选，连接校验与候选判定必须同样拒绝。
+        config.models[0].selected = false;
+        assert!(validate_available_rule(&config, &config.routes[0]).is_err());
+        assert!(!route_has_candidate(&config, &config.routes[0]));
+        // 直调语义不受影响：模型仍启用，显式原 ID 直调仍被放行（连接校验不修改任何状态）。
+        assert!(config.models[0].enabled);
+        assert!(crate::subscription::admit_target(&config, &config.providers[0], &config.models[0].model_id, crate::protocol::Protocol::Chat).is_ok());
+        // 重新选择后可连接；停用则再次拒绝。
+        config.models[0].selected = true;
+        assert!(validate_available_rule(&config, &config.routes[0]).is_ok());
+        assert!(route_has_candidate(&config, &config.routes[0]));
+        config.models[0].enabled = false;
+        assert!(validate_available_rule(&config, &config.routes[0]).is_err());
+        assert!(!route_has_candidate(&config, &config.routes[0]));
     }
 
     #[test]

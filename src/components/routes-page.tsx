@@ -3,6 +3,7 @@ import { Copy, Plus, Settings2, Trash2, X } from 'lucide-react';
 import type { DashboardSnapshot, RouteRule } from '../types';
 import { saveRoute, deleteRoute } from '../lib/bridge';
 import { usePreferences } from '../lib/preferences-context';
+import { isRouteCandidate, routeCandidateModels } from '../lib/route-candidates';
 import { Select } from './select';
 
 const strategies = { round_robin: 'Load balancing', jev: 'Intelligent selection' } as const;
@@ -35,12 +36,12 @@ export function RoutesPage({ snapshot, onChange }: { snapshot: DashboardSnapshot
         <td><div className="provider-table-name"><div><div className="route-name"><strong>{route.name.trim() || route.id}</strong><button className="icon-action" title={t('Copy route ID')} aria-label={t('Copy route ID')} onClick={async () => { try { await navigator.clipboard.writeText('autojev/' + route.id); setCopied('autojev/' + route.id); } catch { setError(t('Could not copy route ID')); } }}><Copy size={15}/></button></div><small>{route.id}</small></div></div></td>
         <td>{t(strategies[route.strategy === 'fixed' ? 'round_robin' : route.strategy])}{route.strategy === 'jev' && <> · {t(preferences[(route.automatic_policy ?? snapshot.policy).decision_preference || 'balanced'])}</>}</td>
         <td>{(() => {
-          if (route.strategy === 'jev' && route.all_models) return <span>{t('All enabled models')} · {candidates.length}</span>;
+          if (route.strategy === 'jev' && route.all_models) return <span>{t('All enabled models')} · {routeCandidateModels(route, snapshot.models, snapshot.providers).length}</span>;
           const models = route.model_ids.filter(id => snapshot.models.some(m => m.id === id)).map(id => {
             const model = snapshot.models.find(m => m.id === id);
             const provider = snapshot.providers.find(p => p.id === model?.provider_id);
             const name = model ? model.name || model.model_id : t('Model removed');
-            const detail = model ? `${provider?.name ?? '—'} · ${model.model_id}${!model.enabled || !provider?.enabled ? ' · ' + t('Disabled') : ''}` : `${name} · ${id}`;
+            const detail = model ? `${provider?.name ?? '—'} · ${model.model_id}${!model.enabled || !provider?.enabled ? ' · ' + t('Disabled') : !isRouteCandidate(route, model, snapshot.providers) ? ' · ' + t('Not selected') : ''}` : `${name} · ${id}`;
             return { name, detail };
           });
           return <div className="route-candidates" title={models.map(m => m.detail).join('\n')} tabIndex={models.length ? 0 : undefined} aria-label={models.map(m => m.detail).join(', ')}>
