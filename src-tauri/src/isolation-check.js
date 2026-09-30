@@ -40,7 +40,17 @@
   const waitStatus = predicate => waitStatusFor(providerId, predicate);
   const subscriptionView = async () => (await invoke('get_snapshot')).subscriptions.find(item => item.provider_id === providerId);
   const grokView = async () => (await invoke('get_snapshot')).subscriptions.find(item => item.provider_id === grokProviderId);
+  // 登出后证据被整体清空：只接受 unknown/unsupported。denied 仍表示存在额度依据，
+  // 不能算作已清空；残留 denied 必须让断言直接失败。
   const clearedQuota = quota => !quota || ['unknown', 'unsupported'].includes(quota.state) === true;
+  const quotaNodeText = id => document.querySelector(`[data-testid="sub-quota-${id}"]`)?.textContent?.replace(/\s+/g, ' ').trim() || '';
+  const catalogNodeText = id => document.querySelector(`[data-testid="sub-catalog-${id}"]`)?.textContent?.replace(/\s+/g, ' ').trim() || '';
+  const tokenOf = (text, name) => { const match = new RegExp(`(?:^|\\s)${name}=([^\\s]*)`).exec(text); return match ? match[1] : null; };
+  const bucketSegments = text => text.split(/\bbucket=/).slice(1).map(part => `bucket=${part}`);
+  // 契约 D 的窗口格式：label:used=..,remaining=..,minutes=..,resets_at=..；Unknown 占位必须可读。
+  const windowEntries = segment => [...segment.matchAll(/([a-z_]+):used=([^,\s]+),remaining=([^,\s]+),minutes=([^,\s]+),resets_at=([^,\s\]]+)/g)]
+    .map(match => ({ label: match[1], used: match[2], remaining: match[3], minutes: match[4], resetsAt: match[5] }));
+  const catalogModelTokens = text => (tokenOf(text, 'models') || '').split(',').filter(Boolean);
   // Issue #13 登录/退出/换号闭环：每次桌面运行只排练一个场景，替身场景队列与之对应。
   const loginLifecycle = async mode => {
     const details = { mode, observations: [] };
@@ -210,8 +220,305 @@
       await wait(() => !grokDialog(), 'grok subscription auth dialog closed');
     }
   };
+  // Issue #15 目录/额度只读验收：先完成一次成功登录，再通过真实界面刷新控件逐个排练目录与额度
+  // 场景（一次运行只排练一组队列），断言同时取自界面稳定文本与后端 snapshot，不只看替身日志。
+  const catalogLifecycle = async () => {
+    const details = { mode: 'catalog', observations: [] };
+    report.details = details;
+    const record = (label, value) => details.observations.push({ label, value });
+    const quotaText = () => quotaNodeText(providerId);
+    const catalogText = () => catalogNodeText(providerId);
+    const clickRefresh = async () => {
+      const button = await wait(() => {
+        const row = [...document.querySelectorAll('tbody tr')].find(item => item.textContent.includes(providerId));
+        const candidate = row && [...row.querySelectorAll('.row-actions .icon-action:not(.danger)')]
+          .find(item => /refresh|刷新/i.test(`${item.getAttribute('title') || ''} ${item.getAttribute('aria-label') || ''}`));
+        return candidate && !candidate.disabled ? candidate : null;
+      }, 'subscription refresh control');
+      button.click();
+    };
+    // 点真实控件的刷新按钮；等待「界面文本」与「后端 snapshot」同时满足该场景的判据。
+    const refreshUntil = async (label, predicate) => {
+      await clickRefresh();
+      return await wait(async () => {
+        const view = await subscriptionView();
+        const dom = { quota: quotaText(), catalog: catalogText() };
+        return predicate(view, dom) ? { view, dom } : null;
+      }, label);
+    };
+    await nav(1);
+    await wait(() => [...document.querySelectorAll('tbody tr')].find(item => item.textContent.includes(providerId)), 'subscription row');
+    check(Boolean(document.querySelector(`[data-testid="sub-quota-${providerId}"]`)), 'The row must expose the stable quota node');
+    check(Boolean(document.querySelector(`[data-testid="sub-catalog-${providerId}"]`)), 'The row must expose the stable catalog node');
+    const started = await wait(async () => (await subscriptionView()) || null, 'subscription view');
+    check(started.state !== 'connected', `Catalog rehearsal needs a disconnected subscription: ${started.state}`);
+    // 目录与额度读取只对已核实账号生效：先完成一次成功登录。
+    await click(`[data-testid="sub-login-${providerId}"]`);
+    const pending = await wait(async () => { const item = await subscriptionView(); return item?.login?.stage === 'pending' ? item : null; }, 'pending login');
+    const signedIn = await wait(async () => { const item = await subscriptionView(); return item?.login?.stage === 'completed' && item.identity ? item : null; }, 'completed login');
+    check(signedIn.generation === pending.generation, `A completed sign-in must keep its generation: ${pending.generation} -> ${signedIn.generation}`);
+    await waitStatus(text => text.includes(`identity=${signedIn.identity}`));
+    record('signedIn', { generation: signedIn.generation, identity: signedIn.identity, state: signedIn.state });
+    passed('a successful sign-in precedes the catalog and quota reads');
+    // 1) 多桶 + 许可 true：字段映射、view、来源、时间、多桶优先于旧版单桶。
+    const multi = await refreshUntil('multi-bucket quota with a discovered catalog', (view, dom) =>
+      view?.quota?.buckets?.some(bucket => bucket.limit_id === 'fictional-primary')
+      && dom.quota.includes('bucket=fictional-primary') && dom.catalog.includes('codex-fixture-model'));
+    const multiQuota = multi.view.quota;
+    check(multiQuota.state === 'available', `A multi-bucket allowed read must be available: ${JSON.stringify(multiQuota.state)}`);
+    check(multiQuota.view === 'rate_limits_by_limit_id', `Two buckets must use the multi-bucket view: ${multiQuota.view}`);
+    check(multiQuota.history === false, `A fresh read must not be marked historical: ${multiQuota.history}`);
+    check(/^\d{4}-\d{2}-\d{2}T/.test(multiQuota.observed_at || ''), `A successful read must record an RFC3339 timestamp: ${multiQuota.observed_at}`);
+    check(String(multiQuota.source).includes('account/rateLimits/read') && String(multiQuota.source).includes('rateLimitsByLimitId'), `The source must name the RPC and view: ${multiQuota.source}`);
+    check(multiQuota.buckets.length === 2, `Both buckets must be exposed: ${multiQuota.buckets.map(bucket => bucket.limit_id)}`);
+    check(!multiQuota.buckets.some(bucket => bucket.limit_id === 'fictional-legacy-decoy'), `rateLimitsByLimitId must win over the legacy single snapshot: ${multiQuota.buckets.map(bucket => bucket.limit_id)}`);
+    const primary = multiQuota.buckets.find(bucket => bucket.limit_id === 'fictional-primary');
+    const primaryWindows = Object.fromEntries((primary?.windows || []).map(window => [window.label, window]));
+    check(primary?.permission === 'allowed', `An allowed root permission must allow every bucket: ${JSON.stringify(primary?.permission)}`);
+    check(primary?.plan_type === 'fictional-plus' && primary?.name === 'Fictional primary window', `Bucket metadata must be mapped: ${JSON.stringify({ plan: primary?.plan_type, name: primary?.name })}`);
+    check(primaryWindows.primary?.used_percent === 42 && primaryWindows.primary?.window_minutes === 300 && primaryWindows.primary?.resets_at === 1767225600, `usedPercent/windowDurationMins/resetsAt must map through: ${JSON.stringify(primaryWindows.primary)}`);
+    check(primaryWindows.secondary?.used_percent === 7 && primaryWindows.secondary?.window_minutes === 10080 && primaryWindows.secondary?.resets_at === 1767830400, `The secondary window must map through: ${JSON.stringify(primaryWindows.secondary)}`);
+    check(primary?.credits?.has_credits === true && primary?.credits?.unlimited === false && primary?.credits?.balance === '12.5 fictional credits', `Credits must be kept verbatim: ${JSON.stringify(primary?.credits)}`);
+    const multiDomBuckets = bucketSegments(multi.dom.quota);
+    check(tokenOf(multi.dom.quota, 'quota_state') === 'available' && tokenOf(multi.dom.quota, 'quota_view') === 'rate_limits_by_limit_id', `The DOM must show the multi-bucket view: ${multi.dom.quota}`);
+    check(tokenOf(multi.dom.quota, 'permission') === 'allowed' && tokenOf(multi.dom.quota, 'history') === 'false', `The DOM must show the aggregated permission and freshness: ${multi.dom.quota}`);
+    check(tokenOf(multi.dom.quota, 'observed_at') === multiQuota.observed_at, `The DOM timestamp must match the snapshot: ${multi.dom.quota}`);
+    check(multi.dom.quota.includes(`source=${multiQuota.source}`), `The DOM must show the read source: ${multi.dom.quota}`);
+    check(multiDomBuckets.length === 2 && !multi.dom.quota.includes('fictional-legacy-decoy'), `The DOM must show exactly the two buckets: ${multi.dom.quota}`);
+    const domPrimaryWindows = Object.fromEntries(windowEntries(multiDomBuckets.find(segment => tokenOf(segment, 'bucket') === 'fictional-primary') || '').map(window => [window.label, window]));
+    check(domPrimaryWindows.primary?.used === '42' && domPrimaryWindows.primary?.remaining === '58' && domPrimaryWindows.primary?.minutes === '300' && domPrimaryWindows.primary?.resetsAt === '1767225600', `The DOM must derive remaining = 100 - used and keep the window numbers: ${JSON.stringify(domPrimaryWindows.primary)}`);
+    check(domPrimaryWindows.secondary?.remaining === '93' && domPrimaryWindows.secondary?.resetsAt === '1767830400', `The DOM secondary window is wrong: ${JSON.stringify(domPrimaryWindows.secondary)}`);
+    // 目录：发现 ≠ 资格，eligible 一律 false。
+    check(multi.view.catalog?.state === 'available', `A successful catalog read must be available: ${JSON.stringify(multi.view.catalog)}`);
+    check(String(multi.view.catalog?.source).includes('model/list'), `The catalog source must name the RPC: ${multi.view.catalog?.source}`);
+    check((multi.view.models || []).length === 2 && multi.view.models.every(model => model.eligible === false), `Discovered models must stay ineligible: ${JSON.stringify(multi.view.models)}`);
+    check(multi.view.models.some(model => model.model_id === 'codex-fixture-model') && multi.view.models.some(model => model.model_id === 'codex-fixture-legacy-id'), `id/model fallback must be mapped: ${JSON.stringify(multi.view.models)}`);
+    const multiDomModels = catalogModelTokens(multi.dom.catalog);
+    check(multiDomModels.length === 2 && multiDomModels.every(entry => entry.endsWith(':false')), `The DOM catalog must list both models as ineligible: ${multi.dom.catalog}`);
+    check(tokenOf(multi.dom.catalog, 'catalog_state') === 'available' && tokenOf(multi.dom.catalog, 'observed_at') === multi.view.catalog.observed_at, `The DOM catalog state and time must match: ${multi.dom.catalog}`);
+    record('multi', { quota: multiQuota, catalog: multi.view.catalog, models: multi.view.models, domQuota: multi.dom.quota.slice(0, 800), domCatalog: multi.dom.catalog.slice(0, 400) });
+    passed('multi-bucket quota maps usedPercent/windowDurationMins/resetsAt into the DOM and the snapshot, legacy single is not used');
+    passed('discovered catalog models stay eligible=false in the DOM and the snapshot');
+    // 生成准入仍被统一拒绝：即使额度可读、模型已发现，也不得派发任何生成请求。
+    // 不能用「samples 计数变大」判断：summary 只保留最近 5 个样本，计数器会饱和。
+    // 判据是这一批 3 次探测全部完成、任务结束且带拒绝原因（start 会先把 job 重置为 running）。
+    await invoke('start_model_speed_tests', { ids: ['codex-subscription-model'] });
+    const deniedWithCatalog = await wait(async () => {
+      const value = await invoke('get_model_performance');
+      return !value.job.running && value.job.completed === 3 && value.job.error ? value : null;
+    }, 'denied speed test with a catalog');
+    check(/eligible/i.test(deniedWithCatalog.job.error || ''), `Generation must be denied as ineligible even with an available quota read: ${JSON.stringify(deniedWithCatalog.job)}`);
+    record('deniedWithCatalog', { error: deniedWithCatalog.job.error });
+    passed('generation stays denied with a discovered catalog and an available quota read');
+    // 2) 旧版单桶（仅 rateLimits，根层许可）+ 旧目录形状 `models`：整体替换为本次权威结果。
+    const single = await refreshUntil('legacy single-bucket quota and models-array catalog', (view, dom) =>
+      view?.quota?.view === 'rate_limits' && dom.quota.includes('bucket=fictional-single')
+      && dom.catalog.includes('codex-fixture-legacy-shape'));
+    check(single.view.quota.state === 'available' && single.view.quota.view === 'rate_limits', `A legacy single snapshot must be available in the legacy view: ${JSON.stringify({ state: single.view.quota.state, view: single.view.quota.view })}`);
+    check(single.view.quota.buckets.length === 1 && single.view.quota.buckets[0].limit_id === 'fictional-single', `Exactly the legacy bucket must be used: ${JSON.stringify(single.view.quota.buckets.map(bucket => bucket.limit_id))}`);
+    const singleWindow = single.view.quota.buckets[0].windows[0];
+    check(singleWindow?.used_percent === 33 && singleWindow?.window_minutes === 120 && singleWindow?.resets_at === 1767232800, `The legacy window must map through: ${JSON.stringify(singleWindow)}`);
+    check(single.view.quota.buckets[0].permission === 'allowed', `A root-level ordinaryUsageAllowed must permit the bucket: ${single.view.quota.buckets[0].permission}`);
+    check(tokenOf(single.dom.quota, 'quota_view') === 'rate_limits', `The DOM must show the legacy view: ${single.dom.quota}`);
+    const singleDomWindow = windowEntries(bucketSegments(single.dom.quota)[0])[0];
+    check(singleDomWindow?.used === '33' && singleDomWindow?.remaining === '67' && singleDomWindow?.minutes === '120' && singleDomWindow?.resetsAt === '1767232800', `The DOM legacy window is wrong: ${JSON.stringify(singleDomWindow)}`);
+    // 目录以本次权威结果整体替换：旧列表里的多桶模型必须被撤销。
+    check((single.view.models || []).length === 1 && single.view.models[0].model_id === 'codex-fixture-legacy-shape', `A successful read must replace the catalog wholesale: ${JSON.stringify(single.view.models)}`);
+    check(single.view.models.every(model => model.eligible === false), `The legacy-shaped model must stay ineligible: ${JSON.stringify(single.view.models)}`);
+    check(tokenOf(single.dom.catalog, 'catalog_state') === 'available' && catalogModelTokens(single.dom.catalog).join(',') === 'codex-fixture-legacy-shape:false', `The DOM catalog must be replaced wholesale: ${single.dom.catalog}`);
+    check(!single.dom.catalog.includes('codex-fixture-model'), `A model absent from the authoritative result must disappear: ${single.dom.catalog}`);
+    record('single', { quota: single.view.quota, catalog: single.view.catalog, models: single.view.models, domQuota: single.dom.quota.slice(0, 600), domCatalog: single.dom.catalog.slice(0, 400) });
+    passed('the legacy single snapshot uses the legacy view and the DOM derives remaining there too');
+    passed('a successful catalog read replaces the previous list wholesale');
+    // 3) 缺字段：resetsAt 与 credits 必须进 missing_fields，且不得伪造数值。
+    const missing = await refreshUntil('missing resetsAt and credits plus a skipped catalog entry', (view, dom) =>
+      view?.quota?.buckets?.some(bucket => bucket.limit_id === 'fictional-missing')
+      && dom.quota.includes('bucket=fictional-missing') && dom.catalog.includes('model.list[0].id'));
+    const missingBucket = missing.view.quota.buckets.find(bucket => bucket.limit_id === 'fictional-missing');
+    const missingWindow = missingBucket.windows[0];
+    check(missingWindow.used_percent === 55 && missingWindow.window_minutes === 300, `Present fields must still map when others are missing: ${JSON.stringify(missingWindow)}`);
+    check(missingWindow.resets_at == null, `A missing resetsAt must stay absent: ${missingWindow.resets_at}`);
+    check((missingWindow.missing_fields || []).some(field => /resetsAt/i.test(field)), `The window must record the missing resetsAt: ${JSON.stringify(missingWindow.missing_fields)}`);
+    check((missingBucket.missing_fields || []).some(field => /credits/i.test(field)), `The bucket must record the missing credits: ${JSON.stringify(missingBucket.missing_fields)}`);
+    check((missingBucket.credits ? (missingBucket.credits.missing_fields || []) : (missingBucket.missing_fields || [])).length > 0, `Missing credits fields must be recorded individually: ${JSON.stringify(missingBucket.credits)}`);
+    const missingDom = bucketSegments(missing.dom.quota).find(segment => tokenOf(segment, 'bucket') === 'fictional-missing') || '';
+    check(/missing=[^\s]*resetsAt/i.test(missingDom), `The DOM must report the missing resetsAt: ${missingDom}`);
+    check(/missing=[^\s]*credits|credits=[^\s]*Unknown/i.test(missingDom), `The DOM must report the missing credits fields: ${missingDom}`);
+    check(!/resets_at=0\b/.test(missingDom), `A missing resetsAt must not be rendered as zero: ${missingDom}`);
+    check(!/remaining=0\b/.test(missingDom), `A missing window field must not fabricate remaining=0: ${missingDom}`);
+    // 条目没有可用标识 → 计入 missing_fields 并跳过该条，只保留合法条目。
+    check((missing.view.models || []).length === 1 && missing.view.models[0].model_id === 'codex-fixture-model', `A catalog entry without an identifier must be skipped: ${JSON.stringify(missing.view.models)}`);
+    check((missing.view.catalog?.missing_fields || []).some(field => field.includes('model.list[0].id')), `The skipped entry must be recorded as model.list[i].id: ${JSON.stringify(missing.view.catalog?.missing_fields)}`);
+    check(tokenOf(missing.dom.catalog, 'missing')?.includes('model.list[0].id') === true, `The DOM catalog must show the skipped entry: ${missing.dom.catalog}`);
+    record('missing', { window: missingWindow, bucketMissing: missingBucket.missing_fields, catalog: missing.view.catalog, models: missing.view.models, dom: missingDom.slice(0, 500), domCatalog: missing.dom.catalog.slice(0, 400) });
+    passed('missing resetsAt/credits fields are recorded, never fabricated, and a catalog entry without an identifier is skipped');
+    // 4) 越界/类型不符：值为 None 并原样记入 invalid_fields，绝不截断或改写成合法值。
+    const invalid = await refreshUntil('out-of-range quota fields', (view, dom) =>
+      view?.quota?.buckets?.some(bucket => bucket.limit_id === 'fictional-invalid') && dom.quota.includes('bucket=fictional-invalid'));
+    const invalidBucket = invalid.view.quota.buckets.find(bucket => bucket.limit_id === 'fictional-invalid');
+    const invalidPrimary = invalidBucket.windows.find(window => window.label === 'primary');
+    const invalidSecondary = invalidBucket.windows.find(window => window.label === 'secondary');
+    check(invalidPrimary.used_percent == null && invalidPrimary.resets_at == null && invalidPrimary.window_minutes == null, `Out-of-range numbers must not be adopted: ${JSON.stringify(invalidPrimary)}`);
+    check(invalidSecondary.used_percent === 50 && invalidSecondary.resets_at === 1767232800, `A valid sibling window must be unaffected: ${JSON.stringify(invalidSecondary)}`);
+    const invalidText = (invalidPrimary.invalid_fields || []).join(',');
+    check(invalidText.includes('142') && /resetsAt|resets_at/i.test(invalidText) && /windowDurationMins|window_minutes/i.test(invalidText), `The invalid fields must keep the raw text: ${JSON.stringify(invalidPrimary.invalid_fields)}`);
+    check((invalidPrimary.invalid_fields || []).length >= 3, `Every out-of-range/type-mismatched field must be recorded: ${JSON.stringify(invalidPrimary.invalid_fields)}`);
+    const invalidDom = bucketSegments(invalid.dom.quota).find(segment => tokenOf(segment, 'bucket') === 'fictional-invalid') || '';
+    check(!/used=142\b/.test(invalidDom), `The out-of-range usedPercent must not appear as a value: ${invalidDom}`);
+    check(!/resets_at=0\b/.test(invalidDom), `The out-of-range resetsAt must not appear as a value: ${invalidDom}`);
+    check(!/minutes=-1\b/.test(invalidDom), `The out-of-range windowDurationMins must not appear as a value: ${invalidDom}`);
+    check(/used=Unknown/.test(invalidDom) && /remaining=Unknown/.test(invalidDom) && !/remaining=0\b/.test(invalidDom), `Invalid numbers must read Unknown, never zero: ${invalidDom}`);
+    check(/invalid=[^\s]*142/.test(invalidDom), `The DOM must record the invalid field with its raw text: ${invalidDom}`);
+    check(/used=50\b/.test(invalidDom) && /resets_at=1767232800\b/.test(invalidDom), `The valid sibling window must still render as numbers: ${invalidDom}`);
+    record('invalid', { window: invalidPrimary, bucketInvalid: invalidBucket.invalid_fields, dom: invalidDom.slice(0, 600) });
+    passed('out-of-range usedPercent=142/resetsAt=0/windowDurationMins=-1 are recorded as invalid, stay None and never render as values');
+    // 5) 根层 ordinaryUsageAllowed=false → permission=denied。
+    const denied = await refreshUntil('denied ordinary usage', (view, dom) =>
+      view?.quota?.state === 'denied' && dom.quota.includes('bucket=fictional-denied'));
+    check(denied.view.quota.view === 'rate_limits_by_limit_id' && denied.view.quota.buckets.every(bucket => bucket.permission === 'denied'), `A denied permission must deny every bucket: ${JSON.stringify(denied.view.quota.buckets.map(bucket => bucket.permission))}`);
+    check(denied.view.quota.buckets[0].windows[0].used_percent === 12, `A denied bucket must still expose its window numbers: ${JSON.stringify(denied.view.quota.buckets[0].windows[0])}`);
+    check(tokenOf(denied.dom.quota, 'quota_state') === 'denied' && tokenOf(denied.dom.quota, 'permission') === 'denied', `The DOM must show the aggregate denied state: ${denied.dom.quota}`);
+    // `view.denial` 只承载连接级原因（not_connected/evidence_missing），额度拒绝码走 admit_model；
+    // 本票 eligible 恒 false 时生成先停在 model_not_eligible，因此 quota_denied 端到端不可达，
+    // 由 subscription.rs 单测覆盖；隔离验收只断言已展示的 denied 状态与本地化文案。
+    check(denied.view.denial == null, `A connected, evidenced subscription must not carry a connection-level denial: ${JSON.stringify(denied.view.denial)}`);
+    const deniedLabel = await wait(() => /额度访问被拒绝|[Qq]uota access denied/.test(rowText()) ? rowText() : null, 'denied quota label');
+    check(deniedLabel, 'A denied permission must be labelled as denied in the row');
+    record('denied', { state: denied.view.quota.state, permission: denied.view.quota.buckets[0].permission, denial: denied.view.denial, label: deniedLabel.slice(-200), dom: denied.dom.quota.slice(0, 500) });
+    passed('ordinaryUsageAllowed=false maps to permission=denied and the denied quota label');
+    // 6) 桶内显式 false 不得被根层 true 覆盖（fail-closed 防御）。
+    const bucketDenied = await refreshUntil('bucket-level false is not overridden by root true', (view, dom) =>
+      view?.quota?.state === 'denied' && dom.quota.includes('bucket=fictional-bucket-denied'));
+    check(bucketDenied.view.quota.buckets.every(bucket => bucket.permission === 'denied'), `A bucket-level explicit false must deny, not be overridden by a root true: ${JSON.stringify(bucketDenied.view.quota.buckets.map(bucket => bucket.permission))}`);
+    check(bucketDenied.view.quota.buckets[0].windows[0].used_percent === 15, `A bucket-level denial must still expose its window numbers: ${JSON.stringify(bucketDenied.view.quota.buckets[0].windows[0])}`);
+    check(tokenOf(bucketDenied.dom.quota, 'quota_state') === 'denied' && tokenOf(bucketDenied.dom.quota, 'permission') === 'denied', `The DOM must show the bucket-level denial: ${bucketDenied.dom.quota}`);
+    record('bucketDenied', { state: bucketDenied.view.quota.state, permission: bucketDenied.view.quota.buckets[0].permission, dom: bucketDenied.dom.quota.slice(0, 500) });
+    passed('a bucket-level ordinaryUsageAllowed=false is not overridden by a root true (fail-closed)');
+    // 7) 根层 ordinaryUsageAllowed 缺失与显式 null → unknown（不是 denied，也不是 0）。
+    const noPermission = await refreshUntil('absent ordinaryUsageAllowed', (view, dom) =>
+      view?.quota?.buckets?.some(bucket => bucket.limit_id === 'fictional-noperm') && dom.quota.includes('bucket=fictional-noperm'));
+    check(noPermission.view.quota.buckets.every(bucket => bucket.permission === 'unknown'), `An absent permission must be unknown per bucket: ${JSON.stringify(noPermission.view.quota.buckets.map(bucket => bucket.permission))}`);
+    check(noPermission.view.quota.state === 'unknown', `An absent permission must not be available: ${noPermission.view.quota.state}`);
+    check(tokenOf(noPermission.dom.quota, 'permission') === 'unknown' && tokenOf(noPermission.dom.quota, 'quota_state') === 'unknown', `The DOM must show unknown, not denied: ${noPermission.dom.quota}`);
+    check(!/permission=denied/.test(noPermission.dom.quota), `Unknown permission must not be rendered as denied: ${noPermission.dom.quota}`);
+    check(/used=20\b/.test(bucketSegments(noPermission.dom.quota)[0] || ''), `The readable window number must still be shown: ${noPermission.dom.quota}`);
+    const noPermissionMissing = [...(noPermission.view.quota.missing_fields || []), ...noPermission.view.quota.buckets.flatMap(bucket => bucket.missing_fields || [])].join(',');
+    check(/ordinaryUsageAllowed/i.test(noPermissionMissing), `The missing permission must be recorded in missing_fields: ${noPermissionMissing}`);
+    record('noPermission', { state: noPermission.view.quota.state, permission: noPermission.view.quota.buckets[0].permission, missing: noPermissionMissing, dom: noPermission.dom.quota.slice(0, 500) });
+    passed('an absent ordinaryUsageAllowed is unknown, recorded in missing_fields and never rendered as denied or zero');
+    const nullPermission = await refreshUntil('null ordinaryUsageAllowed', (view, dom) =>
+      view?.quota?.buckets?.some(bucket => bucket.limit_id === 'fictional-nullperm') && dom.quota.includes('bucket=fictional-nullperm'));
+    check(nullPermission.view.quota.buckets.every(bucket => bucket.permission === 'unknown') && nullPermission.view.quota.state === 'unknown', `A null permission must stay unknown: ${JSON.stringify({ state: nullPermission.view.quota.state, permissions: nullPermission.view.quota.buckets.map(bucket => bucket.permission) })}`);
+    check(tokenOf(nullPermission.dom.quota, 'permission') === 'unknown', `The DOM must show unknown for a null permission: ${nullPermission.dom.quota}`);
+    record('nullPermission', { state: nullPermission.view.quota.state, dom: nullPermission.dom.quota.slice(0, 400) });
+    passed('a null ordinaryUsageAllowed is unknown, not denied');
+    // 8) 额度读取失败：state=failed、history=true、observed_at 保持上一次成功值、桶数字不被清零。
+    //    先等过一秒，确保「时间未被更新」这条断言不会被同一秒内的等值掩盖。
+    const lastGoodObservedAt = nullPermission.view.quota.observed_at;
+    const lastGoodBuckets = JSON.parse(JSON.stringify(nullPermission.view.quota.buckets));
+    await new Promise(r => setTimeout(r, 1100));
+    const failQuota = await refreshUntil('quota read failure retains history', (view, dom) =>
+      view?.quota?.state === 'failed' && dom.quota.includes('quota_state=failed'));
+    const failedQuota = failQuota.view.quota;
+    check(failedQuota.history === true, `A failed quota read must be marked historical: ${JSON.stringify(failedQuota)}`);
+    check(failedQuota.observed_at === lastGoodObservedAt, `A failed quota read must keep the last successful observed_at: ${lastGoodObservedAt} -> ${failedQuota.observed_at}`);
+    check(JSON.stringify(failedQuota.buckets) === JSON.stringify(lastGoodBuckets), `A failed quota read must retain the previous buckets: ${JSON.stringify(failedQuota.buckets)}`);
+    check(tokenOf(failQuota.dom.quota, 'history') === 'true' && tokenOf(failQuota.dom.quota, 'quota_state') === 'failed', `The DOM must show the historical failure: ${failQuota.dom.quota}`);
+    check(failQuota.dom.quota.includes(`observed_at=${lastGoodObservedAt}`), `The DOM must keep the last successful timestamp: ${failQuota.dom.quota}`);
+    const retainedDom = bucketSegments(failQuota.dom.quota).find(segment => tokenOf(segment, 'bucket') === 'fictional-nullperm') || '';
+    check(/used=21\b/.test(retainedDom) && !/used=0\b/.test(retainedDom), `The retained bucket numbers must not be zeroed: ${retainedDom}`);
+    const historyLabelled = await wait(() => /历史数据|[Hh]istorical/.test(rowText()) ? true : null, 'historical data label');
+    check(historyLabelled, `A historical quota must be labelled as historical in the row`);
+    record('failQuota', { state: failedQuota.state, history: failedQuota.history, observedAt: failedQuota.observed_at, previousObservedAt: lastGoodObservedAt, buckets: failedQuota.buckets, dom: failQuota.dom.quota.slice(0, 700) });
+    passed('a failed quota read keeps the last numbers and timestamp, marks the quota historical and never zeroes the buckets');
+    // 9) 目录读取失败：catalog.state=stale，已核实目录原样保留，observed_at 不更新。
+    const lastGoodCatalogObservedAt = failQuota.view.catalog.observed_at;
+    const lastGoodModelIds = (failQuota.view.models || []).map(model => model.model_id).sort().join(',');
+    check(lastGoodModelIds.length > 0, `The stale rehearsal needs a previously verified catalog: ${lastGoodModelIds}`);
+    await new Promise(r => setTimeout(r, 1100));
+    const failCatalog = await refreshUntil('catalog read failure keeps the verified directory', (view, dom) =>
+      view?.catalog?.state === 'stale' && dom.catalog.includes('catalog_state=stale'));
+    check(failCatalog.view.catalog.state === 'stale', `A failed catalog read after a verified one must be stale: ${JSON.stringify(failCatalog.view.catalog)}`);
+    check(failCatalog.view.catalog.observed_at === lastGoodCatalogObservedAt, `A failed catalog read must keep the last successful observed_at: ${lastGoodCatalogObservedAt} -> ${failCatalog.view.catalog.observed_at}`);
+    check((failCatalog.view.models || []).map(model => model.model_id).sort().join(',') === lastGoodModelIds, `A stale catalog must retain the verified models: ${JSON.stringify(failCatalog.view.models)}`);
+    check(tokenOf(failCatalog.dom.catalog, 'catalog_state') === 'stale' && failCatalog.dom.catalog.includes('codex-fixture-model'), `The DOM must keep listing the stale models: ${failCatalog.dom.catalog}`);
+    check(tokenOf(failCatalog.dom.catalog, 'observed_at') === lastGoodCatalogObservedAt, `The DOM must keep the last successful catalog time: ${failCatalog.dom.catalog}`);
+    check(failCatalog.view.quota.state === 'failed' && failCatalog.view.quota.history === true, `The independent quota failure must survive a catalog refresh: ${JSON.stringify({ state: failCatalog.view.quota.state, history: failCatalog.view.quota.history })}`);
+    record('failCatalog', { catalog: failCatalog.view.catalog, models: failCatalog.view.models, previousObservedAt: lastGoodCatalogObservedAt, dom: failCatalog.dom.catalog.slice(0, 500) });
+    passed('a failed catalog read keeps the verified directory, marks it stale and keeps the last successful timestamp');
+    passed('a catalog failure does not rewrite the independently failed quota evidence');
+    // Helper 自行改变状态：直接刷新，不先调用应用内 logout。
+    const incomplete = await refreshUntil('incomplete identity suspends current authorization', (view, dom) =>
+      view?.state === 'not_connected' && dom.quota.includes('history=true') && dom.catalog.includes('catalog_state=stale'));
+    check(incomplete.view.identity === failCatalog.view.identity, 'Keep the last verified owner for history');
+    check(incomplete.view.catalog.observed_at === failCatalog.view.catalog.observed_at, 'Incomplete identity must keep the catalog time');
+    check(incomplete.view.quota.observed_at === failCatalog.view.quota.observed_at, 'Incomplete identity must keep the quota time');
+    check(JSON.stringify(incomplete.view.models) === JSON.stringify(failCatalog.view.models), 'Incomplete identity must retain only the old models');
+    check(JSON.stringify(incomplete.view.quota.buckets) === JSON.stringify(failCatalog.view.quota.buckets), 'Incomplete identity must retain only the old buckets');
+    check(incomplete.view.denial?.code === 'not_connected', 'Incomplete identity must refuse admission');
+    await waitStatus(text => text.includes('state=not_connected'));
+    passed('incomplete identity suspends the connection and displays stale historical evidence with original timestamps');
+    const recovered = await refreshUntil('same account recovery with failed evidence reads', (view, dom) =>
+      view?.state === 'connected' && dom.catalog.includes('catalog_state=stale') && dom.quota.includes('quota_state=failed'));
+    check(recovered.view.identity === failCatalog.view.identity, 'Recovery must confirm the original account');
+    check(recovered.view.catalog.observed_at === failCatalog.view.catalog.observed_at, 'Recovery failure must keep historical catalog time');
+    check(recovered.view.quota.observed_at === failCatalog.view.quota.observed_at && recovered.view.quota.history, 'Recovery failure must keep historical quota time');
+    passed('same-account recovery retains the stale catalog and failed historical quota');
+    // 10) 登出：目录与额度一并清空，生成仍被统一准入拒绝。
+    const connectedGeneration = recovered.view.generation;
+    await click(`[data-testid="sub-logout-${providerId}"]`);
+    const after = await wait(async () => { const item = await subscriptionView(); return item?.logout && !item.identity ? item : null; }, 'logout outcome');
+    check(after.generation > connectedGeneration, `Sign-out must advance the generation: ${connectedGeneration} -> ${after.generation}`);
+    check((after.models || []).length === 0, `Sign-out must clear the discovered catalog: ${JSON.stringify(after.models)}`);
+    check(after.catalog?.state === 'unknown' && !after.catalog?.source && !after.catalog?.observed_at, `Sign-out must clear the catalog evidence: ${JSON.stringify(after.catalog)}`);
+    check((after.quota?.buckets || []).length === 0 && after.quota?.state === 'unknown' && after.quota?.history !== true && !after.quota?.observed_at, `Sign-out must clear the quota evidence: ${JSON.stringify(after.quota)}`);
+    await wait(() => {
+      const quota = quotaText(); const catalog = catalogText();
+      return tokenOf(quota, 'quota_state') === 'unknown' && !quota.includes('bucket=')
+        && tokenOf(catalog, 'catalog_state') === 'unknown' && !/models=[^\s]/.test(catalog) ? true : null;
+    }, 'cleared catalog and quota nodes');
+    check(!/codex-fixture/.test(catalogText()), `The cleared DOM node must not keep stale model ids: ${catalogText()}`);
+    record('afterLogout', { generation: after.generation, identity: after.identity ?? null, catalog: after.catalog, models: after.models, quota: after.quota, domQuota: quotaText().slice(0, 400), domCatalog: catalogText().slice(0, 300) });
+    passed('sign-out clears the catalog and quota evidence together');
+    await invoke('start_model_speed_tests', { ids: ['codex-subscription-model'] });
+    const deniedAfterLogout = await wait(async () => {
+      const value = await invoke('get_model_performance');
+      return !value.job.running && value.job.completed === 3 && value.job.error ? value : null;
+    }, 'denied speed test after sign-out');
+    check(/not connected/i.test(deniedAfterLogout.job.error || ''), `A signed-out subscription must stay denied with its reason: ${deniedAfterLogout.job.error}`);
+    record('deniedAfterLogout', { error: deniedAfterLogout.job.error });
+    passed('generation stays denied after the catalog and quota evidence is cleared');
+    // 重新连接 A，留下有效证据，再排练 helper 自行退出（此前应用内退出不参与这次故障路径）。
+    await click(`[data-testid="sub-login-${providerId}"]`);
+    await wait(async () => { const item = await subscriptionView(); return item?.login?.stage === 'completed' && item?.state === 'connected' ? item : null; }, 'second account verification');
+    const helperConnected = await refreshUntil('connected A before helper disconnect', (view, dom) =>
+      view?.state === 'connected' && dom.catalog.includes('catalog_state=available') && dom.quota.includes('quota_state=available'));
+    const helperOut = await refreshUntil('helper disconnect without app logout', (view, dom) =>
+      view?.state === 'not_connected' && !view.identity && dom.catalog.includes('catalog_state=unknown') && !dom.quota.includes('bucket='));
+    check(helperOut.view.generation > helperConnected.view.generation, 'Helper disconnect must invalidate the generation');
+    check(!helperOut.view.models.length && !helperOut.view.quota.buckets.length, 'Helper disconnect must clear active evidence');
+    check(helperOut.view.denial?.code === 'not_connected', 'Helper disconnect must refuse admission');
+    await invoke('start_model_speed_tests', { ids: ['codex-subscription-model'] });
+    const helperDenied = await wait(async () => {
+      const value = await invoke('get_model_performance');
+      return !value.job.running && value.job.completed === 3 && value.job.error ? value : null;
+    }, 'helper disconnect admission refusal');
+    check(/not connected/i.test(helperDenied.job.error), `Helper disconnect must refuse generation: ${helperDenied.job.error}`);
+    record('helperDisconnect', { generation: helperOut.view.generation, denial: helperOut.view.denial, error: helperDenied.job.error });
+    passed('helper disconnect clears evidence and refuses generation without app logout');
+    // 全部故障断言完成后才调用退出，清理本次替身生成的专用授权文件。
+    await invoke('logout_subscription', { providerId });
+
+  };
   try {
     await wait(() => document.querySelector('.app-shell'));
+    if (window.__ISOLATION_CHECK__.loginMode === 'catalog') {
+      // 目录/额度只读验收：先成功登录，再按替身队列逐个排练目录与额度场景。
+      try { await catalogLifecycle(); report.ok = true; }
+      catch (error) { report.error = String(error); report.screen = document.body.innerText.slice(-5000); }
+      await invoke('isolation_check_report', { report });
+      return;
+    }
     if (window.__ISOLATION_CHECK__.loginMode) {
       try { await loginLifecycle(window.__ISOLATION_CHECK__.loginMode); report.ok = true; }
       catch (error) { report.error = String(error); report.screen = document.body.innerText.slice(-5000); }

@@ -1782,6 +1782,7 @@ mod provider_authorization_tests {
             models: Vec::new(),
             capabilities: Vec::new(),
             quota: Default::default(),
+            catalog: Default::default(),
         });
         config
     }
