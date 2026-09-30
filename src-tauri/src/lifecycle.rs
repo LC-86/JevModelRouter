@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use std::{fs, path::PathBuf};
 
 pub fn root() -> Result<PathBuf> {
-    Ok(dirs::home_dir()
+    Ok(crate::runtime::home_dir()
         .context("Cannot locate home directory")?
         .join(".autojev"))
 }
@@ -69,7 +69,7 @@ pub fn watchdog_entry() -> bool {
         if !matches!(port, crate::config::DEV_PORT | crate::config::DEFAULT_PORT) || pid < 2 {
             return true;
         }
-        if let Some(home) = dirs::home_dir() {
+        if let Some(home) = crate::runtime::home_dir() {
             watch_parent(pid, port, &home);
         }
     }

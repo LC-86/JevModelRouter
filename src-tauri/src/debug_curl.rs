@@ -25,13 +25,14 @@ pub async fn debug_curl(state: State<'_, AppState>, id: String, endpoint: String
     let _ = on_progress.send(json!({"started":true}));
     let operation = async {
         let start = std::time::Instant::now();
-        let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).timeout(std::time::Duration::from_secs(90)).build().map_err(|e|e.to_string())?;
-        let mut request = client.post(format!("http://127.0.0.1:{}/v1/{endpoint}", state.store.read().port));
+        let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().map_err(|e|e.to_string())?;
+        let mut request = client.post(format!("http://127.0.0.1:{}/v1/{endpoint}", state.store.read().port))
+            .timeout(std::time::Duration::from_secs(90));
         for (name, value) in headers {
             if matches!(name.to_ascii_lowercase().as_str(), "host" | "content-length" | "transfer-encoding" | "connection") { return Err(format!("Unsupported header: {name}")); }
             request = request.header(name, value);
         }
-        let mut response = request.header("user-agent", "AutoJev/Debug").json(&body).send().await.map_err(|e|e.to_string())?;
+        let mut response = crate::dispatch::send_http(request.header("user-agent", "AutoJev/Debug").json(&body), crate::runtime::isolated()).await.map_err(|e|e.to_string())?;
         let status = response.status().as_u16();
         let request_id = response.headers().get("x-autojev-request-id").and_then(|v|v.to_str().ok()).unwrap_or("").to_owned();
         let response_headers: HashMap<_,_> = response.headers().iter().map(|(k,v)|(k.to_string(),v.to_str().unwrap_or("").to_owned())).collect();

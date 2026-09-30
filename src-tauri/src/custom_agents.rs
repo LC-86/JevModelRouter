@@ -16,6 +16,7 @@ impl Injection {
         if !path.is_absolute() || path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
             return Err(anyhow!("Use an absolute configuration path or ~/ path"));
         }
+        crate::runtime::check_path(&path)?;
         let extension = path.extension().and_then(|x| x.to_str()).unwrap_or("");
         let valid = match self.template.as_str() {
             "kilo" | "opencode" | "openclaw" => matches!(extension, "json" | "jsonc"),

@@ -26,6 +26,7 @@
     "release:check": "node scripts/check-release.mjs",
     "release:mac": "node scripts/release-mac.mjs",
     "test": "vitest run",
+    "test:isolated": "pnpm build && cargo build --locked --manifest-path src-tauri/Cargo.toml --features isolation-check && node scripts/check-isolated-desktop.mjs",
     "test:decision-ui": "node scripts/check-decision-provider-ui.mjs",
     "test:ui": "node scripts/check-availability-ui.mjs"
   },
