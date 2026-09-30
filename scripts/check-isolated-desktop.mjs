@@ -165,7 +165,12 @@ try {
   assert.ok(lateObs.lateCompletion.generation >= lateObs.lateCompletion.pendingGeneration, `A late completion must not roll the generation back: ${JSON.stringify(lateObs.lateCompletion)}`);
   assert.ok(logs.late.some(entry => entry.event === 'request' && entry.method === 'account/login/cancel'), 'The late run must cancel the pending login');
   assert.ok(logs.late.some(entry => entry.event === 'notification' && entry.scenario === 'late' && entry.ok === true), 'The stand-in must emit the late completion');
-  for (const label of ['cancelled', 'lateCompletion']) {
+  // 重启归位：late 运行带着挂起登录退出，failed 运行启动时必须已回到未连接。
+  assert.equal(lateObs.exitPending?.login?.stage, 'pending', `The late run must exit with a pending sign-in: ${JSON.stringify(lateObs.exitPending)}`);
+  const reconciled = observation(failedRun.report, 'reconciled');
+  assert.equal(reconciled?.state, 'not_connected', `A restarted desktop must reconcile the orphaned pending sign-in: ${JSON.stringify(reconciled)}`);
+  assert.match(String(reconciled?.status), /login=idle/, `The reconciled row must be idle again: ${reconciled?.status}`);
+  for (const label of ['cancelled', 'lateCompletion', 'exitPending']) {
     const text = String(lateObs[label]?.status ?? '');
     assert.ok(!text.includes(fictionalIdentities.late), `${label} must not show the late identity: ${text}`);
     assert.ok(!text.includes(fictionalIdentities.success), `${label} must not revive the previous identity: ${text}`);

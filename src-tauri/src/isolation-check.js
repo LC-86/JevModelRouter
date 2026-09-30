@@ -124,13 +124,21 @@
       const lateText = await waitStatus(text => text.includes('identity=Unknown') && !text.includes('login=completed'));
       record('lateCompletion', { stage: afterLate.login.stage, generation: afterLate.generation, identity: afterLate.identity ?? null, status: lateText, pendingGeneration: pending.generation });
       passed('a late completion is discarded: no revived identity and no generation rollback');
-      // 这里不再发起新的挂起登录：取消后状态回到未连接，替身进程仍然存活，
-      // 由外层在桌面退出后断言它被回收。
+      // 取消后状态回到未连接；随后再留一个挂起登录到桌面退出，用来验证下次启动会把
+      // 落在盘上的 authorization_pending 归位成未连接，并且可以重新登录。
       const settledState = (await subscriptionView()).state;
       check(settledState === 'not_connected', `Cancelling must settle back to not_connected: ${settledState}`);
+      const stillPending = await startLogin();
+      const pendingText = await waitStatus(text => text.includes('login=pending'));
+      check(!stillPending.identity, `A pending sign-in must not carry an identity: ${stillPending.identity}`);
+      record('exitPending', { generation: stillPending.generation, state: stillPending.state, login: stillPending.login, status: pendingText });
+      passed('desktop exits with a sign-in still pending');
     }
     if (mode === 'failed') {
-      check(started.state !== 'connected', `Failed rehearsal needs a disconnected subscription: ${started.state}`);
+      // 上一次运行在挂起登录中退出：重启后必须归位成未连接（不动世代与身份），否则登录按钮会被禁用。
+      check(started.state === 'not_connected', `A restarted desktop must reconcile an orphaned pending sign-in: ${JSON.stringify({ state: started.state, generation: started.generation })}`);
+      const reconciledText = await waitStatus(text => text.includes('login=idle'));
+      record('reconciled', { state: started.state, generation: started.generation, identity: started.identity ?? null, status: reconciledText });
       const pending = await startLogin();
       const failed = await wait(async () => { const item = await subscriptionView(); return item?.login?.stage === 'failed' ? item : null; }, 'failed login');
       check(Boolean(failed.login.error), `A failed login must report an error: ${JSON.stringify(failed.login)}`);
@@ -143,6 +151,7 @@
       check(view.login.stage === 'failed', `The backend snapshot must report the failure: ${JSON.stringify(view.login)}`);
       record('failed', { stage: failed.login.stage, error: failed.login.error, generation: failed.generation, status: failedText, row: failedRow.slice(-600), snapshot: JSON.stringify(view) });
       passed('a failed sign-in is reported in the row and the backend snapshot');
+      passed('a restarted desktop reconciles the orphaned pending sign-in and can sign in again');
     }
   };
   try {
