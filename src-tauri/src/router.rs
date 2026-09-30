@@ -71,6 +71,57 @@ pub fn validate_rule(config: &AppConfig, rule: &crate::config::RouteRule) -> Res
     Ok(())
 }
 
+/// 服务商是否为订阅服务商：订阅模型的资格与停用由账号目录与用户配置分别决定。
+pub(crate) fn is_subscription_model(config: &AppConfig, model: &Model) -> bool {
+    config
+        .providers
+        .iter()
+        .find(|provider| provider.id == model.provider_id)
+        .is_some_and(crate::subscription::is_subscription_provider)
+}
+
+/// 路由规则的候选判定：显式 `model_ids` 总是候选；`all_models` 只扩到 API 模型。
+/// 「订阅模型不进全部启用模型集合」：上游目录随时可能整批变化，隐含选中它们等于替用户做决定；
+/// 订阅模型参与路由的唯一途径是显式 `model_ids`。
+pub(crate) fn rule_includes_model(
+    config: &AppConfig,
+    rule: &crate::config::RouteRule,
+    model: &Model,
+) -> bool {
+    if rule.model_ids.iter().any(|candidate| candidate == &model.id) {
+        return true;
+    }
+    rule.strategy == "jev" && rule.all_models && !is_subscription_model(config, model)
+}
+
+/// 显式固定直调的目标：`autojev/model/<标识>`、`model/<标识>`、`<provider>/<model_id>` 或内部标识。
+/// 这些路径不因取消选择被拒；只有自动候选集合要求 `selected`。
+fn pinned_model<'a>(config: &'a AppConfig, input: &RoutePreviewInput) -> Option<&'a Model> {
+    let requested = input.requested_model.as_deref()?.trim();
+    let bare = requested.strip_prefix("autojev/").unwrap_or(requested);
+    if bare.is_empty() || bare == "auto" {
+        return None;
+    }
+    if let Some(id) = bare.strip_prefix("model/") {
+        return config.models.iter().find(|model| model.id == id).or_else(|| {
+            config
+                .models
+                .iter()
+                .find(|model| format!("{}/{}", model.provider_id, model.model_id) == id)
+                .or_else(|| config.models.iter().find(|model| model.model_id == id))
+        });
+    }
+    // 路由 ID 走候选集合，不属于固定直调。
+    if bare.starts_with("route/") || config.routes.iter().any(|rule| rule.id == bare) {
+        return None;
+    }
+    config.models.iter().find(|model| {
+        model.id == bare
+            || model.model_id == bare
+            || format!("{}/{}", model.provider_id, model.model_id) == bare
+    })
+}
+
 // Saved routes may still reference deleted models. Runtime routing already excludes
 // these IDs; connection validation must use the same surviving candidate set.
 pub fn validate_available_rule(config: &AppConfig, rule: &crate::config::RouteRule) -> Result<()> {
@@ -78,7 +129,7 @@ pub fn validate_available_rule(config: &AppConfig, rule: &crate::config::RouteRu
     let mut seen = std::collections::HashSet::new();
     effective.model_ids.retain(|id| config.models.iter().any(|m| &m.id == id) && seen.insert(id.clone()));
     effective.model_settings.retain(|id, _| effective.model_ids.contains(id));
-    if !rule.enabled || !config.models.iter().any(|model| model.enabled && effective.includes_model(&model.id)
+    if !rule.enabled || !config.models.iter().any(|model| model.enabled && rule_includes_model(config, &effective, model)
         && config.providers.iter().any(|provider| provider.id == model.provider_id && provider.enabled
             && crate::protocol::Protocol::upstream(model, provider).is_ok())) {
         return Err(anyhow!("No compatible enabled candidate for this route"));
@@ -135,7 +186,7 @@ pub async fn decide(config: &AppConfig, input: &RoutePreviewInput, client: &Clie
     let rule = config.routes.iter().find(|r| r.id == id && r.enabled)
         .ok_or_else(|| anyhow!("Route is unavailable: {id}"))?;
     let mut scoped = config.clone();
-    scoped.models.retain(|m| rule.includes_model(&m.id));
+    scoped.models.retain(|m| rule_includes_model(config, rule, m));
     if rule.strategy == "jev" {
         if let Some(policy) = &rule.automatic_policy { scoped.policy.prefer_local = policy.prefer_local; scoped.policy.decision_preference = policy.decision_preference.clone(); scoped.policy.savings_baseline_model_id = policy.savings_baseline_model_id.clone(); }
     }
@@ -327,10 +378,13 @@ async fn decide_global(
 
 fn eligible_models(config: &AppConfig, input: &RoutePreviewInput) -> Vec<(Model, Provider)> {
     let protocol = crate::protocol::Protocol::parse(&input.endpoint).ok();
+    let pinned = pinned_model(config, input).map(|model| model.id.clone());
     config
         .models
         .iter()
         .filter(|model| model.enabled && (!input.requires_vision || model.supports_vision))
+        // 取消选择只移出自动候选；显式固定直调的模型仍按原 ID 放行（停用仍然禁止一切调用）。
+        .filter(|model| model.selected || Some(&model.id) == pinned.as_ref())
         // 订阅准入：未连接、未验证能力或缺额度依据的订阅模型不进入候选。
         .filter(|model| protocol.is_some_and(|protocol| crate::subscription::generation_ready(config, model, protocol)))
         .filter_map(|model| {
@@ -560,7 +614,7 @@ pub(crate) fn balanced_session_is_slow(config: &AppConfig, input: &RoutePreviewI
     let mut scoped = config.clone();
     if let Some(policy) = &rule.automatic_policy { scoped.policy = policy.clone(); }
     if decision_preference(&scoped) != "balanced" { return false; }
-    scoped.models.retain(|m| rule.includes_model(&m.id));
+    scoped.models.retain(|m| rule_includes_model(config, rule, m));
     let eligible = eligible_models(&scoped,input);
     let Ok((preferred, provider)) = select_balanced(&scoped,&eligible,input,desired_tier(classify(input).score)) else { return false; };
     if preferred.id == current.id { return false; }
@@ -898,6 +952,55 @@ mod rule_tests {
     }
 
     #[tokio::test]
+    async fn unselected_models_leave_automatic_candidates_but_keep_the_direct_binding() {
+        let (mut config, input) = setup("round_robin");
+        let second = config.models[1].id.clone();
+        config.models[1].selected = false;
+        // 自动候选只剩已选模型。
+        assert_eq!(decide(&config, &input, &Client::new(), None).await.unwrap().model.id, config.models[0].id);
+        // 显式固定直调（原 ID）在其它条件满足时仍然放行。
+        let mut pinned = config.clone();
+        pinned.models.retain(|model| model.id == second);
+        let mut pinned_input = input.clone();
+        pinned_input.requested_model = Some(format!("autojev/model/{second}"));
+        assert_eq!(decide(&pinned, &pinned_input, &Client::new(), None).await.unwrap().model.id, second);
+        // 候选全部取消选择时，路由没有可派发候选。
+        config.models[0].selected = false;
+        assert!(decide(&config, &input, &Client::new(), None).await.is_err());
+    }
+
+    #[test]
+    fn subscription_models_join_a_route_only_through_explicit_candidates() {
+        let mut config = AppConfig::default();
+        let provider = Provider {
+            preset: String::new(), api_type: String::new(), test_model: String::new(),
+            id: "grok".into(), name: "Grok".into(), kind: ProviderKind::GrokSubscription,
+            base_url: String::new(), enabled: true, has_api_key: false,
+        };
+        config.providers.push(provider.clone());
+        let mut subscription_model = config.models[0].clone();
+        subscription_model.id = "grok-model".into();
+        subscription_model.provider_id = provider.id.clone();
+        subscription_model.model_id = "grok-4".into();
+        config.models.push(subscription_model.clone());
+        let all_models = RouteRule { all_models: true, automatic_policy: None, model_settings: Default::default(),
+            id: "everything".into(), name: "Everything".into(), strategy: "jev".into(), model_ids: Vec::new(), enabled: true };
+        // 「全部启用模型」只覆盖 API 模型：订阅模型不会被隐含选中。
+        assert!(!rule_includes_model(&config, &all_models, &subscription_model));
+        assert!(rule_includes_model(&config, &all_models, &config.models[0]));
+        // 显式 model_ids 才是订阅模型参与路由的唯一途径。
+        let explicit = RouteRule { all_models: false, model_ids: vec!["grok-model".into()], ..all_models.clone() };
+        assert!(rule_includes_model(&config, &explicit, &subscription_model));
+        assert!(!rule_includes_model(&config, &explicit, &config.models[0]));
+        // 只有订阅模型的全部模型路由连不上（没有候选）；显式候选则可以。
+        let mut only_subscription = config.clone();
+        only_subscription.models = vec![subscription_model.clone()];
+        only_subscription.models[0].api_type = "chat_completions".into();
+        assert!(validate_available_rule(&only_subscription, &all_models).is_err());
+        assert!(validate_available_rule(&only_subscription, &explicit).is_ok());
+    }
+
+    #[tokio::test]
     async fn balanced_prefers_measured_fast_image_model_and_refreshes_slow_session() {
         let (mut config, mut input)=setup("jev");
         config.policy.decision_preference="balanced".into();
@@ -1012,7 +1115,7 @@ mod rule_tests {
         assert_eq!(decide(&config,&input,&client,None).await.unwrap().model.id,config.models[1].id);
         let mut legacy=serde_json::to_value(&config.routes[0]).unwrap();legacy.as_object_mut().unwrap().remove("all_models");
         let restored:RouteRule=serde_json::from_value(legacy).unwrap();
-        assert!(!restored.all_models);assert!(!restored.includes_model(&config.models[0].id));
+        assert!(!restored.all_models);assert!(!rule_includes_model(&config, &restored, &config.models[0]));
     }
 
     #[tokio::test]

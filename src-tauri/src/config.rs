@@ -6,6 +6,8 @@ use rusqlite::{Connection, OptionalExtension};
 use uuid::Uuid;
 
 fn default_tools() -> bool { true }
+/// 旧配置与 API 模型默认已选：迁移不得把既有模型变成未选。
+fn default_selected() -> bool { true }
 
 pub const DEFAULT_PORT: u16 = 9527;
 pub const DEV_PORT: u16 = 9526;
@@ -56,6 +58,9 @@ pub struct Model {
     pub name: String,
     pub tier: ModelTier,
     pub enabled: bool,
+    /// 用户是否把该模型列入模型列表与自动候选。取消选择不禁止原模型标识的合规直调，停用才禁止调用。
+    #[serde(default = "default_selected")]
+    pub selected: bool,
     #[serde(default = "default_tools")]
     pub supports_tools: bool,
     pub supports_vision: bool,
@@ -138,12 +143,6 @@ pub struct RouteRule {
     pub enabled: bool,
 }
 
-impl RouteRule {
-    pub fn includes_model(&self, id: &str) -> bool {
-        (self.strategy == "jev" && self.all_models) || self.model_ids.iter().any(|candidate| candidate == id)
-    }
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AppConfig {
     #[serde(skip)]
@@ -171,6 +170,10 @@ pub struct AppConfig {
     /// 订阅服务商的活动连接，按服务商标识索引：每家一个，证据绑定连接世代。
     #[serde(default)]
     pub subscriptions: std::collections::HashMap<String, crate::subscription::Connection>,
+    /// 订阅目录：按服务商保存上游已核实模型目录与账号绑定资格。用户的选择／停用保存在 `models` 行上，
+    /// 因此退出或换号只作废资格，不重建标识、也不丢失配置。
+    #[serde(default)]
+    pub subscription_catalogs: std::collections::HashMap<String, crate::subscription_catalog::ProviderCatalog>,
     pub install_id: String,
     pub port: u16,
     pub providers: Vec<Provider>,
@@ -193,6 +196,7 @@ impl Default for AppConfig {
             custom_agents: Vec::new(),
             routes: Vec::new(),
             subscriptions: Default::default(),
+            subscription_catalogs: Default::default(),
             install_id: Uuid::new_v4().to_string(),
             port: DEFAULT_PORT,
             providers: vec![
@@ -224,6 +228,7 @@ impl Default for AppConfig {
                     name: "Qwen 3 Coder Flash".into(),
                     tier: ModelTier::Fast,
                     enabled: true,
+                    selected: true,
                     supports_tools: true,
                     supports_vision: false,
                     supports_reasoning: false,
@@ -239,6 +244,7 @@ impl Default for AppConfig {
                     name: "Claude Sonnet 4".into(),
                     tier: ModelTier::Strong,
                     enabled: true,
+                    selected: true,
                     supports_tools: true,
                     supports_vision: true,
                     supports_reasoning: true,

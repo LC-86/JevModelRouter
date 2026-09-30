@@ -353,11 +353,14 @@ fn evaluate(
     }
     let connection = connection_check(config, provider)?;
     let evidence = evidence_check(provider, connection)?;
-    if !evidence.models.iter().any(|entry| entry.model_id == model_id && entry.eligible) {
+    // 资格只看账号目录：同一账号同一世代的读取失败仍算合格（网络失败 ≠ 被移除）。
+    // 只读证据里的 `eligible` 是当次读取的原始结果，不再单独构成调用依据。
+    let eligibility = crate::subscription_catalog::eligibility(config, &provider.id, model_id);
+    if !eligibility.is_eligible() {
         return Err(Denial::new(
-            "model_not_eligible",
+            eligibility.code().unwrap_or("model_unqualified"),
             DenialFamily::NotEligible,
-            format!("{} does not list {model_id} as eligible for this account.", label(provider)),
+            format!("{} cannot use {model_id}: {}.", label(provider), eligibility.reason()),
             "Refresh the directory, or pick a model this account can use.".into(),
         ));
     }
@@ -383,8 +386,14 @@ pub fn admit_model(config: &AppConfig, model: &Model, provider: &Provider, proto
 }
 
 /// 没有模型记录的目标（例如服务商弹窗里的测试模型）使用同一套连接、资格、能力与额度规则。
+/// 目标若已有对应模型行（模型测试/测速入口也会走到这里），停用优先于资格：禁止一切调用。
 pub fn admit_target(config: &AppConfig, provider: &Provider, model_id: &str, protocol: Protocol) -> Result<(), Denial> {
-    evaluate(config, provider, None, model_id, protocol)
+    let model_id = model_id.trim();
+    let model = config
+        .models
+        .iter()
+        .find(|model| model.provider_id == provider.id && model.model_id == model_id);
+    evaluate(config, provider, model, model_id, protocol)
 }
 
 /// 自动选路用的过滤条件：被拒绝的订阅模型不进入候选。
@@ -394,6 +403,24 @@ pub fn generation_ready(config: &AppConfig, model: &Model, protocol: Protocol) -
         .iter()
         .find(|provider| provider.id == model.provider_id)
         .is_some_and(|provider| admit_model(config, model, provider, protocol).is_ok())
+}
+
+/// 模型列表（公共目录、应用内选择、Agent 可选列表）的展示条件：已选、未停用、服务商启用，
+/// 且订阅模型在当前账号与世代下资格合格。取消选择只影响列表与自动候选；显式原 ID 直调不经过这里。
+pub fn catalog_listed(config: &AppConfig, model: &Model) -> bool {
+    if !model.selected || !model.enabled {
+        return false;
+    }
+    let Some(provider) = config.providers.iter().find(|provider| provider.id == model.provider_id) else {
+        return false;
+    };
+    if !provider.enabled {
+        return false;
+    }
+    if !is_subscription_provider(provider) {
+        return true;
+    }
+    crate::subscription_catalog::eligibility(config, &provider.id, &model.model_id).is_eligible()
 }
 
 /// 连接级拒绝原因，供界面在服务商行上直接显示。
@@ -656,6 +683,7 @@ async fn pending_attempt(
 }
 
 /// 只在新世代仍是当前世代时绑定已核实身份；证据必须重新读取，不沿用旧账号。
+/// 身份改绑同时作废账号目录资格：保留稳定标识、选择与停用，等重新核对再恢复资格。
 fn bind_identity(store: &ConfigStore, provider_id: &str, generation: u64, identity: &str) -> Result<(), String> {
     store
         .update(|config| {
@@ -666,6 +694,7 @@ fn bind_identity(store: &ConfigStore, provider_id: &str, generation: u64, identi
             connection.state = ConnectionState::Connected;
             connection.identity = Some(identity.to_owned());
             connection.evidence = None;
+            crate::subscription_catalog::invalidate_account(config, provider_id);
         })
         .map_err(|error| error.to_string())
 }
@@ -870,12 +899,17 @@ pub async fn logout(
                 config.subscriptions.insert(provider_id.to_owned(), Connection::default());
                 return 1;
             }
-            let connection = config.subscriptions.get_mut(provider_id).expect("checked above");
-            connection.generation += 1;
-            let generation = connection.generation;
-            connection.state = ConnectionState::NotConnected;
-            connection.identity = None;
-            connection.evidence = None;
+            let generation = {
+                let connection = config.subscriptions.get_mut(provider_id).expect("checked above");
+                connection.generation += 1;
+                let generation = connection.generation;
+                connection.state = ConnectionState::NotConnected;
+                connection.identity = None;
+                connection.evidence = None;
+                generation
+            };
+            // 退出后旧账号的目录资格整体作废：保留稳定标识、选择与停用，等重核再恢复。
+            crate::subscription_catalog::invalidate_account(config, provider_id);
             generation
         })
         .map_err(|error| error.to_string())?;
@@ -1073,7 +1107,7 @@ pub fn sync_provider(config: &mut AppConfig, provider_id: &str, kind: &ProviderK
     }
 }
 
-/// 服务商标识重命名时迁移连接，保留世代与已核实身份。
+/// 服务商标识重命名时迁移连接，保留世代与已核实身份；订阅目录随标识一起迁移。
 pub fn rename_provider(config: &mut AppConfig, old_id: &str, new_id: &str) {
     if old_id == new_id {
         return;
@@ -1085,11 +1119,13 @@ pub fn rename_provider(config: &mut AppConfig, old_id: &str, new_id: &str) {
         }
         config.subscriptions.insert(new_id.to_owned(), connection);
     }
+    crate::subscription_catalog::rename_provider(config, old_id, new_id);
 }
 
-/// 删除服务商时一并丢弃其连接与证据。
+/// 删除服务商时一并丢弃其连接、证据与订阅目录。
 pub fn forget_provider(config: &mut AppConfig, provider_id: &str) {
     config.subscriptions.remove(provider_id);
+    crate::subscription_catalog::forget_provider(config, provider_id);
 }
 
 // CHUNK-6
@@ -1137,6 +1173,8 @@ pub async fn refresh(store: &ConfigStore, provider_id: &str) -> Result<Connectio
                     if let Some(evidence) = connection.evidence.as_mut().filter(|evidence| evidence.generation == generation) {
                         evidence.quota = QuotaEvidence { state: EvidenceState::Failed, source: None, observed_at: None };
                     }
+                    // 同一账号同一世代的读取失败：保留已核实目录项，只标陈旧，绝不当作被移除。
+                    crate::subscription_catalog::mark_stale(config, provider_id);
                 })
                 .map_err(|save| save.to_string())?;
             return Err(error);
@@ -1147,29 +1185,60 @@ pub async fn refresh(store: &ConfigStore, provider_id: &str) -> Result<Connectio
         if !config.providers.iter().any(|provider| provider.id == provider_id && is_subscription_provider(provider)) {
             return Err("The subscription provider was removed while refreshing".into());
         }
-        let connection = config.subscriptions.entry(provider_id.to_owned()).or_default();
-        if connection.generation != generation {
+        if config.subscriptions.get(provider_id).is_some_and(|connection| connection.generation != generation) {
             return Err("The connection changed while refreshing; the read-only result was discarded".into());
         }
         let identity = status.identity.filter(|identity| !identity.trim().is_empty());
-        let capabilities = connection
-            .current_evidence()
-            .map(|evidence| evidence.capabilities.clone())
-            .unwrap_or_default();
-        connection.state = status.state;
-        connection.identity = identity.clone();
-        connection.evidence = Some(Evidence {
-            generation,
-            account: identity,
-            helper_version: status.helper_version,
-            account_path: status.account_path,
-            models,
-            capabilities,
-            quota,
-        });
-        Ok(connection.clone())
+        let observed_at = chrono::Utc::now().to_rfc3339();
+        let connection = {
+            let connection = config.subscriptions.entry(provider_id.to_owned()).or_default();
+            let capabilities = connection
+                .current_evidence()
+                .map(|evidence| evidence.capabilities.clone())
+                .unwrap_or_default();
+            connection.state = status.state;
+            connection.identity = identity.clone();
+            connection.evidence = Some(Evidence {
+                generation,
+                account: identity.clone(),
+                helper_version: status.helper_version,
+                account_path: status.account_path,
+                models: models.clone(),
+                capabilities,
+                quota,
+            });
+            connection.clone()
+        };
+        // 权威目录核对：账号用已核实身份，世代用当前世代；新增模型建档且默认未选，
+        // 本次目录中不存在的已核实项标移除。用户的选择与停用不因核对改变。
+        if status.state == ConnectionState::Connected {
+            if let Some(account) = identity.as_deref() {
+                crate::subscription_catalog::reconcile(
+                    config,
+                    provider_id,
+                    account,
+                    generation,
+                    &models,
+                    Some(&observed_at),
+                );
+            }
+        }
+        Ok(connection)
     })
     .map_err(|error| error.to_string())?
+}
+
+/// 订阅目录行：稳定标识（`model_id` 为上游身份、`internal_id` 为内部标识）与用户配置分开表达。
+/// 选择与停用是用户配置，可用性与资格来自账号目录；界面按这三者分别展示。
+#[derive(Clone, Debug, Serialize)]
+pub struct SubscriptionCatalogView {
+    pub model_id: String,
+    pub name: Option<String>,
+    pub internal_id: String,
+    pub availability: crate::subscription_catalog::Availability,
+    pub eligibility: crate::subscription_catalog::Eligibility,
+    pub selected: bool,
+    pub disabled: bool,
 }
 
 /// 界面视图：每家订阅服务商的实际状态、只读证据与当前拒绝原因。
@@ -1185,6 +1254,8 @@ pub struct SubscriptionView {
     pub models: Vec<DiscoveredModel>,
     pub capabilities: Vec<Capability>,
     pub quota: QuotaEvidence,
+    /// 订阅目录行：按服务商取全部已建档模型，逐行给出当前账号与世代下的资格。
+    pub catalog: Vec<SubscriptionCatalogView>,
     pub denial: Option<Denial>,
     pub adapter_available: bool,
     /// 登录会话（内存态）：阶段、挂起链接、尝试序号与绑定世代。
@@ -1204,6 +1275,29 @@ pub fn views(config: &AppConfig, adapter_available: bool, sessions: &SessionStat
             let connection = config.subscriptions.get(&provider.id).cloned().unwrap_or_default();
             let evidence = connection.current_evidence();
             let session = sessions.session(&provider.id);
+            let known = crate::subscription_catalog::catalog(config, &provider.id);
+            // 目录视图按模型行组装：选择/停用来自用户配置，可用性与资格来自账号目录。
+            let catalog: Vec<_> = crate::subscription_catalog::models(config, &provider.id)
+                .into_iter()
+                .map(|model| {
+                    let entry = known.and_then(|known| known.entry(&model.model_id));
+                    SubscriptionCatalogView {
+                        model_id: model.model_id.clone(),
+                        name: entry
+                            .and_then(|entry| entry.name.clone())
+                            .or_else(|| (!model.name.is_empty()).then(|| model.name.clone())),
+                        internal_id: model.id.clone(),
+                        availability: entry.map(|entry| entry.availability).unwrap_or_default(),
+                        eligibility: crate::subscription_catalog::eligibility(
+                            config,
+                            &provider.id,
+                            &model.model_id,
+                        ),
+                        selected: model.selected,
+                        disabled: !model.enabled,
+                    }
+                })
+                .collect();
             // 适配器不支持这类服务商时，如实报 helper 不可用：不借用其它服务商的进程信息。
             let supported = sessions.supports(&provider.id);
             SubscriptionView {
@@ -1217,6 +1311,7 @@ pub fn views(config: &AppConfig, adapter_available: bool, sessions: &SessionStat
                 models: evidence.map(|evidence| evidence.models.clone()).unwrap_or_default(),
                 capabilities: evidence.map(|evidence| evidence.capabilities.clone()).unwrap_or_default(),
                 quota: evidence.map(|evidence| evidence.quota.clone()).unwrap_or_default(),
+                catalog,
                 denial: connection_denial(config, provider),
                 adapter_available,
                 login: SubscriptionLoginView {
@@ -1277,6 +1372,7 @@ mod admission_tests {
             name: "Fixture".into(),
             tier: ModelTier::Balanced,
             enabled: true,
+            selected: true,
             supports_tools: true,
             supports_vision: false,
             supports_reasoning: false,
@@ -1288,27 +1384,56 @@ mod admission_tests {
 
     /// 一个已核实到可派发程度的 Codex 连接；各用例只改动其中一项。
     fn connected(config: &mut AppConfig) {
-        let connection = config.subscriptions.entry(FIXTURE_PROVIDER.to_owned()).or_default();
-        let generation = connection.generation;
-        connection.state = ConnectionState::Connected;
-        connection.identity = Some("fixture@example.invalid".into());
-        connection.evidence = Some(Evidence {
+        let models = vec![DiscoveredModel { model_id: "fixture-model".into(), name: None, eligible: true }];
+        let (identity, generation) = {
+            let connection = config.subscriptions.entry(FIXTURE_PROVIDER.to_owned()).or_default();
+            let generation = connection.generation;
+            connection.state = ConnectionState::Connected;
+            connection.identity = Some("fixture@example.invalid".into());
+            connection.evidence = Some(Evidence {
+                generation,
+                account: connection.identity.clone(),
+                helper_version: Some("fixture-helper-1.0".into()),
+                account_path: Some("/tmp/fixture-account".into()),
+                models: models.clone(),
+                capabilities: vec![Capability {
+                    model_id: "fixture-model".into(),
+                    protocol: protocol_key(Protocol::Chat).into(),
+                    status: CapabilityStatus::Verified,
+                }],
+                quota: QuotaEvidence {
+                    state: EvidenceState::Available,
+                    source: Some("fixture".into()),
+                    observed_at: Some("2026-09-30T00:00:00Z".into()),
+                },
+            });
+            (connection.identity.clone().unwrap(), generation)
+        };
+        // 账号目录是资格来源：已核实身份与当前世代下核对一次，模型才有调用资格。
+        crate::subscription_catalog::reconcile(
+            config,
+            FIXTURE_PROVIDER,
+            &identity,
             generation,
-            account: connection.identity.clone(),
-            helper_version: Some("fixture-helper-1.0".into()),
-            account_path: Some("/tmp/fixture-account".into()),
-            models: vec![DiscoveredModel { model_id: "fixture-model".into(), name: None, eligible: true }],
-            capabilities: vec![Capability {
-                model_id: "fixture-model".into(),
-                protocol: protocol_key(Protocol::Chat).into(),
-                status: CapabilityStatus::Verified,
-            }],
-            quota: QuotaEvidence {
-                state: EvidenceState::Available,
-                source: Some("fixture".into()),
-                observed_at: Some("2026-09-30T00:00:00Z".into()),
-            },
-        });
+            &models,
+            Some("2026-09-30T00:00:00Z"),
+        );
+    }
+
+    /// 以当前已核实身份与世代重新核对目录（用于制造撤销/移除等资格变化）。
+    fn reconcile_fixture(config: &mut AppConfig, discovered: &[DiscoveredModel]) {
+        let (identity, generation) = {
+            let connection = config.subscriptions.get(FIXTURE_PROVIDER).unwrap();
+            (connection.identity.clone().unwrap(), connection.generation)
+        };
+        crate::subscription_catalog::reconcile(
+            config,
+            FIXTURE_PROVIDER,
+            &identity,
+            generation,
+            discovered,
+            Some("2026-09-30T00:00:00Z"),
+        );
     }
 
     fn fixture(kind: ProviderKind) -> (AppConfig, Provider, Model) {
@@ -1325,6 +1450,11 @@ mod admission_tests {
         admit_model(config, model, provider, Protocol::Chat).expect_err("subscription generation must stay denied")
     }
 
+    /// 取当前配置里的 fixture 模型行：用例改动配置后必须重新取，避免用到旧快照。
+    fn stored_model(config: &AppConfig) -> Model {
+        config.models.iter().find(|model| model.provider_id == FIXTURE_PROVIDER).unwrap().clone()
+    }
+
     #[test]
     fn api_providers_keep_their_existing_behaviour() {
         let mut config = AppConfig::default();
@@ -1334,9 +1464,18 @@ mod admission_tests {
         assert!(admit_model(&config, &api_model, &api_provider, Protocol::Chat).is_ok());
         assert!(admit_target(&config, &api_provider, "unlisted-model", Protocol::Chat).is_ok());
         assert!(generation_ready(&config, &api_model, Protocol::Chat));
-        // 复制出一份未连接的订阅服务商也不影响 API 服务商本身。
+        // API 模型不因本票改变：默认已选、出现在模型列表里。
+        assert!(api_model.selected);
+        assert!(catalog_listed(&config, &api_model));
+        // 取消选择把 API 模型移出列表，但直调不受影响。
+        config.models[0].selected = false;
+        assert!(!catalog_listed(&config, &config.models[0]));
+        assert!(admit_model(&config, &api_model, &api_provider, Protocol::Chat).is_ok());
+        config.models[0].selected = true;
+        // 另一份未连接的订阅服务商不影响 API 服务商本身。
         config.providers.push(provider("codex", ProviderKind::CodexSubscription));
         assert!(admit_model(&config, &api_model, &api_provider, Protocol::Chat).is_ok());
+        assert!(catalog_listed(&config, &config.models[0]));
     }
 
     #[test]
@@ -1352,9 +1491,10 @@ mod admission_tests {
                 connected(config);
                 config.subscriptions.get_mut(FIXTURE_PROVIDER).unwrap().identity = None;
             })),
-            ("model_not_eligible", Box::new(|config: &mut AppConfig| {
+            ("model_unqualified", Box::new(|config: &mut AppConfig| {
                 connected(config);
-                config.subscriptions.get_mut("fixture-subscription").unwrap().evidence.as_mut().unwrap().models.clear();
+                // 身份/世代未变但资格被作废（退出、换号尚未重核）：稳定拒绝码是 model_unqualified。
+                crate::subscription_catalog::invalidate_account(config, FIXTURE_PROVIDER);
             })),
             ("capability_unverified", Box::new(|config: &mut AppConfig| {
                 connected(config);
@@ -1406,6 +1546,171 @@ mod admission_tests {
         // 未验证的第二协议仍然被拒绝，能力按协议分别判定。
         let denial = admit_model(&config, &model, &provider, Protocol::Responses).unwrap_err();
         assert_eq!(denial.code, "capability_unverified");
+    }
+
+    #[test]
+    fn eligibility_codes_come_from_the_account_catalog() {
+        let cases: Vec<(&str, Box<dyn Fn(&mut AppConfig)>)> = vec![
+            ("model_not_discovered", Box::new(|config: &mut AppConfig| {
+                connected(config);
+                // 目录里没有这个模型：视为本账号未发现。
+                crate::subscription_catalog::forget_provider(config, FIXTURE_PROVIDER);
+            })),
+            ("model_revoked", Box::new(|config: &mut AppConfig| {
+                connected(config);
+                // 上游列出该模型但当前账号无权限。
+                reconcile_fixture(config, &[DiscoveredModel { model_id: "fixture-model".into(), name: None, eligible: false }]);
+            })),
+            ("model_removed", Box::new(|config: &mut AppConfig| {
+                connected(config);
+                // 权威目录不再包含该模型。
+                reconcile_fixture(config, &[]);
+            })),
+            ("model_unqualified", Box::new(|config: &mut AppConfig| {
+                connected(config);
+                crate::subscription_catalog::invalidate_account(config, FIXTURE_PROVIDER);
+            })),
+        ];
+        for (expected, change) in cases {
+            let (mut config, provider, model) = fixture(ProviderKind::CodexSubscription);
+            change(&mut config);
+            let denial = denial(&config, &model, &provider);
+            assert_eq!(denial.code, expected, "unexpected code for {expected}");
+            assert_eq!(denial.family, DenialFamily::NotEligible);
+            assert!(!catalog_listed(&config, &model), "{expected} must not be listed");
+        }
+    }
+
+    #[test]
+    fn disabling_a_model_or_provider_denies_every_entry_including_direct_calls() {
+        let (mut config, provider, _) = fixture(ProviderKind::CodexSubscription);
+        connected(&mut config);
+        assert!(admit_model(&config, &stored_model(&config), &provider, Protocol::Chat).is_ok());
+        assert!(admit_target(&config, &provider, "fixture-model", Protocol::Chat).is_ok());
+        // 停用模型：显式原 ID 直调、测试/测速（按同一目标 ID）与自动候选全被拒。
+        config.models.iter_mut().find(|m| m.provider_id == FIXTURE_PROVIDER).unwrap().enabled = false;
+        assert_eq!(denial(&config, &stored_model(&config), &provider).code, "model_disabled");
+        assert_eq!(
+            admit_target(&config, &provider, "fixture-model", Protocol::Chat).unwrap_err().code,
+            "model_disabled"
+        );
+        assert!(!generation_ready(&config, &stored_model(&config), Protocol::Chat));
+        assert!(!catalog_listed(&config, &stored_model(&config)));
+        config.models.iter_mut().find(|m| m.provider_id == FIXTURE_PROVIDER).unwrap().enabled = true;
+        // 停用服务商：所有入口同样禁止。
+        config.providers.iter_mut().find(|p| p.id == provider.id).unwrap().enabled = false;
+        let disabled_provider = config.providers.iter().find(|p| p.id == provider.id).unwrap().clone();
+        assert_eq!(denial(&config, &stored_model(&config), &disabled_provider).code, "provider_disabled");
+        assert_eq!(
+            admit_target(&config, &disabled_provider, "fixture-model", Protocol::Chat).unwrap_err().code,
+            "provider_disabled"
+        );
+        assert!(!catalog_listed(&config, &stored_model(&config)));
+    }
+
+    #[test]
+    fn cancelling_selection_only_removes_the_model_from_lists_and_candidates() {
+        let (mut config, provider, _) = fixture(ProviderKind::CodexSubscription);
+        connected(&mut config);
+        config.models.iter_mut().find(|m| m.provider_id == FIXTURE_PROVIDER).unwrap().selected = false;
+        let model = stored_model(&config);
+        // 取消选择不禁止调用：显式原 ID 直调与测试入口在其它条件满足时仍然放行。
+        assert!(admit_model(&config, &model, &provider, Protocol::Chat).is_ok());
+        assert!(admit_target(&config, &provider, "fixture-model", Protocol::Chat).is_ok());
+        // 但不再出现在模型列表与自动候选里。
+        assert!(!catalog_listed(&config, &model));
+        assert!(!crate::subscription_catalog::selected_models(&config, FIXTURE_PROVIDER)
+            .iter()
+            .any(|entry| entry.id == model.id));
+        let view = views(&config, false, &SessionState::default()).pop().unwrap();
+        let row = view.catalog.iter().find(|row| row.internal_id == model.id).unwrap();
+        assert_eq!(row.model_id, "fixture-model");
+        assert!(!row.selected && !row.disabled);
+        assert_eq!(row.availability, crate::subscription_catalog::Availability::Available);
+        assert_eq!(row.eligibility, crate::subscription_catalog::Eligibility::Eligible);
+    }
+
+    #[test]
+    fn newly_discovered_models_are_materialized_unselected_with_a_stable_identity() {
+        let (mut config, provider, _) = fixture(ProviderKind::CodexSubscription);
+        // 该服务商还没有任何模型行：核对后建档。
+        config.models.clear();
+        connected(&mut config);
+        let model = config.models.iter().find(|entry| entry.provider_id == provider.id).unwrap().clone();
+        assert_eq!(model.model_id, "fixture-model");
+        assert!(!model.selected && model.enabled, "新发现模型默认未选但未停用");
+        let entry = crate::subscription_catalog::catalog(&config, FIXTURE_PROVIDER)
+            .and_then(|catalog| catalog.entry("fixture-model"))
+            .unwrap()
+            .clone();
+        assert_eq!(entry.internal_id, model.id, "目录内部标识必须等于对应模型行标识");
+        assert_eq!(
+            crate::subscription_catalog::eligibility(&config, FIXTURE_PROVIDER, "fixture-model"),
+            crate::subscription_catalog::Eligibility::Eligible
+        );
+        let view = views(&config, false, &SessionState::default()).pop().unwrap();
+        assert_eq!(view.catalog.len(), 1);
+        assert_eq!(view.catalog[0].internal_id, model.id);
+        assert!(!view.catalog[0].selected && !view.catalog[0].disabled);
+    }
+
+    #[test]
+    fn stale_qualification_from_the_same_account_is_still_eligible() {
+        let (mut config, provider, model) = fixture(ProviderKind::CodexSubscription);
+        connected(&mut config);
+        crate::subscription_catalog::mark_stale(&mut config, FIXTURE_PROVIDER);
+        let view = views(&config, false, &SessionState::default()).pop().unwrap();
+        let row = view.catalog.iter().find(|row| row.internal_id == model.id).unwrap();
+        assert_eq!(row.availability, crate::subscription_catalog::Availability::Stale);
+        assert_eq!(row.eligibility, crate::subscription_catalog::Eligibility::Stale);
+        // 网络失败不等于被移除：陈旧但同账号同世代的资格仍然成立。
+        assert!(crate::subscription_catalog::eligibility(&config, FIXTURE_PROVIDER, "fixture-model").is_eligible());
+        assert!(admit_model(&config, &model, &provider, Protocol::Chat).is_ok());
+        assert!(catalog_listed(&config, &model));
+    }
+
+    #[test]
+    fn account_and_provider_changes_keep_the_user_configuration_and_stable_ids() {
+        let (mut config, provider, model) = fixture(ProviderKind::CodexSubscription);
+        connected(&mut config);
+        let materialized = config
+            .models
+            .iter()
+            .find(|entry| entry.provider_id == FIXTURE_PROVIDER && entry.model_id == "fixture-model")
+            .unwrap()
+            .clone();
+        assert_eq!(materialized.id, model.id);
+        config.models.iter_mut().find(|entry| entry.id == model.id).unwrap().selected = false;
+        config.models.iter_mut().find(|entry| entry.id == model.id).unwrap().enabled = false;
+        // 退出/换号作废资格，但保留稳定标识与用户配置。
+        crate::subscription_catalog::invalidate_account(&mut config, FIXTURE_PROVIDER);
+        assert_eq!(
+            crate::subscription_catalog::eligibility(&config, FIXTURE_PROVIDER, "fixture-model"),
+            crate::subscription_catalog::Eligibility::AccountChanged
+        );
+        let kept = config.models.iter().find(|entry| entry.id == model.id).unwrap();
+        assert!(!kept.selected && !kept.enabled);
+        // 重核后按同一上游 ID 恢复资格，标识不变。
+        connected(&mut config);
+        let restored = config.models.iter().find(|entry| entry.model_id == "fixture-model").unwrap();
+        assert_eq!(restored.id, model.id);
+        assert_eq!(
+            crate::subscription_catalog::eligibility(&config, FIXTURE_PROVIDER, "fixture-model"),
+            crate::subscription_catalog::Eligibility::Eligible
+        );
+        assert!(provider.enabled);
+    }
+
+    #[test]
+    fn provider_rename_and_removal_move_the_catalog_with_the_connection() {
+        let (mut config, provider, _) = fixture(ProviderKind::CodexSubscription);
+        connected(&mut config);
+        assert!(crate::subscription_catalog::catalog(&config, FIXTURE_PROVIDER).is_some());
+        rename_provider(&mut config, &provider.id, "codex-renamed");
+        assert!(crate::subscription_catalog::catalog(&config, FIXTURE_PROVIDER).is_none());
+        assert!(crate::subscription_catalog::catalog(&config, "codex-renamed").is_some());
+        forget_provider(&mut config, "codex-renamed");
+        assert!(crate::subscription_catalog::catalog(&config, "codex-renamed").is_none());
     }
 
     #[test]
@@ -1648,6 +1953,21 @@ mod refresh_tests {
         assert_eq!(evidence.account_path.as_deref(), Some("/tmp/fixture-account"));
         assert_eq!(evidence.models.len(), 1);
         assert_eq!(evidence.quota.state, EvidenceState::Available);
+        // 成功刷新把权威目录写进目录状态：可用、绑定当前账号与世代。
+        let catalog = crate::subscription_catalog::catalog(&store.read(), "codex").cloned().unwrap();
+        assert_eq!(catalog.entries.len(), 1);
+        assert_eq!(catalog.entries[0].model_id, "fixture-model");
+        assert_eq!(catalog.entries[0].availability, crate::subscription_catalog::Availability::Available);
+        assert_eq!(catalog.entries[0].account.as_deref(), Some("fixture@example.invalid"));
+        assert_eq!(catalog.entries[0].confirmed_generation, Some(1));
+        assert_eq!(
+            crate::subscription_catalog::eligibility(&store.read(), "codex", "fixture-model"),
+            crate::subscription_catalog::Eligibility::Eligible
+        );
+        // 已有模型行的用户配置不因一次目录核对改变；目录条目的内部标识必须等于该模型行。
+        let existing = store.read().models.iter().find(|model| model.provider_id == "codex").unwrap().clone();
+        assert!(existing.selected && existing.enabled);
+        assert_eq!(catalog.entries[0].internal_id, existing.id);
         // 证据齐备后仍然缺能力记录：未验证能力不会因为一次只读刷新而被视为已验证。
         let (model, provider) = target(&store.read());
         assert_eq!(admit_model(&store.read(), &model, &provider, Protocol::Chat).unwrap_err().code, "capability_unverified");
@@ -1697,6 +2017,13 @@ mod refresh_tests {
         let evidence = connection.current_evidence().unwrap();
         assert_eq!(evidence.models.len(), 1);
         assert_eq!(evidence.quota.state, EvidenceState::Failed);
+        // 同一账号同一世代的读取失败只标陈旧：目录项保留，资格仍然成立。
+        let catalog = crate::subscription_catalog::catalog(&store.read(), "codex").cloned().unwrap();
+        assert_eq!(catalog.entries[0].availability, crate::subscription_catalog::Availability::Stale);
+        assert_eq!(
+            crate::subscription_catalog::eligibility(&store.read(), "codex", "fixture-model"),
+            crate::subscription_catalog::Eligibility::Stale
+        );
         let (model, provider) = target(&store.read());
         assert_eq!(admit_model(&store.read(), &model, &provider, Protocol::Chat).unwrap_err().code, "quota_failed");
     }
@@ -2299,6 +2626,89 @@ mod lifecycle_tests {
         assert!(switch_account(&store, "missing", &sessions).await.is_err());
     }
 
+    #[tokio::test]
+    async fn sign_out_and_rebinding_invalidate_qualification_but_keep_user_configuration() {
+        let adapter = LifecycleStub::new();
+        let (store, _directory, sessions) = fixture(adapter.clone()).await;
+        // 先建立一次已核实的账号资格。
+        store
+            .update(|config| {
+                let generation = {
+                    let connection = config.subscriptions.get_mut("codex").unwrap();
+                    connection.state = ConnectionState::Connected;
+                    connection.identity = Some("old@example.invalid".into());
+                    connection.generation
+                };
+                crate::subscription_catalog::reconcile(
+                    config,
+                    "codex",
+                    "old@example.invalid",
+                    generation,
+                    &[DiscoveredModel { model_id: "fixture-model".into(), name: None, eligible: true }],
+                    Some("2026-09-30T00:00:00Z"),
+                );
+            })
+            .unwrap();
+        // 用户在目录里取消选择并停用：退出与重核都不得改写这两个状态。
+        store
+            .update(|config| {
+                let model = config.models.iter_mut().find(|m| m.provider_id == "codex").unwrap();
+                model.selected = false;
+                model.enabled = false;
+                model.name = "Renamed".into();
+            })
+            .unwrap();
+        assert_eq!(
+            crate::subscription_catalog::eligibility(&store.read(), "codex", "fixture-model"),
+            crate::subscription_catalog::Eligibility::Eligible
+        );
+        // 退出：账号相关资格整体作废，稳定标识与用户配置保留。
+        logout(&store, "codex", &sessions).await.unwrap();
+        let config = store.read();
+        assert_eq!(
+            crate::subscription_catalog::eligibility(&config, "codex", "fixture-model"),
+            crate::subscription_catalog::Eligibility::AccountChanged
+        );
+        assert!(config.subscription_catalogs["codex"]
+            .entries
+            .iter()
+            .all(|entry| entry.availability == crate::subscription_catalog::Availability::Unknown));
+        let kept = config.models.iter().find(|m| m.provider_id == "codex").unwrap();
+        assert!(!kept.selected && !kept.enabled && kept.name == "Renamed");
+        drop(config);
+        // 身份改绑：新账号的资格必须重新核对，旧账号的目录证据不得沿用。
+        let generation = store.read().subscriptions["codex"].generation;
+        store
+            .update(|config| {
+                crate::subscription_catalog::reconcile(
+                    config,
+                    "codex",
+                    "new@example.invalid",
+                    generation,
+                    &[DiscoveredModel { model_id: "fixture-model".into(), name: None, eligible: true }],
+                    Some("2026-09-30T00:00:00Z"),
+                );
+            })
+            .unwrap();
+        assert_eq!(
+            crate::subscription_catalog::eligibility(&store.read(), "codex", "fixture-model"),
+            crate::subscription_catalog::Eligibility::AccountChanged,
+            "目录还绑定旧账号时不算当前账号的资格"
+        );
+        bind_identity(&store, "codex", generation, "new@example.invalid").unwrap();
+        let config = store.read();
+        assert_eq!(
+            crate::subscription_catalog::eligibility(&config, "codex", "fixture-model"),
+            crate::subscription_catalog::Eligibility::AccountChanged
+        );
+        assert!(config.subscription_catalogs["codex"]
+            .entries
+            .iter()
+            .all(|entry| entry.account.is_none() && entry.availability == crate::subscription_catalog::Availability::Unknown));
+        let kept = config.models.iter().find(|m| m.provider_id == "codex").unwrap();
+        assert!(!kept.selected && !kept.enabled);
+    }
+
     #[test]
     fn subscription_view_json_matches_the_frozen_shape() {
         let mut config = AppConfig::default();
@@ -2328,6 +2738,8 @@ mod lifecycle_tests {
         assert_eq!(json["helper"]["available"], false);
         assert_eq!(json["adapter_available"], false);
         assert_eq!(json["state"], "not_connected");
+        // 目录视图字段名冻结：前端与 lib.rs 快照都按 `catalog` 取。
+        assert!(json["catalog"].is_array());
         // 挂起登录 + 一次退出记录：字段名与取值都是冻结契约里的 snake_case。
         let mut sessions = SessionState::default();
         sessions.helper = HelperStatus {

@@ -26,7 +26,14 @@ export interface Model {
   model_id: string;
   name: string;
   tier: ModelTier;
+  /** 用户停用：禁止该模型的所有调用（含按原 ID 直调）。 */
   enabled: boolean;
+  /**
+   * 用户选择：进入模型列表、自动候选与 Agent 可选列表。
+   * 缺省视为 true（与后端 serde 默认一致，旧配置不因新增字段被清空）；
+   * 取消选择不禁止按原模型标识的合规直调，只有停用才禁止调用。
+   */
+  selected?: boolean;
   supports_tools: boolean;
   supports_vision: boolean;
   supports_reasoning: boolean;
@@ -89,6 +96,31 @@ export interface SubscriptionHelperView {
 export interface SubscriptionModel { model_id: string; name?: string | null; eligible: boolean }
 export interface SubscriptionCapability { model_id: string; protocol: string; status: SubscriptionCapabilityStatus }
 export interface SubscriptionQuota { state: SubscriptionEvidenceState; source?: string | null; observed_at?: string | null }
+
+/** 上游目录项的可用性：权威读取、读取失败、移除、撤销与未知互相区分。 */
+export type SubscriptionCatalogAvailability = 'available' | 'stale' | 'removed' | 'revoked' | 'unknown';
+/** 当前账号与连接世代下的资格；`eligible` 与 `stale` 仍构成资格，其余不可用。 */
+export type SubscriptionCatalogEligibility = 'eligible' | 'stale' | 'not_discovered' | 'removed' | 'revoked' | 'account_changed' | 'unknown';
+
+/**
+ * 已发现订阅模型的界面投影：发现身份与用户配置分开。
+ * `internal_id` 等于本地 `Model.id`，上游 ID 变化按新模型处理；
+ * `selected` / `disabled` 来自用户配置，`availability` / `eligibility` 来自账号与上游。
+ */
+export interface SubscriptionCatalogEntry {
+  /** 上游限定模型 ID：调用身份，不因显示名改变。 */
+  model_id: string;
+  /** 上游显示名：只用于展示。 */
+  name?: string | null;
+  /** 稳定内部标识，等于本地模型行的 `id`。 */
+  internal_id: string;
+  availability: SubscriptionCatalogAvailability;
+  eligibility: SubscriptionCatalogEligibility;
+  /** 用户是否把该模型列入模型列表与自动候选。 */
+  selected: boolean;
+  /** 用户是否停用该模型（停用禁止所有调用）。 */
+  disabled: boolean;
+}
 /** 准入拒绝：稳定 code、类别、原因与恢复动作。 */
 export interface SubscriptionDenial { code: string; family: string; message: string; recovery: string }
 /** 一家订阅服务商的实际状态、只读证据与当前拒绝原因。 */
@@ -101,6 +133,8 @@ export interface SubscriptionView {
   helper_version?: string | null;
   account_path?: string | null;
   models: SubscriptionModel[];
+  /** 已发现模型的目录投影；目录失败时保留已核实项。API 服务商不出现。 */
+  catalog?: SubscriptionCatalogEntry[];
   capabilities: SubscriptionCapability[];
   quota: SubscriptionQuota;
   denial?: SubscriptionDenial | null;
@@ -150,6 +184,11 @@ export interface AgentStatus {
   connected: boolean;
   config_path: string;
   detail: string;
+  /**
+   * 注入目录待同步：保存的目录与当前应用内选择不一致。
+   * 缺省视为 false。待同步只影响外部配置刷新，不推迟后端的撤销与停用生效。
+   */
+  catalog_pending_sync?: boolean;
 }
 
 export interface RouteEvent {

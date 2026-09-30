@@ -63,9 +63,12 @@ import { SearchSelect } from './components/search-select';
 import { BrandMark } from './components/brand-mark';
 import { rangeStart, summarize } from './lib/traffic';
 import {
-  capabilityLabel, connectionStateLabel, connectionStateTone, denialLabel, identityLabel, isSubscriptionKind,
-isSubscriptionProvider, localLogoutLabel, loginStageLabel, loginStageTone, modelCapability, protocolKey, quotaLabel,
-  remoteRevocationLabel, subscriptionActions, subscriptionAuthView, subscriptionReason, subscriptionStatusText, subscriptionView,
+  agentCatalogPendingSync, agentSelectableModels, availabilityLabel, capabilityLabel,
+  catalogModelRow, connectionStateLabel, connectionStateTone, denialLabel, eligibilityLabel, identityLabel,
+  isSubscriptionKind, isSubscriptionProvider, localLogoutLabel, loginStageLabel, loginStageTone, modelCapability,
+  modelListMembers, modelSelected, protocolKey, quotaLabel, remoteRevocationLabel, speedTestCandidates,
+  subscriptionActions, subscriptionAuthView, subscriptionCatalog, subscriptionReason, subscriptionStatusText,
+  subscriptionView, unselectedModels,
 } from './lib/subscription';
 import {
   beginSubscriptionLogin,
@@ -96,6 +99,7 @@ import type {
   DashboardSnapshot,
   Model,
   Provider,
+  SubscriptionCatalogEntry,
 } from './types';
 
 type Page = 'overview' | 'providers' | 'models' | 'router' | 'agents' | 'activity' | 'usage' | 'debug';
@@ -116,6 +120,7 @@ const EMPTY_MODEL: Model = {
   name: '',
   tier: 'balanced',
   enabled: true,
+  selected: true,
   supports_tools: true,
   supports_vision: false,
   supports_reasoning: false,
@@ -419,7 +424,9 @@ export default function App() {
 function Overview({ snapshot, go }: { snapshot: DashboardSnapshot; go: (page: Page) => void }) {
   const { t } = usePreferences();
   const providers = snapshot.providers.filter((provider) => provider.enabled);
-  const models = snapshot.models.filter((model) => model.enabled && providers.some((provider) => provider.id === model.provider_id));
+  // 未选模型不进入列表与计数；停用模型仍算列表成员，只是不参与路由。
+  const pool = modelListMembers(snapshot.models);
+  const models = pool.filter((model) => model.enabled && providers.some((provider) => provider.id === model.provider_id));
   const [today, setToday] = useState<{ requests: number; tokens: number } | null>(null);
   useEffect(() => {
     let disposed = false;
@@ -475,7 +482,7 @@ function Overview({ snapshot, go }: { snapshot: DashboardSnapshot; go: (page: Pa
     <section className="router-home-summary" aria-label={t('Overview')}>
       {([
         { page: 'providers', label: 'Providers', count: snapshot.providers.length, icon: Server },
-        { page: 'models', label: 'Models', count: snapshot.models.length, icon: Cpu },
+        { page: 'models', label: 'Models', count: pool.length, icon: Cpu },
         { page: 'router', label: 'Routes', count: snapshot.routes.length, icon: GitBranch },
         { page: 'agents', label: 'Agents', count: snapshot.agents.filter((agent) => agent.installed || agent.custom).length, icon: Bot },
         { page: 'activity', label: 'Requests today', count: today?.requests, icon: Activity },
@@ -534,6 +541,25 @@ function ProvidersPage({ snapshot, onAdd, onEdit, onDelete, onTest, onImport, on
   const [refreshing, setRefreshing] = useState<Record<string, boolean>>({});
   const [subscriptionBusy, setSubscriptionBusy] = useState<Record<string, SubscriptionAction | undefined>>({});
   const [subscriptionErrors, setSubscriptionErrors] = useState<Record<string, string>>({});
+  const [catalogBusy, setCatalogBusy] = useState<Record<string, boolean>>({});
+  // 目录行的选择/停用直接写回模型配置：复用 save_model，写回后以返回的快照为准刷新。
+  const toggleCatalogEntry = async (provider: Provider, entry: SubscriptionCatalogEntry, patch: { selected?: boolean; enabled?: boolean }) => {
+    const key = `${provider.id}:${entry.internal_id}`;
+    if (catalogBusy[key]) return;
+    const model = catalogModelRow(snapshot.models, entry);
+    if (!model) { onNotify(t('This catalog entry has no local model row yet; refresh the snapshot.'), true); return; }
+    setCatalogBusy((previous) => ({ ...previous, [key]: true }));
+    try {
+      onSnapshot(await saveModel({ ...model, ...patch }));
+      onNotify(t(patch.selected !== undefined
+        ? (patch.selected ? 'Model added to the model list' : 'Model removed from the model list')
+        : (patch.enabled ? 'Model enabled' : 'Model disabled')));
+    } catch (error) {
+      onNotify(error instanceof Error ? error.message : String(error), true);
+    } finally {
+      setCatalogBusy((previous) => { const next = { ...previous }; delete next[key]; return next; });
+    }
+  };
   const toggle = async (provider: Provider) => {
     if (toggling[provider.id]) return;
     setToggling((previous) => ({ ...previous, [provider.id]: true }));
@@ -611,6 +637,37 @@ function ProvidersPage({ snapshot, onAdd, onEdit, onDelete, onTest, onImport, on
           </tbody>
         </table>
         {snapshot.providers.length === 0 && <EmptyState icon={<Server />} title={t('No providers yet')} body={t('Add a provider or import from CC Switch or Termany.')} />}
+        {providers.filter((provider) => isSubscriptionProvider(provider)).map((provider) => {
+          const entries = subscriptionCatalog(subscriptionView(snapshot, provider.id));
+          if (!entries.length) return null;
+          return <section className="provider-catalog" key={provider.id} data-testid={`sub-catalog-${provider.id}`} aria-label={t('{provider} discovered models', { provider: provider.name })}>
+            <header><strong>{provider.name}</strong><span>{t('{count} discovered models', { count: entries.length })}</span></header>
+            <ul className="provider-catalog-list">
+              {entries.map((entry) => {
+                const key = `${provider.id}:${entry.internal_id}`;
+                const model = catalogModelRow(snapshot.models, entry);
+                const disabled = catalogBusy[key] === true || !model;
+                return <li className="provider-catalog-row" key={entry.internal_id} data-testid={`sub-catalog-entry-${provider.id}-${entry.internal_id}`}>
+                  <div className="provider-catalog-identity">
+                    <strong>{entry.name || entry.model_id}</strong>
+                    <code title={t('Upstream model ID')}>{entry.model_id}</code>
+                    <small>{t('Internal ID')}: {entry.internal_id}</small>
+                  </div>
+                  <div className="provider-catalog-badges">
+                    <span className={cx('provider-catalog-badge', entry.availability)}>{availabilityLabel(entry.availability, t)}</span>
+                    <span className={cx('provider-catalog-badge', entry.eligibility)}>{eligibilityLabel(entry.eligibility, t)}</span>
+                    <span className={cx('provider-catalog-badge', entry.disabled ? 'disabled' : entry.selected ? 'selected' : 'unselected')}>{t(entry.disabled ? 'Disabled' : entry.selected ? 'Selected' : 'Not selected')}</span>
+                  </div>
+                  <div className="provider-catalog-actions">
+                    <button type="button" className="button ghost small" data-testid={`sub-select-${provider.id}-${entry.internal_id}`} aria-pressed={entry.selected} disabled={disabled} onClick={() => void toggleCatalogEntry(provider, entry, { selected: !entry.selected })}>{t(entry.selected ? 'Remove from model list' : 'Add to model list')}</button>
+                    <button type="button" className="button ghost small" data-testid={`sub-enable-${provider.id}-${entry.internal_id}`} aria-pressed={!entry.disabled} disabled={disabled} onClick={() => void toggleCatalogEntry(provider, entry, { enabled: entry.disabled })}>{t(entry.disabled ? 'Enable model' : 'Disable model')}</button>
+                  </div>
+                  <small className="provider-catalog-note">{t('Deselecting keeps direct calls by the original model ID. Disabling blocks every call.')}</small>
+                </li>;
+              })}
+            </ul>
+          </section>;
+        })}
       </div>
     </div>
   );
@@ -666,13 +723,22 @@ function ModelsPage({ snapshot, onAdd, onEdit, onDelete, onChange, onNotify }: {
     speedTests.dismissError();
     setDismissedSpeedJob(true);
   }, [speedError, onNotify, t, speedTests.dismissError]);
-  const testable = snapshot.models.filter(m => m.enabled && snapshot.providers.some(p => p.id === m.provider_id && p.enabled));
+  // 模型列表只由「已选择」决定；测速候选另外要求未停用且服务商启用。
+  const pool = modelListMembers(snapshot.models);
+  const excluded = unselectedModels(snapshot.models);
+  const testable = speedTestCandidates(snapshot.models, snapshot.providers);
   const selectedCount = testable.filter(model => speedTests.selected.includes(model.id)).length;
   const [tests, setTests] = useState<Record<string, ProviderTestStatus>>({});
   const [toggling, setToggling] = useState<Record<string, boolean>>({});
   const toggle = async (model: Model) => {
     setToggling(previous => ({ ...previous, [model.id]: true }));
     try { onChange(await saveModel({ ...model, enabled: !model.enabled })); onNotify(t(model.enabled ? 'Model disabled' : 'Model enabled')); }
+    catch (error) { onNotify(t(String(error)), true); }
+    finally { setToggling(previous => ({ ...previous, [model.id]: false })); }
+  };
+  const reselect = async (model: Model) => {
+    setToggling(previous => ({ ...previous, [model.id]: true }));
+    try { onChange(await saveModel({ ...model, selected: true })); onNotify(t('Model added to the model list')); }
     catch (error) { onNotify(t(String(error)), true); }
     finally { setToggling(previous => ({ ...previous, [model.id]: false })); }
   };
@@ -697,7 +763,7 @@ function ModelsPage({ snapshot, onAdd, onEdit, onDelete, onChange, onNotify }: {
         <table className="provider-table models-table">
         <thead><tr><th className="model-speed-check"><label className="model-selection"><input autoComplete="off" autoCapitalize="none" ref={element => { if (element) element.indeterminate = selectedCount > 0 && selectedCount < testable.length; }} type="checkbox" aria-label={t("Select all enabled models")} disabled={!testable.length} checked={testable.length > 0 && selectedCount === testable.length} onChange={e => speedTests.select(e.target.checked ? testable.map(m => m.id) : [])}/></label></th><th>{t("MODEL")}</th><th>{t("Enabled status")}</th><th title={t('Time until the first content arrives. Lower is faster.') + ' ' + t('Output tokens per second after the first content. Higher is faster.')}>{t('First response / Output speed')}</th><th>{t("INPUT / OUTPUT")}</th><th>{t("Model information")}</th><th className="provider-actions-heading">{t("Actions")}</th></tr></thead>
         <tbody>
-        {snapshot.models.map((model) => {
+        {pool.map((model) => {
           const provider = snapshot.providers.find(p => p.id === model.provider_id);
           const modelHealth = health.find(h => h.model_id === model.id && h.state !== 'healthy');
           const subscription = isSubscriptionProvider(provider) ? subscriptionView(snapshot, model.provider_id) : undefined;
@@ -714,7 +780,11 @@ function ModelsPage({ snapshot, onAdd, onEdit, onDelete, onChange, onNotify }: {
           </tr>
         ); })}
         </tbody></table>
-        {snapshot.models.length === 0 && <EmptyState icon={<Cpu />} title={t("No models in the pool")} body={t("Add at least one model before starting the proxy.")} />}
+        {excluded.length > 0 && <div className="model-excluded-notice" role="status" data-testid="unselected-models-notice">
+          <div><strong>{t('{count} models are not selected', { count: excluded.length })}</strong><p>{t('Not selected models stay out of the model list, counts, speed tests and agent catalogs. Direct calls by the original model ID still work.')}</p></div>
+          <div className="model-excluded-list">{excluded.map((model) => <button key={model.id} type="button" className="button ghost small" disabled={toggling[model.id]} onClick={() => void reselect(model)}>{t('Add to model list')}: {model.name || model.model_id}</button>)}</div>
+        </div>}
+        {pool.length === 0 && <EmptyState icon={<Cpu />} title={t("No models in the pool")} body={t("Add at least one model before starting the proxy.")} />}
       </div>
     </div>
   );
@@ -747,17 +817,21 @@ function AgentsPage({ snapshot, onRefresh, onConnect, onRestore, onChange, onMan
     catch { setError(t('Could not save model and route selections.')); }
   }, [selections, t]);
   const agents = snapshot.agents.filter(agent => agent.custom || (agent.installed && agent.can_connect !== false));
-  const availableRoutes = snapshot.routes.filter(route => route.enabled && snapshot.models.some(m => ((route.strategy === 'jev' && route.all_models) || route.model_ids.includes(m.id)) && m.enabled && snapshot.providers.some(p => p.id === m.provider_id && p.enabled))).sort((a, b) => a.id.localeCompare(b.id, 'en'));
+  const availableRoutes = snapshot.routes.filter(route => route.enabled && snapshot.models.some(m => ((route.strategy === 'jev' && route.all_models) || route.model_ids.includes(m.id)) && m.enabled && modelSelected(m) && snapshot.providers.some(p => p.id === m.provider_id && p.enabled))).sort((a, b) => a.id.localeCompare(b.id, 'en'));
   const detect = async () => {
     setDetecting(true); setError('');
     try { await onRefresh(); } catch { setError(t('Could not detect agents. Try again.')); }
     finally { setDetecting(false); }
   };
+  // Agent 可选模型与测速候选同源：未选或停用的模型都不进注入目录。
+  const selectableModels = agentSelectableModels(snapshot.models, snapshot.providers);
   const availableBindings = new Set([
     ...availableRoutes.map(route => route.id),
-    ...snapshot.models.filter(model => model.enabled && snapshot.providers.some(provider => provider.id === model.provider_id && provider.enabled)).map(model => 'model/' + model.id),
+    ...selectableModels.map(model => 'model/' + model.id),
   ]);
   const savedSelections = (agent: DashboardSnapshot['agents'][number]) => selections[agent.id] ?? snapshot.agent_catalogs?.[agent.id]?.map(entry => entry.binding) ?? (agent.route_id ? [agent.route_id] : []);
+  /** 磁盘上的注入目录（默认项在前）；没有保存过目录时以本地选择为准。 */
+  const savedCatalogBindings = (agent: DashboardSnapshot['agents'][number]) => snapshot.agent_catalogs?.[agent.id]?.map(entry => entry.binding);
   const batchTargets = snapshot.agents.map(agent => ({ agent, chosen: availableAgentSelections(savedSelections(agent), availableBindings) }))
     .filter(({ agent, chosen }) => agent.connected && agent.installed && agent.can_connect !== false && chosen.length > 0);
   const injectAll = async () => {
@@ -796,7 +870,7 @@ function AgentsPage({ snapshot, onRefresh, onConnect, onRestore, onChange, onMan
           let selected = agent.route_id ?? '';
           const options = [
             ...availableRoutes.map(route => ({ value: route.id, label: route.id, keywords: route.name, group: t('Routes'), icon: <GitBranch size={18}/> })),
-            ...snapshot.models.filter(model => model.enabled && snapshot.providers.some(p => p.id === model.provider_id && p.enabled)).map(model => {
+            ...selectableModels.map(model => {
               const provider = snapshot.providers.find(p => p.id === model.provider_id)!;
               return { value: 'model/' + model.id, label: providerIdentifier(provider) + '/' + model.model_id, keywords: model.name + ' ' + provider.name, group: t('Models'), icon: <ProviderLogo id={providerPreset(provider)}/> };
             }).sort((a, b) => a.label.localeCompare(b.label, 'en', { sensitivity: 'base' }))
@@ -804,6 +878,9 @@ function AgentsPage({ snapshot, onRefresh, onConnect, onRestore, onChange, onMan
           const saved = savedSelections(agent);
           const chosen = availableAgentSelections(saved, availableBindings);
           const unavailable = saved.filter(binding => !availableBindings.has(binding));
+          // 保存目录与当前应用内选择不一致即待同步；后端停用/撤销不等待这里。
+          const savedCatalog = savedCatalogBindings(agent);
+          const pendingSync = agentCatalogPendingSync({ saved: savedCatalog ?? selections[agent.id] ?? [], chosen, pendingSync: agent.catalog_pending_sync });
           selected = chosen[0] ?? '';
           const allSelected = options.length > 0 && options.every(option => chosen.includes(option.value));
           const valid = options.some(option => option.value === selected) && chosen.includes(selected) && chosen.every(id => options.some(o => o.value === id));
@@ -833,6 +910,7 @@ function AgentsPage({ snapshot, onRefresh, onConnect, onRestore, onChange, onMan
               setSelections(previous => ({ ...previous, [agent.id]: next }));
             }} label={t(chosen.length ? 'Selected models / routes' : 'Not selected')} placeholder={t('Search models or routes…')} empty={t('No matching options')} disabled={connecting || activeAgent !== null || !options.length || agent.can_connect === false} options={options.map(o => o.value === chosen[0] ? { ...o, label: `${o.label} · ${t('Default model')}` } : o)}/>
               {unavailable.length > 0 && <small className="agent-selection-notice" role="status">{t('Unavailable selections excluded: {names}', { names: unavailable.map(binding => snapshot.models.find(model => 'model/' + model.id === binding)?.name ?? snapshot.routes.find(route => route.id === binding)?.name ?? snapshot.agent_catalogs?.[agent.id]?.find(entry => entry.binding === binding)?.name ?? binding).join(' · ') })}{' '}{t(chosen.length ? 'The first remaining selection is the default.' : 'Select a model or route before connecting.')}</small>}
+              {pendingSync && <small className="agent-selection-notice agent-pending-sync" role="status" data-testid={`agent-pending-sync-${agent.id}`}>{t('Pending sync: the saved catalog differs from the current selection. Reconnect to update the agent configuration.')}{' '}{t('Removals and revocations apply in the backend immediately; no external configuration refresh is needed.')}</small>}
             </div></td>
             <td><div className="row-actions">{agent.custom && <button className="icon-action" disabled={connecting || activeAgent !== null || agent.connected} title={t(agent.connected ? 'Disconnect the agent before editing its configuration' : 'Configure')} aria-label={t('Configure')} onClick={() => { setEditingCustom(agent); setAdding(true); }}><Settings2 size={15}/></button>}<button className="icon-action" disabled={connecting || activeAgent !== null} onClick={() => {
               const reason = !agent.installed ? 'Agent executable was not found. Detect again after installing it.' : agent.can_connect === false ? (agent.connection_note || 'Connection unavailable') : !selected ? 'Select a model or route before connecting.' : !valid ? 'Some selected models or routes are unavailable. Remove the unavailable selections or enable their models and providers.' : '';
