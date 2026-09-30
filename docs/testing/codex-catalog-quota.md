@@ -112,7 +112,7 @@
   界面显示“历史数据 · 最后成功更新 `<observed_at>`”，保留的桶数字不清零。
 - **首次读取即失败**（此前从未成功读过）→ `state=failed`、`history=false`、`observed_at=None`、`buckets` 为空；
   界面不得出现“历史数据”，也不得伪造 0。
-- 覆盖状态：首读失败分支由 `src-tauri/src/subscription.rs` 的 `refresh_tests` 单测覆盖（断言 `history=false`
+- 覆盖状态：首读失败分支由 `src-tauri/src/subscription/mod.rs` 的 `refresh_tests` 单测覆盖（断言 `history=false`
   且 `observed_at=None`）；隔离队列的首次读取是成功的 `multi`，因此端到端走的是“失败但保留历史”分支，
   首读失败分支端到端**未走**。
 
@@ -170,3 +170,25 @@ pnpm test:isolated
   `pnpm exec tsc --noEmit`、`pnpm build`、`pnpm release:check` 通过。
   `pnpm test:isolated` exit 0，六份原生 report 全部 `ok=true`（catalog 20 条）；
   替身只有允许的账号/只读 RPC，未发出生成 RPC；身份不完整期间未读取目录/额度。
+
+## PR #31 重叠刷新顺序保护与 main 合并
+
+- 每个 ConfigStore 内按 provider 登记递增刷新请求序号（仅内存态，不新增持久化字段）。
+  `refresh` 开始即登记；成功、身份不完整、状态 RPC 失败、明确未登录统一通过
+  `update_subscription_refresh`，在原子配置更新中校验请求仍为该 provider 的最新请求。
+  登记/提交共享短同步锁，没有任何配置锁或序号锁跨 await；异步读取仍可并行。
+  generation、identity、state、挂起登录与服务商存在性守卫继续生效。
+- 修复前 Head `b278151`：用 Notify 在适配器取得固定结果后暂停旧请求，让同账号、
+  同 generation、同 state 的新成功请求先落盘，再释放旧请求。
+  `cargo test --locked --manifest-path src-tauri/Cargo.toml --lib cannot_clobber_newer_recovery`
+  **0 passed / 3 failed**（身份不完整、RPC 失败、明确未登录）；未使用 sleep。
+- 修复后三项 **3 passed / 0 failed**；另覆盖旧成功不能覆盖新成功、旧成功不能复活
+  较新 helper 退出/换号，以及不同 provider 独立完成刷新。此前 helper 自行退出、历史恢复、
+  账号世代隔离测试保留。
+- 合入 main `7483567754f21939f0044a3022b62def6977b53a`（#30）：沿用 main 的模块拆分、
+  Grok 授权注入与重启归位/清理；配置构造加入请求序号初始化；App 与订阅工具函数进口合并，
+  保留 Grok 授权入口及 Codex 目录/额度/历史展示。两份 Grok 测试夹具仅补 catalog 默认值。
+- 合并后的代码：Rust **335 passed / 0 failed**，前端 **71 passed（12 files）**，
+  TypeScript、build、release 配置检查通过。首次原生隔离运行超时未产出 report；临时
+  回环步骤诊断下完整通过，未找到可重复故障；移除诊断后最终 `pnpm test:isolated` exit 0，六份 report 全部 ok=true，catalog 20 条。
+- 本轮仅修刷新顺序与必要合并兼容；不改变真实 OAuth、真实生成、额度探测或 #25/#26 人工范围。

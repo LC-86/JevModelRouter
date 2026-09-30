@@ -15,6 +15,7 @@ const MOCK: DashboardSnapshot = {
   routes: [],
   install_id: 'preview',
   subscriptions: [],
+  subscription_auth: [],
   proxy: { running: true, port: 9526, base_url: 'http://127.0.0.1:9526' },
   policy: {
     mode: 'auto',
@@ -326,6 +327,12 @@ export async function logoutSubscription(providerId: string): Promise<DashboardS
 export async function switchSubscriptionAccount(providerId: string): Promise<DashboardSnapshot> {
   if (!isTauri()) throw new Error('Open the desktop app to switch a subscription account.');
   return invoke('switch_subscription_account', { providerId });
+}
+
+/** 读取当前登录尝试的进度；迟到结果由后端判定为 Superseded，不写入任何状态。 */
+export async function pollSubscriptionLogin(providerId: string): Promise<DashboardSnapshot> {
+  if (!isTauri()) throw new Error('Open the desktop app to manage subscription authorization.');
+  return invoke('poll_subscription_login', { providerId });
 }
 
 

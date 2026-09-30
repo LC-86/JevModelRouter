@@ -268,6 +268,8 @@ pub struct ConfigStore {
     /// 订阅适配边界。默认构造是 [`crate::subscription::UnavailableAdapter`]（如实返回不可用）；
     /// 生产在 `lib.rs` 构造 `ConfigStore` 处注入真实的 Codex 适配器，代码内固定、无运行时替身开关。
     pub subscription: std::sync::Arc<dyn crate::subscription::SubscriptionAdapter>,
+    /// 订阅登录/退出边界。生产构造只注入 [`crate::subscription::auth::GrokCliAuth`]。
+    pub auth: std::sync::Arc<dyn crate::subscription::auth::SubscriptionAuth>,
     path: PathBuf,
     value: RwLock<AppConfig>,
     /// 进程内、按服务商递增的刷新序号；不持久化、不跨异步读取持锁。
@@ -292,6 +294,22 @@ impl ConfigStore {
         path: PathBuf,
         dispatcher: std::sync::Arc<dyn crate::dispatch::Dispatcher>,
         subscription: std::sync::Arc<dyn crate::subscription::SubscriptionAdapter>,
+    ) -> Result<Self> {
+        Self::load_with_adapters_and_auth(
+            path,
+            dispatcher,
+            subscription,
+            std::sync::Arc::new(crate::subscription::auth::GrokCliAuth::new()),
+        )
+    }
+
+    /// 与 [`Self::load_with_adapters`] 相同，但允许测试注入授权替身。
+    /// 生产构造路径只有 [`Self::load_with_adapters`]，配置与界面都没有替换替身的开关。
+    pub fn load_with_adapters_and_auth(
+        path: PathBuf,
+        dispatcher: std::sync::Arc<dyn crate::dispatch::Dispatcher>,
+        subscription: std::sync::Arc<dyn crate::subscription::SubscriptionAdapter>,
+        auth: std::sync::Arc<dyn crate::subscription::auth::SubscriptionAuth>,
     ) -> Result<Self> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).context("create AutoJev data directory")?;
@@ -336,8 +354,27 @@ impl ConfigStore {
             transaction.execute("INSERT OR IGNORE INTO request_logs (id, created_at, data) VALUES (?1, ?2, ?3)",
                 rusqlite::params![log.id, log.created_at, serde_json::to_string(&log)?])?;
         }
+        // 登录会话是进程内的：重启后残留的授权中连接归位为未连接，pending 登录不会存活。
+        let mut resumed: Vec<String> = Vec::new();
+        for (provider_id, connection) in value.subscriptions.iter_mut() {
+            if connection.state == crate::subscription::ConnectionState::AuthorizationPending {
+                connection.state = crate::subscription::ConnectionState::NotConnected;
+                resumed.push(provider_id.clone());
+            }
+        }
+        if !resumed.is_empty() {
+            transaction.execute("UPDATE app_meta SET value = ?1 WHERE key = 'config'", [serde_json::to_string(&value)?])?;
+        }
         transaction.commit()?;
-        Ok(Self { path, value: RwLock::new(value), dispatcher, subscription, subscription_refreshes: Default::default() })
+        // 这些登录会话已随进程消失：顺带清掉它们的专用 home，避免残留脏目录。
+        // 清理失败不得阻止加载；状态归位已经完成，只把失败如实记到日志（错误必须脱敏）。
+        for provider_id in &resumed {
+            if let Err(error) = auth.dispose(provider_id) {
+                eprintln!("AutoJev subscription cleanup for {provider_id}: {}", crate::subscription::helper::redact(&error));
+            }
+        }
+        Ok(Self { path, value: RwLock::new(value), dispatcher, subscription, auth, subscription_refreshes: Default::default() })
+
     }
 
     fn connect(path: &PathBuf) -> Result<Connection> {
@@ -504,6 +541,120 @@ mod storage_tests {
         let mut unknown = serde_json::to_value(AppConfig::default()).unwrap();
         unknown["providers"][0]["kind"] = serde_json::json!("some_future_subscription");
         assert!(serde_json::from_value::<AppConfig>(unknown).is_err());
+    }
+
+    #[test]
+    fn a_restart_normalizes_pending_authorization_back_to_not_connected() {
+        // 登录会话是进程内的：重启后残留的“授权中”不得被当成仍然有效的登录。
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pending.db");
+        let store = ConfigStore::load(path.clone()).unwrap();
+        store
+            .update(|config| {
+                let mut provider = config.providers[0].clone();
+                provider.id = "grok".into();
+                provider.name = "Grok".into();
+                provider.kind = ProviderKind::GrokSubscription;
+                provider.base_url = String::new();
+                config.providers.push(provider.clone());
+                crate::subscription::sync_provider(config, &provider.id, &provider.kind);
+                config.subscriptions.get_mut("grok").unwrap().state = crate::subscription::ConnectionState::AuthorizationPending;
+            })
+            .unwrap();
+        drop(store);
+        let reopened = ConfigStore::load(path.clone()).unwrap();
+        assert_eq!(
+            reopened.read().subscriptions["grok"].state,
+            crate::subscription::ConnectionState::NotConnected
+        );
+        // 归位会落库：再开一次也不会回到 AuthorizationPending。
+        drop(reopened);
+        let again = ConfigStore::load(path).unwrap();
+        assert_eq!(again.read().subscriptions["grok"].state, crate::subscription::ConnectionState::NotConnected);
+    }
+
+    #[test]
+    fn a_restart_disposes_the_pending_login_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pending-clean.db");
+        let program = PathBuf::from("/nonexistent-fixture-helper");
+        let dispatcher = || std::sync::Arc::new(crate::dispatch::ApiDispatcher { loopback_only: true });
+        let auth = || std::sync::Arc::new(crate::subscription::auth::GrokCliAuth::with_test_helper(dir.path().to_path_buf(), program.clone()));
+        let store = ConfigStore::load_with_adapters_and_auth(
+            path.clone(),
+            dispatcher(),
+            std::sync::Arc::new(crate::subscription::UnavailableAdapter),
+            auth(),
+        )
+        .unwrap();
+        store
+            .update(|config| {
+                let mut provider = config.providers[0].clone();
+                provider.id = "grok".into();
+                provider.name = "Grok".into();
+                provider.kind = ProviderKind::GrokSubscription;
+                provider.base_url = String::new();
+                config.providers.push(provider.clone());
+                crate::subscription::sync_provider(config, &provider.id, &provider.kind);
+                config.subscriptions.get_mut("grok").unwrap().state = crate::subscription::ConnectionState::AuthorizationPending;
+            })
+            .unwrap();
+        // 模拟进程内登录留下的脏目录。
+        let home = crate::subscription::helper::helper_home(&ProviderKind::GrokSubscription, "grok", dir.path()).unwrap();
+        crate::subscription::helper::prepare_home(&home).unwrap();
+        std::fs::write(home.join("session"), "fixture").unwrap();
+        drop(store);
+        let reopened = ConfigStore::load_with_adapters_and_auth(
+            path,
+            dispatcher(),
+            std::sync::Arc::new(crate::subscription::UnavailableAdapter),
+            auth(),
+        )
+        .unwrap();
+        assert_eq!(reopened.read().subscriptions["grok"].state, crate::subscription::ConnectionState::NotConnected);
+        assert_eq!(std::fs::read_dir(&home).unwrap().count(), 0, "重启归位必须清空专用 home");
+    }
+
+    #[test]
+    fn a_restart_still_loads_when_the_pending_home_cleanup_fails() {
+        // home 是 symlink 时 cleanup_home 拒绝：清理失败不得阻止加载，状态仍须归位。
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pending-symlink.db");
+        let program = PathBuf::from("/nonexistent-fixture-helper");
+        let dispatcher = || std::sync::Arc::new(crate::dispatch::ApiDispatcher { loopback_only: true });
+        let auth = || std::sync::Arc::new(crate::subscription::auth::GrokCliAuth::with_test_helper(dir.path().to_path_buf(), program.clone()));
+        let store = ConfigStore::load_with_adapters_and_auth(
+            path.clone(),
+            dispatcher(),
+            std::sync::Arc::new(crate::subscription::UnavailableAdapter),
+            auth(),
+        )
+        .unwrap();
+        store
+            .update(|config| {
+                let mut provider = config.providers[0].clone();
+                provider.id = "grok".into();
+                provider.name = "Grok".into();
+                provider.kind = ProviderKind::GrokSubscription;
+                provider.base_url = String::new();
+                config.providers.push(provider.clone());
+                crate::subscription::sync_provider(config, &provider.id, &provider.kind);
+                config.subscriptions.get_mut("grok").unwrap().state = crate::subscription::ConnectionState::AuthorizationPending;
+            })
+            .unwrap();
+        let home = crate::subscription::helper::helper_home(&ProviderKind::GrokSubscription, "grok", dir.path()).unwrap();
+        std::fs::create_dir_all(home.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(dir.path(), &home).unwrap();
+        drop(store);
+        let reopened = ConfigStore::load_with_adapters_and_auth(
+            path,
+            dispatcher(),
+            std::sync::Arc::new(crate::subscription::UnavailableAdapter),
+            auth(),
+        )
+        .unwrap();
+        assert_eq!(reopened.read().subscriptions["grok"].state, crate::subscription::ConnectionState::NotConnected);
+        assert!(home.is_symlink(), "清理失败时不得改动被拒绝的路径");
     }
 
     #[test]
