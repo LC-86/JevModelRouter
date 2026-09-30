@@ -26,6 +26,20 @@ pub struct AgentStatus {
     pub custom: bool,
     pub can_connect: bool,
     pub connection_note: Option<String>,
+    /// 保存的目录（`agent_catalogs`）与按当前模型／路由／资格重算的目录不一致，且外部配置仍是旧的。
+    /// 只作界面提示：后端准入与后端撤销都不等这个标记。
+    pub catalog_pending_sync: bool,
+}
+
+/// 保存的 Agent 目录与此刻应当注入的目录是否已经不一致（#17：Agent 保存目录单独核对）。
+/// 没有保存目录时没有可同步的对象，报 false；保存的目录已无法重建（候选失效）同样算待同步。
+pub fn catalog_pending_sync(config: &crate::config::AppConfig, agent_id: &str) -> bool {
+    let Some(saved) = config.agent_catalogs.get(agent_id).filter(|entries| !entries.is_empty()) else {
+        return false;
+    };
+    let bindings: Vec<String> = saved.iter().map(|entry| entry.binding.clone()).collect();
+    // 重建失败说明已保存的绑定（模型被取消选择／停用、路由失效等）不再可选：外部配置必然还是旧的。
+    crate::agent_catalog::build(config, &bindings).map_or(true, |rebuilt| rebuilt != *saved)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -75,7 +89,7 @@ fn detect_executable(id: &str, name: &str, command: &str, custom: bool) -> Agent
         config_path: paths.iter().map(|p|display_home(p)).collect::<Vec<_>>().join(", "),
         detail: crate::agent_adapters::limitation(id).unwrap_or(command).into(),
         connection_note: crate::agent_adapters::limitation(id).map(str::to_owned),
-        route_id: bound, custom, can_connect: crate::agent_adapters::supported(id) }
+        route_id: bound, custom, can_connect: crate::agent_adapters::supported(id), catalog_pending_sync: false }
 }
 
 pub fn connect(id: &str, port: u16, route_id: &str, api: &str) -> Result<()> {
@@ -124,6 +138,7 @@ fn detect_codex() -> AgentStatus {
         detail: "OpenAI Responses API".into(),
         route_id: content.parse::<DocumentMut>().ok().and_then(|doc| doc.get("model").and_then(Item::as_str)
             .map(str::to_owned)),
+        catalog_pending_sync: false,
     }
 }
 
@@ -140,6 +155,7 @@ fn detect_claude() -> AgentStatus {
         detail: "Anthropic Messages API".into(),
         route_id: serde_json::from_str::<Value>(&content).ok().and_then(|doc| doc.pointer("/env/ANTHROPIC_MODEL")
             .and_then(Value::as_str).map(str::to_owned)),
+        catalog_pending_sync: false,
     }
 }
 
@@ -603,5 +619,43 @@ pub fn configuration_paths(id: &str) -> Vec<PathBuf> {
         "codex" => vec![codex_path()],
         "claude" => vec![claude_path()],
         _ => crate::agent_adapters::paths(id, &crate::runtime::home_dir().unwrap_or_default()),
+    }
+}
+
+#[cfg(test)]
+mod catalog_pending_sync_tests {
+    use super::*;
+
+    /// 已保存目录与当前模型/路由一致 → 无需同步；不一致或已无法重建 → 待同步。
+    #[test]
+    fn saved_agent_catalog_reports_pending_sync_once_selection_changes() {
+        let mut config = crate::config::AppConfig::default();
+        config.models[0].selected = true;
+        config.models[0].enabled = true;
+        let model = config.models[0].clone();
+        let binding = format!("model/{}", model.id);
+        let saved = vec![crate::agent_catalog::Entry {
+            binding: binding.clone(),
+            id: format!("{}/{}", model.provider_id, model.model_id),
+            name: model.name.clone(),
+        }];
+        // 从未保存过目录：没有可同步的对象。
+        assert!(!catalog_pending_sync(&config, "codex"));
+        config.agent_catalogs.insert("codex".into(), Vec::new());
+        assert!(!catalog_pending_sync(&config, "codex"));
+        config.agent_catalogs.insert("codex".into(), saved.clone());
+        assert!(!catalog_pending_sync(&config, "codex"));
+        // 取消选择：保存的绑定不再可选，外部配置仍是旧的。
+        config.models[0].selected = false;
+        assert!(catalog_pending_sync(&config, "codex"));
+        config.models[0].selected = true;
+        // 停用同理。
+        config.models[0].enabled = false;
+        assert!(catalog_pending_sync(&config, "codex"));
+        config.models[0].enabled = true;
+        // 显示名变化会让已保存目录与重算结果不一致，提示需要重新同步外部配置。
+        config.models[0].name = "Renamed".into();
+        assert!(catalog_pending_sync(&config, "codex"));
+        assert!(!catalog_pending_sync(&config, "hermes"));
     }
 }

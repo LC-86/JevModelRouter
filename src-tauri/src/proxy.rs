@@ -225,7 +225,7 @@ async fn forward_captured(context: ProxyContext, headers: HeaderMap, body: Value
         if let Some(entry) = config.agent_catalogs.get(agent).and_then(|c|c.iter().find(|e| e.id == body["model"].as_str().unwrap_or(""))) {binding = entry.binding.clone();}
     }
     let attempts = config.routes.iter().find(|r| r.id == binding && r.enabled && matches!(r.strategy.as_str(), "round_robin" | "jev"))
-        .map_or(1, |r| config.models.iter().filter(|m| r.includes_model(&m.id) && m.enabled && config.providers.iter().any(|p|p.id == m.provider_id && p.enabled)).count().max(1));
+        .map_or(1, |r| config.models.iter().filter(|m| m.selected && crate::router::rule_includes_model(&config, r, m) && m.enabled && config.providers.iter().any(|p|p.id == m.provider_id && p.enabled)).count().max(1));
     let attempts = attempts.min(config.gateway.max_attempts);
     let mut tried = std::collections::HashSet::new();
     let mut last_response = None;
@@ -307,7 +307,7 @@ async fn forward_attempt(context: ProxyContext, headers: HeaderMap, body: Value,
     }
     capture.lock().unwrap().routing_rule(&config, input.requested_model.as_deref().unwrap_or(""));
     let requested=input.requested_model.as_deref().unwrap_or("").strip_prefix("autojev/").unwrap_or("");
-    let unavailable = if let Some(id)=requested.strip_prefix("model/") {context.store.read().models.iter().any(|m|m.id==id) && !config.models.iter().any(|m|m.id==id)} else {config.routes.iter().find(|r|r.id==requested && r.enabled).is_some_and(|r|!config.models.iter().any(|m|r.includes_model(&m.id)))};
+    let unavailable = if let Some(id)=requested.strip_prefix("model/") {context.store.read().models.iter().any(|m|m.id==id) && !config.models.iter().any(|m|m.id==id)} else {config.routes.iter().find(|r|r.id==requested && r.enabled).is_some_and(|r|!config.models.iter().any(|m|crate::router::rule_includes_model(&config, r, m)))};
     if unavailable {let mut response=error_response(StatusCode::SERVICE_UNAVAILABLE,"All candidates for this route are cooling down or already attempted. Retry shortly.");response.headers_mut().insert("retry-after",HeaderValue::from_static("5"));return response;}
     // Validate the actual payload before selecting (or reusing) a model. Native
     // hosted tools cannot be implemented merely by translating the JSON schema.
@@ -326,13 +326,15 @@ async fn forward_attempt(context: ProxyContext, headers: HeaderMap, body: Value,
         .collect();
     config.models.retain(|model| !denied.contains(&model.id));
     let mut conversion_error=None;
+    // 先按绑定定下作用域内的模型 ID，再改动 config.models：避免同时借用配置的冲突。
+    let scoped_ids: Option<std::collections::HashSet<String>> = match binding {
+        Some(id) if id.starts_with("model/") => Some(std::iter::once(id.trim_start_matches("model/").to_owned()).collect()),
+        Some(id) => config.routes.iter().find(|r|r.id==id).map(|r| config.models.iter()
+            .filter(|m| crate::router::rule_includes_model(&config, r, m)).map(|m|m.id.clone()).collect()),
+        None => None,
+    };
     config.models.retain(|model| {
-        let in_scope=match binding {
-            Some(id) if id.starts_with("model/") => model.id==id.trim_start_matches("model/"),
-            Some(id) => config.routes.iter().find(|r|r.id==id).is_none_or(|r|r.includes_model(&model.id)),
-            None => true,
-        };
-        if !in_scope { return true; }
+        if scoped_ids.as_ref().is_some_and(|ids| !ids.contains(&model.id)) { return true; }
         let Some(provider)=config.providers.iter().find(|p|p.id==model.provider_id) else { return false; };
         match request_compatible(&body,source,model,provider) {
             Ok(()) => true,
@@ -340,9 +342,8 @@ async fn forward_attempt(context: ProxyContext, headers: HeaderMap, body: Value,
         }
     });
     if let Some(error)=conversion_error {
-        let scoped_available=config.models.iter().any(|model| match binding {
-            Some(id) if id.starts_with("model/") => model.id==id.trim_start_matches("model/"),
-            Some(id) => config.routes.iter().find(|r|r.id==id).is_none_or(|r|r.includes_model(&model.id)),
+        let scoped_available=config.models.iter().any(|model| match &scoped_ids {
+            Some(ids) => ids.contains(&model.id),
             None => true,
         });
         if !scoped_available { return error_response(StatusCode::UNPROCESSABLE_ENTITY,&format!("No candidate supports this request. {error} For Codex through AutoJev, reconnect and restart Codex to apply web_search=disabled, or choose a native Responses model supporting this tool.")); }
@@ -695,7 +696,7 @@ fn still_eligible(
     !crate::router::balanced_session_is_slow(config,input,&route.model)
         && (!speed_route || crate::router::speed_capable(&route.model,input))
         && route.model.enabled
-        && config.models.iter().any(|m| m.id == route.model.id && m.enabled && (!input.requires_vision || m.supports_vision))
+        && config.models.iter().any(|m| m.id == route.model.id && m.enabled && m.selected && (!input.requires_vision || m.supports_vision))
         && crate::router::protocol_matches(&route.model, &route.provider, &input.endpoint)
         && Protocol::parse(&input.endpoint).is_ok_and(|protocol| crate::subscription::generation_ready(config, &route.model, protocol))
         && config
@@ -781,6 +782,55 @@ mod tests {
         assert!(!still_eligible(&route, &input, &config));
         config.models[0].supports_vision = true;
         assert!(still_eligible(&route, &input, &config));
+    }
+
+    #[tokio::test]
+    async fn public_catalog_lists_only_selected_models_and_keeps_saved_agent_catalogs() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(ConfigStore::load(directory.path().join("catalog.db")).unwrap());
+        // 由系统分配端口：并行用例不得争抢默认端口。
+        store.update(|config| { config.port = 0; config.models.truncate(1); }).unwrap();
+        let public_id = {
+            let config = store.read();
+            format!("{}/{}", config.models[0].provider_id, config.models[0].model_id)
+        };
+        store
+            .update(|config| {
+                config.agent_catalogs.insert(
+                    "hermes".into(),
+                    vec![crate::agent_catalog::Entry {
+                        binding: "model/kept".into(),
+                        id: "kept/frozen-model".into(),
+                        name: "Frozen".into(),
+                    }],
+                );
+            })
+            .unwrap();
+        let gateway = start(store.clone()).await.unwrap();
+        let client = Client::new();
+        let catalog: Value = client
+            .get(format!("http://127.0.0.1:{}/v1/models", gateway.port))
+            .send().await.unwrap().json().await.unwrap();
+        let ids: Vec<String> = catalog["data"]
+            .as_array().unwrap().iter()
+            .map(|entry| entry["id"].as_str().unwrap().to_owned()).collect();
+        assert!(ids.iter().any(|id| id == &public_id), "{ids:?}");
+        // Agent 保存目录按保存内容原样返回：它是注入清单，不因本地目录状态改写。
+        let agent: Value = client
+            .get(format!("http://127.0.0.1:{}/v1/models", gateway.port))
+            .header("x-autojev-agent", "hermes").send().await.unwrap().json().await.unwrap();
+        assert_eq!(agent["data"][0]["id"], "kept/frozen-model");
+        // 取消选择：移出公共目录，但 Agent 保存目录与直调都不受影响。
+        store.update(|config| config.models[0].selected = false).unwrap();
+        let catalog: Value = client
+            .get(format!("http://127.0.0.1:{}/v1/models", gateway.port))
+            .send().await.unwrap().json().await.unwrap();
+        assert!(catalog["data"].as_array().unwrap().is_empty(), "{}", catalog);
+        let agent: Value = client
+            .get(format!("http://127.0.0.1:{}/v1/models", gateway.port))
+            .header("x-autojev-agent", "hermes").send().await.unwrap().json().await.unwrap();
+        assert_eq!(agent["data"][0]["id"], "kept/frozen-model");
+        gateway.stop().await;
     }
 
     #[test]
@@ -1118,14 +1168,23 @@ fn observe_health(response:Response,lease:crate::resilience::Lease,settings:crat
 async fn model_catalog(State(context):State<ProxyContext>,headers:HeaderMap)->Response {
     let config=context.store.read();
     if let Some(agent)=headers.get("x-autojev-agent").and_then(|v|v.to_str().ok()) {
+        // Agent 保存目录按保存内容原样返回：它是注入清单，不是准入依据，外部待同步不在此判定。
         let entries=config.agent_catalogs.get(agent).cloned().unwrap_or_default();
         return Json(json!({"object":"list","data":entries.iter().map(|e|json!({"id":e.id,"name":e.name,"object":"model","created":0,"owned_by":"autojev"})).collect::<Vec<_>>()})).into_response();
     }
-    let bindings=config.models.iter().filter(|m|m.enabled&&config.providers.iter().any(|p|p.id==m.provider_id&&p.enabled)).map(|m|format!("model/{}",m.id))
-        .chain(config.routes.iter().filter(|r|r.enabled).map(|r|r.id.clone())).collect::<Vec<_>>();
+    // 公共目录：只列已选、已启用、服务商启用且当前账号资格合格的模型；
+    // 路由只有在至少有一个这样的候选时才出现。取消选择与资格不可用都不在这里展示。
+    let bindings=config.models.iter().filter(|m|crate::subscription::catalog_listed(&config,m)).map(|m|format!("model/{}",m.id))
+        .chain(config.routes.iter().filter(|r|r.enabled&&route_catalog_listed(&config,r)).map(|r|r.id.clone())).collect::<Vec<_>>();
     let data=bindings.iter().filter_map(|b|crate::agent_catalog::build(&config,std::slice::from_ref(b)).ok()).flatten()
         .map(|e|json!({"id":e.id,"name":e.name,"object":"model","created":0,"owned_by":"autojev"})).collect::<Vec<_>>();
     Json(json!({"object":"list","data":data})).into_response()
+}
+
+/// 路由进入公共目录的条件：至少有一个已选、启用、服务商启用且资格合格的候选。
+fn route_catalog_listed(config:&crate::config::AppConfig, rule:&crate::config::RouteRule) -> bool {
+    config.models.iter().any(|model| crate::router::rule_includes_model(config, rule, model)
+        && crate::subscription::catalog_listed(config, model))
 }
 
 #[cfg(test)]

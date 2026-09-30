@@ -2,7 +2,7 @@ use crate::config::AppConfig;
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry { pub binding: String, pub id: String, pub name: String }
 pub fn supported(agent: &str) -> bool { matches!(agent, "hermes" | "opencode" | "openclaw" | "omp" | "kimi" | "grok") }
 pub fn reconnect_targets(config: &AppConfig) -> Vec<(&str, &str)> {
@@ -17,7 +17,8 @@ pub fn build(config: &AppConfig, bindings: &[String]) -> Result<Vec<Entry>> {
     for binding in bindings {
         if entries.iter().any(|e: &Entry| &e.binding == binding) { continue; }
         let (id, name) = if let Some(id) = binding.strip_prefix("model/") {
-            let m = config.models.iter().find(|m| m.id == id && m.enabled && config.providers.iter().any(|p| p.id == m.provider_id && p.enabled)).ok_or_else(|| anyhow!("Model is unavailable"))?;
+            // 已选、未停用且服务商启用才进入 Agent 可选列表；取消选择与停用都让该绑定不可用。
+            let m = config.models.iter().find(|m| m.id == id && m.selected && m.enabled && config.providers.iter().any(|p| p.id == m.provider_id && p.enabled)).ok_or_else(|| anyhow!("Model is unavailable"))?;
             (format!("{}/{}", m.provider_id, m.model_id), m.name.clone())
         } else {
             let r = config.routes.iter().find(|r| &r.id == binding && r.enabled).ok_or_else(|| anyhow!("Route is unavailable"))?;
@@ -46,6 +47,24 @@ mod tests {
         config.agent_auto_connect.insert("codex".into(), true);
         assert_eq!(reconnect_targets(&config).len(), 2);
     }
+    #[test]
+    fn unselected_or_disabled_models_leave_the_agent_selectable_list() {
+        let mut config = AppConfig::default();
+        let binding = format!("model/{}", config.models[0].id);
+        assert!(build(&config, &[binding.clone()]).is_ok());
+        // 取消选择：移出 Agent 可选列表（列表是注入清单，不承担直调能力）。
+        config.models[0].selected = false;
+        assert!(build(&config, &[binding.clone()]).unwrap_err().to_string().contains("unavailable"));
+        config.models[0].selected = true;
+        // 停用：同样不可选。
+        config.models[0].enabled = false;
+        assert!(build(&config, &[binding.clone()]).is_err());
+        config.models[0].enabled = true;
+        // 服务商停用：不可选。
+        config.providers[0].enabled = false;
+        assert!(build(&config, &[binding]).is_err());
+    }
+
     #[test]
     fn routes_with_deleted_candidates_can_connect_but_empty_routes_cannot() {
         let mut config = AppConfig::default();

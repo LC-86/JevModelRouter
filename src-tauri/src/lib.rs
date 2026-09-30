@@ -19,6 +19,7 @@ mod provider_test;
 mod router;
 mod dispatch;
 mod subscription;
+mod subscription_catalog;
 mod codex_helper;
 mod runtime;
 #[cfg(feature = "isolation-check")]
@@ -135,6 +136,17 @@ async fn snapshot(state: &AppState) -> DashboardSnapshot {
     }
 }
 
+/// 订阅适配器注入：生产固定是官方 Codex 适配器。
+/// 只有 isolation-check 构建在显式给出 `--autojev-catalog-fixture` 时才换成受控目录替身，
+/// 而替身只替换上游目录与额度读取这一项外部依赖（登录、准入、派发与快照仍是生产代码）。
+fn subscription_adapter() -> anyhow::Result<Arc<dyn subscription::SubscriptionAdapter>> {
+    #[cfg(feature = "isolation-check")]
+    if let Some(adapter) = isolation_check::catalog_adapter()? {
+        return Ok(adapter);
+    }
+    Ok(Arc::new(codex_helper::CodexAdapter::new()))
+}
+
 fn detected_agents_with_selection(config: &config::AppConfig) -> Vec<agents::AgentStatus> {
     let mut detected = agents::detect(&config.custom_agents);
     for agent in &mut detected {
@@ -145,6 +157,8 @@ fn detected_agents_with_selection(config: &config::AppConfig) -> Vec<agents::Age
         if agent.route_id.is_none() {
             agent.route_id = config.agent_selections.get(&agent.id).cloned();
         }
+        // #17：保存的 Agent 目录与当前模型／路由／资格不一致时提示「待同步」；它不参与任何准入判断。
+        agent.catalog_pending_sync = agents::catalog_pending_sync(config, &agent.id);
     }
     detected
 }
@@ -545,7 +559,7 @@ fn add_provider_test_model(config: &mut config::AppConfig, provider: &Provider) 
     config.models.push(config::Model { input_price_known: Some(false), output_price_known: Some(false), cache_price_known: Some(false),
         id: uuid::Uuid::new_v4().to_string(), provider_id: provider.id.clone(),
         model_id: model_id.into(), name: model_id.into(), api_type: provider.api_type.clone(),
-        tier: config::ModelTier::Balanced, enabled: true,
+        tier: config::ModelTier::Balanced, enabled: true, selected: true,
         supports_tools: true, supports_vision: false, supports_reasoning: false,
         context_window: 1000000, input_cost_per_million: 0.0,
         output_cost_per_million: 0.0, cache_cost_per_million: 0.0,
@@ -656,6 +670,8 @@ async fn delete_model(state: State<'_, AppState>, id: String) -> Result<Dashboar
     state
         .store
         .update(|config| {
+            // #17：只删除这一行模型配置。订阅目录项与其中的稳定 internal_id 不在这里删除：
+            // 下一次目录核对会按同一个 model_id 用原 internal_id 重新建档，标识不会漂移。
             config.models.retain(|model| model.id != id);
             for route in &mut config.routes {
                 route.model_ids.retain(|candidate| candidate != &id);
@@ -1002,16 +1018,15 @@ async fn connect_agent(
             .ok_or("Route is unavailable")?;
         router::validate_available_rule(&config, route).map_err(|e| e.to_string())?;
     }
-    let candidates: Vec<_> = if let Some(model_id) = route_id.strip_prefix("model/") {
-        config.models.iter().filter(|m| m.id == model_id).collect()
+    // 路由候选与上面的连接校验使用同一套判断（作用域 + 选择 + 停用 + 服务商启用 + 协议兼容），
+    // 避免「连接成功、实际请求没有候选」。直调绑定 model/<标识> 不要求 selected：取消选择只影响
+    // 列表与自动候选，只有停用才禁止调用（保留原 ID 直调语义），但协议兼容仍必须满足。
+    let has_candidate = if let Some(model_id) = route_id.strip_prefix("model/") {
+        router::direct_binding_ready(&config, model_id)
     } else {
         let route = config.routes.iter().find(|r| r.id == route_id).ok_or("Route is unavailable")?;
-        config.models.iter().filter(|m| route.includes_model(&m.id)).collect()
+        router::route_has_candidate(&config, route)
     };
-    let has_candidate = candidates.iter().filter(|m| m.enabled).any(|model| {
-        config.providers.iter().any(|provider| provider.id == model.provider_id && provider.enabled
-            && protocol::Protocol::upstream(model, provider).is_ok())
-    });
     if !has_candidate { return Err("No compatible enabled candidate for this route".into()); }
     let mut service=state.proxy.lock().await;
     let config_lock=ownership::config_lock(&crate::runtime::home_dir().unwrap_or_default()).map_err(|e|e.to_string())?;
@@ -1154,6 +1169,21 @@ fn validate_model(config: &AppConfig, model: &Model) -> anyhow::Result<()> {
         && existing.model_id.trim() == model.model_id.trim()) {
         return Err(anyhow!("This model ID already exists for this provider."));
     }
+    // #17：目录建档的订阅模型，其上游 ID 就是调用身份。行编辑只能改选择、停用、显示名与价格，
+    // 不得把它重绑到另一个上游模型：上游改名按新模型处理，必须走目录核对（新目录项 + 新 Model 行）。
+    if let Some(existing) = config.models.iter().find(|existing| existing.id == model.id) {
+        let catalog_entry = config
+            .subscription_catalogs
+            .get(&existing.provider_id)
+            .is_some_and(|catalog| catalog.entry(existing.model_id.trim()).is_some());
+        if catalog_entry
+            && (existing.model_id.trim() != model.model_id.trim() || existing.provider_id != model.provider_id)
+        {
+            return Err(anyhow!(
+                "A directory-discovered model keeps its provider and upstream model ID; a different upstream ID is a new model."
+            ));
+        }
+    }
     if [model.input_cost_per_million, model.output_cost_per_million, model.cache_cost_per_million].iter().any(|cost| !cost.is_finite() || *cost < 0.0) {
         return Err(anyhow!("Model pricing cannot be negative"));
     }
@@ -1218,9 +1248,11 @@ pub fn run() {
             // 生产装的是按服务商类型分派的注册表：官方 Codex 适配器 + Grok 只读适配器，两家互不冒用。
             // 默认构造（`ConfigStore::load`，测试用）仍是不提供任何辅助进程的 UnavailableAdapter。
             // 没有任何配置/环境/界面开关能把它换成替身。
+            // isolation-check 构建里，验收脚本可以额外指定受控目录文件（`--autojev-catalog-fixture`）：
+            // 那个替身只替换上游目录与额度读取，登录、世代、准入与派发仍是同一套生产代码。
             let mut store = ConfigStore::load(root.join(database))?;
             store.subscription = Arc::new(subscription::SubscriptionAdapters::new(vec![
-                Arc::new(codex_helper::CodexAdapter::new()),
+                subscription_adapter()?,
                 Arc::new(subscription::grok::GrokSubscriptionAdapter::new()),
             ]));
             let store = Arc::new(store);
@@ -1450,6 +1482,51 @@ mod model_uniqueness_tests {
         assert!(validate_model(&config, &model).is_err());
         model.provider_id = config.providers[1].id.clone();
         assert!(validate_model(&config, &model).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod subscription_catalog_row_tests {
+    use super::*;
+
+    fn discovered() -> Vec<subscription::DiscoveredModel> {
+        vec![subscription::DiscoveredModel { model_id: "upstream-a".into(), name: Some("Upstream A".into()), eligible: true }]
+    }
+
+    /// 删除模型行不得删除目录项与稳定标识；下一次核对用同一个 internal_id 重新建档。
+    #[test]
+    fn deleting_a_directory_row_keeps_the_catalog_entry_and_its_stable_id() {
+        let mut config = AppConfig::default();
+        let provider_id = config.providers[0].id.clone();
+        subscription_catalog::reconcile(&mut config, &provider_id, "fixture@example.invalid", 1, &discovered(), Some("2026-01-01T00:00:00Z"));
+        let row = config.models.iter().find(|model| model.model_id == "upstream-a").expect("reconcile must materialize the row").clone();
+        assert!(!row.selected, "a newly discovered model must start unselected");
+        assert_eq!(config.subscription_catalogs[&provider_id].entry("upstream-a").unwrap().internal_id, row.id);
+        config.models.retain(|model| model.model_id != "upstream-a");
+        let entry = config.subscription_catalogs[&provider_id]
+            .entry("upstream-a")
+            .expect("the catalog entry must survive deleting the model row");
+        assert_eq!(entry.internal_id, row.id);
+        subscription_catalog::reconcile(&mut config, &provider_id, "fixture@example.invalid", 1, &discovered(), Some("2026-01-01T00:00:00Z"));
+        let restored = config.models.iter().find(|model| model.model_id == "upstream-a").expect("reconcile must restore the row");
+        assert_eq!(restored.id, row.id, "the internal ID must not drift");
+        assert!(!restored.selected);
+    }
+
+    /// 目录建档的行只能改选择／停用／显示名，不能把上游 ID（调用身份）改绑到另一个模型。
+    #[test]
+    fn directory_rows_cannot_be_rebound_to_another_upstream_id() {
+        let mut config = AppConfig::default();
+        let provider_id = config.providers[0].id.clone();
+        subscription_catalog::reconcile(&mut config, &provider_id, "fixture@example.invalid", 1, &discovered(), Some("2026-01-01T00:00:00Z"));
+        let mut row = config.models.iter().find(|model| model.model_id == "upstream-a").unwrap().clone();
+        row.selected = true;
+        assert!(validate_model(&config, &row).is_ok());
+        row.model_id = "upstream-b".into();
+        assert!(validate_model(&config, &row).is_err(), "an upstream ID change is a new model, not an edit");
+        row.model_id = "upstream-a".into();
+        row.provider_id = config.providers[1].id.clone();
+        assert!(validate_model(&config, &row).is_err(), "a directory row must keep its provider");
     }
 }
 

@@ -1,14 +1,16 @@
 import { describe, expect, it } from 'vitest';
 import { translate } from './preferences-context';
 import {
-  CATALOG_REFERENCE_URL, QUOTA_REFERENCE_URL, authHomeLabel, capabilityLabel, catalogLabel, catalogRemovedLabel,
-  catalogText, connectionStateLabel, connectionStateTone, creditsAxisText, denialLabel,
-  helperVersionLabel, identityLabel, isSubscriptionProvider, knownOrUnknown, localLogoutLabel, loginStageLabel,
-  loginStageTone, modelCapability, protocolKey, quotaEvidenceText, quotaHistoryLabel, quotaLabel, quotaPermissionLabel,
-  quotaViewLabel, remainingPercent, remoteRevocationLabel, subscriptionActions, subscriptionCatalogText,
-  subscriptionQuotaText, subscriptionReason, subscriptionStatusText, subscriptionView,
+  CATALOG_REFERENCE_URL, QUOTA_REFERENCE_URL, agentCatalogPendingSync, agentSelectableModels, authHomeLabel,
+  availabilityLabel, capabilityLabel, catalogEntryEligible, catalogEntryInPool, catalogEntryStateLabel, catalogLabel,
+  catalogModelRow, catalogRemovedLabel, catalogText, connectionStateLabel, connectionStateTone, creditsAxisText,
+  denialLabel, eligibilityLabel, helperVersionLabel, identityLabel, isSubscriptionProvider, knownOrUnknown,
+  localLogoutLabel, loginStageLabel, loginStageTone, modelCapability, modelListMembers, modelSelected, protocolKey,
+  quotaEvidenceText, quotaHistoryLabel, quotaLabel, quotaPermissionLabel, quotaViewLabel, remainingPercent,
+  remoteRevocationLabel, speedTestCandidates, subscriptionActions, subscriptionCatalog, subscriptionCatalogText,
+  subscriptionQuotaText, subscriptionReason, subscriptionStatusText, subscriptionView, unselectedModels,
 } from './subscription';
-import type { DashboardSnapshot, SubscriptionQuota, SubscriptionView } from '../types';
+import type { DashboardSnapshot, Model, Provider, SubscriptionCatalogEntry, SubscriptionQuota, SubscriptionView } from '../types';
 
 const t = (message: string, values?: Record<string, string | number>) => translate('zh-CN', message, values);
 
@@ -70,6 +72,11 @@ describe('subscription views', () => {
     expect(denialLabel(undefined, t)).toBe('');
     expect(denialLabel(denied.denial, t)).toBe('未连接');
     expect(denialLabel({ code: 'quota_failed', family: 'quota', message: '', recovery: '' }, t)).toBe('额度读取失败');
+    // #17 的四种账号资格拒绝码必须登记文案，否则界面只会显示裸 code。
+    expect(denialLabel({ code: 'model_not_discovered', family: 'not_eligible', message: '', recovery: '' }, t)).toBe('当前账号目录中没有该模型');
+    expect(denialLabel({ code: 'model_removed', family: 'not_eligible', message: '', recovery: '' }, t)).toBe('上游目录已移除该模型');
+    expect(denialLabel({ code: 'model_revoked', family: 'not_eligible', message: '', recovery: '' }, t)).toBe('上游已撤销该账号的模型权限');
+    expect(denialLabel({ code: 'model_unqualified', family: 'not_eligible', message: '', recovery: '' }, t)).toBe('该模型的账号资格尚未按当前连接重新核实');
     // 未知 code 原样显示，不编造文案。
     expect(denialLabel({ code: 'future_reason', family: 'quota', message: '', recovery: '' }, t)).toBe('future_reason');
     expect(subscriptionView(snapshot, 'codex')?.generation).toBe(1);
@@ -168,6 +175,110 @@ describe('subscription login and logout lifecycle', () => {
     expect(subscriptionActions('authorization_pending')).toEqual({ canLogin: false, canCancel: true, canLogout: false });
     expect(subscriptionActions('connected')).toEqual({ canLogin: false, canCancel: false, canLogout: true });
     expect(subscriptionActions('expired')).toEqual({ canLogin: true, canCancel: false, canLogout: false });
+  });
+});
+
+function model(patch: Partial<Model> = {}): Model {
+  return {
+    id: 'internal-1', provider_id: 'codex', model_id: 'gpt-5-codex', name: 'GPT-5 Codex', tier: 'balanced',
+    enabled: true, supports_tools: true, supports_vision: false, supports_reasoning: true, context_window: 200000,
+    input_cost_per_million: 0, output_cost_per_million: 0, ...patch,
+  };
+}
+
+function entry(patch: Partial<SubscriptionCatalogEntry> = {}): SubscriptionCatalogEntry {
+  return {
+    model_id: 'gpt-5-codex', internal_id: 'internal-1', availability: 'available', eligibility: 'eligible',
+    selected: true, disabled: false, ...patch,
+  };
+}
+
+function provider(patch: Partial<Provider> = {}): Provider {
+  return { id: 'codex', name: 'Codex', kind: 'codex_subscription', base_url: '', enabled: true, has_api_key: false, ...patch };
+}
+
+describe('subscription catalog selection and eligibility', () => {
+  it('treats a missing selected flag as selected so legacy configs keep their models', () => {
+    expect(modelSelected(model())).toBe(true);
+    expect(modelSelected(model({ selected: undefined }))).toBe(true);
+    expect(modelSelected(model({ selected: false }))).toBe(false);
+  });
+
+  it('keeps only selected models in the model list and its count', () => {
+    const models = [model({ id: 'a' }), model({ id: 'b', selected: false }), model({ id: 'c', selected: true })];
+    expect(modelListMembers(models).map(m => m.id)).toEqual(['a', 'c']);
+    expect(unselectedModels(models).map(m => m.id)).toEqual(['b']);
+    // 停用模型仍是列表成员（由行内标注停用），但不进入任何候选。
+    expect(modelListMembers([model({ id: 'd', enabled: false })]).map(m => m.id)).toEqual(['d']);
+  });
+
+  it('excludes unselected and disabled models from speed tests and agent catalogs alike', () => {
+    const providers = [provider(), provider({ id: 'grok', enabled: false })];
+    const models = [
+      model({ id: 'selected' }),
+      model({ id: 'unselected', selected: false }),
+      model({ id: 'disabled', enabled: false }),
+      model({ id: 'grok-model', provider_id: 'grok' }),
+    ];
+    expect(speedTestCandidates(models, providers).map(m => m.id)).toEqual(['selected']);
+    expect(agentSelectableModels(models, providers).map(m => m.id)).toEqual(['selected']);
+  });
+
+  it('maps availability and eligibility to localised labels', () => {
+    expect(availabilityLabel('available', t)).toBe('可用');
+    expect(availabilityLabel('stale', t)).toBe('陈旧（保留上次已核实结果）');
+    expect(availabilityLabel('removed', t)).toBe('上游已移除');
+    expect(availabilityLabel('revoked', t)).toBe('该账号权限已撤销');
+    expect(availabilityLabel('unknown', t)).toBe('可用性未知');
+    // 未知枚举值回落为「未知」，不编造可用性。
+    expect(availabilityLabel('future' as never, t)).toBe('可用性未知');
+    expect(eligibilityLabel('eligible', t)).toBe('资格有效');
+    expect(eligibilityLabel('stale', t)).toBe('资格有效（证据陈旧）');
+    expect(eligibilityLabel('not_discovered', t)).toBe('尚未发现');
+    expect(eligibilityLabel('removed', t)).toBe('已从上游目录移除');
+    expect(eligibilityLabel('revoked', t)).toBe('权限已撤销');
+    expect(eligibilityLabel('account_changed', t)).toBe('已在其它账号下核实');
+    expect(eligibilityLabel('unknown', t)).toBe('资格未知');
+    expect(eligibilityLabel('future' as never, t)).toBe('资格未知');
+  });
+
+  it('keeps stale eligibility usable but never treats removal or revocation as eligible', () => {
+    expect(catalogEntryEligible(entry({ eligibility: 'eligible' }))).toBe(true);
+    expect(catalogEntryEligible(entry({ eligibility: 'stale' }))).toBe(true);
+    for (const eligibility of ['not_discovered', 'removed', 'revoked', 'account_changed', 'unknown'] as const) {
+      expect(catalogEntryEligible(entry({ eligibility }))).toBe(false);
+      expect(catalogEntryInPool(entry({ eligibility }))).toBe(false);
+    }
+    expect(catalogEntryInPool(entry())).toBe(true);
+    expect(catalogEntryInPool(entry({ selected: false }))).toBe(false);
+    expect(catalogEntryInPool(entry({ disabled: true }))).toBe(false);
+    expect(catalogEntryStateLabel(entry(), t)).toBe('可用 · 资格有效');
+  });
+
+  it('resolves the local model row by stable internal id, never by display name', () => {
+    const models = [model({ id: 'internal-1', name: 'Old name' }), model({ id: 'other', model_id: 'gpt-5-codex' })];
+    expect(catalogModelRow(models, entry({ name: 'Renamed upstream' }))?.id).toBe('internal-1');
+    expect(catalogModelRow(models, entry({ internal_id: 'missing' }))).toBeUndefined();
+  });
+
+  it('lists catalog entries from the subscription view and treats a missing catalog as empty', () => {
+    expect(subscriptionCatalog(view({ catalog_entries: [entry()] }))).toHaveLength(1);
+    expect(subscriptionCatalog(view())).toEqual([]);
+    expect(subscriptionCatalog(undefined)).toEqual([]);
+  });
+
+  it('flags pending sync when the saved catalog differs from the current in-app selection', () => {
+    expect(agentCatalogPendingSync({ saved: ['model/a'], chosen: ['model/a'] })).toBe(false);
+    expect(agentCatalogPendingSync({ saved: [], chosen: [] })).toBe(false);
+    expect(agentCatalogPendingSync({ saved: ['model/a'], chosen: [] })).toBe(true);
+    expect(agentCatalogPendingSync({ saved: [], chosen: ['model/a'] })).toBe(true);
+    expect(agentCatalogPendingSync({ saved: ['model/a', 'model/b'], chosen: ['model/b', 'model/a'] })).toBe(true);
+    expect(agentCatalogPendingSync({ saved: ['model/a'], chosen: ['model/a', 'model/a'] })).toBe(false);
+  });
+
+  it('flags pending sync whenever the backend marks the catalog as pending', () => {
+    expect(agentCatalogPendingSync({ saved: [], chosen: [], pendingSync: true })).toBe(true);
+    expect(agentCatalogPendingSync({ saved: ['model/a'], chosen: ['model/a'], pendingSync: false })).toBe(false);
   });
 });
 
