@@ -257,12 +257,19 @@ impl Default for AppConfig {
 }
 
 pub struct ConfigStore {
+    pub dispatcher: std::sync::Arc<dyn crate::dispatch::Dispatcher>,
     path: PathBuf,
     value: RwLock<AppConfig>,
 }
 
 impl ConfigStore {
     pub fn load(path: PathBuf) -> Result<Self> {
+        Self::load_with_dispatcher(path, std::sync::Arc::new(crate::dispatch::ApiDispatcher {
+            loopback_only: crate::runtime::isolated(),
+        }))
+    }
+
+    pub fn load_with_dispatcher(path: PathBuf, dispatcher: std::sync::Arc<dyn crate::dispatch::Dispatcher>) -> Result<Self> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).context("create AutoJev data directory")?;
             #[cfg(unix)] {
@@ -307,7 +314,7 @@ impl ConfigStore {
                 rusqlite::params![log.id, log.created_at, serde_json::to_string(&log)?])?;
         }
         transaction.commit()?;
-        Ok(Self { path, value: RwLock::new(value) })
+        Ok(Self { path, value: RwLock::new(value), dispatcher })
     }
 
     fn connect(path: &PathBuf) -> Result<Connection> {

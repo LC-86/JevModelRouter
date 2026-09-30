@@ -730,12 +730,11 @@ async fn ask_jev(
 ) -> Result<Option<JevChoice>> {
     let body = jev_request_body(config, input, eligible, complexity)?;
     let decisions_api = body.get("questions").is_some();
-    let response: Value = client
+    let response: Value = crate::dispatch::send_http(client
         .post(&config.policy.jev_endpoint)
         .timeout(std::time::Duration::from_secs(if decision_preference(config) == "balanced" { 2 } else { 8 }))
         .bearer_auth(key)
-        .json(&body)
-        .send()
+        .json(&body), crate::runtime::isolated())
         .await
         .context("call AutoJev")?
         .error_for_status()

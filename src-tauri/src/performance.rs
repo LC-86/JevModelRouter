@@ -408,7 +408,7 @@ async fn probe(store: &ConfigStore, id: &str) -> Result<()> {
                 request.bearer_auth(key)
             };
         }
-        let response = request.send().await?;
+        let response = store.dispatcher.send(crate::dispatch::Target { provider, model_id: &model.model_id, protocol }, request).await?;
         capture.lock().unwrap().log.status_code = response.status().as_u16();
         ensure!(response.status().is_success(), "Speed test HTTP failure");
         let sse = response

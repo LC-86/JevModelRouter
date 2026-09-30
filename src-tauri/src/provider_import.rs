@@ -33,7 +33,7 @@ fn nonempty<'a>(first: &'a str, fallback: &'a str) -> &'a str { if first.trim().
 fn string<'a>(v: &'a Value, pointer: &str) -> &'a str { v.pointer(pointer).and_then(Value::as_str).unwrap_or("") }
 
 pub fn read(source: &str) -> Result<(Vec<Candidate>, usize)> {
-    let home = dirs::home_dir().context("Home directory unavailable")?;
+    let home = crate::runtime::home_dir().context("Home directory unavailable")?;
     let path = match source { "ccswitch" => home.join(".cc-switch/cc-switch.db"), "termany" => home.join(".termany/termany.db"), _ => anyhow::bail!("Unknown import source") };
     let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).context("Could not open the source database. Make sure the app is installed on this device.")?;
     read_database(&db, source)

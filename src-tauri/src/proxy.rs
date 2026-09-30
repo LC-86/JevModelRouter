@@ -29,6 +29,7 @@ struct ProxyContext {
 }
 
 pub struct ProxyHandle {
+    pub port: u16,
     paused: Arc<std::sync::atomic::AtomicBool>,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     pub health: crate::resilience::Health,
@@ -50,6 +51,11 @@ impl ProxyHandle {
 pub async fn start(store: Arc<ConfigStore>) -> anyhow::Result<ProxyHandle> {
     let port = store.read().port;
     let listener = TcpListener::bind(("127.0.0.1", port)).await?;
+    let port = listener.local_addr()?.port();
+    if crate::runtime::isolated() {
+        crate::runtime::gateway_port(port);
+        store.update(|c| c.port = port)?;
+    }
     let circuit_health = crate::resilience::Health::default();
     let client = store.read().gateway.client()?;
     let context = ProxyContext {
@@ -88,6 +94,7 @@ pub async fn start(store: Arc<ConfigStore>) -> anyhow::Result<ProxyHandle> {
         }
     });
     Ok(ProxyHandle {
+        port,
         health: circuit_health, task, paused,
         shutdown: Some(shutdown_tx),
     })
@@ -411,7 +418,9 @@ async fn forward_attempt(context: ProxyContext, headers: HeaderMap, body: Value,
             .header("X-Title", "AutoJev");
     }
 
-    let upstream = match tokio::time::timeout(std::time::Duration::from_secs(config.gateway.response_timeout_seconds), request.send()).await {
+    let upstream = match tokio::time::timeout(std::time::Duration::from_secs(config.gateway.response_timeout_seconds), context.store.dispatcher.send(crate::dispatch::Target {
+        provider: &resolved.provider, model_id: &resolved.model.model_id, protocol: target,
+    }, request)).await {
         Ok(Ok(response)) => response,
         Err(_) => return error_response(StatusCode::GATEWAY_TIMEOUT, "Upstream response timed out"),
         Ok(Err(error)) => {
@@ -1141,7 +1150,7 @@ mod pause_tests {
     #[tokio::test]
     async fn pause_retains_listener_state_and_returns_not_found_with_retry_hint() {
         let task = tokio::spawn(std::future::pending::<()>());
-        let handle = ProxyHandle { shutdown: None, health: Default::default(), task, paused: Arc::new(std::sync::atomic::AtomicBool::new(false)) };
+        let handle = ProxyHandle { port: 0, shutdown: None, health: Default::default(), task, paused: Arc::new(std::sync::atomic::AtomicBool::new(false)) };
         handle.set_paused(true);
         assert!(handle.running());
         assert!(handle.paused());

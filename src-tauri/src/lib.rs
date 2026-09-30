@@ -17,6 +17,12 @@ mod protocol;
 mod provider_import;
 mod provider_test;
 mod router;
+mod dispatch;
+mod runtime;
+#[cfg(feature = "isolation-check")]
+mod isolation_check;
+#[cfg(test)]
+mod dispatch_tests;
 
 use std::sync::Arc;
 
@@ -70,6 +76,7 @@ async fn snapshot(state: &AppState) -> DashboardSnapshot {
     }
     config.policy.has_autojev_key = decision_key.is_some();
     let running = state.proxy.lock().await.as_ref().is_some_and(|p|p.running());
+    let port = state.proxy.lock().await.as_ref().map_or(config.port, |p| p.port);
     let paused = state.proxy.lock().await.as_ref().is_some_and(|p| p.running() && p.paused());
     let detected = detected_agents_with_selection(&config);
     DashboardSnapshot {
@@ -83,8 +90,8 @@ async fn snapshot(state: &AppState) -> DashboardSnapshot {
         policy: config.policy,
         proxy: ProxyStatus {
             running, paused,
-            port: config.port,
-            base_url: format!("http://127.0.0.1:{}", config.port),
+            port,
+            base_url: format!("http://127.0.0.1:{port}"),
         },
         agents: detected,
         events: config.events,
@@ -95,7 +102,7 @@ async fn snapshot(state: &AppState) -> DashboardSnapshot {
 fn detected_agents_with_selection(config: &config::AppConfig) -> Vec<agents::AgentStatus> {
     let mut detected = agents::detect(&config.custom_agents);
     for agent in &mut detected {
-        agent.connected = agent.injection.as_ref().map(|i| custom_agents::owned(i, &dirs::home_dir().unwrap_or_default(), config.port)).unwrap_or_else(|| agents::owned_by(&agent.id,config.port));
+        agent.connected = agent.injection.as_ref().map(|i| custom_agents::owned(i, &crate::runtime::home_dir().unwrap_or_default(), config.port)).unwrap_or_else(|| agents::owned_by(&agent.id,config.port));
         if let Some(selected) = agent.route_id.as_ref() {
             if let Some(entry) = config.agent_catalogs.get(&agent.id).and_then(|entries| entries.iter().find(|e| &e.id == selected)) { agent.route_id = Some(entry.binding.clone()); }
         }
@@ -453,11 +460,11 @@ async fn debug_request(state: State<'_, AppState>, target: String, endpoint: Str
         }
     }
     let start = std::time::Instant::now();
-    let mut response = Client::builder().timeout(std::time::Duration::from_secs(90)).build().map_err(|e|e.to_string())?
+    let mut response = dispatch::send_http(Client::builder().timeout(std::time::Duration::from_secs(90)).build().map_err(|e|e.to_string())?
         .post(format!("http://127.0.0.1:{}/v1/{endpoint}", state.store.read().port))
         .header("x-autojev-session-id", session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()))
         .header("user-agent", "AutoJev/Debug")
-        .header("anthropic-version", "2023-06-01").json(&body).send().await.map_err(|_| "Debug request failed or timed out".to_string())?;
+        .header("anthropic-version", "2023-06-01").json(&body), runtime::isolated()).await.map_err(|_| "Debug request failed or timed out".to_string())?;
     let is_sse = response.headers().get("content-type").and_then(|v| v.to_str().ok()).is_some_and(|v| v.contains("text/event-stream"));
     let status = response.status().as_u16();
     let request_id = response.headers().get("x-autojev-request-id").and_then(|v| v.to_str().ok()).unwrap_or("").to_owned();
@@ -500,7 +507,7 @@ async fn test_custom_agent(agent: agents::CustomAgent) -> Result<String, String>
 async fn save_custom_agent(state: State<'_, AppState>, mut agent: agents::CustomAgent) -> Result<DashboardSnapshot, String> {
     agent.name = agent.name.trim().to_owned();
     agent.command = agent.command.trim().to_owned();
-    let home = dirs::home_dir().ok_or("Cannot locate home directory")?;
+    let home = crate::runtime::home_dir().ok_or("Cannot locate home directory")?;
     let requested_path = agent.config_path.as_deref().or_else(|| agent.injection.as_ref().map(|i| i.path.as_str())).unwrap_or("").to_owned();
     agent.injection = custom_agents::infer(&agent.command, &requested_path, &home).map_err(|e| e.to_string())?;
     agent.config_path = Some(agent.injection.as_ref().map(|i| i.path.clone()).unwrap_or_else(|| requested_path.trim().to_owned()));
@@ -528,6 +535,7 @@ async fn save_custom_agent(state: State<'_, AppState>, mut agent: agents::Custom
 
 #[tauri::command]
 async fn launch_agent(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    runtime::external_action().map_err(|e| e.to_string())?;
     let custom = state.store.read().custom_agents;
     tauri::async_runtime::spawn_blocking(move || agents::launch(&id, &custom))
         .await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())
@@ -535,10 +543,11 @@ async fn launch_agent(state: State<'_, AppState>, id: String) -> Result<(), Stri
 
 #[tauri::command]
 async fn open_agent_config(app: tauri::AppHandle, state: State<'_, AppState>, id: String, index: usize) -> Result<(), String> {
+    runtime::external_action().map_err(|e| e.to_string())?;
     if !agents::detect(&state.store.read().custom_agents).iter().any(|agent| agent.id == id) { return Err("Unknown agent".into()); }
     let custom = state.store.read().custom_agents;
     let paths = if let Some(injection) = custom.iter().find(|a| a.id == id).and_then(|a| a.injection.as_ref()) {
-        vec![injection.resolve(&dirs::home_dir().unwrap_or_default()).map_err(|e| e.to_string())?]
+        vec![injection.resolve(&crate::runtime::home_dir().unwrap_or_default()).map_err(|e| e.to_string())?]
     } else { agents::configuration_paths(&id) };
     let path = paths.get(index).cloned().ok_or("Configuration file is unavailable")?;
     if !path.is_file() { return Err("Configuration file does not exist yet".into()); }
@@ -567,15 +576,15 @@ fn inject_agent(custom: &[agents::CustomAgent], id: &str, port: u16, binding: &s
     if let Some(agent) = custom.iter().find(|agent| agent.id == id) {
         let injection = agent.injection.as_ref().context("Custom agent requires manual configuration")?;
         let public = &catalog.iter().find(|entry| entry.binding == binding).context("Default model must be selected")?.id;
-        return custom_agents::connect(injection, &dirs::home_dir().context("Cannot locate home directory")?, port, public, id);
+        return custom_agents::connect(injection, &crate::runtime::home_dir().context("Cannot locate home directory")?, port, public, id);
     }
     let api = if id == "claude" { "messages" } else if id == "codex" { "responses" } else { "chat_completions" };
     if id == "codex" {
-        agents::connect_codex_catalog(port, binding, catalog, &dirs::home_dir().context("Cannot locate home directory")?)
+        agents::connect_codex_catalog(port, binding, catalog, &crate::runtime::home_dir().context("Cannot locate home directory")?)
     } else if id == "claude" {
-        agents::connect_claude_catalog(port, binding, catalog, &dirs::home_dir().context("Cannot locate home directory")?)
+        agents::connect_claude_catalog(port, binding, catalog, &crate::runtime::home_dir().context("Cannot locate home directory")?)
     } else if agent_catalog::supported(id) {
-        agent_adapters::connect_catalog(id, port, binding, api, &dirs::home_dir().unwrap_or_default(), catalog)
+        agent_adapters::connect_catalog(id, port, binding, api, &crate::runtime::home_dir().unwrap_or_default(), catalog)
     } else {
         let public = &catalog.iter().find(|entry| entry.binding == binding).context("Default model must be selected")?.id;
         agents::connect(id, port, public, api)
@@ -583,8 +592,9 @@ fn inject_agent(custom: &[agents::CustomAgent], id: &str, port: u16, binding: &s
 }
 
 fn reconnect_saved_agents(store: &ConfigStore) -> anyhow::Result<()> {
-    let _lock = ownership::config_lock(&dirs::home_dir().context("Cannot locate home directory")?)?;
-    agents::repair_orphan_models(&dirs::home_dir().context("Cannot locate home directory")?)?;
+    if runtime::isolated() { return Ok(()); }
+    let _lock = ownership::config_lock(&crate::runtime::home_dir().context("Cannot locate home directory")?)?;
+    agents::repair_orphan_models(&crate::runtime::home_dir().context("Cannot locate home directory")?)?;
     let config = store.read();
     let mut errors = Vec::new();
     for (id, binding) in agent_catalog::reconnect_targets(&config) {
@@ -638,7 +648,7 @@ async fn connect_agent(
     });
     if !has_candidate { return Err("No compatible enabled candidate for this route".into()); }
     let mut service=state.proxy.lock().await;
-    let config_lock=ownership::config_lock(&dirs::home_dir().unwrap_or_default()).map_err(|e|e.to_string())?;
+    let config_lock=ownership::config_lock(&crate::runtime::home_dir().unwrap_or_default()).map_err(|e|e.to_string())?;
     if only_connected.unwrap_or(false) {
         let current = state.store.read();
         if current.agent_auto_connect.get(&id) == Some(&false)
@@ -648,7 +658,7 @@ async fn connect_agent(
     } else if !service.as_ref().is_some_and(|p|p.running()) {
         *service=Some(proxy::start(state.store.clone()).await.map_err(|e|e.to_string())?);
     }
-    inject_agent(&config.custom_agents, &id, config.port, &route_id, &catalog).map_err(|error| error.to_string())?;
+    inject_agent(&config.custom_agents, &id, state.store.read().port, &route_id, &catalog).map_err(|error| error.to_string())?;
     state.store.update(|config| { config.agent_selections.insert(id.clone(), route_id.clone()); config.agent_catalogs.insert(id.clone(), catalog); config.agent_auto_connect.insert(id.clone(), true); }).map_err(|e| e.to_string())?;
     drop(config_lock);
     drop(service);
@@ -661,15 +671,15 @@ async fn restore_agent(
     id: String,
 ) -> Result<DashboardSnapshot, String> {
     let service=state.proxy.lock().await;
-    let config_lock=ownership::config_lock(&dirs::home_dir().unwrap_or_default()).map_err(|e|e.to_string())?;
+    let config_lock=ownership::config_lock(&crate::runtime::home_dir().unwrap_or_default()).map_err(|e|e.to_string())?;
     let config = state.store.read();
     let custom_injection = config.custom_agents.iter().find(|a| a.id == id).and_then(|a| a.injection.as_ref());
-    let owned = custom_injection.map(|i| custom_agents::owned(i, &dirs::home_dir().unwrap_or_default(), config.port)).unwrap_or_else(|| agents::owned_by(&id,config.port));
+    let owned = custom_injection.map(|i| custom_agents::owned(i, &crate::runtime::home_dir().unwrap_or_default(), config.port)).unwrap_or_else(|| agents::owned_by(&id,config.port));
     if !owned {return Err("This agent is not connected to this gateway instance".into());}
     if let Some(binding) = detected_agents_with_selection(&config).into_iter().find(|a| a.id == id).and_then(|a| a.route_id) {
         state.store.update(|config| { config.agent_selections.insert(id.clone(), binding); }).map_err(|e| e.to_string())?;
     }
-    if let Some(injection) = custom_injection { custom_agents::restore(injection, &dirs::home_dir().unwrap_or_default(), config.port).map_err(|e| e.to_string())?; }
+    if let Some(injection) = custom_injection { custom_agents::restore(injection, &crate::runtime::home_dir().unwrap_or_default(), config.port).map_err(|e| e.to_string())?; }
     else { agents::restore_for_gateway(&id,config.port).map_err(|error| error.to_string())?; }
     state.store.update(|config| { config.agent_auto_connect.insert(id.clone(), false); }).map_err(|e| e.to_string())?;
     drop(config_lock);drop(service);
@@ -698,7 +708,8 @@ async fn test_provider_draft(state: State<'_, AppState>, provider: Provider, api
     let mut request = state.store.read().gateway.client().map_err(|e|e.to_string())?.post(format!("{base}/{endpoint}")).header("user-agent", "AutoJev/ProviderTest").header("HTTP-Referer", "https://autojev.ai").header("X-Title", "AutoJev").timeout(std::time::Duration::from_secs(30)).json(&payload);
     if messages { request = request.header("anthropic-version", "2023-06-01"); }
     if let Some(key) = key.as_ref() { request = if messages { request.header("x-api-key", key.trim()) } else { request.bearer_auth(key.trim()) }; }
-    let response = match request.send().await {
+    let protocol = protocol::Protocol::parse(endpoint).map_err(|e| e.to_string())?;
+    let response = match state.store.dispatcher.send(dispatch::Target { provider: &provider, model_id: &provider.test_model, protocol }, request).await {
         Ok(response) => response,
         Err(_) => {
             return Err("Connection failed or timed out. Check the base URL and network.".into());
@@ -780,9 +791,35 @@ fn request_safe_exit(app:tauri::AppHandle){
     });
 }
 pub fn run() {
+    if let Err(error) = runtime::init() { eprintln!("AutoJev isolation: {error}"); std::process::exit(2); }
     if lifecycle::watchdog_entry(){return;}
-    tauri::Builder::default()
-        .plugin(tauri_plugin_updater::Builder::new().build())
+    let mut context = tauri::generate_context!();
+    if runtime::isolated() {
+        context.config_mut().identifier = "ai.autojev.client.isolated".into();
+        let args: Vec<_> = std::env::args().collect();
+        if let Some(index) = args.iter().position(|s| s == "--autojev-ui-url") {
+            let url = args.get(index + 1).and_then(|s| reqwest::Url::parse(s).ok())
+                .filter(|url| dispatch::ensure_loopback(url).is_ok()).expect("Isolation UI URL must be literal loopback HTTP");
+            context.config_mut().build.dev_url = Some(url);
+        }
+        for window in &mut context.config_mut().app.windows {
+            window.incognito = true;
+            window.data_directory = Some(runtime::home_dir().unwrap().join("webview"));
+        }
+    }
+    let builder = tauri::Builder::default();
+    let builder = if runtime::isolated() { builder } else { builder.plugin(tauri_plugin_updater::Builder::new().build()) };
+    builder
+        .on_page_load(|_window, _payload| {
+            #[cfg(feature = "isolation-check")]
+            if _payload.event() == tauri::webview::PageLoadEvent::Finished {
+                match isolation_check::script() {
+                    Ok(Some(script)) => { let _ = _window.eval(&script); },
+                    Ok(None) => {},
+                    Err(error) => eprintln!("Desktop isolation check: {error}"),
+                }
+            }
+        })
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_opener::init())
         .on_window_event(|window,event|{if let tauri::WindowEvent::CloseRequested{api,..}=event{api.prevent_close();let _=window.hide();}})
@@ -791,22 +828,27 @@ pub fn run() {
                 window.set_decorations(false)?;
                 window.set_background_color(Some(tauri::window::Color(0, 0, 0, 0)))?;
             }
-            let root = dirs::home_dir().context("find home directory")?.join(".autojev");
+            let root = crate::runtime::home_dir().context("find home directory")?.join(".autojev");
             let database = if app.config().identifier.ends_with(".dev") { "autojev-dev.db" } else { "autojev.db" };
             let store = Arc::new(ConfigStore::load(root.join(database))?);
-            let port = if app.config().identifier.ends_with(".dev") { config::DEV_PORT } else { config::DEFAULT_PORT };
+            let port = if runtime::isolated() { 0 } else if app.config().identifier.ends_with(".dev") { config::DEV_PORT } else { config::DEFAULT_PORT };
             app.manage(lifecycle::lock(port)?);
-            lifecycle::spawn_watchdog(port)?;
+            if !runtime::isolated() { lifecycle::spawn_watchdog(port)?; }
+            let port = if runtime::isolated() { 0 } else { port };
             if store.read().port != port { store.update(|config| config.port = port)?; }
             let state = AppState {
                 performance: Arc::new(performance::Runner::default()),
                 store: store.clone(),
                 proxy: Arc::new(Mutex::new(None)),
             };
-            tauri::async_runtime::spawn(performance::schedule(state.store.clone(),state.performance.clone()));
+            if runtime::isolated() {
+                store.update(|c| c.performance_settings.enabled = false)?;
+            } else {
+                tauri::async_runtime::spawn(performance::schedule(state.store.clone(),state.performance.clone()));
+            }
             let proxy_state = state.clone();
             let startup_app = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
+            if !runtime::isolated() { tauri::async_runtime::spawn(async move {
                 let mut service=proxy_state.proxy.lock().await;
                 if service.is_some(){return;}
                 match proxy::start(store).await {
@@ -819,7 +861,7 @@ pub fn run() {
                     },
                     Err(error) => eprintln!("AutoJev proxy did not start automatically: {error}"),
                 }
-            });
+            }); }
             app.manage(state);
             let show=tauri::menu::MenuItem::with_id(app,"show","Open AutoJev",true,None::<&str>)?;
             let quit=tauri::menu::MenuItem::with_id(app,"safe-quit","Quit AutoJev (restore agents)",true,None::<&str>)?;
@@ -834,7 +876,13 @@ pub fn run() {
             tray.build(app)?;
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![
+        .invoke_handler(|invoke: tauri::ipc::Invoke<tauri::Wry>| {
+            #[cfg(feature = "isolation-check")]
+            if invoke.message.command() == "isolation_check_report" {
+                let handler: fn(tauri::ipc::Invoke<tauri::Wry>) -> bool = tauri::generate_handler![isolation_check::isolation_check_report];
+                return handler(invoke);
+            }
+            let handler: fn(tauri::ipc::Invoke<tauri::Wry>) -> bool = tauri::generate_handler![
             get_snapshot,
             get_model_performance,
             start_model_speed_tests,
@@ -869,8 +917,10 @@ pub fn run() {
             restore_agent,
             test_provider,
             test_provider_draft
-        ])
-        .build(tauri::generate_context!())
+        ];
+            handler(invoke)
+        })
+        .build(context)
         .expect("error while building AutoJev")
         .run(|app,event|{match event{
             tauri::RunEvent::ExitRequested{api,code,..} if code!=Some(tauri::RESTART_EXIT_CODE) && !EXIT_READY.load(std::sync::atomic::Ordering::SeqCst)=>{api.prevent_exit();request_safe_exit(app.clone());},

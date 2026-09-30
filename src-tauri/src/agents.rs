@@ -47,7 +47,7 @@ pub fn validate_custom(agent: &CustomAgent) -> Result<()> {
         return Err(anyhow!("Agent name and executable are required"));
     }
     if !agent.id.starts_with("custom-") { return Err(anyhow!("Invalid custom agent ID")); }
-    if let Some(injection) = &agent.injection { injection.resolve(&dirs::home_dir().unwrap_or_default())?; }
+    if let Some(injection) = &agent.injection { injection.resolve(&crate::runtime::home_dir().unwrap_or_default())?; }
     Ok(())
 }
 pub fn detect(custom: &[CustomAgent]) -> Vec<AgentStatus> {
@@ -61,12 +61,12 @@ pub fn detect(custom: &[CustomAgent]) -> Vec<AgentStatus> {
         result.push(detect_executable(id, name, command, false));
     }
     result.extend(custom.iter().map(|a| { let mut status = detect_executable(&a.id, &a.name, &a.command, true); status.icon = a.icon.clone(); status.args = a.args.clone(); status.injection = a.injection.clone(); status.config_path = a.config_path.clone().unwrap_or_default();
-        if let Some(injection) = &a.injection { status.config_path = injection.path.clone(); status.can_connect = injection.resolve(&dirs::home_dir().unwrap_or_default()).is_ok(); }
+        if let Some(injection) = &a.injection { status.config_path = injection.path.clone(); status.can_connect = injection.resolve(&crate::runtime::home_dir().unwrap_or_default()).is_ok(); }
         status }));
     result
 }
 fn detect_executable(id: &str, name: &str, command: &str, custom: bool) -> AgentStatus {
-    let home = dirs::home_dir().unwrap_or_default();
+    let home = crate::runtime::home_dir().unwrap_or_default();
     let paths = crate::agent_adapters::paths(id, &home);
     let bound = crate::agent_adapters::binding(id, &home);
     let executable = executable_path(command);
@@ -82,7 +82,7 @@ pub fn connect(id: &str, port: u16, route_id: &str, api: &str) -> Result<()> {
     match id {
         "codex" => connect_codex(port, route_id),
         "claude" => connect_claude(port, route_id),
-        _ => crate::agent_adapters::connect(id, port, route_id, api, &dirs::home_dir().unwrap_or_default()),
+        _ => crate::agent_adapters::connect(id, port, route_id, api, &crate::runtime::home_dir().unwrap_or_default()),
     }
 }
 
@@ -144,7 +144,7 @@ fn detect_claude() -> AgentStatus {
 }
 
 fn connect_codex(port: u16, route_id: &str) -> Result<()> {
-    connect_codex_catalog(port, route_id, &[crate::agent_catalog::Entry { binding: route_id.into(), id: crate::agent_catalog::wire_id(route_id), name: route_id.into() }], &dirs::home_dir().context("Cannot locate home directory")?)
+    connect_codex_catalog(port, route_id, &[crate::agent_catalog::Entry { binding: route_id.into(), id: crate::agent_catalog::wire_id(route_id), name: route_id.into() }], &crate::runtime::home_dir().context("Cannot locate home directory")?)
 }
 
 pub fn connect_codex_catalog(port: u16, route_id: &str, catalog: &[crate::agent_catalog::Entry], home: &Path) -> Result<()> {
@@ -268,13 +268,13 @@ fn connect_claude_catalog_at(port: u16, binding: &str, catalog: &[crate::agent_c
 }
 
 fn codex_path() -> PathBuf {
-    dirs::home_dir()
+    crate::runtime::home_dir()
         .unwrap_or_default()
         .join(".codex/config.toml")
 }
 
 fn claude_path() -> PathBuf {
-    dirs::home_dir()
+    crate::runtime::home_dir()
         .unwrap_or_default()
         .join(".claude/settings.json")
 }
@@ -306,7 +306,7 @@ fn ensure_parent(path: &Path) -> Result<()> {
 fn migrate_before_connect(path:&Path,port:u16)->Result<()> {
     if backup_path(path).exists() && crate::ownership::owner(path)?.is_none(){
         if let Some(previous)=[port,crate::config::DEFAULT_PORT,crate::config::DEV_PORT,9487].into_iter().find(|p|crate::ownership::points_to(path,*p)) {
-            let id=if path==codex_path(){"codex"}else{"claude"};prepare_legacy(id,&dirs::home_dir().unwrap_or_default(),previous)?;
+            let id=if path==codex_path(){"codex"}else{"claude"};prepare_legacy(id,&crate::runtime::home_dir().unwrap_or_default(),previous)?;
         }
     }Ok(())
 }
@@ -314,7 +314,7 @@ fn inject_owned(path:&Path,port:u16,output:&str)->Result<()> {
     let original=fs::read_to_string(backup_path(path))?;
     crate::ownership::apply(&[path.to_owned()],port,&[if original.is_empty(){None}else{Some(original)}],&[output.to_owned()])
 }
-pub fn restore_gateway(port:u16)->Result<()> {restore_gateway_at(port,&dirs::home_dir().ok_or_else(||anyhow!("Cannot locate home directory"))?)}
+pub fn restore_gateway(port:u16)->Result<()> {restore_gateway_at(port,&crate::runtime::home_dir().ok_or_else(||anyhow!("Cannot locate home directory"))?)}
 pub fn repair_orphan_models(home: &Path) -> Result<()> {
     for id in ["codex", "claude", "grok", "kimi", "openclaw", "opencode", "hermes", "omp", "gemini"] {
         let paths = match id {
@@ -359,12 +359,13 @@ fn prepare_legacy(id:&str,home:&Path,port:u16)->Result<Vec<PathBuf>> {
     Ok(paths)
 }
 pub fn restore_for_gateway(id:&str,port:u16)->Result<()> {
-    let home=dirs::home_dir().ok_or_else(||anyhow!("Cannot locate home directory"))?;
+    let home=crate::runtime::home_dir().ok_or_else(||anyhow!("Cannot locate home directory"))?;
     if id!="fastclaw"{prepare_legacy(id,&home,port)?;}
     restore_at(id,&home)
 }
 
 fn executable_path(command: &str) -> Option<String> {
+    if crate::runtime::isolated() { return None; }
     let output = Command::new(std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()))
         .args(["-lc", "command -v -- \"$1\"", "autojev-detect", command])
         .output().ok()?;
@@ -376,7 +377,7 @@ fn executable_path(command: &str) -> Option<String> {
 fn command_exists(command: &str) -> bool { executable_path(command).is_some() }
 
 fn display_home(path: &Path) -> String {
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = crate::runtime::home_dir() {
         if let Ok(relative) = path.strip_prefix(home) {
             return format!("~/{}", relative.display());
         }
@@ -423,6 +424,7 @@ pub fn prompt_args(args: &[String], prompt: &str) -> Vec<String> {
     result
 }
 pub async fn test_custom(agent: CustomAgent) -> Result<String> {
+    crate::runtime::external_action()?;
     validate_custom(&agent)?;
     let path = executable_path(agent.command.trim()).ok_or_else(|| anyhow!("Agent executable not found"))?;
     let mut command = tokio::process::Command::new(path);
@@ -437,6 +439,7 @@ pub async fn test_custom(agent: CustomAgent) -> Result<String> {
 }
 
 pub fn launch(id: &str, custom: &[CustomAgent]) -> Result<()> {
+    crate::runtime::external_action()?;
     let agent = detect(custom).into_iter().find(|a| a.id == id)
         .ok_or_else(|| anyhow!("Agent not found"))?;
     let path = agent.executable_path.ok_or_else(|| anyhow!("Agent executable not found"))?;
@@ -533,7 +536,7 @@ mod recovery_tests {
 }
 
 pub fn owned_by(id:&str,port:u16)->bool {
-    let home=dirs::home_dir().unwrap_or_default();
+    let home=crate::runtime::home_dir().unwrap_or_default();
     if id=="fastclaw"{return crate::agent_adapters::paths(id,&home).first().is_some_and(|p|crate::fastclaw_adapter::uses_port(p,port));}
     let paths=match id{"codex"=>vec![codex_path()],"claude"=>vec![claude_path()],_=>crate::agent_adapters::paths(id,&home)};
     paths.iter().any(|p|crate::ownership::owner(p).ok().flatten()==Some(port) || crate::ownership::points_to(p,port))
@@ -599,6 +602,6 @@ pub fn configuration_paths(id: &str) -> Vec<PathBuf> {
     match id {
         "codex" => vec![codex_path()],
         "claude" => vec![claude_path()],
-        _ => crate::agent_adapters::paths(id, &dirs::home_dir().unwrap_or_default()),
+        _ => crate::agent_adapters::paths(id, &crate::runtime::home_dir().unwrap_or_default()),
     }
 }
