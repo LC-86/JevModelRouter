@@ -917,7 +917,7 @@ fn parse_catalog(result: &Value) -> Result<CatalogRead> {
         // 发现 ≠ 资格：固定版本没有任何资格布尔字段，本票一律保持 false（资格由 #17 定义）。
         models.push(DiscoveredModel { model_id, name, eligible: false });
     }
-    Ok(CatalogRead { models, source: Some(CATALOG_SOURCE.to_owned()), observed_at: Some(observed_at_now()), missing_fields })
+    Ok(CatalogRead { state: EvidenceState::Available, models, source: Some(CATALOG_SOURCE.to_owned()), observed_at: Some(observed_at_now()), missing_fields })
 }
 
 // CHUNK-QUOTA

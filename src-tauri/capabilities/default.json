@@ -26,6 +26,9 @@
         },
         {
           "url": "https://chatgpt.com/*"
+        },
+        {
+          "url": "https://docs.x.ai/*"
         }
       ]
     },

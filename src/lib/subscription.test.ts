@@ -1,14 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import { translate } from './preferences-context';
 import {
-  agentCatalogPendingSync, agentSelectableModels, authHomeLabel, availabilityLabel, capabilityLabel,
-  catalogEntryEligible, catalogEntryInPool, catalogEntryStateLabel, catalogLabel, catalogModelRow, catalogText,
-  connectionStateLabel, connectionStateTone, denialLabel, eligibilityLabel, helperVersionLabel,
-  identityLabel, isSubscriptionProvider, knownOrUnknown, localLogoutLabel, loginStageLabel, loginStageTone,
-  modelCapability, modelListMembers, modelSelected, protocolKey, quotaEvidenceText, quotaHistoryLabel, quotaLabel,
-  quotaPermissionLabel, quotaViewLabel, remainingPercent, remoteRevocationLabel, speedTestCandidates,
-  subscriptionActions, subscriptionCatalog, subscriptionCatalogText, subscriptionQuotaText, subscriptionReason,
-  subscriptionStatusText, subscriptionView, unselectedModels,
+  CATALOG_REFERENCE_URL, QUOTA_REFERENCE_URL, agentCatalogPendingSync, agentSelectableModels, authHomeLabel,
+  availabilityLabel, capabilityLabel, catalogEntryEligible, catalogEntryInPool, catalogEntryStateLabel, catalogLabel,
+  catalogModelRow, catalogRemovedLabel, catalogText, connectionStateLabel, connectionStateTone, creditsAxisText,
+  denialLabel, eligibilityLabel, helperVersionLabel, identityLabel, isSubscriptionProvider, knownOrUnknown,
+  localLogoutLabel, loginStageLabel, loginStageTone, modelCapability, modelListMembers, modelSelected, protocolKey,
+  quotaEvidenceText, quotaHistoryLabel, quotaLabel, quotaPermissionLabel, quotaViewLabel, remainingPercent,
+  remoteRevocationLabel, speedTestCandidates, subscriptionActions, subscriptionCatalog, subscriptionCatalogText,
+  subscriptionQuotaText, subscriptionReason, subscriptionStatusText, subscriptionView, unselectedModels,
 } from './subscription';
 import type { DashboardSnapshot, Model, Provider, SubscriptionCatalogEntry, SubscriptionQuota, SubscriptionView } from '../types';
 
@@ -433,7 +433,61 @@ describe('subscription catalog and quota evidence', () => {
     // 目录证据级文本不含模型列表，但也必须给出同样的状态与来源。
     expect(catalogText(withCatalog.catalog)).toContain('catalog_state=stale');
     expect(catalogText(withCatalog.catalog)).toContain('missing=model.list[3].id');
-    expect(catalogText(undefined)).toBe('catalog_state=unknown source=Unknown observed_at=Unknown missing=');
+    // #16 在 models= 与 missing= 之间固定插入 removed=（上一次已核实目录里已消失的模型）。
+    expect(catalogText(undefined)).toBe('catalog_state=unknown source=Unknown observed_at=Unknown removed= missing=');
+  });
+
+  it('always renders the credits axis, even when the backend sent no credits at all', () => {
+    // 后端完全没给 credits：token 仍是诚实的 Unknown，该轴不消失，也不是 0/100%。
+    expect(quotaEvidenceText({ state: 'available', buckets: [{ limit_id: 'subscription_pool' }] }))
+      .toContain('credits=has:Unknown,unlimited:Unknown,balance:Unknown,unit:Unknown,permission:unknown');
+    const unknown = { has_credits: null, unlimited: null, balance: null, unit: null, permission: 'unknown' as const, missing_fields: ['has_credits'], invalid_fields: [] };
+    const axis = creditsAxisText(unknown, t);
+    expect(axis).toContain('额外 credits');
+    expect(axis).toContain('余额: Unknown');
+    expect(axis).toContain('单位: Unknown');
+    expect(axis).toContain('缺字段: has_credits');
+    const missingAxis = creditsAxisText(null, t);
+    expect(missingAxis).toContain('额外 credits');
+    expect(missingAxis).toContain('有 credits: Unknown');
+    expect([axis, missingAxis].join(' ')).not.toMatch(/0%|100%|余额: 0|单位: 0/);
+  });
+
+  it('lists removed models between models and missing, and never as ineligible', () => {
+    // removed= 空时为空串，位置固定在 models= 与 missing= 之间。
+    expect(subscriptionCatalogText(view({ catalog: { state: 'available', removed_models: [] }, models: [{ model_id: 'grok-4', eligible: true }] })))
+      .toBe('catalog_state=available source=Unknown observed_at=Unknown models=grok-4:true removed= missing=');
+    expect(catalogText({ state: 'available', removed_models: ['grok-3', 'grok-3-mini'] }))
+      .toBe('catalog_state=available source=Unknown observed_at=Unknown removed=grok-3,grok-3-mini missing=');
+    // 被移除 ≠ 不具备资格，也绝不写成可调用。
+    expect(catalogRemovedLabel(['grok-3', 'grok-3-mini'], t)).toBe('已从上一次目录移除：grok-3, grok-3-mini');
+    expect(catalogRemovedLabel([], t)).toBe('');
+    expect(catalogRemovedLabel(undefined, t)).toBe('');
+    expect(catalogRemovedLabel(['  '], t)).toBe('');
+    expect(catalogRemovedLabel(['grok-3'], t)).not.toContain('资格');
+  });
+
+  it('passes the credits unit through as raw upstream text and keeps the permission axes apart', () => {
+    const withUnit: SubscriptionQuota = {
+      state: 'available', buckets: [{
+        limit_id: 'subscription_pool', permission: 'allowed',
+        credits: { has_credits: true, unlimited: false, balance: '12.50', unit: 'USD', permission: 'denied', missing_fields: [] },
+      }],
+    };
+    const text = quotaEvidenceText(withUnit);
+    expect(text).toContain('credits=has:true,unlimited:false,balance:12.50,unit:USD,permission:denied');
+    // 池许可仍是 allowed：credits 轴不参与聚合。
+    expect(text).toContain('permission=allowed');
+    // 缺单位不推断单位，缺余额不用 0 顶替。
+    expect(quotaEvidenceText({ state: 'available', buckets: [{ limit_id: 'subscription_pool', credits: { has_credits: true, permission: 'unknown' } }] }))
+      .toContain('credits=has:true,unlimited:Unknown,balance:Unknown,unit:Unknown,permission:unknown');
+    expect(quotaEvidenceText({ state: 'available', buckets: [{ limit_id: 'subscription_pool', credits: null }] }))
+      .toContain('credits=has:Unknown,unlimited:Unknown,balance:Unknown,unit:Unknown,permission:unknown');
+    // Grok 只读契约的视图标签与官方入口是 Grok 专属事实，Codex 没有自己的入口时不新增。
+    expect(catalogLabel('unsupported', t)).toBe('无目录接口');
+    expect(quotaViewLabel('grok_cli_usage', t)).toBe('Grok CLI 用量');
+    expect(CATALOG_REFERENCE_URL).toBe('https://docs.x.ai/build/cli/reference');
+    expect(QUOTA_REFERENCE_URL).toBe('https://docs.x.ai/grok/faq#usage--limits');
   });
 
   it('tolerates legacy snapshots without catalog or extended quota fields', () => {

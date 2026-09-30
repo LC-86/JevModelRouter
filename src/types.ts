@@ -67,7 +67,7 @@ export type SubscriptionEvidenceState = 'unknown' | 'available' | 'stale' | 'fai
 /** 额度许可：缺失、null 或非布尔一律是 unknown，不得当成“已关闭”。 */
 export type SubscriptionQuotaPermission = 'unknown' | 'allowed' | 'denied';
 /** 额度来源视图：多桶优先，其次旧版单桶，都没有就是 unknown。 */
-export type SubscriptionQuotaView = 'unknown' | 'rate_limits_by_limit_id' | 'rate_limits';
+export type SubscriptionQuotaView = 'unknown' | 'rate_limits_by_limit_id' | 'rate_limits' | 'grok_cli_usage';
 
 export type SubscriptionLoginStage = 'idle' | 'pending' | 'completed' | 'failed' | 'cancelled';
 export type SubscriptionLocalClearing = 'cleared' | 'retained';
@@ -113,7 +113,12 @@ export interface SubscriptionQuotaCredits {
   has_credits?: boolean | null;
   unlimited?: boolean | null;
   balance?: string | null;
+  /** 上游给出的原始单位文本；缺失即未知，界面不推断。 */
+  unit?: string | null;
+  /** credits 自身的许可轴（是否允许消耗额外 credits），与订阅内许可互不推导。 */
+  permission?: SubscriptionQuotaPermission;
   missing_fields?: string[];
+  invalid_fields?: string[];
 }
 export interface SubscriptionQuotaBucket {
   limit_id: string;
@@ -136,11 +141,13 @@ export interface SubscriptionQuota {
   history?: boolean;
 }
 /** 模型目录只读证据；失败时保留上次已核实的目录并标记 stale。 */
-export type SubscriptionCatalogState = 'unknown' | 'available' | 'stale' | 'failed';
+export type SubscriptionCatalogState = 'unknown' | 'available' | 'stale' | 'failed' | 'unsupported';
 export interface SubscriptionCatalogEvidence {
   state: SubscriptionCatalogState;
   source?: string | null;
   observed_at?: string | null;
+  /** 上一次已核实目录里有、本次权威结果里已不存在的模型标识。 */
+  removed_models?: string[];
   missing_fields?: string[];
 }
 

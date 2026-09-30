@@ -91,11 +91,13 @@ impl crate::subscription::SubscriptionAdapter for CatalogStandInAdapter {
 
     /// 目录内容来自受控文件，其余证据仍然来自真实适配器。
     /// 返回 #15 的 `CatalogRead`：失败（`fail: true`）时必须返回 `Err`，让调用方走「保留已核实项并标陈旧」，
-    /// 不得用不完整的列表冒充权威目录。
+    /// 不得用不完整的列表冒充权威目录。受控文件给出的列表即本次权威结果（含空列表＝权威移除），
+    /// 因此 `state` 固定为 `Available`，并且不记 `missing_fields`（#16 的不可信列表另有 Grok 侧分支）。
     fn models<'a>(&'a self, _provider_id: &'a str, _generation: u64) -> futures_util::future::BoxFuture<'a, anyhow::Result<crate::subscription::CatalogRead>> {
         Box::pin(async move {
             let read = self.next_read()?;
             Ok(crate::subscription::CatalogRead {
+                state: crate::subscription::EvidenceState::Available,
                 models: read
                     .models
                     .into_iter()
@@ -193,7 +195,7 @@ pub fn script() -> anyhow::Result<Option<String>> {
         .cloned();
     if let Some(mode) = &login_mode {
         anyhow::ensure!(
-            matches!(mode.as_str(), "success" | "late" | "failed" | "grok" | "catalog" | "model-selection"),
+            matches!(mode.as_str(), "success" | "late" | "failed" | "grok" | "grok-read" | "catalog" | "model-selection"),
             "Unknown login check mode: {mode}"
         );
     }

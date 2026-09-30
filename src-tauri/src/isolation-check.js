@@ -218,6 +218,185 @@
       passed('the Codex row is unaffected by the rejected Grok sign-in');
       await click('.subscription-auth-dialog .subscription-auth-footer button.primary');
       await wait(() => !grokDialog(), 'grok subscription auth dialog closed');
+      // Issue #16：隔离验证环境里不得拉起任何 Grok 辅助进程。只读 refresh 必须如实失败，
+      // 且一个连接字段都不改写；从未读取过的目录/额度证据必须保持 unknown，不得伪造 0/100%。
+      const grokReadBefore = await wait(async () => (await grokView()) || null, 'grok view before read-only refresh');
+      const grokReadBeforeJson = JSON.stringify(grokReadBefore);
+      const refreshError = await invoke('refresh_subscription', { providerId: grokProviderId }).then(() => null, error => String(error));
+      check(refreshError !== null, 'A read-only Grok refresh must not succeed while isolated validation provides no Grok helper');
+      check(/isolated|helper|not implemented|unsupported|not supported/i.test(refreshError), `A read-only Grok refresh must fail honestly: ${refreshError}`);
+      const grokReadAfter = await wait(async () => (await grokView()) || null, 'grok view after read-only refresh');
+      check(JSON.stringify(grokReadAfter) === grokReadBeforeJson, `A failed isolated Grok refresh must not rewrite any connection field: before=${grokReadBeforeJson} after=${JSON.stringify(grokReadAfter)}`);
+      check(grokReadAfter.state === 'not_connected', `An isolated Grok refresh must leave the connection unconnected: ${grokReadAfter.state}`);
+      check(grokReadAfter.generation === grokReadBefore.generation, `An isolated Grok refresh must not advance the generation: ${grokReadBefore.generation} -> ${grokReadAfter.generation}`);
+      check(!grokReadAfter.identity, `An isolated Grok refresh must not invent an identity: ${grokReadAfter.identity}`);
+      check(grokReadAfter.catalog?.state === 'unknown', `Grok catalog evidence must stay unknown instead of being fabricated: ${JSON.stringify(grokReadAfter.catalog)}`);
+      check(grokReadAfter.quota?.state === 'unknown', `Grok quota evidence must stay unknown instead of being fabricated: ${JSON.stringify(grokReadAfter.quota)}`);
+      check((grokReadAfter.quota?.buckets || []).length === 0, `An unread Grok quota must keep its buckets empty: ${JSON.stringify(grokReadAfter.quota?.buckets)}`);
+      check((grokReadAfter.models || []).length === 0, `An unread Grok catalog must keep its models empty: ${(grokReadAfter.models || []).length}`);
+      check(grokReadAfter.helper?.available !== true && !grokReadAfter.helper?.version && !grokReadAfter.helper?.auth_home, `The Grok row must report an unavailable helper: ${JSON.stringify(grokReadAfter.helper)}`);
+      const catalogText = await wait(() => document.querySelector(`[data-testid="sub-catalog-${grokProviderId}"]`)?.textContent || null, 'grok catalog read-only text');
+      const quotaText = await wait(() => document.querySelector(`[data-testid="sub-quota-${grokProviderId}"]`)?.textContent || null, 'grok quota read-only text');
+      check(/catalog_state=unknown\b/.test(catalogText), `Grok catalog text must read catalog_state=unknown: ${catalogText}`);
+      check(/quota_state=unknown\b/.test(quotaText), `Grok quota text must read quota_state=unknown: ${quotaText}`);
+      check(!/\bbucket=/.test(quotaText), `An unread Grok quota must not render a bucket segment: ${quotaText}`);
+      check(!/(used|remaining|minutes|resets_at|balance|has_credits|unlimited|credit)=/.test(quotaText), `An unread Grok quota must not render window or credit values: ${quotaText}`);
+      check(!/\d/.test(quotaText), `An unread Grok quota must not fabricate numbers (0/100%): ${quotaText}`);
+      check(!/\d/.test(catalogText), `An unread Grok catalog must not fabricate numbers: ${catalogText}`);
+      check(!/models=\S/.test(catalogText), `An unread Grok catalog must not list models: ${catalogText}`);
+      // 只读块：unknown 状态下必须给出官方查看入口（只看，不作为绕过准入的依据）。
+      const grokRow = await wait(() => [...document.querySelectorAll('tbody tr')].find(item => item.textContent.includes(grokProviderId)) || null, 'grok row for the read-only block');
+      const readOnlyBlock = (() => {
+        const catalog = grokRow.querySelector(`[data-testid="sub-catalog-${grokProviderId}"]`);
+        const quota = grokRow.querySelector(`[data-testid="sub-quota-${grokProviderId}"]`);
+        if (!catalog || !quota) return grokRow;
+        let node = catalog;
+        while (node && node !== grokRow && !node.contains(quota)) node = node.parentElement;
+        return node && node.contains(quota) ? node : grokRow;
+      })();
+      const officialLinks = [...readOnlyBlock.querySelectorAll('a[href]')].map(anchor => anchor.getAttribute('href') || '');
+      check(officialLinks.some(href => href.includes('docs.x.ai/build/cli/reference')), `An unknown Grok catalog must offer the official reference: ${JSON.stringify(officialLinks)}`);
+      check(officialLinks.some(href => href.includes('docs.x.ai/grok/faq')), `An unknown Grok quota must offer the official reference: ${JSON.stringify(officialLinks)}`);
+      // Bugbot #1：官方入口按服务商类型判定，不是名称或标识字符串。同一页面的 Codex 行
+      // （同样处于未读取的 unknown 状态）不得出现 Grok 的入口。
+      const codexRow = [...document.querySelectorAll('tbody tr')].find(item => item.textContent.includes('codex-subscription') && !item.textContent.includes(grokProviderId)) || null;
+      check(codexRow !== null, 'A Codex subscription row must be present to compare the official references');
+      check(!/docs\.x\.ai/.test(codexRow.textContent), `The Codex row must not offer Grok references: ${codexRow.textContent.slice(0, 240)}`);
+      // #12 边界：#16 的只读块不得让 Grok 行借用 Codex 适配器的 helper 版本或授权目录。
+      const codexDuringGrok = await subscriptionView();
+      const codexVersion = codexDuringGrok?.helper?.version || '';
+      const codexHome = codexDuringGrok?.helper?.auth_home || '';
+      const grokStatusText = await waitStatusFor(grokProviderId, text => text.includes('helper=Unknown') && text.includes('auth_home=Unknown'));
+      if (codexVersion) check(!grokStatusText.includes(codexVersion), `The Grok row must not show the Codex helper version: ${grokStatusText}`);
+      if (codexHome) check(!grokStatusText.includes(codexHome), `The Grok row must not show the Codex auth home: ${grokStatusText}`);
+      // #16：生成准入保持拒绝。测速请求必须如实失败、样本不增加，绝不到达任何真实上游
+      //（驱动侧再用 fixture 请求账本复核 Grok 订阅模型零派发）。
+      const grokModelId = 'grok-subscription-model';
+      const grokSnapshot = await invoke('get_snapshot');
+      check(grokSnapshot.models.some(item => item.id === grokModelId && item.provider_id === grokProviderId), `The Grok subscription model configuration must survive read-only refreshes: ${JSON.stringify(grokSnapshot.models.filter(item => item.provider_id === grokProviderId))}`);
+      const samplesBefore = ((await invoke('get_model_performance')).models[grokModelId]?.samples) ?? 0;
+      const startError = await invoke('start_model_speed_tests', { ids: [grokModelId] }).then(() => null, error => String(error));
+      const denied = await wait(async () => {
+        const value = await invoke('get_model_performance');
+        return !value.job.running && (value.job.error || startError) ? value : null;
+      }, 'denied grok speed test');
+      const deniedReason = String(startError || denied.job.error || '');
+      check(deniedReason.length > 0, `A denied Grok subscription test must report a reason: ${JSON.stringify(denied.job)}`);
+      check(/not connected|not_connected|not implemented|unsupported|not supported|denied|未连接/i.test(deniedReason), `A denied Grok subscription test must report an honest reason: ${deniedReason}`);
+      record('grokReadOnly', {
+        refreshError,
+        unchanged: JSON.stringify(grokReadAfter) === grokReadBeforeJson,
+        before: { state: grokReadBefore.state, generation: grokReadBefore.generation, identity: grokReadBefore.identity ?? null, catalogState: grokReadBefore.catalog?.state ?? null, quotaState: grokReadBefore.quota?.state ?? null, buckets: (grokReadBefore.quota?.buckets || []).length, models: (grokReadBefore.models || []).length },
+        after: { state: grokReadAfter.state, generation: grokReadAfter.generation, identity: grokReadAfter.identity ?? null, catalogState: grokReadAfter.catalog?.state ?? null, quotaState: grokReadAfter.quota?.state ?? null, buckets: (grokReadAfter.quota?.buckets || []).length, models: (grokReadAfter.models || []).length, helper: grokReadAfter.helper ?? null },
+        catalogText, quotaText, links: officialLinks, status: grokStatusText,
+        codexHelper: { version: codexVersion || null, auth_home: codexHome || null },
+      });
+      passed('an isolated Grok read-only refresh fails honestly without spawning a helper or rewriting any field');
+      passed('the unread Grok catalog and quota stay unknown with no bucket segment and no fabricated numbers');
+      passed('the unknown Grok read-only block offers the official catalog and quota references');
+      passed('the official references follow the provider kind and never appear on the Codex row');
+      passed('the Grok row never borrows the Codex helper version or auth home');
+      // `samples` 只是尝试计数（失败的尝试也会记录），所以「零派发」由驱动侧的 fixture 请求账本判定；
+      // 这里断言本次拒绝没有被记成任何成功测量（success_rate 必须为 0），不得伪造成可用。
+      const deniedSummary = denied.models[grokModelId] ?? {};
+      check((deniedSummary.success_rate ?? 0) === 0, `A denied Grok subscription test must never be recorded as a success: ${JSON.stringify(deniedSummary)}`);
+      record('grokDenied', {
+        reason: deniedReason.slice(-400),
+        samplesBefore,
+        samplesAfter: deniedSummary.samples ?? null,
+        successRate: deniedSummary.success_rate ?? null,
+      });
+      passed('a denied Grok subscription generation reports a reason without a fabricated success or upstream dispatch');
+    }
+    if (mode === 'grok-read') {
+      // Issue #16：隔离替身真的回复目录/额度。走真实界面路径（行内 Refresh 按钮 → IPC → 适配器 → 替身），
+      // 再用 get_snapshot 交叉核对同一批数值。替身场景队列一次调用消费一项，刷新顺序 account → models → usage。
+      await nav(1);
+      const grokRowFor = () => [...document.querySelectorAll('tbody tr')].find(item => item.textContent.includes(grokProviderId)) || null;
+      await wait(grokRowFor, 'grok row for the read-only stand-in');
+      // 边界（先于任何只读读取）：只读替身绝不代表登录被放行。连接尚未建立时登录仍必须被隔离如实拒绝。
+      const authBefore = await wait(async () => {
+        const snapshot = await invoke('get_snapshot');
+        return (snapshot.subscription_auth ?? []).find(item => item.provider_id === grokProviderId) || null;
+      }, 'grok subscription auth view before the stand-in reads');
+      check(authBefore.helper.available === false, `The read-only stand-in must not make the sign-in helper available: ${JSON.stringify(authBefore.helper)}`);
+      await rejectedAny('begin_subscription_login', { providerId: grokProviderId }, ['isolated', 'helper']);
+      passed('the pinned read-only helper never unlocks Grok sign-in in isolation');
+      const textOf = testid => document.querySelector(`[data-testid="${testid}"]`)?.textContent || '';
+      const modelsToken = text => (text.match(/\bmodels=(\S*)/) || ['', ''])[1];
+      const removedToken = text => (text.match(/\bremoved=(\S*)/) || ['', ''])[1];
+      const clickRefresh = async label => {
+        const button = await wait(() => {
+          const row = grokRowFor();
+          return [...(row?.querySelectorAll('.row-actions button') ?? [])].find(item =>
+            !item.classList.contains('subscription-auth-entry') &&
+            /refresh|刷新/i.test(`${item.getAttribute('aria-label') || ''} ${item.getAttribute('title') || ''}`) &&
+            !item.disabled) || null;
+        }, `grok refresh button ${label}`);
+        button.click();
+      };
+      // 1) account/models/usage 全部成功：目录两个模型（eligible=false）、额度 available、两个许可轴分开。
+      await clickRefresh('#1');
+      const catalog1 = await wait(() => { const text = textOf(`sub-catalog-${grokProviderId}`); return /catalog_state=available\b/.test(text) ? text : null; }, 'round 1 catalog available');
+      const quota1 = await wait(() => { const text = textOf(`sub-quota-${grokProviderId}`); return /quota_state=available\b/.test(text) ? text : null; }, 'round 1 quota available');
+      check(modelsToken(catalog1) === 'grok-build:false,grok-mini:false', `Round 1 catalog must list both stand-in models as not eligible: ${catalog1}`);
+      check(catalog1.includes('source=grok-cli:models') && catalog1.includes('observed_at=2026-01-02T03:04:05Z'), `Round 1 catalog source/time must come from the stand-in: ${catalog1}`);
+      check(/permission=allowed\b/.test(quota1) && /permission:denied\b/.test(quota1), `The pool permission and the credits permission must stay separate axes: ${quota1}`);
+      check(quota1.includes('used=42.5') && quota1.includes('remaining=57.5'), `Round 1 quota must show the stand-in usage and its derived remainder: ${quota1}`);
+      check(quota1.includes('credits=has:true,unlimited:false,balance:12.50,unit:USD,permission:denied'), `Round 1 credits must keep the raw balance and unit: ${quota1}`);
+      check(quota1.includes('source=grok-cli:usage') && quota1.includes('observed_at=2026-01-02T03:04:06Z'), `Round 1 quota source/time must come from the stand-in: ${quota1}`);
+      const view1 = await wait(async () => { const view = await grokView(); return view?.catalog?.state === 'available' && view?.quota?.state === 'available' ? view : null; }, 'round 1 snapshot');
+      const bucket1 = view1.quota?.buckets?.[0] ?? {};
+      const window1 = bucket1.windows?.[0] ?? {};
+      check(view1.models.map(model => model.model_id).join(',') === 'grok-build,grok-mini', `Snapshot catalog must carry both stand-in models: ${JSON.stringify(view1.models)}`);
+      check(view1.models.every(model => model.eligible === false), `Discovered models must stay not eligible: ${JSON.stringify(view1.models)}`);
+      check(view1.state === 'connected' && view1.identity === 'standin-grok@example.invalid', `Snapshot must bind the stand-in identity: ${JSON.stringify({ state: view1.state, identity: view1.identity })}`);
+      check(window1.used_percent === 42.5 && bucket1.permission === 'allowed', `Snapshot must carry the stand-in pool mapping: ${JSON.stringify(bucket1)}`);
+      check(bucket1.credits?.balance === '12.50' && bucket1.credits?.unit === 'USD' && bucket1.credits?.permission === 'denied', `Snapshot credits must stay raw and on their own axis: ${JSON.stringify(bucket1.credits)}`);
+      check(typeof window1.resets_at === 'number', `The stand-in reset time must be mapped to Unix seconds: ${JSON.stringify(window1)}`);
+      record('grokReadRound1', { catalogText: catalog1, quotaText: quota1, snapshot: { state: view1.state, identity: view1.identity, models: view1.models, bucket: bucket1 } });
+      passed('round 1 maps the stand-in catalog and quota into the row and the snapshot');
+      // 2) models=removed + usage=denied：退场模型只说明「这次目录里没有了」，存活模型仍在。
+      await clickRefresh('#2');
+      const catalog2 = await wait(() => { const text = textOf(`sub-catalog-${grokProviderId}`); return /removed=grok-mini\b/.test(text) ? text : null; }, 'round 2 removed token');
+      const quota2 = await wait(() => { const text = textOf(`sub-quota-${grokProviderId}`); return /quota_state=denied\b/.test(text) ? text : null; }, 'round 2 denied quota');
+      check(modelsToken(catalog2) === 'grok-build:false' && removedToken(catalog2) === 'grok-mini', `Round 2 catalog must keep the survivor and report the retired id: ${catalog2}`);
+      check(/permission=denied\b/.test(quota2), `Round 2 quota must report the denied pool permission: ${quota2}`);
+      check(quota2.includes('used=42.5') && quota2.includes('remaining=57.5'), `Round 2 must keep the stand-in numbers on the denied axis: ${quota2}`);
+      const view2 = await wait(async () => { const view = await grokView(); return view?.quota?.state === 'denied' ? view : null; }, 'round 2 snapshot');
+      check((view2.catalog?.removed_models || []).join(',') === 'grok-mini', `Snapshot must report the retired model: ${JSON.stringify(view2.catalog)}`);
+      check(view2.models.map(model => model.model_id).join(',') === 'grok-build', `The surviving model must stay listed: ${JSON.stringify(view2.models)}`);
+      check(view2.quota?.state === 'denied' && view2.quota?.buckets?.[0]?.permission === 'denied', `Snapshot must report the denied quota: ${JSON.stringify(view2.quota)}`);
+      record('grokReadRound2', { catalogText: catalog2, quotaText: quota2, snapshot: { catalog: view2.catalog, models: view2.models, quota: view2.quota } });
+      passed('round 2 reports the retired model while the quota denial stays on its own axis');
+      // 3) models=unsupported-catalog + usage=fail-quota：如实 unsupported/failed，保留上一次数字与时间，不给 0。
+      await clickRefresh('#3');
+      const catalog3 = await wait(() => { const text = textOf(`sub-catalog-${grokProviderId}`); return /catalog_state=unsupported\b/.test(text) ? text : null; }, 'round 3 unsupported catalog');
+      const quota3 = await wait(() => { const text = textOf(`sub-quota-${grokProviderId}`); return /quota_state=failed\b/.test(text) ? text : null; }, 'round 3 failed quota');
+      check(modelsToken(catalog3) === '', `An unsupported catalog must not list models: ${catalog3}`);
+      const readOnlyRowText = grokRowFor().textContent || '';
+      check((/历史数据|Historical data/.test(readOnlyRowText)) && readOnlyRowText.includes('2026-01-02T03:04:06Z'), `The retained history must be labelled with its last successful time: ${readOnlyRowText.slice(-600)}`);
+      check(quota3.includes('history=true'), `Round 3 must flag the retained history: ${quota3}`);
+      check(quota3.includes('used=42.5') && quota3.includes('remaining=57.5') && quota3.includes('balance:12.50'), `Round 3 must retain the last observed numbers instead of zeroing them: ${quota3}`);
+      check(quota3.includes('observed_at=2026-01-02T03:04:06Z'), `Round 3 must retain the last observed time: ${quota3}`);
+      const view3 = await wait(async () => { const view = await grokView(); return view?.quota?.state === 'failed' ? view : null; }, 'round 3 snapshot');
+      check(view3.catalog?.state === 'unsupported' && view3.models.length === 0, `Snapshot must report the unsupported catalog without models: ${JSON.stringify(view3.catalog)} ${JSON.stringify(view3.models)}`);
+      check(view3.quota?.history === true && view3.quota?.observed_at === '2026-01-02T03:04:06Z' && (view3.quota?.buckets || []).length === 1, `Snapshot must retain the last quota evidence: ${JSON.stringify(view3.quota)}`);
+      record('grokReadRound3', { catalogText: catalog3, quotaText: quota3, snapshot: { catalog: view3.catalog, models: view3.models, quota: view3.quota } });
+      passed('round 3 reports unsupported/failed honestly and keeps the last observed numbers and time');
+      // 4) 永不伪造：替身没给过的 0/100% 不许出现在任何抓到 token 或人读面上。
+      const evidenceText = grokRowFor().querySelector('.provider-subscription-evidence')?.textContent || '';
+      const captured = [catalog1, quota1, catalog2, quota2, catalog3, quota3, evidenceText];
+      const fabricated = ['remaining=0', 'used=0', 'remaining=100', 'used=100', 'balance:0', '100%']
+        .filter(pattern => captured.some(text => text.includes(pattern)));
+      check(fabricated.length === 0, `The stand-in never supplied a zero or full value, so none may appear: ${JSON.stringify(fabricated)}`);
+      // 5) 只读替身不得解锁登录：已连接时拒绝矩阵优先 already_connected；只要被如实拒绝、
+      //    且只读连接与证据不被扰动即可（未连接时的隔离拒绝已在本分支开头断言）。
+      await rejectedAny('begin_subscription_login', { providerId: grokProviderId }, ['isolated', 'helper', 'already_connected']);
+      const viewAfterSignIn = await grokView();
+      check(viewAfterSignIn.state === 'connected' && viewAfterSignIn.identity === 'standin-grok@example.invalid', `A rejected sign-in must not disturb the read-only connection: ${JSON.stringify({ state: viewAfterSignIn.state, identity: viewAfterSignIn.identity })}`);
+      record('grokReadFabrication', { captured: captured.map(text => text.slice(0, 400)), fabricated, rejectedSignIn: true });
+      passed('no fabricated zero or 100% token appears and the read-only helper never unlocks sign-in');
     }
   };
   // Issue #15 目录/额度只读验收：先完成一次成功登录，再通过真实界面刷新控件逐个排练目录与额度
@@ -326,7 +505,10 @@
     check((single.view.models || []).length === 1 && single.view.models[0].model_id === 'codex-fixture-legacy-shape', `A successful read must replace the catalog wholesale: ${JSON.stringify(single.view.models)}`);
     check(single.view.models.every(model => model.eligible === false), `The legacy-shaped model must stay ineligible: ${JSON.stringify(single.view.models)}`);
     check(tokenOf(single.dom.catalog, 'catalog_state') === 'available' && catalogModelTokens(single.dom.catalog).join(',') === 'codex-fixture-legacy-shape:false', `The DOM catalog must be replaced wholesale: ${single.dom.catalog}`);
-    check(!single.dom.catalog.includes('codex-fixture-model'), `A model absent from the authoritative result must disappear: ${single.dom.catalog}`);
+    // #16 在 models= 之后固定增加 removed=（上一次已核实目录里已消失的模型）：旧模型只允许出现在
+    // removed= 里，绝不能再出现在 models= 列表里；列表本身仍以本次权威结果整体替换。
+    check(!catalogModelTokens(single.dom.catalog).some(token => token.startsWith('codex-fixture-model:')), `A model absent from the authoritative result must disappear from the model list: ${single.dom.catalog}`);
+    check((tokenOf(single.dom.catalog, 'removed') || '').includes('codex-fixture-model'), `The retired model must be reported as removed instead of silently kept: ${single.dom.catalog}`);
     record('single', { quota: single.view.quota, catalog: single.view.catalog, models: single.view.models, domQuota: single.dom.quota.slice(0, 600), domCatalog: single.dom.catalog.slice(0, 400) });
     passed('the legacy single snapshot uses the legacy view and the DOM derives remaining there too');
     passed('a successful catalog read replaces the previous list wholesale');

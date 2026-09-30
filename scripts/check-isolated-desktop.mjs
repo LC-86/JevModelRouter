@@ -22,9 +22,12 @@ const codexHomeFingerprint = () => {
   const stat = statSync(realCodexHome, { throwIfNoEntry: false });
   return stat ? { exists: true, mtimeMs: stat.mtimeMs, ino: stat.ino } : { exists: false };
 };
-const helperHomeEntries = () => {
-  try { return readdirSync(helperHome); } catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+const dirEntries = path => {
+  try { return readdirSync(path); } catch (error) { if (error.code === 'ENOENT') return null; throw error; }
 };
+const helperHomeEntries = () => dirEntries(helperHome);
+// Grok 只读替身的专用 home（`helper::helper_home` 约定：<home>/.autojev/subscription-helpers/grok_subscription/<id>/home）。
+const grokHelperHomePath = join(root, '.autojev', 'subscription-helpers', 'grok_subscription', 'grok-subscription', 'home');
 // 本机正在运行的外部 Codex 客户端会持续写 ~/.codex；只要它在跑，mtime 就不能归因给本应用。
 const externalCodexClients = () => {
   try { return execFileSync('pgrep', ['-fl', 'ChatGPT.app.*codex'], { encoding: 'utf8' }).trim().split('\n').filter(Boolean); }
@@ -105,12 +108,15 @@ const reaped = async pids => {
 };
 // 每次运行只排练一组场景，替身的场景队列与该运行一一对应；替身证据写进独立 JSONL。
 // `reads`（额度）与 `catalog`（目录）各自一条队列：#15 的 catalog 运行用它排练多桶/单桶/缺字段/
-// 越界/拒绝/许可缺失/读取失败等场景。
+// 越界/拒绝/许可缺失/读取失败等场景；`grokScenarios` 只给 #16 的 Grok 只读替身运行。
 // `catalogFixture`（对象）是 #17 的受控目录替身输入：写进隔离根目录的 JSON 文件并交给
 // `--autojev-catalog-fixture`，只在该运行生效；两条 loginMode 互不冒充。
-const runDesktop = async ({ label, scenarios, reload = false, loginMode = null, reads = null, catalog = null, catalogFixture = null, accounts = null }) => {
+const runDesktop = async ({ label, scenarios, reload = false, loginMode = null, grokScenarios = null, reads = null, catalog = null, catalogFixture = null, accounts = null }) => {
   const helperLog = join(root, `helper-${label}.jsonl`);
+  const grokHelperLog = join(root, `grok-helper-${label}.jsonl`);
   const args = ['--autojev-isolated', root, '--autojev-upstream', base, '--autojev-ui-url', `http://127.0.0.1:${uiPort}`, '--autojev-ui-check', base, '--autojev-helper', helper];
+  // Grok 只读替身只在 grok-read 运行里注入；其它运行必须保持「无 Grok helper」的边界。
+  if (grokScenarios) args.push('--autojev-grok-helper', resolve('scripts/fake-grok-read-helper.mjs'));
   if (reload) args.push('--autojev-check-reload');
   if (loginMode) args.push('--autojev-login-check', loginMode);
   if (catalogFixture) {
@@ -119,6 +125,12 @@ const runDesktop = async ({ label, scenarios, reload = false, loginMode = null, 
     args.push('--autojev-catalog-fixture', fixturePath);
   }
   const env = { ...environment, AUTOJEV_FAKE_HELPER_SCENARIOS: scenarios, AUTOJEV_FAKE_HELPER_LOG: helperLog, AUTOJEV_FAKE_HELPER_DELAY_MS: '150' };
+  if (grokScenarios) Object.assign(env, {
+    AUTOJEV_FAKE_GROK_SCENARIOS: grokScenarios, AUTOJEV_FAKE_GROK_LOG: grokHelperLog,
+    // 权威名是 `AUTOJEV_GROK_FAKE_*`（落在 helper.rs 的 `AUTOJEV_GROK_*` 白名单内，零 Rust 改动）；
+    // 冻结名 `AUTOJEV_FAKE_GROK_*` 作为兼容别名带同一份值。
+    AUTOJEV_GROK_FAKE_SCENARIOS: grokScenarios, AUTOJEV_GROK_FAKE_LOG: grokHelperLog,
+  });
   if (reads) env.AUTOJEV_FAKE_HELPER_READS = reads;
   if (catalog) env.AUTOJEV_FAKE_HELPER_CATALOG = catalog;
   if (accounts) env.AUTOJEV_FAKE_HELPER_ACCOUNTS = accounts;
@@ -139,7 +151,7 @@ const runDesktop = async ({ label, scenarios, reload = false, loginMode = null, 
   const pids = await helperPids(helperLog);
   assert.ok(await reaped(pids), `Stand-in children ${JSON.stringify(pids)} must be reaped once the desktop (${label}) exits`);
   console.log(report.checks.join('\n'));
-  return { label, report, helperLog, liveDuringRun };
+  return { label, report, helperLog, grokHelperLog, liveDuringRun };
 };
 
 try {
@@ -172,7 +184,16 @@ try {
   const reload = await runDesktop({ label: 'reload', scenarios: 'success', reload: true });
   const late = await runDesktop({ label: 'late', scenarios: 'late', loginMode: 'late' });
   const failedRun = await runDesktop({ label: 'failed', scenarios: 'failed', loginMode: 'failed' });
+  const requestsBeforeGrok = requests.length;
   const grokRun = await runDesktop({ label: 'grok', scenarios: 'success', loginMode: 'grok' });
+  const grokRunRequests = requests.slice(requestsBeforeGrok);
+  // 「无 Grok helper」运行的证据必须在 grok-read 之前采集：后者会按设计准备专用 home。
+  const grokEntriesAfterNoHelperRun = dirEntries(grokHelperHomePath);
+  // #16 端到端：Grok 只读替身真的回复。三次刷新 = 9 次一次性 helper 调用（每次刷新 account → models → usage）。
+  const grokReadScenarios = 'success,success,success,success,removed,denied,success,unsupported-catalog,fail-quota';
+  const requestsBeforeGrokRead = requests.length;
+  const grokReadRun = await runDesktop({ label: 'grok-read', scenarios: 'success', loginMode: 'grok-read', grokScenarios: grokReadScenarios });
+  const grokReadRequests = requests.slice(requestsBeforeGrokRead);
   // #15：目录/额度只读验收。一次运行排练一组队列：登录成功后按刷新次序逐个取场景。
   const catalogReads = 'multi,single,missing,invalid,denied,bucket-denied,no-permission,null-permission,fail-quota,fail-quota,fail-quota,multi';
   const catalogScenarios = 'success,legacy,missing,success,success,success,success,success,success,fail-catalog,fail-catalog,success';
@@ -195,7 +216,7 @@ try {
       ],
     },
   });
-  const runs = [first, reload, late, failedRun, grokRun, catalogRun, modelSelectionRun];
+  const runs = [first, reload, late, failedRun, grokRun, grokReadRun, catalogRun, modelSelectionRun];
   const logs = {};
   for (const run of runs) logs[run.label] = await readLog(run.helperLog);
   const allEntries = Object.values(logs).flat();
@@ -218,6 +239,7 @@ try {
   const unsupported = allEntries.filter(entry => entry.event === 'request' && !allowedMethods.has(entry.method));
   assert.deepEqual(unsupported, [], `The stand-in must never receive a generation request: ${JSON.stringify(unsupported)}`);
   assert.equal(requests.filter(r => r.body?.model === 'codex-fixture-model').length, 0, 'Denied subscription generation must never reach an upstream');
+  assert.equal(requests.filter(r => r.body?.model === 'grok-fixture-model').length, 0, 'Denied Grok subscription generation must never reach an upstream');
   // 第 5 条：替身看到的 CODEX_HOME 位于隔离根目录下，日志中没有真实凭据。
   const helperHomes = [...new Set(allEntries.map(entry => entry.codexHome))];
   assert.ok(helperHomes.length > 0, 'The stand-in must have reported its CODEX_HOME');
@@ -300,6 +322,68 @@ try {
   assert.equal(grokRejected.codex?.state, grokStartObs.codexBefore?.state, `The Codex row state must not change because of Grok: ${JSON.stringify(grokRejected)}`);
   assert.equal(grokRejected.codex?.generation, grokStartObs.codexBefore?.generation, `The Codex generation must not change because of Grok: ${JSON.stringify(grokRejected)}`);
   assert.equal(logs.grok.length, 0, `The Grok run must not start the Codex stand-in: ${JSON.stringify(logs.grok)}`);
+  // Issue #16 只读诚实性：隔离下 Grok 只读 refresh 必须如实失败、零字段改写、零伪造数字，且官方入口可见。
+  const grokReadOnly = observation(grokRun.report, 'grokReadOnly');
+  assert.ok(grokReadOnly, 'The isolated Grok read-only refresh must be observed');
+  assert.match(String(grokReadOnly?.refreshError), /isolated|helper|not implemented|unsupported|not supported/i, `The isolated Grok read-only refresh must fail honestly: ${JSON.stringify(grokReadOnly)}`);
+  assert.equal(grokReadOnly?.unchanged, true, `A failed isolated Grok refresh must not rewrite any connection field: ${JSON.stringify(grokReadOnly)}`);
+  assert.equal(grokReadOnly?.after?.state, 'not_connected', `The Grok connection must stay unconnected: ${JSON.stringify(grokReadOnly?.after)}`);
+  assert.equal(grokReadOnly?.after?.generation, grokReadOnly?.before?.generation, `The Grok generation must not move: ${JSON.stringify(grokReadOnly)}`);
+  assert.ok(!grokReadOnly?.after?.identity, `The Grok refresh must not invent an identity: ${JSON.stringify(grokReadOnly?.after)}`);
+  assert.equal(grokReadOnly?.after?.catalogState, 'unknown', `Grok catalog evidence must stay unknown: ${JSON.stringify(grokReadOnly?.after)}`);
+  assert.equal(grokReadOnly?.after?.quotaState, 'unknown', `Grok quota evidence must stay unknown: ${JSON.stringify(grokReadOnly?.after)}`);
+  assert.equal(grokReadOnly?.after?.buckets, 0, `An unread Grok quota must keep its buckets empty: ${JSON.stringify(grokReadOnly?.after)}`);
+  assert.equal(grokReadOnly?.after?.models, 0, `An unread Grok catalog must keep its models empty: ${JSON.stringify(grokReadOnly?.after)}`);
+  assert.match(String(grokReadOnly?.catalogText), /catalog_state=unknown/, `Grok catalog must read catalog_state=unknown: ${grokReadOnly?.catalogText}`);
+  assert.match(String(grokReadOnly?.quotaText), /quota_state=unknown/, `Grok quota must read quota_state=unknown: ${grokReadOnly?.quotaText}`);
+  assert.ok(!/bucket=/.test(String(grokReadOnly?.quotaText)), `An unread Grok quota must not render a bucket segment: ${grokReadOnly?.quotaText}`);
+  assert.ok(!/\d/.test(String(grokReadOnly?.quotaText)), `An unread Grok quota must not fabricate numbers: ${grokReadOnly?.quotaText}`);
+  assert.ok(!/\d/.test(String(grokReadOnly?.catalogText)), `An unread Grok catalog must not fabricate numbers: ${grokReadOnly?.catalogText}`);
+  assert.ok(!/models=\S/.test(String(grokReadOnly?.catalogText)), `An unread Grok catalog must not list models: ${grokReadOnly?.catalogText}`);
+  assert.ok((grokReadOnly?.links || []).some(href => String(href).includes('docs.x.ai/build/cli/reference')), `The unknown Grok catalog must offer the official reference: ${JSON.stringify(grokReadOnly?.links)}`);
+  assert.ok((grokReadOnly?.links || []).some(href => String(href).includes('docs.x.ai/grok/faq')), `The unknown Grok quota must offer the official reference: ${JSON.stringify(grokReadOnly?.links)}`);
+  assert.ok(grokReadOnly?.after?.helper?.available !== true && !grokReadOnly?.after?.helper?.version && !grokReadOnly?.after?.helper?.auth_home, `Grok must not borrow the Codex helper report: ${JSON.stringify(grokReadOnly?.after?.helper)}`);
+  assert.match(String(grokReadOnly?.status), /helper=Unknown auth_home=Unknown/, `The Grok row must show Unknown helper fields: ${grokReadOnly?.status}`);
+  // 生成准入仍拒绝：Grok 订阅模型零派发，且该次运行没有新增任何上游模型请求。
+  // `samples` 是尝试计数（失败的尝试也计入），所以「没有派发」由上面的 fixture 账本判定；
+  // 这里断言本次拒绝没有被记成任何成功测量。
+  const grokDenied = observation(grokRun.report, 'grokDenied');
+  assert.ok(grokDenied, 'The denied Grok subscription probe must be observed');
+  assert.ok(grokDenied?.reason, `A denied Grok subscription test must report a reason: ${JSON.stringify(grokDenied)}`);
+  assert.equal(grokDenied?.successRate, 0, `A denied Grok subscription test must not be recorded as a success: ${JSON.stringify(grokDenied)}`);
+  assert.equal(grokRunRequests.filter(r => r.body?.model === 'grok-fixture-model' || r.body?.model === 'codex-fixture-model').length, 0, `The Grok run must not dispatch any subscription model upstream: ${JSON.stringify(grokRunRequests)}`);
+  assert.equal(grokRunRequests.filter(r => r.headers['user-agent'] === 'AutoJev/ModelTest').length, 0, `The Grok run must not run upstream model tests: ${JSON.stringify(grokRunRequests)}`);
+  // 无 Grok 辅助进程被拉起：应用自有 Grok home 从未写入（不存在或为空）。证据在 grok-read 运行之前采集。
+  assert.ok(grokEntriesAfterNoHelperRun === null || grokEntriesAfterNoHelperRun.length === 0, `The no-helper Grok run must not spawn a helper that leaves state behind: ${JSON.stringify(grokEntriesAfterNoHelperRun)}`);
+  // #16 grok-read：只读替身的调用账本（顺序、一次性进程、回收、环境白名单、专用 home）。
+  const grokEntries = await readLog(grokReadRun.grokHelperLog);
+  assert.equal(grokEntries.length, 9, `The Grok stand-in must serve exactly three refreshes: ${JSON.stringify(grokEntries)}`);
+  assert.deepEqual(grokEntries.map(entry => entry.subcommand), ['account', 'models', 'usage', 'account', 'models', 'usage', 'account', 'models', 'usage'], `Each refresh must call account → models → usage sequentially: ${JSON.stringify(grokEntries.map(entry => entry.subcommand))}`);
+  assert.deepEqual(grokEntries.map(entry => entry.scenario), grokReadScenarios.split(','), `One queue entry must be consumed per helper invocation, in order: ${JSON.stringify(grokEntries.map(entry => entry.scenario))}`);
+  assert.deepEqual(grokEntries.map(entry => entry.index), [0, 1, 2, 3, 4, 5, 6, 7, 8], `The stand-in must consume the queue in order: ${JSON.stringify(grokEntries.map(entry => entry.index))}`);
+  const grokStandinPids = [...new Set(grokEntries.map(entry => entry.pid).filter(Boolean))];
+  assert.equal(grokStandinPids.length, 9, `Each read must be its own one-shot process: ${JSON.stringify(grokStandinPids)}`);
+  assert.ok(await reaped(grokStandinPids), `Grok stand-in children ${JSON.stringify(grokStandinPids)} must be reaped once the desktop exits`);
+  for (const entry of grokEntries) {
+    assert.equal(entry.home, grokHelperHomePath, `The Grok stand-in must run with the app-owned helper home: ${entry.home}`);
+    assert.ok(!String(entry.home).startsWith(realHome + '/'), `The Grok stand-in must never see the real home: ${entry.home}`);
+  }
+  const inheritedEnv = [...new Set(grokEntries.flatMap(entry => entry.envKeys || []).filter(key => /AUTOJEV_FAKE_HELPER|CODEX_HOME|API_?KEY|TOKEN|SECRET|PASSWORD/i.test(key)))];
+  assert.deepEqual(inheritedEnv, [], `The Grok stand-in must not inherit Codex stand-in or credential env: ${JSON.stringify(inheritedEnv)}`);
+  assert.ok((dirEntries(grokHelperHomePath) || []).length === 0, `The Grok helper home must stay free of residue: ${JSON.stringify(dirEntries(grokHelperHomePath))}`);
+  // 三轮的机器文本与「没有伪造 0/100%」复核。
+  const grokReadObs = allObservations(grokReadRun.report);
+  assert.ok(grokReadObs.grokReadRound1 && grokReadObs.grokReadRound2 && grokReadObs.grokReadRound3 && grokReadObs.grokReadFabrication, `All three Grok stand-in rounds must be observed: ${JSON.stringify(Object.keys(grokReadObs))}`);
+  assert.match(String(grokReadObs.grokReadRound1.catalogText), /catalog_state=available/, `Round 1 catalog must be available: ${grokReadObs.grokReadRound1.catalogText}`);
+  assert.match(String(grokReadObs.grokReadRound1.quotaText), /used=42\.5/, `Round 1 quota must carry the stand-in usage: ${grokReadObs.grokReadRound1.quotaText}`);
+  assert.match(String(grokReadObs.grokReadRound2.catalogText), /removed=grok-mini/, `Round 2 must report the retired model: ${grokReadObs.grokReadRound2.catalogText}`);
+  assert.match(String(grokReadObs.grokReadRound2.quotaText), /quota_state=denied/, `Round 2 quota must be denied: ${grokReadObs.grokReadRound2.quotaText}`);
+  assert.match(String(grokReadObs.grokReadRound3.catalogText), /catalog_state=unsupported/, `Round 3 catalog must be unsupported: ${grokReadObs.grokReadRound3.catalogText}`);
+  assert.match(String(grokReadObs.grokReadRound3.quotaText), /quota_state=failed/, `Round 3 quota must be failed: ${grokReadObs.grokReadRound3.quotaText}`);
+  assert.match(String(grokReadObs.grokReadRound3.quotaText), /history=true/, `Round 3 must flag the retained history: ${grokReadObs.grokReadRound3.quotaText}`);
+  assert.deepEqual(grokReadObs.grokReadFabrication.fabricated ?? [], [], `The stand-in never supplied a zero/100% value, so none may appear: ${JSON.stringify(grokReadObs.grokReadFabrication)}`);
+  assert.equal(grokReadRequests.filter(r => r.body?.model === 'grok-fixture-model' || r.body?.model === 'codex-fixture-model').length, 0, `The Grok stand-in run must not dispatch any subscription model upstream: ${JSON.stringify(grokReadRequests)}`);
+  assert.equal(grokReadRequests.filter(r => r.headers['user-agent'] === 'AutoJev/ModelTest').length, 0, `The Grok stand-in run must not run upstream model tests: ${JSON.stringify(grokReadRequests)}`);
   // #17 受控目录全过程：替身只替换上游目录与额度读取，登录/准入/派发/快照都走生产代码。
   const catalogObs = allObservations(modelSelectionRun.report);
   const catalogPublicId = 'codex-subscription/codex-catalog-alpha';
@@ -428,7 +512,9 @@ try {
   const allowedUrls = (opener.allow || []).map(entry => entry.url || '');
   assert.ok(allowedUrls.some(url => url.includes('auth.openai.com')), `The OpenAI authorization host must be allowed: ${JSON.stringify(allowedUrls)}`);
   assert.ok(allowedUrls.some(url => url.includes('chatgpt.com')), `The ChatGPT authorization host must be allowed: ${JSON.stringify(allowedUrls)}`);
-  console.log('Authorization-link ACL asserted statically (auth.openai.com, chatgpt.com); the real browser open was NOT executed.');
+  // 只读块的官方查看入口走同一条 openUrl 路径：桌面端必须允许该主机，否则未知/unsupported 的兜底入口实际打不开。
+  assert.ok(allowedUrls.some(url => url.includes('docs.x.ai')), `The Grok reference host must be allowed: ${JSON.stringify(allowedUrls)}`);
+  console.log('Authorization-link ACL asserted statically (auth.openai.com, chatgpt.com, docs.x.ai); the real browser open was NOT executed.');
   console.log(`Native desktop login lifecycle acceptance passed. Fictional evidence: ${root}`);
 } finally {
   await writeFile(join(root, 'requests.json'), JSON.stringify(requests, null, 2));

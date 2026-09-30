@@ -271,9 +271,10 @@ impl Default for AppConfig {
 
 pub struct ConfigStore {
     pub dispatcher: std::sync::Arc<dyn crate::dispatch::Dispatcher>,
-    /// 订阅适配边界。默认构造是 [`crate::subscription::UnavailableAdapter`]（如实返回不可用）；
-    /// 生产在 `lib.rs` 构造 `ConfigStore` 处注入真实的 Codex 适配器，代码内固定、无运行时替身开关。
-    pub subscription: std::sync::Arc<dyn crate::subscription::SubscriptionAdapter>,
+    /// 订阅适配边界（按服务商类型分派的注册表）。默认构造只装
+    /// [`crate::subscription::UnavailableAdapter`]（如实返回不可用）；生产在 `lib.rs` 构造
+    /// `ConfigStore` 处注入真实的 Codex + Grok 适配器，代码内固定、无运行时替身开关。
+    pub subscription: std::sync::Arc<crate::subscription::SubscriptionAdapters>,
     /// 订阅登录/退出边界。生产构造只注入 [`crate::subscription::auth::GrokCliAuth`]。
     pub auth: std::sync::Arc<dyn crate::subscription::auth::SubscriptionAuth>,
     path: PathBuf,
@@ -317,6 +318,7 @@ impl ConfigStore {
         subscription: std::sync::Arc<dyn crate::subscription::SubscriptionAdapter>,
         auth: std::sync::Arc<dyn crate::subscription::auth::SubscriptionAuth>,
     ) -> Result<Self> {
+        let subscription = std::sync::Arc::new(crate::subscription::SubscriptionAdapters::single(subscription));
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).context("create AutoJev data directory")?;
             #[cfg(unix)] {

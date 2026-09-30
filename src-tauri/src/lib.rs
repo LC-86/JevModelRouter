@@ -89,19 +89,29 @@ async fn snapshot(state: &AppState) -> DashboardSnapshot {
     let port = state.proxy.lock().await.as_ref().map_or(config.port, |p| p.port);
     let paused = state.proxy.lock().await.as_ref().is_some_and(|p| p.running() && p.paused());
     let detected = detected_agents_with_selection(&config);
-    let helper = state.store.subscription.helper_status();
-    // 只有适配器真正支持的订阅行才能带上 helper 版本与授权目录，其余行如实不可用。
-    let supported: Vec<String> = config
-        .providers
-        .iter()
-        .filter(|provider| subscription::is_subscription_provider(provider) && state.store.subscription.supports(&provider.kind))
-        .map(|provider| provider.id.clone())
-        .collect();
+    // per-kind：每家订阅服务商只带自己那类适配器的 helper 自述与 availability，
+    // Grok 行既拿不到 Codex 的版本/授权目录，也不会借用它的适配器可用性。
+    let mut supported: Vec<String> = Vec::new();
+    // 全局回落值：本构建是否管理任何订阅辅助进程（per-kind 值在下面逐家覆盖）。
+    let mut adapter_available = state.store.subscription.any_available();
+    let mut helpers: std::collections::HashMap<String, subscription::HelperStatus> =
+        std::collections::HashMap::new();
+    let mut adapters_available: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    for provider in config.providers.iter().filter(|provider| subscription::is_subscription_provider(provider)) {
+        helpers.insert(provider.id.clone(), state.store.subscription.helper_status(&provider.kind));
+        let available = state.store.subscription.available(&provider.kind);
+        adapter_available |= available;
+        adapters_available.insert(provider.id.clone(), available);
+        if state.store.subscription.supports(&provider.kind) {
+            supported.push(provider.id.clone());
+        }
+    }
     let subscriptions = {
         let mut sessions = state.sessions.lock().await;
-        sessions.helper = helper.clone();
+        sessions.helpers = helpers;
+        sessions.adapters_available = adapters_available;
         sessions.supported_providers = supported;
-        subscription::views(&config, state.store.subscription.available(), &sessions)
+        subscription::views(&config, adapter_available, &sessions)
     };
     let subscription_auth = subscription::auth::views(&config, &*state.store.auth);
     DashboardSnapshot {
@@ -1234,13 +1244,17 @@ pub fn run() {
             }
             let root = crate::runtime::home_dir().context("find home directory")?.join(".autojev");
             let database = if app.config().identifier.ends_with(".dev") { "autojev-dev.db" } else { "autojev.db" };
-            // #13：生产唯一的订阅适配器注入点就是这里——ConfigStore 构造处，代码内固定。
-            // 生产实际装的是官方 Codex 适配器；默认构造（`ConfigStore::load`，测试用）仍是不提供
-            // 任何辅助进程的 UnavailableAdapter。没有任何配置/环境/界面开关能把它换成替身。
+            // #13/#16：生产唯一的订阅适配器注入点就是这里——ConfigStore 构造处，代码内固定。
+            // 生产装的是按服务商类型分派的注册表：官方 Codex 适配器 + Grok 只读适配器，两家互不冒用。
+            // 默认构造（`ConfigStore::load`，测试用）仍是不提供任何辅助进程的 UnavailableAdapter。
+            // 没有任何配置/环境/界面开关能把它换成替身。
             // isolation-check 构建里，验收脚本可以额外指定受控目录文件（`--autojev-catalog-fixture`）：
             // 那个替身只替换上游目录与额度读取，登录、世代、准入与派发仍是同一套生产代码。
             let mut store = ConfigStore::load(root.join(database))?;
-            store.subscription = subscription_adapter()?;
+            store.subscription = Arc::new(subscription::SubscriptionAdapters::new(vec![
+                subscription_adapter()?,
+                Arc::new(subscription::grok::GrokSubscriptionAdapter::new()),
+            ]));
             let store = Arc::new(store);
             // 挂起登录只存在于内存：上次进程退出时留下的 authorization_pending 无法继续，
             // 启动时归位成未连接，否则界面只允许取消、而取消又无会话可 settle。

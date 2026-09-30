@@ -1,9 +1,10 @@
 import type {
   DashboardSnapshot, Model, Provider, ProviderKind, SubscriptionAuthError, SubscriptionAuthPhase, SubscriptionAuthView,
   SubscriptionCapabilityStatus, SubscriptionCatalogAvailability, SubscriptionCatalogEligibility, SubscriptionCatalogEntry,
-  SubscriptionCatalogEvidence, SubscriptionCatalogState, SubscriptionConnectionState, SubscriptionDenial,
-  SubscriptionEvidenceState, SubscriptionLocalClearing, SubscriptionLocalLogoutState, SubscriptionLoginStage,
-  SubscriptionQuota, SubscriptionQuotaBucket, SubscriptionQuotaPermission, SubscriptionQuotaView,
+  SubscriptionCatalogEvidence, SubscriptionCatalogState, SubscriptionConnectionState,
+  SubscriptionDenial, SubscriptionEvidenceState, SubscriptionLocalClearing, SubscriptionLocalLogoutState,
+  SubscriptionLoginStage, SubscriptionQuota, SubscriptionQuotaBucket, SubscriptionQuotaCredits, SubscriptionQuotaPermission,
+  SubscriptionQuotaView,
   SubscriptionQuotaWindow, SubscriptionRemoteRevocation, SubscriptionRemoteRevokeState, SubscriptionView,
 } from '../types';
 import type { Translate } from './preferences-context';
@@ -161,6 +162,7 @@ export function catalogLabel(state: SubscriptionCatalogState, t: Translate): str
     available: 'Catalog available',
     stale: 'Catalog stale',
     failed: 'Catalog read failed',
+    unsupported: 'No catalog interface',
   }[state]);
 }
 
@@ -178,6 +180,7 @@ export function quotaViewLabel(view: SubscriptionQuotaView | undefined, t: Trans
   return t({
     rate_limits_by_limit_id: 'Multiple quota buckets',
     rate_limits: 'Legacy single quota bucket',
+    grok_cli_usage: 'Grok CLI usage',
     unknown: 'Quota view unknown',
   }[view ?? 'unknown']);
 }
@@ -249,11 +252,12 @@ function quotaBucketText(bucket: SubscriptionQuotaBucket): string {
   const invalid = stableList([
     ...(bucket.invalid_fields ?? []),
     ...windows.flatMap(window => window.invalid_fields ?? []),
+    ...(credits?.invalid_fields ?? []),
   ]);
   return [
     `bucket=${knownOrUnknown(bucket.limit_id)}`,
     `windows=${windows.map(quotaWindowToken).join(',')}`,
-    `credits=has:${stableBoolean(credits?.has_credits)},unlimited:${stableBoolean(credits?.unlimited)},balance:${knownOrUnknown(credits?.balance)}`,
+    `credits=has:${stableBoolean(credits?.has_credits)},unlimited:${stableBoolean(credits?.unlimited)},balance:${knownOrUnknown(credits?.balance)},unit:${knownOrUnknown(credits?.unit)},permission:${credits?.permission ?? 'unknown'}`,
     `missing=${missing}`,
     `invalid=${invalid}`,
   ].join(' ');
@@ -296,12 +300,17 @@ function catalogMissingToken(catalog: SubscriptionCatalogEvidence | null | undef
   return `missing=${stableList(catalog?.missing_fields)}`;
 }
 
+/** 已移除模型 token：上一次已核实目录里有、本次权威结果里已不存在的模型标识。 */
+function catalogRemovedToken(catalog: SubscriptionCatalogEvidence | null | undefined): string {
+  return `removed=${stableList(catalog?.removed_models)}`;
+}
+
 /**
  * 目录证据的机器可读稳定文本：
  * `catalog_state=<state> source=<..> observed_at=<..> missing=<..>`。
  */
 export function catalogText(catalog: SubscriptionCatalogEvidence | null | undefined): string {
-  return [catalogHead(catalog), catalogMissingToken(catalog)].join(' ');
+  return [catalogHead(catalog), catalogRemovedToken(catalog), catalogMissingToken(catalog)].join(' ');
 }
 
 /**
@@ -313,7 +322,37 @@ export function catalogText(catalog: SubscriptionCatalogEvidence | null | undefi
 export function subscriptionCatalogText(view: SubscriptionView | undefined): string {
   const catalog = view?.catalog;
   const models = (view?.models ?? []).map(model => `${model.model_id}:${model.eligible === true ? 'true' : 'false'}`).join(',');
-  return [catalogHead(catalog), `models=${models}`, catalogMissingToken(catalog)].join(' ');
+  return [catalogHead(catalog), `models=${models}`, catalogRemovedToken(catalog), catalogMissingToken(catalog)].join(' ');
+}
+
+/** 已移除模型的用户文案；空列表不产生任何文案，不把「移除」混进「不具备资格」。 */
+export function catalogRemovedLabel(removed: string[] | null | undefined, t: Translate): string {
+  const ids = (removed ?? []).map(id => id.trim()).filter(id => id.length > 0);
+  if (ids.length === 0) return '';
+  return t('Removed from the previous catalog: {models}', { models: ids.join(', ') });
+}
+
+/** 官方查看入口：只供人工查看，绝不作为绕过准入的依据；没有可靠官方入口的服务商不新增链接。 */
+export const CATALOG_REFERENCE_URL = 'https://docs.x.ai/build/cli/reference';
+export const QUOTA_REFERENCE_URL = 'https://docs.x.ai/grok/faq#usage--limits';
+
+/**
+ * 额外 credits 轴的用户文案：未知一律 `Unknown`，单位与余额原样显示，缺失/越界字段照实列出。
+ * `credits` 为 null/undefined 时也照实输出一整行未知，而不是让这一轴消失。
+ */
+export function creditsAxisText(credits: SubscriptionQuotaCredits | null | undefined, t: Translate): string {
+  const parts = [
+    `${t('Has credits')}: ${stableBoolean(credits?.has_credits)}`,
+    `${t('Unlimited')}: ${stableBoolean(credits?.unlimited)}`,
+    `${t('Balance')}: ${knownOrUnknown(credits?.balance)}`,
+    `${t('Unit')}: ${knownOrUnknown(credits?.unit)}`,
+    quotaPermissionLabel(credits?.permission, t),
+  ];
+  const missing = credits?.missing_fields ?? [];
+  const invalid = credits?.invalid_fields ?? [];
+  if (missing.length > 0) parts.push(`${t('Missing fields')}: ${missing.join(', ')}`);
+  if (invalid.length > 0) parts.push(`${t('Invalid fields')}: ${invalid.join(', ')}`);
+  return `${t('Credits')} · ${parts.join(' · ')}`;
 }
 
 /** 协议能力按模型与客户端协议分别记录；没有记录就是未验证，不推断。 */

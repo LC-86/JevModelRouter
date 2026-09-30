@@ -6,6 +6,7 @@
 //! 与界面都没有把它换成替身的开关；未验证的订阅生成一律拒绝。
 
 pub mod auth;
+pub mod grok;
 pub mod helper;
 
 use anyhow::{bail, Result};
@@ -92,6 +93,8 @@ pub enum QuotaView {
     Unknown,
     RateLimitsByLimitId,
     RateLimits,
+    /// 本应用的 Grok 只读额度事件（`usage --json`）；与 Codex 的多桶/旧版单桶语义不可混用。
+    GrokCliUsage,
 }
 
 pub fn protocol_key(protocol: Protocol) -> &'static str {
@@ -156,8 +159,16 @@ pub struct QuotaCredits {
     pub unlimited: Option<bool>,
     #[serde(default)]
     pub balance: Option<String>,
+    /// 上游给出的原始单位文本；缺失即未知，绝不推断。
+    #[serde(default)]
+    pub unit: Option<String>,
+    /// credits 自身的许可轴（是否允许消耗额外 credits），与订阅内许可互不推导。
+    #[serde(default)]
+    pub permission: QuotaPermission,
     #[serde(default)]
     pub missing_fields: Vec<String>,
+    #[serde(default)]
+    pub invalid_fields: Vec<String>,
 }
 
 /// 一个额度桶（多桶视图下每个 `limitId` 一个，旧版单桶视图下只有一个）。
@@ -179,6 +190,13 @@ pub struct QuotaBucket {
     pub missing_fields: Vec<String>,
     #[serde(default)]
     pub invalid_fields: Vec<String>,
+}
+
+impl QuotaBucket {
+    /// 只读映射里的桶构造入口：其余字段留给各服务商的映射逐键填充。
+    pub(crate) fn new(limit_id: &str) -> Self {
+        Self { limit_id: limit_id.to_owned(), ..Self::default() }
+    }
 }
 
 /// 额度证据：来源、时间、视图、桶与解析时记下的缺字段/越界字段。
@@ -211,6 +229,9 @@ pub struct CatalogEvidence {
     pub source: Option<String>,
     #[serde(default)]
     pub observed_at: Option<String>,
+    /// 上一次已核实目录里有、本次权威结果里已不存在的模型标识；只在本次列表可信时重算。
+    #[serde(default)]
+    pub removed_models: Vec<String>,
     #[serde(default)]
     pub missing_fields: Vec<String>,
 }
@@ -218,6 +239,10 @@ pub struct CatalogEvidence {
 /// 一次目录读取的完整结果：条目 + 解析时记下的缺失字段 + 来源与时间。
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CatalogRead {
+    /// 本次读取的结局：`Available` 是一次成功读取；`Unsupported` 表示该固定版本没有这个机器接口，
+    /// 是**如实结果**而不是失败（Grok 契约 §3）。
+    #[serde(default)]
+    pub state: EvidenceState,
     #[serde(default)]
     pub models: Vec<DiscoveredModel>,
     #[serde(default)]
@@ -753,6 +778,11 @@ pub struct SessionState {
     /// 当前适配器真正支持登录的服务商标识（来自 `SubscriptionAdapter::supports`）。
     /// 未列出的订阅行不得借用全局 helper 的版本与授权目录。
     pub supported_providers: Vec<String>,
+    /// 每家的 helper 自述状态（按服务商标识）：Grok 行拿不到 Codex 的版本与授权目录。
+    /// 缺失时回落到全局 `helper`，保持旧调用点语义不变。
+    pub helpers: HashMap<String, HelperStatus>,
+    /// 每家自己那类适配器是否可用（按服务商标识）；缺失时回落到全局 `adapter_available`。
+    pub adapters_available: HashMap<String, bool>,
 }
 
 impl SessionState {
@@ -874,8 +904,7 @@ pub async fn begin_login(
     // 不支持的订阅类型不得拉起任何辅助进程，也不得改动连接状态。
     require_supported(store, &provider, "sign-in")?;
     let generation = connection_generation(store, provider_id);
-    let start = store
-        .subscription
+    let start = adapter_for(store, &provider.kind)?
         .start_login(provider_id, generation)
         .await
         .map_err(|error| sanitize_error(&error.to_string()))?;
@@ -926,7 +955,7 @@ pub async fn cancel_login(
         }
     };
     let generation = if recorded == 0 { connection_generation(store, provider_id) } else { recorded };
-    let result = store.subscription.cancel_login(provider_id, generation).await;
+    let result = adapter_for(store, &provider.kind)?.cancel_login(provider_id, generation).await;
     settle_not_connected(store, provider_id, generation)?;
     match result {
         Ok(()) => Ok(()),
@@ -966,7 +995,9 @@ pub async fn await_login(
     let Some((generation, attempt)) = pending_attempt(&sessions, &provider_id).await else {
         return Err("No pending subscription login for this provider".to_owned());
     };
-    let outcome = match store.subscription.login_result(&provider_id, generation).await {
+    let kind = subscription_kind(store.as_ref(), &provider_id)
+        .ok_or_else(|| format!("Unknown subscription provider: {provider_id}"))?;
+    let outcome = match adapter_for(store.as_ref(), &kind)?.login_result(&provider_id, generation).await {
         Ok(Some(outcome)) => outcome,
         // 辅助进程中途退出（stdout 关闭或尝试已不在跟踪）与出错同等处理：结束挂起态并如实报错，
         // 否则会话会永远停在 Pending，用户既不能登录也不能取消。
@@ -1063,7 +1094,7 @@ pub async fn logout(
         })
         .map_err(|error| error.to_string())?;
     let previous_generation = generation.saturating_sub(1);
-    let adapter = store.subscription.logout(provider_id, previous_generation).await;
+    let adapter = adapter_for(store, &provider.kind)?.logout(provider_id, previous_generation).await;
     let (local_cleared, remote) = match adapter {
         Ok(outcome) => (outcome.local_cleared, Some(outcome.remote)),
         // 没拿到“专用授权目录已清”的确认，就不能声称本地已清除；远端结果同样未知。
@@ -1135,7 +1166,7 @@ pub async fn migrate_helper(
         return Ok(());
     };
     if store.subscription.supports(&kind) {
-        if let Err(error) = store.subscription.rename(old_id, new_id).await {
+        if let Err(error) = store.subscription.rename_all(old_id, new_id).await {
             let message = sanitize_error(&error.to_string());
             logout(store, old_id, sessions).await.map(|_| ())?;
             eprintln!("AutoJev subscription rename fell back to sign-out: {message}");
@@ -1247,6 +1278,66 @@ impl SubscriptionAdapter for UnavailableAdapter {
     }
 }
 
+/// 按服务商类型分派的适配器注册表：生产同时装官方 Codex 与 Grok 适配器，按 `provider.kind` 解析。
+/// 解析不到即明确拒绝（沿用 [`require_supported`] 语义），**绝不**让一家借用另一家的辅助进程、
+/// 版本或授权目录。`--autojev-helper`、`AUTOJEV_GROK_HELPER` 等覆盖入口都不改变这条边界。
+pub struct SubscriptionAdapters {
+    adapters: Vec<std::sync::Arc<dyn SubscriptionAdapter>>,
+}
+
+impl SubscriptionAdapters {
+    pub fn new(adapters: Vec<std::sync::Arc<dyn SubscriptionAdapter>>) -> Self {
+        Self { adapters }
+    }
+
+    /// 只装一个适配器：兼容既有测试注入与默认的 [`UnavailableAdapter`]。
+    pub fn single(adapter: std::sync::Arc<dyn SubscriptionAdapter>) -> Self {
+        Self { adapters: vec![adapter] }
+    }
+
+    /// 按服务商类型解析适配器；同一类型出现多次时取第一个，绝不回落到别家的实现。
+    pub fn for_kind(&self, kind: &ProviderKind) -> Option<&std::sync::Arc<dyn SubscriptionAdapter>> {
+        self.adapters.iter().find(|adapter| adapter.supports(kind))
+    }
+
+    pub fn supports(&self, kind: &ProviderKind) -> bool {
+        self.for_kind(kind).is_some()
+    }
+
+    /// 该类型是否有可用的官方辅助进程；没有适配器即不可用。
+    pub fn available(&self, kind: &ProviderKind) -> bool {
+        self.for_kind(kind).is_some_and(|adapter| adapter.available())
+    }
+
+    /// 任一类型可用即真。只供「本构建是否管理任何订阅辅助进程」这类全局判断使用。
+    pub fn any_available(&self) -> bool {
+        self.adapters.iter().any(|adapter| adapter.available())
+    }
+
+    /// 服务商标识改名：让每个适配器各自迁移自有状态（辅助进程、挂起尝试、专用授权目录）。
+    /// 没有自有状态的适配器用默认实现如实返回 `Ok`；任何一处失败都必须如实上报。
+    pub async fn rename_all(&self, old_id: &str, new_id: &str) -> Result<(), String> {
+        for adapter in &self.adapters {
+            adapter.rename(old_id, new_id).await.map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// per-kind helper 自述状态：Grok 行永远拿不到 Codex 适配器的版本或授权目录。
+    pub fn helper_status(&self, kind: &ProviderKind) -> HelperStatus {
+        self.for_kind(kind).map(|adapter| adapter.helper_status()).unwrap_or_default()
+    }
+}
+
+/// 解析某服务商类型自己的适配器；解析不到即明确拒绝，绝不落到别家。
+fn adapter_for(store: &ConfigStore, kind: &ProviderKind) -> Result<std::sync::Arc<dyn SubscriptionAdapter>, String> {
+    store
+        .subscription
+        .for_kind(kind)
+        .cloned()
+        .ok_or_else(|| "This subscription type has no adapter in this build".to_owned())
+}
+
 /// 服务商保存后同步连接记录：订阅服务商得到一个活动连接，API 服务商不保留订阅身份。
 pub fn sync_provider(config: &mut AppConfig, provider_id: &str, kind: &ProviderKind) {
     if is_subscription(kind) {
@@ -1287,6 +1378,29 @@ fn had_verified_catalog(previous: Option<&Evidence>) -> bool {
     })
 }
 
+/// 本次目录事件是否给出了一份可信的模型列表：判据只取本次读取自己的缺失记账——
+/// `models` 数组缺失，或条目缺可用标识被跳过。不可信即「本次列表未知」，既不等于模型被移除，
+/// 也不等于目录为空。
+fn catalog_list_is_trustworthy(missing_fields: &[String]) -> bool {
+    !missing_fields
+        .iter()
+        .any(|field| field == "models" || (field.starts_with("models[") && field.ends_with("].id")))
+}
+
+/// 上一次已核实目录里有、本次权威结果里已不存在的模型标识；按旧目录顺序稳定去重。
+/// 只应在本次列表可信时调用。
+fn removed_models(previous: Option<&Evidence>, current: &[DiscoveredModel]) -> Vec<String> {
+    let Some(previous) = previous else { return Vec::new() };
+    let mut removed: Vec<String> = Vec::new();
+    for model in &previous.models {
+        let still_present = current.iter().any(|entry| entry.model_id == model.model_id);
+        if !still_present && !removed.iter().any(|entry| entry == &model.model_id) {
+            removed.push(model.model_id.clone());
+        }
+    }
+    removed
+}
+
 /// 只读刷新：按当前连接世代读取状态、目录与额度并写回证据。
 /// 它与生成准入无关，因此生成被拒绝、网关暂停或服务商停用时仍可执行。
 ///
@@ -1303,7 +1417,8 @@ pub async fn refresh(store: &ConfigStore, provider_id: &str) -> Result<Connectio
         return Ok(before);
     }
     let generation = before.generation;
-    let (status, status_error) = match store.subscription.status(provider_id, generation).await {
+    let adapter = adapter_for(store, &provider.kind)?;
+    let (status, status_error) = match adapter.status(provider_id, generation).await {
         Ok(status) => (status, None),
         Err(error) => (ConnectionStatus { identity_incomplete: true, ..ConnectionStatus::default() }, Some(error.to_string())),
     };
@@ -1351,10 +1466,16 @@ pub async fn refresh(store: &ConfigStore, provider_id: &str) -> Result<Connectio
         return Err("The account changed while refreshing; the read-only result was discarded".into());
     }
     // 2) 目录与额度独立读取：任一失败都不影响另一项写回。
-    let catalog_read = store.subscription.models(provider_id, generation).await;
-    let quota_read = store.subscription.quota(provider_id, generation).await;
+    let catalog_read = adapter.models(provider_id, generation).await;
+    let quota_read = adapter.quota(provider_id, generation).await;
     // #32：目录读取成败与本次读取时间在写入前确定，供目录资格核对使用。
-    let catalog_failed = catalog_read.is_err();
+    // #16：只有本次权威的目录读取才能重核资格。读取失败、列表不可信（缺 `models` 或条目缺标识）、
+    // 或上游没有该机器接口时，一律只标陈旧，绝不把「本次未知」写成「模型被移除」。
+    let catalog_authoritative = catalog_read
+        .as_ref()
+        .map(|read| catalog_list_is_trustworthy(&read.missing_fields) && read.state != EvidenceState::Unsupported)
+        .unwrap_or(false);
+    let catalog_failed = !catalog_authoritative;
     let catalog_observed_at = catalog_read.as_ref().ok().and_then(|read| read.observed_at.clone());
     store.update_subscription_refresh(provider_id, request, |config| -> Result<Connection, String> {
         // 服务商可能在读取期间被删除或换号：迟到的只读结果不得复活或污染连接。
@@ -1368,15 +1489,50 @@ pub async fn refresh(store: &ConfigStore, provider_id: &str) -> Result<Connectio
         let previous = connection.account_evidence().cloned();
         // 目录：成功即以本次权威结果整体替换；失败保留已核实目录并标陈旧，没有目录才标失败。
         let (models, catalog) = match catalog_read {
-            Ok(read) => (
-                read.models,
+            // 本次列表本身不可信：整份读取都不算权威结果，不得用空列表覆盖已核实目录，
+            // 也不得据此判定「全部被移除」。有已核实目录就保留并标陈旧，否则如实标失败。
+            Ok(read) if !catalog_list_is_trustworthy(&read.missing_fields) => {
+                if had_verified_catalog(previous.as_ref()) {
+                    let kept = previous.as_ref().map(|evidence| evidence.catalog.clone()).unwrap_or_default();
+                    (
+                        previous.as_ref().map(|evidence| evidence.models.clone()).unwrap_or_default(),
+                        CatalogEvidence { state: EvidenceState::Stale, missing_fields: read.missing_fields, ..kept },
+                    )
+                } else {
+                    (
+                        Vec::new(),
+                        CatalogEvidence { state: EvidenceState::Failed, missing_fields: read.missing_fields, ..CatalogEvidence::default() },
+                    )
+                }
+            }
+            // 固定版本没有这个机器接口：如实标 unsupported、列表为空，来源与时间只取本次事件。
+            Ok(read) if read.state == EvidenceState::Unsupported => (
+                Vec::new(),
                 CatalogEvidence {
-                    state: EvidenceState::Available,
+                    state: EvidenceState::Unsupported,
                     source: read.source,
                     observed_at: read.observed_at,
+                    removed_models: previous
+                        .as_ref()
+                        .map(|evidence| evidence.catalog.removed_models.clone())
+                        .unwrap_or_default(),
                     missing_fields: read.missing_fields,
                 },
             ),
+            Ok(read) => {
+                // 一次成功读取即权威结果：旧目录里有、本次没有的模型就是被上游移除了。
+                let removed_models = removed_models(previous.as_ref(), &read.models);
+                (
+                    read.models,
+                    CatalogEvidence {
+                        state: EvidenceState::Available,
+                        source: read.source,
+                        observed_at: read.observed_at,
+                        removed_models,
+                        missing_fields: read.missing_fields,
+                    },
+                )
+            }
             Err(_) if had_verified_catalog(previous.as_ref()) => {
                 let kept = previous.as_ref().map(|evidence| evidence.catalog.clone()).unwrap_or_default();
                 (previous.as_ref().map(|evidence| evidence.models.clone()).unwrap_or_default(), CatalogEvidence { state: EvidenceState::Stale, ..kept })
@@ -1493,6 +1649,9 @@ pub fn views(config: &AppConfig, adapter_available: bool, sessions: &SessionStat
                 .collect();
             // 适配器不支持这类服务商时，如实报 helper 不可用：不借用其它服务商的进程信息。
             let supported = sessions.supports(&provider.id);
+            // per-kind helper 与可用性：快照按 provider.kind 填；缺失时回落到全局值。
+            let helper = sessions.helpers.get(&provider.id);
+            let available = sessions.adapters_available.get(&provider.id).copied().unwrap_or(adapter_available);
             SubscriptionView {
                 provider_id: provider.id.clone(),
                 label: label(provider).to_owned(),
@@ -1507,7 +1666,7 @@ pub fn views(config: &AppConfig, adapter_available: bool, sessions: &SessionStat
                 quota: evidence.map(|evidence| evidence.quota.clone()).unwrap_or_default(),
                 catalog_entries: catalog,
                 denial: connection_denial(config, provider),
-                adapter_available,
+                adapter_available: available,
                 login: SubscriptionLoginView {
                     stage: session.map(|session| session.stage).unwrap_or_default(),
                     authorization_url: session.and_then(|session| session.authorization_url.clone()),
@@ -1521,9 +1680,17 @@ pub fn views(config: &AppConfig, adapter_available: bool, sessions: &SessionStat
                 },
                 logout: session.and_then(|session| session.last_logout.as_ref()).map(LogoutRecord::view),
                 helper: SubscriptionHelperView {
-                    available: sessions.helper.available && supported,
-                    version: if supported { sessions.helper.version.clone() } else { None },
-                    auth_home: if supported { sessions.helper.auth_home.clone() } else { None },
+                    available: helper.map(|helper| helper.available).unwrap_or(sessions.helper.available) && supported,
+                    version: if supported {
+                        helper.and_then(|helper| helper.version.clone()).or_else(|| sessions.helper.version.clone())
+                    } else {
+                        None
+                    },
+                    auth_home: if supported {
+                        helper.and_then(|helper| helper.auth_home.clone()).or_else(|| sessions.helper.auth_home.clone())
+                    } else {
+                        None
+                    },
                 },
             }
         })
@@ -1984,6 +2151,8 @@ mod refresh_tests {
         models: Mutex<Vec<DiscoveredModel>>,
         catalog_missing: Mutex<Vec<String>>,
         catalog_time: Mutex<String>,
+        /// 本次目录读取的结局：默认 `Available`；用例可改成 `Unsupported`。
+        catalog_state: Mutex<EvidenceState>,
         quota: Mutex<QuotaEvidence>,
         reads: Mutex<Vec<u64>>,
         /// 目录与额度读取的调用次数：用来证明「无法确认身份时本次刷新根本不发起这两项读取」。
@@ -2021,6 +2190,7 @@ mod refresh_tests {
                 models: Mutex::new(vec![DiscoveredModel { model_id: "fixture-model".into(), name: None, eligible: true }]),
                 catalog_missing: Mutex::new(Vec::new()),
                 catalog_time: Mutex::new(STUB_CATALOG_OBSERVED_AT.into()),
+                catalog_state: Mutex::new(EvidenceState::Available),
                 quota: Mutex::new(QuotaEvidence {
                     state: EvidenceState::Available,
                     source: Some("fixture:account/rateLimits/read".into()),
@@ -2100,6 +2270,7 @@ mod refresh_tests {
                     bail!("fixture catalog read failed");
                 }
                 let read = CatalogRead {
+                    state: self.catalog_state.lock().unwrap().clone(),
                     models: self.models.lock().unwrap().clone(),
                     source: Some("fixture:model/list".into()),
                     observed_at: Some(self.catalog_time.lock().unwrap().clone()),
@@ -2273,6 +2444,157 @@ mod refresh_tests {
         assert_eq!(json["catalog"]["state"], "available");
         assert_eq!(json["quota"]["view"], "rate_limits_by_limit_id");
         assert_eq!(json["quota"]["history"], false);
+    }
+
+    /// 一次成功目录读取要能单独呈现「被移除的模型」，恢复后清零；stale 保留旧值。
+    #[tokio::test]
+    async fn a_removed_catalog_model_is_reported_separately() {
+        let adapter = StubAdapter::new();
+        let (store, _directory) = fixture_store(adapter.clone());
+        let fixture = |ids: &[&str]| -> Vec<DiscoveredModel> {
+            ids.iter().map(|id| DiscoveredModel { model_id: (*id).into(), name: None, eligible: false }).collect()
+        };
+        *adapter.models.lock().unwrap() = fixture(&["fixture-model", "fixture-extra"]);
+        let connection = refresh(&store, "codex").await.unwrap();
+        assert!(connection.current_evidence().unwrap().catalog.removed_models.is_empty());
+        // 第二次成功读取少了一个：按旧目录顺序记录被移除的标识。
+        *adapter.models.lock().unwrap() = fixture(&["fixture-extra"]);
+        let connection = refresh(&store, "codex").await.unwrap();
+        let evidence = connection.current_evidence().unwrap();
+        assert_eq!(evidence.catalog.removed_models, vec!["fixture-model"]);
+        assert_eq!(evidence.models.len(), 1);
+        // 目录读取失败（stale）不动这份记录。
+        adapter.fail_models.store(true, Ordering::SeqCst);
+        let connection = refresh(&store, "codex").await.unwrap();
+        let evidence = connection.current_evidence().unwrap();
+        assert_eq!(evidence.catalog.state, EvidenceState::Stale);
+        assert_eq!(evidence.catalog.removed_models, vec!["fixture-model"]);
+        // 再次成功读取把模型读回来：移除记录清零。
+        adapter.fail_models.store(false, Ordering::SeqCst);
+        *adapter.models.lock().unwrap() = fixture(&["fixture-extra", "fixture-model"]);
+        let connection = refresh(&store, "codex").await.unwrap();
+        assert!(connection.current_evidence().unwrap().catalog.removed_models.is_empty());
+    }
+
+    /// 此前从未成功读过目录时，不可信列表如实标失败、绝不留「可用 + 0 个模型」。
+    #[tokio::test]
+    async fn an_untrustworthy_first_catalog_read_is_reported_as_failed() {
+        let adapter = StubAdapter::new();
+        let (store, _directory) = fixture_store(adapter.clone());
+        adapter.catalog_missing.lock().unwrap().push("models".into());
+        *adapter.models.lock().unwrap() = Vec::new();
+        let connection = refresh(&store, "codex").await.unwrap();
+        let evidence = connection.current_evidence().unwrap();
+        assert_eq!(evidence.catalog.state, EvidenceState::Failed);
+        assert!(evidence.models.is_empty());
+        assert!(evidence.catalog.source.is_none() && evidence.catalog.observed_at.is_none());
+        assert!(evidence.catalog.removed_models.is_empty());
+        assert_eq!(evidence.catalog.missing_fields, vec!["models"]);
+    }
+
+    /// 本次列表不可信（缺 `models` 键或有条目被跳过）时，整份读取都不算权威结果：
+    /// 保留已核实目录（模型/来源/时间/移除记录）并标陈旧，`missing_fields` 用本次记账；
+    /// 列表重新可信后整体替换、移除记录清零。
+    #[tokio::test]
+    async fn an_untrustworthy_catalog_list_never_replaces_a_verified_catalog() {
+        let adapter = StubAdapter::new();
+        let (store, _directory) = fixture_store(adapter.clone());
+        let fixture = |ids: &[&str]| -> Vec<DiscoveredModel> {
+            ids.iter().map(|id| DiscoveredModel { model_id: (*id).into(), name: None, eligible: false }).collect()
+        };
+        *adapter.models.lock().unwrap() = fixture(&["grok-build", "grok-mini"]);
+        refresh(&store, "codex").await.unwrap();
+        *adapter.models.lock().unwrap() = fixture(&["grok-mini"]);
+        let connection = refresh(&store, "codex").await.unwrap();
+        let verified = connection.current_evidence().unwrap().catalog.clone();
+        assert_eq!(verified.state, EvidenceState::Available);
+        assert_eq!(verified.removed_models, vec!["grok-build"]);
+
+        // 不可信的读取刻意带上与上一次不同的观测时间：它不得写进证据。
+        *adapter.catalog_time.lock().unwrap() = "2026-10-01T00:00:00Z".into();
+        adapter.catalog_missing.lock().unwrap().push("models".into());
+        let connection = refresh(&store, "codex").await.unwrap();
+        let evidence = connection.current_evidence().unwrap();
+        assert_eq!(evidence.catalog.state, EvidenceState::Stale);
+        assert_eq!(evidence.models.iter().map(|model| model.model_id.as_str()).collect::<Vec<_>>(), vec!["grok-mini"]);
+        assert_eq!(evidence.catalog.source, verified.source);
+        assert_eq!(evidence.catalog.observed_at, verified.observed_at);
+        assert_eq!(evidence.catalog.removed_models, vec!["grok-build"]);
+        assert_eq!(evidence.catalog.missing_fields, vec!["models"], "missing_fields 用本次的记账");
+
+        // 有可用条目被跳过（models[i].id）：同样整份不可信，处理方式相同。
+        adapter.catalog_missing.lock().unwrap().clear();
+        adapter.catalog_missing.lock().unwrap().push("models[1].id".into());
+        let connection = refresh(&store, "codex").await.unwrap();
+        let evidence = connection.current_evidence().unwrap();
+        assert_eq!(evidence.catalog.state, EvidenceState::Stale);
+        assert_eq!(evidence.models.iter().map(|model| model.model_id.as_str()).collect::<Vec<_>>(), vec!["grok-mini"]);
+        assert_eq!(evidence.catalog.source, verified.source);
+        assert_eq!(evidence.catalog.observed_at, verified.observed_at);
+        assert_eq!(evidence.catalog.removed_models, vec!["grok-build"]);
+        assert_eq!(evidence.catalog.missing_fields, vec!["models[1].id"]);
+
+        // 列表重新可信：整体替换、移除记录清零。
+        adapter.catalog_missing.lock().unwrap().clear();
+        *adapter.catalog_time.lock().unwrap() = STUB_CATALOG_OBSERVED_AT.into();
+        *adapter.models.lock().unwrap() = fixture(&["grok-build", "grok-mini"]);
+        let connection = refresh(&store, "codex").await.unwrap();
+        let evidence = connection.current_evidence().unwrap();
+        assert_eq!(evidence.catalog.state, EvidenceState::Available);
+        assert_eq!(evidence.models.len(), 2);
+        assert!(evidence.catalog.removed_models.is_empty());
+    }
+
+    /// 目录返回 `unsupported` 不是失败：如实标 unsupported、模型列表为空，来源与时间只取本次事件。
+    #[tokio::test]
+    async fn an_unsupported_catalog_read_is_not_a_failure() {
+        let adapter = StubAdapter::new();
+        let (store, _directory) = fixture_store(adapter.clone());
+        let first = refresh(&store, "codex").await.unwrap();
+        assert_eq!(first.current_evidence().unwrap().catalog.observed_at.as_deref(), Some(STUB_CATALOG_OBSERVED_AT));
+        *adapter.catalog_state.lock().unwrap() = EvidenceState::Unsupported;
+        *adapter.catalog_time.lock().unwrap() = "2026-10-02T00:00:00Z".into();
+        *adapter.models.lock().unwrap() = Vec::new();
+        let connection = refresh(&store, "codex").await.unwrap();
+        let evidence = connection.current_evidence().unwrap();
+        assert_eq!(evidence.catalog.state, EvidenceState::Unsupported);
+        assert!(evidence.models.is_empty(), "固定版本没有该接口即撤销旧条目");
+        // 只取本次事件：不是上一次的观测时间，也不沿用被清空的旧模型。
+        assert_eq!(evidence.catalog.observed_at.as_deref(), Some("2026-10-02T00:00:00Z"));
+        assert_eq!(evidence.catalog.source.as_deref(), Some("fixture:model/list"));
+        // 额度读取仍然独立成功，不受目录 unsupported 影响。
+        assert_eq!(evidence.quota.state, EvidenceState::Available);
+    }
+
+    /// per-kind availability：Grok 行不得借用 Codex 适配器的可用性。
+    #[test]
+    fn the_view_availability_is_taken_per_provider_kind() {
+        let mut config = AppConfig::default();
+        for (id, kind) in [("codex", ProviderKind::CodexSubscription), ("grok", ProviderKind::GrokSubscription)] {
+            let provider = Provider {
+                preset: String::new(),
+                api_type: String::new(),
+                test_model: String::new(),
+                id: id.into(),
+                name: id.into(),
+                kind,
+                base_url: String::new(),
+                enabled: true,
+                has_api_key: false,
+            };
+            config.providers.push(provider.clone());
+            sync_provider(&mut config, &provider.id, &provider.kind);
+        }
+        let mut sessions = SessionState::default();
+        sessions.supported_providers = vec!["codex".into(), "grok".into()];
+        sessions.adapters_available.insert("codex".into(), true);
+        sessions.adapters_available.insert("grok".into(), false);
+        // 回退值故意传 true：per-kind 结果优先，Grok 行不得借用 Codex 的 availability。
+        let items = views(&config, true, &sessions);
+        let codex = items.iter().find(|view| view.provider_id == "codex").unwrap();
+        let grok = items.iter().find(|view| view.provider_id == "grok").unwrap();
+        assert!(codex.adapter_available);
+        assert!(!grok.adapter_available);
     }
 
     #[tokio::test]
@@ -2792,7 +3114,7 @@ mod refresh_tests {
     fn production_has_no_switch_to_install_a_stub() {
         let directory = tempfile::tempdir().unwrap();
         let store = ConfigStore::load(directory.path().join("autojev.db")).unwrap();
-        assert!(!store.subscription.available());
+        assert!(!store.subscription.any_available());
         store
             .update(|config| {
                 for (id, kind) in [("codex", ProviderKind::CodexSubscription), ("grok", ProviderKind::GrokSubscription)] {
@@ -2807,8 +3129,8 @@ mod refresh_tests {
             })
             .unwrap();
         // 配置里没有任何字段能把它换成替身。
-        assert!(!store.subscription.available());
-        let views = views(&store.read(), store.subscription.available(), &SessionState::default());
+        assert!(!store.subscription.any_available());
+        let views = views(&store.read(), store.subscription.any_available(), &SessionState::default());
         assert_eq!(views.len(), 2);
         assert!(views.iter().all(|view| !view.adapter_available && view.denial.is_some()));
     }
@@ -2908,6 +3230,7 @@ mod lifecycle_tests {
         fn models<'a>(&'a self, _provider_id: &'a str, _generation: u64) -> BoxFuture<'a, Result<CatalogRead>> {
             Box::pin(async {
                 Ok(CatalogRead {
+                    state: EvidenceState::Available,
                     models: vec![DiscoveredModel { model_id: "fixture-model".into(), name: None, eligible: true }],
                     source: Some("fixture:model/list".into()),
                     observed_at: Some("2026-09-30T00:00:00Z".into()),
@@ -3052,12 +3375,23 @@ mod lifecycle_tests {
         sessions: &Arc<tokio::sync::Mutex<SessionState>>,
     ) -> SubscriptionView {
         let mut guard = sessions.lock().await;
-        guard.helper = store.subscription.helper_status();
-        guard.supported_providers = store
-            .read()
-            .providers
+        // 与 lib.rs 的 snapshot 同构：per-kind helper 与 availability，另留全局回落值。
+        let providers: Vec<Provider> = store.read().providers.iter().filter(|provider| is_subscription_provider(provider)).cloned().collect();
+        guard.helper = providers
+            .first()
+            .and_then(|provider| store.subscription.for_kind(&provider.kind).map(|adapter| adapter.helper_status()))
+            .unwrap_or_default();
+        guard.helpers = providers
             .iter()
-            .filter(|provider| is_subscription_provider(provider) && store.subscription.supports(&provider.kind))
+            .map(|provider| (provider.id.clone(), store.subscription.helper_status(&provider.kind)))
+            .collect();
+        guard.adapters_available = providers
+            .iter()
+            .map(|provider| (provider.id.clone(), store.subscription.available(&provider.kind)))
+            .collect();
+        guard.supported_providers = providers
+            .iter()
+            .filter(|provider| store.subscription.supports(&provider.kind))
             .map(|provider| provider.id.clone())
             .collect();
         views(&store.read(), adapter_available, &guard).pop().unwrap()
@@ -3071,7 +3405,7 @@ mod lifecycle_tests {
     async fn login_success_binds_identity_to_the_current_generation() {
         let adapter = LifecycleStub::new();
         let (store, _directory, sessions) = fixture(adapter.clone()).await;
-        assert!(store.subscription.helper_status().available);
+        assert!(store.subscription.helper_status(&ProviderKind::CodexSubscription).available);
         let start = begin_login(&store, "codex", &sessions).await.unwrap();
         assert_eq!(start.login_id, "codex-1");
         assert_eq!(start.authorization_url.as_deref(), Some("https://example.invalid/authorize?state=fixture"));
@@ -3101,7 +3435,7 @@ mod lifecycle_tests {
         let (model, provider) = target(&store.read());
         assert_eq!(admit_model(&store.read(), &model, &provider, Protocol::Chat).unwrap_err().code, "evidence_missing");
         assert!(!generation_ready(&store.read(), &model, Protocol::Chat));
-        let view = view_of(&store, store.subscription.available(), &sessions).await;
+        let view = view_of(&store, store.subscription.any_available(), &sessions).await;
         assert_eq!(view.login.stage, LoginStage::Completed);
         assert_eq!(view.login.generation, 1);
         assert!(view.helper.available);

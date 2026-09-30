@@ -946,3 +946,10 @@ main.debug-main { height: 100dvh; min-height: 0; overflow: hidden; }
 .subscription-auth-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 16px; }
 .subscription-auth-footer { display: flex; justify-content: flex-end; gap: 10px; margin-top: 26px; padding-top: 18px; border-top: 1px solid var(--line); }
 @media (max-width: 600px) { .subscription-auth-dialog { padding: 20px; } .subscription-auth-facts > div { grid-template-columns: 1fr; gap: 4px; } }
+
+/* 只读额度/目录块：额外 credits 轴、已移除模型、官方查看入口。 */
+.provider-subscription-credits { color: var(--muted); font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
+/* 被移除 != 不具备资格：用中性提示色，与资格警告区分。 */
+.provider-subscription-removed { color: var(--faint); font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
+.provider-subscription-reference { font-size: 11px; overflow-wrap: anywhere; }
+.provider-subscription-evidence-note { color: var(--faint); font-size: 11px; line-height: 1.5; }
