@@ -51,6 +51,12 @@
 | 账号不具备模型资格 | `model_not_discovered` / `model_removed` / `model_revoked` / `model_unqualified` | NotEligible |
 | 能力未验证或不支持 | `capability_unverified` / `capability_unsupported` | Capability |
 | 额度依据未知、陈旧、读取失败或无机器接口 | `quota_unknown` / `quota_stale` / `quota_failed` / `quota_unsupported` | Quota |
+| 上游明确允许额外 credits，或当前证据未证明每个额度桶都禁止额外 credits | `extra_usage_allowed` / `extra_usage_permission_unknown` | Quota |
+
+订阅准入要求当前账号与连接世代的目录、协议能力及额度证据都成立；额度摘要为 `available` 还必须与每个桶的
+当前许可一致。额外 credits 是独立的计费轴：只有每个当前额度桶都显式报告额外用量许可为 `denied` 才能派发。
+余额、余额为零、缺少 credits 对象或许可未知都不能证明不会发生订阅外消费。界面分别显示额度许可与额外
+credits 许可；未知字段仍显示为未知。刷新只读证据可以恢复准入，重置时间本身不会自动恢复。
 
 网关按客户端协议返回结构化错误体，并带上 `code`、类别、恢复动作、`retryable` 与
 `x-autojev-subscription-denial` 响应头；被拒绝的订阅模型不进入自动选路候选，固定直调返回该目标的具体原因。

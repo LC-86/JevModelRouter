@@ -72,6 +72,8 @@ describe('subscription views', () => {
     expect(denialLabel(undefined, t)).toBe('');
     expect(denialLabel(denied.denial, t)).toBe('未连接');
     expect(denialLabel({ code: 'quota_failed', family: 'quota', message: '', recovery: '' }, t)).toBe('额度读取失败');
+    expect(denialLabel({ code: 'extra_usage_allowed', family: 'quota', message: '', recovery: '' }, t)).toBe('上游当前允许使用额外 credits');
+    expect(denialLabel({ code: 'extra_usage_permission_unknown', family: 'quota', message: '', recovery: '' }, t)).toBe('尚未核实上游是否禁止额外 credits');
     // #17 的四种账号资格拒绝码必须登记文案，否则界面只会显示裸 code。
     expect(denialLabel({ code: 'model_not_discovered', family: 'not_eligible', message: '', recovery: '' }, t)).toBe('当前账号目录中没有该模型');
     expect(denialLabel({ code: 'model_removed', family: 'not_eligible', message: '', recovery: '' }, t)).toBe('上游目录已移除该模型');
@@ -444,12 +446,15 @@ describe('subscription catalog and quota evidence', () => {
     const unknown = { has_credits: null, unlimited: null, balance: null, unit: null, permission: 'unknown' as const, missing_fields: ['has_credits'], invalid_fields: [] };
     const axis = creditsAxisText(unknown, t);
     expect(axis).toContain('额外 credits');
+    expect(axis).toContain('额外 credits 许可未知');
     expect(axis).toContain('余额: Unknown');
     expect(axis).toContain('单位: Unknown');
     expect(axis).toContain('缺字段: has_credits');
     const missingAxis = creditsAxisText(null, t);
     expect(missingAxis).toContain('额外 credits');
     expect(missingAxis).toContain('有 credits: Unknown');
+    expect(creditsAxisText({ permission: 'allowed' }, t)).toContain('允许使用额外 credits');
+    expect(creditsAxisText({ permission: 'denied' }, t)).toContain('禁止使用额外 credits');
     expect([axis, missingAxis].join(' ')).not.toMatch(/0%|100%|余额: 0|单位: 0/);
   });
 
