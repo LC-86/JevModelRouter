@@ -634,6 +634,7 @@ struct AdapterState {
 }
 
 const GENERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+const TURN_COMPLETION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const MAX_GENERATION_INPUT_BYTES: usize = 32 * 1024;
 
 type GenerationGuardCell = Arc<Mutex<Option<tokio::sync::OwnedMutexGuard<()>>>>;
@@ -753,16 +754,12 @@ impl Drop for TurnCancellation {
                     let _ = gate.started.send(());
                     let _ = gate.release.await;
                 }
-                match (thread_id, turn_id) {
-                    (Some(thread_id), Some(turn_id)) => {
-                        if let Some(helper_instance_id) = helper_instance_id.as_deref() {
-                            if !interrupt_active_turn(&servers, &provider_id, helper_instance_id, &thread_id, &turn_id).await {
-                                reap_owned_helper(&servers, &provider_id, helper_instance_id).await;
-                            }
+                if let Some(helper_instance_id) = helper_instance_id.as_deref() {
+                    match (thread_id, turn_id) {
+                        (Some(thread_id), Some(turn_id)) => {
+                            stop_active_turn(&servers, &provider_id, helper_instance_id, &thread_id, &turn_id).await;
                         }
-                    }
-                    _ => {
-                        if let Some(helper_instance_id) = helper_instance_id.as_deref() {
+                        _ => {
                             reap_owned_helper(&servers, &provider_id, helper_instance_id).await;
                         }
                     }
@@ -1431,7 +1428,7 @@ impl SubscriptionAdapter for CodexAdapter {
                     }
                     if tokio::time::Instant::now() >= state.deadline {
                         if let Some(helper_instance_id) = state.cancellation.helper_instance_id.as_deref() {
-                            let _ = interrupt_active_turn(
+                            stop_active_turn(
                                 &state.servers,
                                 &state.provider_id,
                                 helper_instance_id,
@@ -1511,7 +1508,7 @@ impl SubscriptionAdapter for CodexAdapter {
                                 continue;
                             }
                             if let Some(helper_instance_id) = state.cancellation.helper_instance_id.as_deref() {
-                                let _ = interrupt_active_turn(
+                                stop_active_turn(
                                     &state.servers,
                                     &state.provider_id,
                                     helper_instance_id,
@@ -1547,6 +1544,52 @@ async fn wait_for_cancel_completion(receiver: &mut tokio::sync::watch::Receiver<
             return;
         }
     }
+}
+
+async fn wait_for_turn_completion(
+    servers: &Arc<tokio::sync::Mutex<HashMap<String, CodexAppServer>>>,
+    provider_id: &str,
+    helper_instance_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + TURN_COMPLETION_TIMEOUT;
+    loop {
+        let next = {
+            let mut servers = servers.lock().await;
+            let Some(server) = servers.get_mut(provider_id) else { return false };
+            if server.instance_id() != helper_instance_id { return false; }
+            tokio::time::timeout_at(deadline, server.next_notification()).await
+        };
+        let value = match next {
+            Ok(Some(value)) => value,
+            Ok(None) | Err(_) => return false,
+        };
+        if value["method"] == "turn/completed"
+            && value["params"]["threadId"].as_str() == Some(thread_id)
+            && value.pointer("/params/turn/id").and_then(Value::as_str) == Some(turn_id)
+        {
+            return true;
+        }
+    }
+}
+
+async fn stop_active_turn(
+    servers: &Arc<tokio::sync::Mutex<HashMap<String, CodexAppServer>>>,
+    provider_id: &str,
+    helper_instance_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+) {
+    if interrupt_active_turn(servers, provider_id, helper_instance_id, thread_id, turn_id).await
+        && wait_for_turn_completion(servers, provider_id, helper_instance_id, thread_id, turn_id).await
+    {
+        return;
+    }
+    // An interrupt reply only acknowledges the RPC. If it fails or the terminal turn
+    // notification never arrives, kill and reap this exact app-owned helper before its
+    // per-account generation guard can be released.
+    reap_owned_helper(servers, provider_id, helper_instance_id).await;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1969,6 +2012,10 @@ while IFS= read -r line; do
     *'"method":"account/login/cancel"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"cancelled":true}}\n' "$id" ;;
     *'"method":"account/logout"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"local":"cleared","remote":"revoked"}}\n' "$id" ;;
     *'"method":"thread/start"'*)
+      if [ -f "$queue.active" ]; then
+        active_pid=$(cat "$queue.active")
+        if kill -0 "$active_pid" 2>/dev/null; then printf 'active helper %s\n' "$active_pid" >> "$queue.overlap"; else rm -f "$queue.active"; fi
+      fi
       n=0; if [ -f "$queue.thread.counter" ]; then n=$(cat "$queue.thread.counter"); fi; n=$((n+1)); printf '%s' "$n" > "$queue.thread.counter"
       thread_id="fixture-thread-$n"
       case "$line" in *'"ephemeral":true'*) ephemeral=true ;; *) ephemeral=false ;; esac
@@ -2005,6 +2052,9 @@ while IFS= read -r line; do
           printf '{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"%s","turnId":"%s","completedAtMs":6,"item":{"type":"agentMessage","id":"fixture-item","text":"fixture"}}}\n' "$thread_id" "$turn_id"
         elif [ "$scenario" = tool-activity ]; then
           printf '{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"%s","turnId":"%s","startedAtMs":1,"item":{"type":"commandExecution","id":"fixture-command","command":"echo blocked","cwd":"/tmp","commandActions":[],"status":"inProgress"}}}\n' "$thread_id" "$turn_id"
+        elif [ "$scenario" = tool-interrupt-fails ]; then
+          printf '%s\n' "$helper_pid" > "$queue.active"
+          printf '{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"%s","turnId":"%s","startedAtMs":1,"item":{"type":"commandExecution","id":"fixture-command","command":"echo blocked","cwd":"/tmp","commandActions":[],"status":"inProgress"}}}\n' "$thread_id" "$turn_id"
         elif [ "$scenario" = partial-disconnect ]; then
           printf '{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"%s","turnId":"%s","itemId":"fixture-item","delta":"partial"}}\n' "$thread_id" "$turn_id"
           sleep 0.05
@@ -2015,7 +2065,9 @@ while IFS= read -r line; do
         fi
         if [ "$scenario" = slow-success ]; then sleep 0.25; fi
         if [ "$scenario" = hold ]; then sleep 5; fi
-        if [ "$scenario" = partial-failure ]; then
+        if [ "$scenario" = tool-interrupt-fails ]; then
+          : # Keep this turn active until the app-owned helper is reaped.
+        elif [ "$scenario" = partial-failure ]; then
           printf '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"%s","turn":{"id":"%s","status":"failed","error":{"message":"fixture turn failure"}}}}\n' "$thread_id" "$turn_id"
         else
           status=completed
@@ -2028,9 +2080,13 @@ while IFS= read -r line; do
     *'"method":"turn/interrupt"'*)
       thread_id=$(printf '%s' "$line" | sed -n 's/.*"threadId":"\([^"]*\)".*/\1/p')
       turn_id=$(printf '%s' "$line" | sed -n 's/.*"turnId":"\([^"]*\)".*/\1/p')
-      if [ -n "$generation_pid" ]; then kill "$generation_pid" 2>/dev/null; fi
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"interrupted":true}}\n' "$id"
-      printf '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"%s","turn":{"id":"%s","status":"interrupted"}}}\n' "$thread_id" "$turn_id" ;;
+      if [ "$scenario" = "tool-interrupt-fails" ]; then
+        printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32000,"message":"fixture interrupt failed"}}\n' "$id"
+      else
+        if [ -n "$generation_pid" ]; then kill "$generation_pid" 2>/dev/null; fi
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"interrupted":true}}\n' "$id"
+        printf '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"%s","turn":{"id":"%s","status":"interrupted"}}}\n' "$thread_id" "$turn_id"
+      fi ;;
     *) printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"no such method; authorization_code=SUPERSECRET1234567890 refresh_token=abcdef0123456789abcdef0123456789"}}\n' "$id" ;;
   esac
 done
@@ -3138,6 +3194,127 @@ done
         let streaming_logs: Vec<_> = request_logs.iter().filter(|entry| entry.streaming).collect();
         assert_eq!(streaming_logs.len(), 3);
         assert!(streaming_logs.iter().all(|entry| entry.status == "success"), "stream terminals must be understood by debug capture: {streaming_logs:?}");
+    }
+
+    #[tokio::test]
+    async fn codex_nonstreaming_event_wait_obeys_gateway_response_timeout() {
+        let home = tempfile::tempdir().unwrap();
+        let log = home.path().join("response-timeout-helper.log");
+        std::fs::write(format!("{}.generation", log.to_string_lossy()), "hold").unwrap();
+        let adapter = Arc::new(CodexAdapter::with_launch(home.path().to_path_buf(), fixture_launch(home.path(), &log)));
+        let store = admitted_gateway_store(home.path().join("gateway.db").as_path(), adapter, "http://127.0.0.1:9");
+        store.update(|config| config.gateway.response_timeout_seconds = 1).unwrap();
+
+        let started = tokio::time::Instant::now();
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            crate::proxy::forward_test_request(
+                store,
+                gateway_text_request(Protocol::Responses, "autojev/model/codex-fixture-binding", false),
+                gateway_endpoint(Protocol::Responses),
+            ),
+        ).await.expect("the non-streaming turn must not wait beyond response_timeout_seconds");
+        assert_eq!(response.status(), axum::http::StatusCode::GATEWAY_TIMEOUT);
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+        let _ = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let calls = std::fs::read_to_string(format!("{}.calls", log.to_string_lossy())).unwrap_or_default();
+                if calls.lines().any(|method| method == "turn/interrupt") { break; }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }).await.expect("timing out the HTTP request must cancel its helper turn");
+    }
+
+    #[tokio::test]
+    async fn codex_streaming_body_obeys_gateway_idle_timeout_after_partial_output() {
+        let home = tempfile::tempdir().unwrap();
+        let log = home.path().join("stream-idle-helper.log");
+        std::fs::write(format!("{}.generation", log.to_string_lossy()), "hold").unwrap();
+        let adapter = Arc::new(CodexAdapter::with_launch(home.path().to_path_buf(), fixture_launch(home.path(), &log)));
+        let store = admitted_gateway_store(home.path().join("gateway.db").as_path(), adapter, "http://127.0.0.1:9");
+        store.update(|config| config.gateway.stream_idle_seconds = 1).unwrap();
+        let response = crate::proxy::forward_test_request(
+            store,
+            gateway_text_request(Protocol::Responses, "autojev/model/codex-fixture-binding", true),
+            gateway_endpoint(Protocol::Responses),
+        ).await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        let mut stream = response.into_body().into_data_stream();
+        let mut saw_output = false;
+        let timeout_error = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                match stream.next().await {
+                    Some(Ok(bytes)) => saw_output |= !bytes.is_empty(),
+                    Some(Err(error)) => break error.to_string(),
+                    None => panic!("the stalled Codex body must fail with the configured idle timeout"),
+                }
+            }
+        }).await.expect("the Codex HTTP body must apply stream_idle_seconds after partial output");
+        assert!(saw_output, "the fixture must deliver partial SSE bytes before stalling");
+        assert!(timeout_error.contains("Upstream idle timeout"), "{timeout_error}");
+        drop(stream);
+
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let calls = std::fs::read_to_string(format!("{}.calls", log.to_string_lossy())).unwrap_or_default();
+                if calls.lines().any(|method| method == "turn/interrupt") { break; }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }).await.expect("an idle timeout must cancel the helper turn backing the body");
+    }
+
+    #[tokio::test]
+    async fn failed_tool_interrupt_reaps_helper_before_releasing_generation_lock() {
+        let home = tempfile::tempdir().unwrap();
+        let log = home.path().join("failed-interrupt-helper.log");
+        std::fs::write(format!("{}.generation", log.to_string_lossy()), "tool-interrupt-fails").unwrap();
+        let adapter = Arc::new(CodexAdapter::with_launch(home.path().to_path_buf(), fixture_launch(home.path(), &log)));
+        let mut active = adapter.generate(GenerationRequest {
+            provider_id: "codex-failed-interrupt",
+            generation: 1,
+            model_id: "fixture-model",
+            protocol: Protocol::Responses,
+            body: json!({"model":"fixture-model","input":"A"}),
+            pre_dispatch_check: Arc::new(|| Ok(())),
+        }).await.unwrap();
+        assert_eq!(active.next().await, Some(GenerationEvent::Started { generation: 1 }));
+        let helper_a_id = adapter.active_turns.lock().unwrap()["codex-failed-interrupt"]
+            .helper_instance_id.clone().expect("A must register its owned helper instance");
+
+        let request_b = GenerationRequest {
+            provider_id: "codex-failed-interrupt",
+            generation: 2,
+            model_id: "fixture-model",
+            protocol: Protocol::Responses,
+            body: json!({"model":"fixture-model","input":"B"}),
+            pre_dispatch_check: Arc::new(|| Ok(())),
+        };
+        let mut b_start = adapter.generate(request_b);
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(100), &mut b_start).await.is_err(),
+            "B must queue while A owns the helper turn");
+
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(3), active.next()).await.unwrap(),
+            Some(GenerationEvent::Failed { message }) if message.contains("tool activity")
+        ));
+        drop(active);
+        std::fs::write(format!("{}.generation", log.to_string_lossy()), "success").unwrap();
+        let mut b_events = tokio::time::timeout(std::time::Duration::from_secs(3), &mut b_start).await
+            .expect("B should proceed after the failed A turn is stopped").unwrap();
+        let helper_b_id = adapter.servers.lock().await["codex-failed-interrupt"].instance_id().to_owned();
+        assert_ne!(helper_a_id, helper_b_id, "a failed interrupt must reap A's helper before B starts");
+        assert!(!std::path::Path::new(&format!("{}.overlap", log.to_string_lossy())).exists(),
+            "B must not start on an app-server that still owns A's incomplete turn");
+        let mut b_observed = Vec::new();
+        while let Some(event) = b_events.next().await { b_observed.push(event); }
+        assert_eq!(b_observed, vec![
+            GenerationEvent::Started { generation: 2 },
+            GenerationEvent::Chunk("fixture".into()),
+            GenerationEvent::Finished { status: 200 },
+        ]);
     }
 
     #[tokio::test]

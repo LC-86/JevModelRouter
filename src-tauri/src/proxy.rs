@@ -734,8 +734,10 @@ async fn codex_subscription_response(
     }
 
     if !streaming {
-        let mut events = match tokio::time::timeout(
-            std::time::Duration::from_secs(context.store.read().gateway.response_timeout_seconds),
+        let response_deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_secs(context.store.read().gateway.response_timeout_seconds);
+        let mut events = match tokio::time::timeout_at(
+            response_deadline,
             adapter.generate(crate::subscription::GenerationRequest {
                 provider_id: &provider.id,
                 generation,
@@ -752,7 +754,13 @@ async fn codex_subscription_response(
                 model, route_source, protocol.error("Codex did not start generation before the gateway timeout."), capture),
         };
         let mut output = String::new();
-        while let Some(event) = events.next().await {
+        loop {
+            let event = match tokio::time::timeout_at(response_deadline, events.next()).await {
+                Ok(Some(event)) => event,
+                Ok(None) => break,
+                Err(_) => return codex_json_response(StatusCode::GATEWAY_TIMEOUT, protocol, model,
+                    route_source, protocol.error("Codex generation exceeded the gateway response timeout."), capture),
+            };
             match event {
                 crate::subscription::GenerationEvent::Chunk(delta) => {
                     if output.len().saturating_add(delta.len()) > MAX_CODEX_OUTPUT_BYTES {
@@ -788,6 +796,7 @@ async fn codex_subscription_response(
     let provider_id = provider.id.clone();
     let model_id = model.model_id.clone();
     let output_limit = MAX_CODEX_OUTPUT_BYTES;
+    let stream_idle_seconds = context.store.read().gateway.stream_idle_seconds;
     let adapter_for_task = adapter.clone();
     let capture_for_task = capture.clone();
     let pre_dispatch_check_for_task = pre_dispatch_check;
@@ -865,6 +874,7 @@ async fn codex_subscription_response(
     let stream = futures_util::stream::unfold(rx, |mut rx| async move {
         rx.recv().await.map(|bytes| (Ok::<Bytes, std::io::Error>(bytes), rx))
     });
+    let stream = timed_stream(stream, stream_idle_seconds);
     let stream = crate::traffic::observe(stream, capture.clone());
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = StatusCode::OK;
