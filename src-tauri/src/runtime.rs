@@ -9,6 +9,9 @@ use std::{
 static ISOLATION_ROOT: OnceLock<PathBuf> = OnceLock::new();
 static UPSTREAM: OnceLock<reqwest::Url> = OnceLock::new();
 static GATEWAY_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+/// `--autojev-helper <path>` 只在 isolation-check 构建里存在；生产二进制没有这个开关。
+#[cfg(feature = "isolation-check")]
+static HELPER_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 
 pub fn init() -> Result<()> {
     let args: Vec<_> = std::env::args_os().collect();
@@ -37,6 +40,26 @@ pub fn init() -> Result<()> {
             .map_err(|_| anyhow::anyhow!("Isolation already initialized"))?;
         ISOLATION_ROOT
             .set(root)
+            .map_err(|_| anyhow::anyhow!("Isolation already initialized"))?;
+    }
+    #[cfg(feature = "isolation-check")]
+    if let Some(index) = args.iter().position(|arg| arg == "--autojev-helper") {
+        // 覆盖辅助进程可执行文件只服务于隔离验收：必须已经进入隔离模式，且必须是绝对路径的真实文件。
+        ensure!(
+            isolated(),
+            "--autojev-helper requires --autojev-isolated"
+        );
+        let path = PathBuf::from(
+            args.get(index + 1)
+                .context("--autojev-helper requires an absolute path")?,
+        );
+        ensure!(path.is_absolute(), "--autojev-helper requires an absolute path");
+        ensure!(
+            path.is_file(),
+            "--autojev-helper must point at an existing helper executable"
+        );
+        HELPER_OVERRIDE
+            .set(path)
             .map_err(|_| anyhow::anyhow!("Isolation already initialized"))?;
     }
     Ok(())
@@ -98,6 +121,11 @@ fn reject_symlinks(root: &Path) -> Result<()> {
 
 pub fn isolated() -> bool {
     ISOLATION_ROOT.get().is_some()
+}
+/// 隔离验收显式指定的辅助进程可执行文件；生产构建里这个入口不存在。
+#[cfg(feature = "isolation-check")]
+pub fn helper_override() -> Option<&'static Path> {
+    HELPER_OVERRIDE.get().map(PathBuf::as_path)
 }
 pub fn home_dir() -> Option<PathBuf> {
     ISOLATION_ROOT.get().cloned().or_else(dirs::home_dir)
