@@ -40,7 +40,7 @@
 | --- | --- | --- |
 | 服务商或模型停用 | `provider_disabled` / `model_disabled` | Disabled |
 | 未连接、等待授权、授权过期、身份未核实、无当前世代证据 | `not_connected` / `authorization_pending` / `authorization_expired` / `identity_unverified` / `evidence_missing` | NotConnected |
-| 账号不具备模型资格 | `model_not_eligible` | NotEligible |
+| 账号不具备模型资格 | `model_not_discovered` / `model_removed` / `model_revoked` / `model_unqualified` | NotEligible |
 | 能力未验证或不支持 | `capability_unverified` / `capability_unsupported` | Capability |
 | 额度依据未知、陈旧、读取失败或无机器接口 | `quota_unknown` / `quota_stale` / `quota_failed` / `quota_unsupported` | Quota |
 

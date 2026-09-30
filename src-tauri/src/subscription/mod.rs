@@ -405,8 +405,10 @@ pub fn generation_ready(config: &AppConfig, model: &Model, protocol: Protocol) -
         .is_some_and(|provider| admit_model(config, model, provider, protocol).is_ok())
 }
 
-/// 模型列表（公共目录、应用内选择、Agent 可选列表）的展示条件：已选、未停用、服务商启用，
-/// 且订阅模型在当前账号与世代下资格合格。取消选择只影响列表与自动候选；显式原 ID 直调不经过这里。
+/// 可派发候选的口径：公共目录（`/v1/models`）、Agent 可选列表与自动候选要求模型已选、未停用、
+/// 服务商启用，且订阅模型在当前账号与世代下资格合格。
+/// 界面「模型列表」另展示已停用的已选项（行内标注停用），因此与这里不等价；
+/// 取消选择只影响这些集合，显式原 ID 直调不经过这里。
 pub fn catalog_listed(config: &AppConfig, model: &Model) -> bool {
     if !model.selected || !model.enabled {
         return false;

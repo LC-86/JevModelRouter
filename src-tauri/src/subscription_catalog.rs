@@ -139,9 +139,9 @@ pub fn models<'a>(config: &'a AppConfig, provider_id: &str) -> Vec<&'a Model> {
     config.models.iter().filter(|model| model.provider_id == provider_id).collect()
 }
 
-/// 进入模型列表与自动候选的行：既已选也已启用。取消选择只移出这里，不移除调用能力。
-/// 这是「模型列表成员」的语义单点：生产路径经 `subscription::catalog_listed` 表达同一规则
-/// （后者另加服务商启用与账号资格），测试与后续候选集合直接按它断言。
+/// 进入自动候选与公共目录的行：既已选、也未停用。取消选择只移出这里，不移除调用能力。
+/// 这是「可派发候选」的口径；界面「模型列表」还展示已停用的已选项（行内标注停用），
+/// 所以两者不等价。生产路径经 `subscription::catalog_listed` 表达同一规则（另加服务商启用与账号资格）。
 #[allow(dead_code)]
 pub fn selected_models<'a>(config: &'a AppConfig, provider_id: &str) -> Vec<&'a Model> {
     models(config, provider_id).into_iter().filter(|model| model.selected && model.enabled).collect()
@@ -150,6 +150,10 @@ pub fn selected_models<'a>(config: &'a AppConfig, provider_id: &str) -> Vec<&'a 
 /// 权威目录读取成功后的核对。以本次结果整体替换该账号的目录：
 /// 新增模型建档且默认未选，上游 ID 变化按新模型处理，本次结果中不存在的已核实项标 `Removed`。
 /// 用户的选择与停用状态不因核对改变。
+///
+/// 适配器契约：一次成功的 `models()` 读取必须返回该账号**完整**的权威目录；部分读取或截断的
+/// 读取必须返回 `Err`（调用方据此走 [`mark_stale`]，保留已核实项），不得用不完整的列表冒充权威结果。
+/// 否则「目录里没有」会被误判成「被移除」，触发 US 38 之外的撤销。
 pub fn reconcile(
     config: &mut AppConfig,
     provider_id: &str,
@@ -208,6 +212,11 @@ pub fn reconcile(
             Some(registered_id) => {
                 // 模型行存在时以它为准，顺带修正早前版本可能留下的标识不一致。
                 let internal_id = row_id.unwrap_or(registered_id);
+                let previous_name = config
+                    .subscription_catalogs
+                    .get(provider_id)
+                    .and_then(|catalog| catalog.entry(model_id))
+                    .and_then(|entry| entry.name.clone());
                 if let Some(entry) = config
                     .subscription_catalogs
                     .get_mut(provider_id)
@@ -221,6 +230,10 @@ pub fn reconcile(
                     entry.last_confirmed = observed_at.map(str::to_owned);
                     entry.confirmed_generation = Some(generation);
                     entry.account = Some(account.to_owned());
+                }
+                // 上游改名后，模型行的显示名也要跟上，否则服务商面板与模型列表会显示两个名字。
+                if let Some(display) = name {
+                    follow_rename(config, provider_id, model_id, previous_name.as_deref(), display);
                 }
                 outcome.retained.push(model_id.clone());
                 if !config
@@ -283,6 +296,32 @@ fn materialize(config: &mut AppConfig, provider_id: &str, model_id: &str, name: 
         input_cost_per_million: 0.0,
         output_cost_per_million: 0.0,
     });
+}
+
+/// 上游改名后同步模型行的显示名：只有用户没有自定义过名字时才跟随。
+/// 判断依据是模型行当前名字仍等于改名前的上游名；建档时还没有上游名则等于回退标识。
+/// `model_id` 与 `internal_id` 都不随改名改变，调用目标仍只由上游限定 ID 决定。
+fn follow_rename(
+    config: &mut AppConfig,
+    provider_id: &str,
+    model_id: &str,
+    previous_name: Option<&str>,
+    display: &str,
+) {
+    let Some(row) = config
+        .models
+        .iter_mut()
+        .find(|model| model.provider_id == provider_id && model.model_id == model_id)
+    else {
+        return;
+    };
+    let untouched = match previous_name {
+        Some(previous) => row.name == previous,
+        None => row.name == model_id,
+    };
+    if untouched {
+        row.name = display.to_owned();
+    }
 }
 
 /// 同一账号的目录读取失败：保留已核实项，只标陈旧，不删除、不改选择与停用。
@@ -399,6 +438,16 @@ mod tests {
             .expect("模型行应存在");
         row.selected = selected;
         row.enabled = enabled;
+    }
+
+    /// 模拟用户在界面上自定义模型显示名。
+    fn set_row_name(config: &mut AppConfig, model_id: &str, name: &str) {
+        let row = config
+            .models
+            .iter_mut()
+            .find(|model| model.provider_id == PROVIDER && model.model_id == model_id)
+            .expect("模型行应存在");
+        row.name = name.to_owned();
     }
 
     /// 旧配置或手工添加的订阅模型行：先有模型行，再触发目录核对。
@@ -781,5 +830,39 @@ mod tests {
         assert_eq!(model_row(&config, "fixture-model").id, "codex-model");
         assert_eq!(record.account.as_deref(), Some(ACCOUNT));
         assert_eq!(record.confirmed_generation, Some(1));
+    }
+
+    #[test]
+    fn upstream_rename_follows_into_the_model_row_unless_the_name_was_customized() {
+        let mut config = config_with_connection();
+        reconcile(&mut config, PROVIDER, ACCOUNT, 1, &[discovery("grok-4", Some("Grok 4"), true)], Some("t1"));
+        let internal = entry(&config, "grok-4").internal_id.clone();
+
+        // 上游改名：模型行跟随，调用目标与稳定标识不变
+        reconcile(&mut config, PROVIDER, ACCOUNT, 1, &[discovery("grok-4", Some("Grok 4.1"), true)], Some("t2"));
+        assert_eq!(entry(&config, "grok-4").name.as_deref(), Some("Grok 4.1"));
+        let row = model_row(&config, "grok-4");
+        assert_eq!(row.name, "Grok 4.1", "服务商面板与模型列表必须显示同一个名字");
+        assert_eq!(row.model_id, "grok-4", "调用目标仍只由上游限定 ID 决定");
+        assert_eq!(row.id, internal);
+
+        // 用户自定义过名字：上游改名只更新目录，不覆盖用户的名字
+        set_row_name(&mut config, "grok-4", "My Grok");
+        reconcile(&mut config, PROVIDER, ACCOUNT, 1, &[discovery("grok-4", Some("Grok 4.2"), true)], Some("t3"));
+        assert_eq!(entry(&config, "grok-4").name.as_deref(), Some("Grok 4.2"), "目录始终记录上游名");
+        assert_eq!(model_row(&config, "grok-4").name, "My Grok", "用户自定义名不被上游改名覆盖");
+        assert_eq!(model_row(&config, "grok-4").model_id, "grok-4");
+        assert_eq!(model_row(&config, "grok-4").id, internal);
+    }
+
+    #[test]
+    fn first_upstream_name_replaces_the_identifier_fallback() {
+        let mut config = config_with_connection();
+        reconcile(&mut config, PROVIDER, ACCOUNT, 1, &[discovery("grok-4", None, true)], Some("t1"));
+        assert_eq!(model_row(&config, "grok-4").name, "grok-4", "没有上游显示名时回退到限定 ID");
+
+        reconcile(&mut config, PROVIDER, ACCOUNT, 1, &[discovery("grok-4", Some("Grok 4"), true)], Some("t2"));
+        assert_eq!(entry(&config, "grok-4").name.as_deref(), Some("Grok 4"));
+        assert_eq!(model_row(&config, "grok-4").name, "Grok 4", "首次拿到上游名时回退名要跟上");
     }
 }

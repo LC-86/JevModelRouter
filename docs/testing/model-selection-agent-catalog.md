@@ -35,18 +35,21 @@
 
 | #17 验收 | 证据 |
 | --- | --- |
-| 1. 新模型未选；取消选择移出列表与自动候选但保留合规直调；停用禁止所有后续调用 | 隔离场景 `discovered`（`selected=false`）、`selected`/`deselected`（公共目录出现→消失，且两次原 ID 直调的拒绝码与状态完全一致）、`disabled`（`model_disabled` + 公共目录移除 + 手动测速报错 + 上游零派发）；Rust：`agent_catalog::build` 要求 `selected`，`catalog_listed`、`generation_ready`、`rule_includes_model` |
-| 2. 服务商限定 ID 与内部标识稳定，显示名／邮箱不改变调用目标；上游 ID 变化视为新模型 | 隔离场景 `discovered.internal_id`、`removed`/`disabled`/`switched` 中标识不变、`deletedRow`（删行后重建沿用同一标识）、受控目录把显示名改为 `Catalog Alpha (renamed upstream)` 后 `model_id` 与 `internal_id` 不变；`save_model` 拒绝把目录行的上游 ID／服务商改绑 |
-| 3. 同账号目录失败保留已核实项；权威移除或权限撤销不可用；换号后重核且保留选择／停用状态 | 隔离场景 `stale`（保留模型行与配置、`available→stale`、仍按当前世代合格）、`removed`（`removed` + `model_removed`）、`switched`（`unknown`/`account_changed` → 重新登录核对后 `available`/`eligible`，选择与停用保留） |
+| 1. 新模型未选；取消选择移出列表与自动候选但保留合规直调；停用禁止所有后续调用 | 隔离场景 `discovered`（`selected=false`）、`selected`/`deselected`（公共目录出现→消失，且两次原 ID 直调的拒绝码与状态完全一致）、`disabled`（`model_disabled` + 公共目录移除 + 手动测速在派发前报错）。注意本构建里能力与额度证据未接通，替身本来收不到任何生成方法，所以「停用后上游零派发」（`requests.json`）只是支持性检查、单独并不区分停用与否；区分性证据是**同一请求的准入结论从 `capability_unverified` 变为 `model_disabled`**、公共目录移除与测速在派发前被拒。Rust：`agent_catalog::build` 要求 `selected`，`catalog_listed`、`generation_ready`、`rule_includes_model` |
+| 2. 服务商限定 ID 与内部标识稳定，显示名／邮箱不改变调用目标；上游 ID 变化视为新模型 | 隔离场景 `discovered.internal_id`、`removed`/`disabled`/`switched` 中标识不变、`deletedRow`（删行后重建沿用同一标识）、受控目录把显示名改为 `Catalog Alpha (renamed upstream)` 后 `model_id` 与 `internal_id` 不变；`save_model` 拒绝把目录行的上游 ID／服务商改绑；显示名只在上游权威目录里更新，且不覆盖用户自定义名 |
+| 3. 同账号目录失败保留已核实项；权威移除或权限撤销不可用；换号后重核且保留选择／停用状态 | 隔离场景 `stale`（保留模型行与配置、`available→stale`、仍按当前世代合格）、`removed`（`removed` + `model_removed`）、`switched`（`unknown`/`account_changed` → 重新登录核对后 `available`/`eligible`，选择与停用保留）。适配器契约：一次成功的 `models()` 必须返回完整权威目录，截断读取必须返回 `Err`，否则「目录里没有」会被误判为「被移除」 |
 | 4. 公共目录、应用内选择和 Agent 保存目录分别核对；外部待同步不推迟后端撤销 | 隔离场景逐步读取真实网关 `/v1/models`（无 Agent 头）的公共目录；`pendingSync`（Agent 保存目录与当前选择不一致 → `catalog_pending_sync=true`，此时原 ID 直调结论不变；一旦停用，后端立即以 `model_disabled` 撤销，不等外部配置） |
-| 5. 使用既定适配边界的受控目录证明全过程；旧 API 配置迁移与重读通过 | 隔离替身实现 `SubscriptionAdapter`，只替换「上游目录与额度读取」，登录／世代／准入／派发／快照仍是生产代码；旧配置迁移由 `Model.selected` 的 serde 默认值、`subscription_catalogs` 默认为空、以及 `config`／`lib.rs` 的往返测试覆盖 |
+| 5. 使用既定适配边界的受控目录证明全过程；旧 API 配置迁移与重读通过 | 隔离替身实现 `SubscriptionAdapter`，只替换「上游目录与额度读取」，登录／世代／准入／派发／快照仍是生产代码；旧 API 配置迁移由 `Model.selected` 的 serde 默认值、`subscription_catalogs` 默认为空、以及 `config.rs` 的 `ConfigStore` 迁移／重读测试（`legacy_database_config_keeps_api_models_selected_on_reload`）覆盖 |
 
 ## 如何运行
 
 ```sh
+pnpm build
+pnpm test
+pnpm release:check
+cargo test --locked --manifest-path src-tauri/Cargo.toml --lib
 cargo test --manifest-path src-tauri/Cargo.toml
 cargo check --manifest-path src-tauri/Cargo.toml --all-targets
-pnpm build
 pnpm test:isolated          # 构建前端与 --features isolation-check 的开发二进制，再跑原生桌面验收
 ```
 
@@ -60,3 +63,5 @@ pnpm test:isolated          # 构建前端与 --features isolation-check 的开�
 - 本构建的订阅生成能力与额度证据都没有接通（`capability_unverified`），因此「取消选择后仍可原 ID 直调」的可观察证据是：**同一请求在已选与未选下的拒绝码与状态完全一致**（选择不参与准入），而不是一次成功生成。成功生成需要能力与额度证据先落地。
 - 替身只替换外部目录与额度读取；它不提供真实 OAuth，也不消费任何真实账号额度。
 - 换号场景复用同一个受控账号身份，只验证「世代递增 → 资格作废旧目录 → 重核恢复并保留选择／停用」，不验证两家真实账号的邮箱差异。
+- 删除模型行（`delete_model`）不会删除目录项与稳定标识：下一次目录核对会按同一 `model_id` 用原 `internal_id` 重新建档（仍为未选）。这是刻意的选择——保留标识可避免已保存的 Agent 引用被悄悄改指；如果希望「删除即隐藏」，需要另开一票定义用户级忽略状态。
+- 上游显示名变化会更新服务商目录与未被用户自定义过的模型行显示名；`model_id` 与 `internal_id` 始终不变，调用目标不受显示名影响。

@@ -69,6 +69,11 @@ describe('subscription views', () => {
     expect(denialLabel(undefined, t)).toBe('');
     expect(denialLabel(denied.denial, t)).toBe('未连接');
     expect(denialLabel({ code: 'quota_failed', family: 'quota', message: '', recovery: '' }, t)).toBe('额度读取失败');
+    // #17 的四种账号资格拒绝码必须登记文案，否则界面只会显示裸 code。
+    expect(denialLabel({ code: 'model_not_discovered', family: 'not_eligible', message: '', recovery: '' }, t)).toBe('当前账号目录中没有该模型');
+    expect(denialLabel({ code: 'model_removed', family: 'not_eligible', message: '', recovery: '' }, t)).toBe('上游目录已移除该模型');
+    expect(denialLabel({ code: 'model_revoked', family: 'not_eligible', message: '', recovery: '' }, t)).toBe('上游已撤销该账号的模型权限');
+    expect(denialLabel({ code: 'model_unqualified', family: 'not_eligible', message: '', recovery: '' }, t)).toBe('该模型的账号资格尚未按当前连接重新核实');
     // 未知 code 原样显示，不编造文案。
     expect(denialLabel({ code: 'future_reason', family: 'quota', message: '', recovery: '' }, t)).toBe('future_reason');
     expect(subscriptionView(snapshot, 'codex')?.generation).toBe(1);

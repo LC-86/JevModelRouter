@@ -795,3 +795,61 @@ mod request_log_tests {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RouteModelSettings { pub priority: u32, pub weight: u32 }
+
+#[cfg(test)]
+mod legacy_config_storage_tests {
+    use super::*;
+
+    /// 模拟本票之前的落库内容：每个模型没有 `selected` 字段，根上没有 `subscription_catalogs`。
+    /// 返回按旧库内容解析出的期望值，供加载后逐项比对。
+    fn write_legacy_config(path: &std::path::Path) -> AppConfig {
+        let mut legacy: serde_json::Value = serde_json::to_value(AppConfig::default()).unwrap();
+        legacy.as_object_mut().unwrap().remove("subscription_catalogs");
+        for model in legacy["models"].as_array_mut().unwrap() {
+            model.as_object_mut().unwrap().remove("selected");
+        }
+        // 旧库中用户停用过其中一个 API 模型：迁移不得把它重新启用。
+        legacy["models"][1]["enabled"] = serde_json::json!(false);
+
+        let db = Connection::open(path).unwrap();
+        db.execute_batch("CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);").unwrap();
+        db.execute("INSERT INTO app_meta (key, value) VALUES ('config', ?1)", [legacy.to_string()]).unwrap();
+        drop(db);
+
+        serde_json::from_value(legacy).unwrap()
+    }
+
+    #[test]
+    fn legacy_database_config_keeps_api_models_selected_on_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.db");
+        let expected = write_legacy_config(&path);
+
+        let store = ConfigStore::load(path.clone()).unwrap();
+        let loaded = store.read();
+        assert_eq!(loaded.models.len(), expected.models.len(), "迁移不增删模型行");
+        assert!(loaded.subscription_catalogs.is_empty(), "旧库没有目录时为空");
+        for (actual, original) in loaded.models.iter().zip(expected.models.iter()) {
+            assert!(actual.selected, "旧 API 模型迁移后必须保持已选：{}", actual.model_id);
+            assert_eq!(actual.enabled, original.enabled, "迁移不得改写停用状态：{}", actual.model_id);
+            assert_eq!(actual.id, original.id, "迁移不得重建内部标识：{}", actual.model_id);
+            assert_eq!(actual.model_id, original.model_id);
+        }
+        assert!(!loaded.models[1].enabled, "被停用的模型在旧库中保持停用");
+
+        // 选择与停用写回后再重读，仍然保持。
+        store
+            .update(|config| {
+                config.models[0].selected = true;
+                config.models[1].selected = false;
+                config.models[1].enabled = true;
+            })
+            .unwrap();
+        let reopened = ConfigStore::load(path).unwrap().read();
+        assert_eq!(reopened.models.len(), expected.models.len());
+        assert!(reopened.models[0].selected, "已选状态重读后保持");
+        assert!(!reopened.models[1].selected, "取消选择必须持久化");
+        assert!(reopened.models[1].enabled, "重新启用必须持久化");
+        assert!(reopened.subscription_catalogs.is_empty());
+    }
+}
