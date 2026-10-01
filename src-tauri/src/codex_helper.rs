@@ -4154,6 +4154,52 @@ done
     }
 
     #[tokio::test]
+    async fn unsaved_subscription_provider_kind_change_is_rejected_before_helper_dispatch() {
+        use tauri::Manager;
+
+        let home = tempfile::tempdir().unwrap();
+        let log = home.path().join("provider-kind-helper.log");
+        let adapter = Arc::new(CodexAdapter::with_launch(
+            home.path().to_path_buf(),
+            fixture_launch(home.path(), &log),
+        ));
+        let store = admitted_gateway_store(
+            home.path().join("provider-kind.db").as_path(),
+            adapter,
+            "http://127.0.0.1:9",
+        );
+        let gateway = crate::proxy::start(store.clone()).await.unwrap();
+        store.update(|config| config.port = gateway.port).unwrap();
+
+        let saved = store
+            .read()
+            .providers
+            .into_iter()
+            .find(|provider| provider.id == "codex-fixture")
+            .unwrap();
+        let mut draft = saved.clone();
+        draft.kind = crate::config::ProviderKind::GrokSubscription;
+        draft.name = "Grok fixture".into();
+        draft.test_model = "codex-fixture-model".into();
+
+        let app = tauri::test::mock_app();
+        app.manage(crate::AppState {
+            performance: Arc::new(crate::performance::Runner::default()),
+            store: store.clone(),
+            proxy: Arc::new(tokio::sync::Mutex::new(Some(gateway))),
+            sessions: Arc::new(tokio::sync::Mutex::new(crate::subscription::SessionState::default())),
+        });
+        let outcome = crate::test_provider_draft(app.state::<crate::AppState>(), draft, None).await;
+        let calls = std::fs::read_to_string(format!("{}.calls", log.to_string_lossy())).unwrap_or_default();
+        let turn_starts = calls.lines().filter(|method| *method == "turn/start").count();
+        let error = outcome.expect_err("a draft Grok provider must not test through the saved Codex connection");
+        assert!(error.contains("refresh its model catalog"), "the stale target should be rejected with recovery guidance: {error}");
+        assert_eq!(turn_starts, 0, "the rejected draft must not start a Codex helper turn");
+
+        app.state::<crate::AppState>().proxy.lock().await.take().unwrap().stop().await;
+    }
+
+    #[tokio::test]
     async fn codex_nonstreaming_event_wait_obeys_gateway_response_timeout() {
         let home = tempfile::tempdir().unwrap();
         let log = home.path().join("response-timeout-helper.log");

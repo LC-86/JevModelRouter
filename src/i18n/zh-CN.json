@@ -309,6 +309,7 @@
   "The subscription test is locked to Chat Completions text. The API type above configures normal routing and is not verified by this test.": "订阅测试固定使用 Chat Completions 文本。上方 API 类型用于正常路由配置，本测试不会验证该协议。",
   "Subscription tests use a discovered model through the shared generation gate. Subscription usage may apply.": "订阅测试使用已发现的模型，并经过统一生成准入；可能消耗订阅额度。",
   "A subscription provider test sends a short Chat text request through the shared admission gate. It may consume subscription allowance.": "订阅服务商测试会通过统一准入发送一条简短 Chat 文本请求，可能消耗订阅额度。",
+  "Save this provider type and refresh its model catalog before testing.": "请先保存新的服务商类型，再刷新该类型的模型目录后进行测试。",
   "Choose a discovered model": "选择已发现的模型",
   "Refresh the model catalog before testing.": "请先刷新模型目录，再进行测试。",
   "Eligibility unknown or unavailable": "资格未知或不可用",

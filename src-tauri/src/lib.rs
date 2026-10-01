@@ -1090,8 +1090,11 @@ async fn test_provider_draft(state: State<'_, AppState>, provider: Provider, api
     // 订阅服务商的测试入口共用订阅准入，且不经过 API Key 与 base_url 路径。
     if subscription::is_subscription_provider(&provider) {
         let stored = state.store.read().providers.into_iter()
-            .find(|saved| saved.id == provider.id && subscription::is_subscription_provider(saved))
+            .find(|saved| saved.id == provider.id)
             .ok_or_else(|| "Subscription provider not found".to_string())?;
+        if !subscription::is_subscription_provider(&stored) || stored.kind != provider.kind {
+            return Err("Save this subscription provider type and refresh its model catalog before testing".into());
+        }
         if !api_key.as_deref().unwrap_or_default().trim().is_empty() {
             return Err("Subscription tests do not accept API keys".into());
         }

@@ -821,6 +821,24 @@
       return message && message !== previousToast ? message : null;
     }, 'provider row test result');
     check(listTestResult.length > 0, 'The provider row test must invoke the saved test target and report its result');
+    await click(`[data-testid="provider-configure-${providerId}"]`);
+    const changedProviderDialog = await wait(() => document.querySelector('.provider-dialog'), 'provider dialog for subscription kind switch');
+    (await wait(() => changedProviderDialog.querySelector('.search-select-trigger'), 'provider type picker')).click();
+    const typeSearch = await wait(() => changedProviderDialog.querySelector('[role="combobox"]'), 'provider type search');
+    setValue(typeSearch, 'grok-subscription');
+    const grokOption = await wait(() => [...changedProviderDialog.querySelectorAll('[role="option"]')].find(option => /grok subscription|grok 订阅/i.test(option.textContent || '')), 'Grok subscription provider type');
+    grokOption.click();
+    const kindChangeNote = await wait(() => {
+      const text = changedProviderDialog.querySelector('[data-testid="provider-kind-change-warning"]')?.textContent?.replace(/\s+/g, ' ').trim() || '';
+      return /save.*refresh.*catalog|先保存.*刷新.*目录/i.test(text) ? text : null;
+    }, 'save-and-refresh guidance after provider type change');
+    const staleTargetPicker = changedProviderDialog.querySelector('[data-testid="provider-subscription-test-model"]');
+    check(staleTargetPicker?.disabled === true, 'A directory from the previously saved subscription type must be unavailable until refresh');
+    check(![...(staleTargetPicker?.options || [])].some(option => option.value === catalogModelId), 'The old provider directory target must not be offered after switching subscription type');
+    check(changedProviderDialog.querySelector('[data-testid="provider-subscription-test-action"]')?.disabled === true, 'Testing a new subscription type must wait until its own catalog is refreshed');
+    passed('switching a saved subscription provider type blocks its stale directory and test action');
+    (await wait(() => changedProviderDialog.querySelector('.provider-dialog-header button.icon-action'), 'provider dialog close action')).click();
+    await wait(() => !document.querySelector('.provider-dialog'), 'close unsaved provider kind change');
     passed('subscription provider directory target is saved and tested from both the dialog and provider row');
     const unselectedList = await publicCatalog();
     check(!unselectedList.ids.includes(catalogPublicId), `An unselected model must stay out of the public catalog: ${JSON.stringify(unselectedList)}`);

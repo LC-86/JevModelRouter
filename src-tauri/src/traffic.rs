@@ -104,8 +104,6 @@ impl Capture {
             .get("user-agent")
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| value.eq_ignore_ascii_case("AutoJev/ModelSpeedTest"));
-        let subscription_probe = performance_probe
-            && body["model"].as_str().is_some_and(|model| model.starts_with("autojev/model/"));
         let agent = headers
             .get("x-autojev-agent")
             .and_then(|v| v.to_str().ok())
@@ -148,7 +146,9 @@ impl Capture {
             },
             performance_probe,
             subscription_probe_over_budget: false,
-            subscription_probe_bytes: subscription_probe.then_some(0),
+            // The request's model string is user-controlled for API providers and
+            // cannot establish that this probe belongs to a subscription provider.
+            subscription_probe_bytes: None,
             frame_data: vec![],
             start: Instant::now(),
             upstream_start: Instant::now(),
@@ -188,6 +188,10 @@ impl Capture {
         self.log.performance_model_id = model.id.clone();
         self.log.performance_fingerprint = crate::performance::fingerprint(model,provider);
         self.log.performance_context_tokens = context;
+        self.subscription_probe_bytes = (self.performance_probe
+            && crate::subscription::is_subscription_provider(provider))
+            .then_some(0);
+        self.subscription_probe_over_budget = false;
     }
     pub fn route(&mut self, route: &crate::router::ResolvedRoute) {
         self.measure(&route.model,&route.provider,0);
@@ -734,7 +738,8 @@ mod tests {
         let store = Arc::new(ConfigStore::load(directory.path().join("oversized-probe.db")).unwrap());
         let config = store.read();
         let model = config.models.first().expect("default test model");
-        let provider = config.providers.iter().find(|item| item.id == model.provider_id).expect("default test provider");
+        let mut provider = config.providers.iter().find(|item| item.id == model.provider_id).expect("default test provider").clone();
+        provider.kind = crate::config::ProviderKind::CodexSubscription;
         let mut headers = axum::http::HeaderMap::new();
         headers.insert("user-agent", "AutoJev/ModelSpeedTest".parse().unwrap());
         let capture = Capture::new(
@@ -744,7 +749,7 @@ mod tests {
         );
         {
             let mut capture = capture.lock().unwrap();
-            capture.measure(model, provider, 32);
+            capture.measure(model, &provider, 32);
             capture.upstream(Protocol::Chat, true);
             capture.log.status_code = 200;
         }
@@ -788,5 +793,37 @@ mod performance_capture_tests {
         assert!(c.log.first_content_ms.is_some());
         c.measure(&config.models[1],&config.providers[0],100);
         assert!(c.log.first_content_ms.is_none());assert!(c.log.first_byte_ms.is_none());
+    }
+
+    #[test]
+    fn api_speed_probe_with_subscription_style_model_id_keeps_api_response_limit() {
+        let config = crate::config::AppConfig::default();
+        let mut model = config.models[0].clone();
+        model.model_id = "autojev/model/chained-fixture".into();
+        let provider = &config.providers[0];
+        assert!(!crate::subscription::is_subscription_provider(provider));
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("user-agent", "AutoJev/ModelSpeedTest".parse().unwrap());
+        let capture = Capture::new(
+            "chat/completions",
+            &serde_json::json!({"model":model.model_id, "stream":true}),
+            &headers,
+        );
+        let event = serde_json::json!({"choices":[{"index":0,"delta":{"content":"OK"},"finish_reason":null}]});
+        let terminal = serde_json::json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":32,"completion_tokens":2}});
+        let wire = format!(
+            ": {}\n\ndata: {event}\n\ndata: {terminal}\n\ndata: [DONE]\n\n",
+            "p".repeat(70 * 1024),
+        );
+        let mut capture = capture.lock().unwrap();
+        capture.measure(&model, provider, 32);
+        capture.upstream(Protocol::Chat, true);
+        capture.log.status_code = 200;
+        capture.bytes(wire.as_bytes());
+
+        let log = capture.finish(true);
+        assert_eq!(log.status, "success", "API response size must not inherit the subscription limit: {}", log.error);
+        assert_eq!(log.output_tokens, Some(2));
     }
 }
