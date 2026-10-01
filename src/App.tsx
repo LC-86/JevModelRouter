@@ -1090,6 +1090,7 @@ function ModelDialog({ initial, providers, onClose, onSave, onTestStatus }: { on
   const form = useRef<HTMLFormElement>(null);
   const edit = Boolean(initial.id);
   const provider = enabledProviders.find((p) => p.id === model.provider_id);
+  const subscription = provider ? isSubscriptionProvider(provider) : false;
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     if (testing || saving || !provider) return;
@@ -1109,7 +1110,7 @@ function ModelDialog({ initial, providers, onClose, onSave, onTestStatus }: { on
   };
   return <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget && !testing && !saving) onClose(); }}>
     <div className="dialog provider-dialog" role="dialog" aria-modal="true" aria-labelledby="model-dialog-title">
-      <div className="provider-dialog-header"><div><h2 id="model-dialog-title">{t(edit ? 'Configure model' : 'Add model')}</h2><p>{t('Configure a model and test it with the provider’s saved API key.')}</p></div><button type="button" className="icon-action" disabled={testing || saving} onClick={onClose} aria-label={t('Close')}><X size={20} /></button></div>
+      <div className="provider-dialog-header"><div><h2 id="model-dialog-title">{t(edit ? 'Configure model' : 'Add model')}</h2><p>{t(subscription ? 'Configure a subscription model and test it through the shared generation gate.' : 'Configure a model and test it with the provider’s saved API key.')}</p></div><button type="button" className="icon-action" disabled={testing || saving} onClick={onClose} aria-label={t('Close')}><X size={20} /></button></div>
       <form autoComplete="off" ref={form} className="provider-dialog-form" onSubmit={submit} onChange={() => setResult('')}>
         {!enabledProviders.length && <p className="provider-test-help">{t('Enable a provider before adding a model.')}</p>}
         <fieldset disabled={testing || saving}>
@@ -1135,7 +1136,7 @@ function ModelDialog({ initial, providers, onClose, onSave, onTestStatus }: { on
             <label className="form-field"><span>{t('Context length (tokens)')}</span><input autoComplete="off" autoCapitalize="none" type="number" min="1" max="9007199254740991" step="1" placeholder={t('Unknown')} value={model.context_window || ''} onChange={event => setModel({ ...model, context_window: event.target.value === '' ? 0 : Number(event.target.value) })}/></label>
           </div>
           <p className="provider-test-help">{t('Image requests only use models marked as supporting image input. Context length is informational only.')}</p>
-          <p className="provider-test-help">{t('Testing sends a minimal text request using the saved API key. Upstream usage charges may apply.')}</p>
+          <p className="provider-test-help">{t(subscription ? 'Subscription tests use a discovered model through the shared generation gate. Subscription usage may apply.' : 'Testing sends a minimal text request using the saved API key. Upstream usage charges may apply.')}</p>
         </fieldset>
         {result && <p className={cx('provider-test-result', failed && 'error')} role="status">{result}</p>}
         <div className="provider-dialog-actions"><button type="button" className="button ghost" disabled={testing || saving || !provider} onClick={() => void test()}>{testing ? <LoaderCircle size={16} className="import-spinner" /> : <Play size={16} />}{t(testing ? 'Testing…' : 'Test')}</button><button type="submit" className="button primary" disabled={testing || saving || !provider}><Save size={15} />{t('Save model')}</button></div>

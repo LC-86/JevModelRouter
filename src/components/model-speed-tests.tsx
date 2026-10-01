@@ -45,11 +45,19 @@ export function SpeedTestToolbar({ tests, models }: { tests: ReturnType<typeof u
   const { t } = usePreferences();
   const selected = models.filter(m => tests.selected.includes(m.id));
   const running = tests.view?.job.running ?? false;
+  const job = tests.view?.job;
   return <div className="model-speed-actions">
-    {running ? <>
-      <span role="status" className="model-speed-count"><LoaderCircle size={14} className="import-spinner"/>{t('Completed')} {tests.view?.job.completed_models}/{tests.view?.job.total_models}</span>
-      <button className="button ghost" disabled={tests.busy} onClick={() => void tests.cancel()}>{t('Stop speed tests')}</button>
-    </> : <button className="button ghost" disabled={tests.busy} onClick={() => void tests.start(selected.map(m => m.id))}><CircleGauge size={16}/>{t(selected.length ? 'Test selected' : 'Speed test')}{selected.length ? ` (${selected.length})` : ''}</button>}
+    {job && job.total > 0 && <span role="status" className="model-speed-count">
+      {running && <LoaderCircle size={14} className="import-spinner"/>}
+      {t(job.cancelled ? 'Stopped after {completed} of {total} requests.' : 'Requests {completed} of {total}; models {completedModels} of {totalModels}.', {
+        completed: job.completed, total: job.total, completedModels: job.completed_models, totalModels: job.total_models,
+      })}
+    </span>}
+    {running
+      ? <button className="button ghost" disabled={tests.busy || job?.cancelled} onClick={() => void tests.cancel()}>{t(job?.cancelled ? 'Stopping…' : 'Stop speed tests')}</button>
+      : <button className="button ghost" disabled={tests.busy} onClick={() => void tests.start(selected.map(m => m.id))}><CircleGauge size={16}/>{t(selected.length ? 'Test selected' : 'Speed test')}{selected.length ? ` (${selected.length})` : ''}</button>}
+    <small className="model-speed-help">{t('Manual speed tests send three streaming requests per model, one at a time. API requests ask for at most 24 output tokens; subscription responses are capped at 64 KiB. Stopping cancels unfinished requests. Calls may use API or subscription allowance. Automatic speed tests skip subscription models.')}</small>
+    {job?.error && <small role="status" className="model-speed-help">{job.error}</small>}
   </div>;
 }
 
@@ -58,7 +66,7 @@ export function SpeedTestSettings() {
   const tests = useModelSpeedTests();
   const settings = tests.view?.settings;
   return <section className="settings-group speed-test-settings">
-    <div className="setting-row"><div><strong id="auto-speed-label">{t('Automatic speed tests')}</strong><p>{t('Retest models without recent measurements while the app is running. Tests incur API usage.')}</p></div><button type="button" role="switch" aria-labelledby="auto-speed-label" aria-checked={settings?.enabled ?? true} disabled={tests.busy || !settings} className={`switch ${settings?.enabled ? 'on' : ''}`} onClick={() => settings && void tests.save({ ...settings, enabled: !settings.enabled })}><span/></button></div>
+    <div className="setting-row"><div><strong id="auto-speed-label">{t('Automatic speed tests')}</strong><p>{t('Retest API models without recent measurements while the app is running. Subscription models are skipped.')}</p></div><button type="button" role="switch" aria-labelledby="auto-speed-label" aria-checked={settings?.enabled ?? true} disabled={tests.busy || !settings} className={`switch ${settings?.enabled ? 'on' : ''}`} onClick={() => settings && void tests.save({ ...settings, enabled: !settings.enabled })}><span/></button></div>
     <div className="setting-row"><label htmlFor="speed-test-interval">{t('Test interval')}</label><Select id="speed-test-interval" aria-label={t('Test interval')} searchable={false} disabled={tests.busy || !settings || !settings.enabled} value={String(settings?.interval_minutes ?? 30)} onChange={e => settings && void tests.save({ ...settings, interval_minutes: Number(e.target.value) })}>{[5,15,30,60,120].map(n => <option key={n} value={String(n)}>{`${n} ${t('minutes')}`}</option>)}</Select></div>
     {tests.error && <p role="alert" className="route-error">{t(tests.error)}</p>}
   </section>;

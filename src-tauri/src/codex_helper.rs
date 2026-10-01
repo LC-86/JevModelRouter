@@ -4091,6 +4091,69 @@ done
     }
 
     #[tokio::test]
+    async fn manual_speed_probe_uses_the_admitted_subscription_gateway_for_each_round() {
+        let home = tempfile::tempdir().unwrap();
+        let log = home.path().join("manual-speed-helper.log");
+        let adapter = Arc::new(CodexAdapter::with_launch(
+            home.path().to_path_buf(),
+            fixture_launch(home.path(), &log),
+        ));
+        let store = admitted_gateway_store(
+            home.path().join("manual-speed.db").as_path(),
+            adapter,
+            "http://127.0.0.1:9",
+        );
+        let gateway = crate::proxy::start(store.clone()).await.unwrap();
+        store.update(|config| config.port = gateway.port).unwrap();
+
+        store.update(|config| {
+            config.providers.iter_mut().find(|provider| provider.id == "codex-fixture").unwrap().test_model = "codex-fixture-model".into();
+        }).unwrap();
+        assert_eq!(
+            crate::test_subscription_target(store.clone(), "codex-fixture", "codex-fixture-model").await.unwrap(),
+            "Test request succeeded."
+        );
+
+        for _ in 0..3 {
+            crate::performance::probe(&store, "codex-fixture-binding")
+                .await
+                .unwrap();
+        }
+
+        let rpc: Vec<Value> = std::fs::read_to_string(format!("{}.rpc", log.to_string_lossy()))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let turns: Vec<_> = rpc.iter().filter(|call| call["method"] == "turn/start").collect();
+        assert_eq!(turns.len(), 4, "one helper turn must be counted for each test and measured request");
+        assert!(turns[0]["params"]["input"][0]["text"].as_str().is_some_and(|text| text.contains("Say OK")));
+        assert!(turns.iter().skip(1).all(|call| {
+            call["params"]["input"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("1 through 8"))
+        }));
+
+        let samples = store.read().performance_samples["codex-fixture-binding"].clone();
+        assert_eq!(samples.len(), 4);
+        assert_eq!(samples.iter().filter(|sample| sample.probe).count(), 3);
+        assert!(samples.iter().all(|sample| sample.success));
+        let request_logs = store.request_logs("").unwrap();
+        assert_eq!(request_logs.len(), 4);
+        assert!(request_logs.iter().all(|request| request.requested_model == "autojev/model/codex-fixture-binding" && request.status == "success"));
+        assert_eq!(request_logs.iter().filter(|request| request.streaming).count(), 3);
+
+        store.update(|config| {
+            config.subscriptions.get_mut("codex-fixture").unwrap().state = crate::subscription::ConnectionState::NotConnected;
+        }).unwrap();
+        assert!(crate::test_subscription_target(store.clone(), "codex-fixture", "codex-fixture-model").await.is_err());
+        let calls = std::fs::read_to_string(format!("{}.calls", log.to_string_lossy())).unwrap();
+        assert_eq!(calls.lines().filter(|method| *method == "turn/start").count(), 4,
+            "a denied manual test must not dispatch a helper turn");
+        gateway.stop().await;
+    }
+
+    #[tokio::test]
     async fn codex_nonstreaming_event_wait_obeys_gateway_response_timeout() {
         let home = tempfile::tempdir().unwrap();
         let log = home.path().join("response-timeout-helper.log");

@@ -62,6 +62,7 @@ pub fn resolve_requested_model(log: &mut RequestLog, config: &crate::config::App
 
 pub struct Capture {
     pub log: RequestLog,
+    performance_probe: bool,
     start: Instant,
     upstream_start: Instant,
     protocol: Protocol,
@@ -95,6 +96,10 @@ impl Capture {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_lowercase();
+        let performance_probe = headers
+            .get("user-agent")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.eq_ignore_ascii_case("AutoJev/ModelSpeedTest"));
         let agent = headers
             .get("x-autojev-agent")
             .and_then(|v| v.to_str().ok())
@@ -135,6 +140,7 @@ impl Capture {
                 status: "pending".into(),
                 ..Default::default()
             },
+            performance_probe,
             frame_data: vec![],
             start: Instant::now(),
             upstream_start: Instant::now(),
@@ -409,8 +415,12 @@ struct CompletionGuard {
 }
 impl Drop for CompletionGuard {
     fn drop(&mut self) {
-        let log = self.capture.lock().unwrap().finish(self.completed);
-        if let Err(error) = crate::performance::record_log(&self.store,&log,false) {
+        let (log, probe) = {
+            let mut capture = self.capture.lock().unwrap();
+            let probe = capture.performance_probe;
+            (capture.finish(self.completed), probe)
+        };
+        if let Err(error) = crate::performance::record_log(&self.store,&log,probe) {
             eprintln!("Could not persist performance sample: {error}");
         }
         if let Err(error) = self.store.save_request_log(&log) {
