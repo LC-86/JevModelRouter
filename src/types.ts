@@ -182,7 +182,14 @@ export interface SubscriptionView {
   provider_id: string;
   label: string;
   generation: number;
+  /** Persistent unique identity for this stored connection instance; prevents delete/recreate aliasing. */
+  connection_instance_id: string;
   state: SubscriptionConnectionState;
+  /** Leo's explicit, volatile real-generation opt-in for this Codex connection generation. */
+  real_generation_enabled?: boolean;
+  /** Finite per-confirmation AutoJev request ceiling and remaining attempts. */
+  generation_call_limit?: number | null;
+  generation_calls_remaining?: number | null;
   identity?: string | null;
   helper_version?: string | null;
   account_path?: string | null;

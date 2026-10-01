@@ -5,24 +5,69 @@ import { cancelModelSpeedTests, getModelPerformance, savePerformanceSettings, st
 import { usePreferences } from '../lib/preferences-context';
 import { Select } from './select';
 
-export function useModelSpeedTests() {
+type BudgetSnapshotRefresh = () => Promise<unknown>;
+
+export function useModelSpeedTests(onBudgetSnapshotRefresh?: BudgetSnapshotRefresh, pollingEnabled = true) {
   const [view, setView] = useState<PerformanceView | null>(null);
   const [selected, setSelected] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const lastPollError = useRef('');
-  const refresh = useCallback(async () => setView(await getModelPerformance()), []);
-  useEffect(() => {
-    let stopped = false;
-    let timer: ReturnType<typeof setTimeout>;
-    const poll = async () => {
-      try { const next = await getModelPerformance(); if (!stopped) { setView(next); lastPollError.current = ''; } }
-      catch (e) { if (!stopped) { const message = e instanceof Error ? e.message : String(e); if (lastPollError.current !== message) setError(message); lastPollError.current = message; } }
-      if (!stopped) timer = setTimeout(() => void poll(), 2000);
-    };
-    void poll();
-    return () => { stopped = true; clearTimeout(timer); };
+  const budgetSnapshotRefresh = useRef(onBudgetSnapshotRefresh);
+  budgetSnapshotRefresh.current = onBudgetSnapshotRefresh;
+  const budgetMonitor = useRef<'starting' | 'running' | null>(null);
+  const lastBudgetProgress = useRef('');
+  const pollingEnabledRef = useRef(pollingEnabled);
+  pollingEnabledRef.current = pollingEnabled;
+  const pollTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pollInFlight = useRef(false);
+  const mounted = useRef(true);
+  const pollRef = useRef<() => Promise<void>>(async () => {});
+  const refreshBudgetSnapshot = useCallback(async () => {
+    try { await budgetSnapshotRefresh.current?.(); } catch { /* Keep speed-test status visible if a dashboard refresh fails. */ }
   }, []);
+  const progress = (job: PerformanceView['job']) => JSON.stringify([job.running, job.completed, job.cancelled, job.error]);
+  const refresh = useCallback(async () => setView(await getModelPerformance()), []);
+  const poll = useCallback(async () => {
+    if (pollTimer.current) { clearTimeout(pollTimer.current); pollTimer.current = null; }
+    if (pollInFlight.current || (!pollingEnabledRef.current && !budgetMonitor.current)) return;
+    pollInFlight.current = true;
+    try {
+      const next = await getModelPerformance();
+      if (mounted.current) {
+        setView(next); lastPollError.current = '';
+        if (next.job.running && budgetMonitor.current !== 'running') {
+          const starting = budgetMonitor.current === 'starting';
+          budgetMonitor.current = 'running';
+          lastBudgetProgress.current = progress(next.job);
+          if (!starting) await refreshBudgetSnapshot();
+        } else if (budgetMonitor.current === 'running') {
+          const nextProgress = progress(next.job);
+          if (nextProgress !== lastBudgetProgress.current) {
+            lastBudgetProgress.current = nextProgress;
+            await refreshBudgetSnapshot();
+          }
+          if (!next.job.running) budgetMonitor.current = null;
+        }
+      }
+    } catch (e) {
+      if (mounted.current) { const message = e instanceof Error ? e.message : String(e); if (lastPollError.current !== message) setError(message); lastPollError.current = message; }
+    } finally {
+      pollInFlight.current = false;
+      if (mounted.current && (pollingEnabledRef.current || budgetMonitor.current)) {
+        pollTimer.current = setTimeout(() => void pollRef.current(), budgetMonitor.current ? 350 : 2000);
+      }
+    }
+  }, [refreshBudgetSnapshot]);
+  pollRef.current = poll;
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; if (pollTimer.current) clearTimeout(pollTimer.current); };
+  }, []);
+  useEffect(() => {
+    if (pollingEnabled || budgetMonitor.current) void poll();
+    else if (pollTimer.current) { clearTimeout(pollTimer.current); pollTimer.current = null; }
+  }, [pollingEnabled, poll]);
   const act = async (work: () => Promise<void>) => {
     setBusy(true); setError('');
     try { await work(); await refresh(); }
@@ -35,13 +80,33 @@ export function useModelSpeedTests() {
     select: setSelected,
     start: (ids: string[]) => {
       if (!ids.length) { setError('Select models before running a speed test.'); return Promise.resolve(); }
-      return act(() => startModelSpeedTests(ids));
+      setBusy(true); setError(''); budgetMonitor.current = 'starting'; lastBudgetProgress.current = '';
+      return (async () => {
+        try {
+          await startModelSpeedTests(ids);
+          const next = await getModelPerformance(); setView(next);
+          await refreshBudgetSnapshot();
+          if (next.job.running) {
+            budgetMonitor.current = 'running';
+            lastBudgetProgress.current = progress(next.job);
+          } else budgetMonitor.current = null;
+        } catch (e) {
+          setError(e instanceof Error ? e.message : String(e));
+          await refreshBudgetSnapshot();
+          budgetMonitor.current = null;
+        } finally { setBusy(false); }
+      })();
     },
-    cancel: () => act(cancelModelSpeedTests),
+    cancel: () => act(async () => {
+      try { await cancelModelSpeedTests(); }
+      finally { await refreshBudgetSnapshot(); }
+    }),
     save: (settings: PerformanceSettings) => act(() => savePerformanceSettings(settings)),
   };
 }
-export function SpeedTestToolbar({ tests, models }: { tests: ReturnType<typeof useModelSpeedTests>; models: Model[] }) {
+export type ModelSpeedTests = ReturnType<typeof useModelSpeedTests>;
+
+export function SpeedTestToolbar({ tests, models }: { tests: ModelSpeedTests; models: Model[] }) {
   const { t } = usePreferences();
   const selected = models.filter(m => tests.selected.includes(m.id));
   const running = tests.view?.job.running ?? false;
@@ -61,9 +126,8 @@ export function SpeedTestToolbar({ tests, models }: { tests: ReturnType<typeof u
   </div>;
 }
 
-export function SpeedTestSettings() {
+export function SpeedTestSettings({ tests }: { tests: ModelSpeedTests }) {
   const { t } = usePreferences();
-  const tests = useModelSpeedTests();
   const settings = tests.view?.settings;
   return <section className="settings-group speed-test-settings">
     <div className="setting-row"><div><strong id="auto-speed-label">{t('Automatic speed tests')}</strong><p>{t('Retest API models without recent measurements while the app is running. Subscription models are skipped.')}</p></div><button type="button" role="switch" aria-labelledby="auto-speed-label" aria-checked={settings?.enabled ?? true} disabled={tests.busy || !settings} className={`switch ${settings?.enabled ? 'on' : ''}`} onClick={() => settings && void tests.save({ ...settings, enabled: !settings.enabled })}><span/></button></div>

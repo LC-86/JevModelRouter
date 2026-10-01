@@ -296,6 +296,10 @@ pub struct Evidence {
 /// 每家服务商一个活动连接。换号与退出递增 `generation`，旧世代的结果一律不采用。
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Connection {
+    /// Stable identity for this stored connection instance. Numeric generations can restart at 1
+    /// when a provider is deleted and recreated, so confirmations must also bind to this token.
+    #[serde(default = "new_connection_instance_id")]
+    pub connection_instance_id: String,
     #[serde(default = "first_generation")]
     pub generation: u64,
     #[serde(default)]
@@ -311,9 +315,19 @@ fn first_generation() -> u64 {
     1
 }
 
+fn new_connection_instance_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
 impl Default for Connection {
     fn default() -> Self {
-        Self { generation: 1, state: ConnectionState::NotConnected, identity: None, evidence: None }
+        Self {
+            connection_instance_id: new_connection_instance_id(),
+            generation: 1,
+            state: ConnectionState::NotConnected,
+            identity: None,
+            evidence: None,
+        }
     }
 }
 
@@ -580,12 +594,243 @@ fn admission_denial(provider: &Provider, quota: &QuotaEvidence) -> Option<Denial
         .or_else(|| extra_usage_denial(provider, extra_usage_permission(quota)))
 }
 
+/// The real Codex generation control is a volatile, connection-generation-scoped opt-in.
+/// It never creates or changes identity, model, protocol, quota, or extra-usage evidence.
+pub const CODEX_REAL_GENERATION_MAX_CALLS: u32 = 15;
+
+pub fn codex_real_generation_enabled(config: &AppConfig, provider: &Provider) -> bool {
+    if provider.kind != ProviderKind::CodexSubscription {
+        return false;
+    }
+    let Some(connection) = config.subscriptions.get(&provider.id) else {
+        return false;
+    };
+    connection.state == ConnectionState::Connected
+        && connection.identity.as_deref().is_some_and(|identity| !identity.trim().is_empty())
+        && config
+            .codex_real_generation_grants
+            .get(&provider.id)
+            .is_some_and(|grant| {
+                grant.enabled
+                    && grant.generation == connection.generation
+                    && grant.connection_instance_id == connection.connection_instance_id
+                    && connection.identity.as_deref() == Some(grant.identity.as_str())
+            })
+}
+
+pub fn codex_real_generation_call_counts(
+    config: &AppConfig,
+    provider: &Provider,
+) -> Option<(u32, u32)> {
+    let connection = config.subscriptions.get(&provider.id)?;
+    if provider.kind != ProviderKind::CodexSubscription
+        || connection.state != ConnectionState::Connected
+        || connection.identity.as_deref().map(str::trim).unwrap_or("").is_empty()
+    {
+        return None;
+    }
+    config
+        .codex_real_generation_grants
+        .get(&provider.id)
+        .filter(|grant| {
+            grant.generation == connection.generation
+                && grant.connection_instance_id == connection.connection_instance_id
+                && connection.identity.as_deref() == Some(grant.identity.as_str())
+        })
+        .map(|grant| (grant.max_calls, grant.max_calls.saturating_sub(grant.used_calls)))
+}
+
+/// Arming the UI control is an explicit, in-memory user action for the current connected Codex account.
+/// Dispatch still runs all ordinary admission checks below; turning this on alone is never permission.
+pub fn set_codex_real_generation_enabled(
+    config: &mut AppConfig,
+    provider_id: &str,
+    enabled: bool,
+    max_calls: Option<u32>,
+) -> Result<(), Denial> {
+    if !enabled {
+        let current = config.subscriptions.get(provider_id).and_then(|connection| {
+            connection.identity.as_deref().map(|identity| {
+                (
+                    connection.connection_instance_id.clone(),
+                    connection.generation,
+                    identity.to_owned(),
+                )
+            })
+        });
+        let grant_matches = current.as_ref().is_some_and(|(instance_id, generation, identity)| {
+            config.codex_real_generation_grants.get(provider_id).is_some_and(|grant| {
+                grant.connection_instance_id == *instance_id
+                    && grant.generation == *generation
+                    && grant.identity == *identity
+            })
+        });
+        if grant_matches {
+            if let Some(grant) = config.codex_real_generation_grants.get_mut(provider_id) {
+                grant.enabled = false;
+            }
+        } else {
+            config.codex_real_generation_grants.remove(provider_id);
+        }
+        return Ok(());
+    }
+    let provider = config
+        .providers
+        .iter()
+        .find(|provider| provider.id == provider_id)
+        .ok_or_else(|| {
+            Denial::new(
+                "provider_not_found",
+                DenialFamily::Disabled,
+                "The Codex subscription provider is unavailable.".into(),
+                "Open Providers and select the configured Codex subscription.".into(),
+            )
+        })?;
+    if provider.kind != ProviderKind::CodexSubscription {
+        return Err(Denial::new(
+            "not_codex_subscription",
+            DenialFamily::Disabled,
+            "The real-generation control is only available for Codex subscriptions.".into(),
+            "Select the Codex subscription provider in Providers.".into(),
+        ));
+    }
+    let max_calls = max_calls
+        .filter(|value| (1..=CODEX_REAL_GENERATION_MAX_CALLS).contains(value))
+        .ok_or_else(|| {
+            Denial::new(
+                "codex_generation_call_limit_invalid",
+                DenialFamily::Disabled,
+                format!("The Codex request limit must be between 1 and {CODEX_REAL_GENERATION_MAX_CALLS}."),
+                "Complete HAND_RUN with a finite request count before arming real generation.".into(),
+            )
+        })?;
+    let connection = connection_check(config, provider)?;
+    let connection_instance_id = connection.connection_instance_id.clone();
+    let generation = connection.generation;
+    let identity = connection.identity.as_deref().expect("connection_check verified the identity").to_owned();
+    if let Some(grant) = config
+        .codex_real_generation_grants
+        .get_mut(provider_id)
+        .filter(|grant| {
+            grant.connection_instance_id == connection_instance_id
+                && grant.generation == generation
+                && grant.identity == identity
+        })
+    {
+        if max_calls > grant.max_calls || max_calls < grant.used_calls {
+            return Err(Denial::new(
+                "codex_generation_call_limit_invalid",
+                DenialFamily::Disabled,
+                "The request limit for this connection cannot be increased or set below calls already used.".into(),
+                "Keep the original confirmed limit for this connection generation.".into(),
+            ));
+        }
+        if grant.used_calls >= max_calls {
+            return Err(Denial::new(
+                "codex_generation_call_limit",
+                DenialFamily::Disabled,
+                "The confirmed Codex request limit has been reached.".into(),
+                "Stop this run; the request budget for this connection generation is exhausted.".into(),
+            ));
+        }
+        grant.max_calls = max_calls;
+        grant.enabled = true;
+    } else {
+        config.codex_real_generation_grants.insert(
+            provider_id.to_owned(),
+            crate::config::CodexRealGenerationGrant {
+                connection_instance_id,
+                generation,
+                identity,
+                max_calls,
+                used_calls: 0,
+                enabled: true,
+            },
+        );
+    }
+    Ok(())
+}
+
+/// Apply an opt-in only if the connection instance still matches the confirmation snapshot,
+/// in addition to its verified account and numeric generation.
+/// The check and mutation run under one ConfigStore update.
+pub fn set_codex_real_generation_enabled_for_snapshot(
+    config: &mut AppConfig,
+    provider_id: &str,
+    enabled: bool,
+    max_calls: Option<u32>,
+    expected_connection_instance_id: &str,
+    expected_generation: u64,
+    expected_identity: &str,
+) -> Result<(), Denial> {
+    if enabled {
+        let matches = config.subscriptions.get(provider_id).is_some_and(|connection| {
+            connection.connection_instance_id == expected_connection_instance_id
+                && connection.generation == expected_generation
+                && connection.identity.as_deref() == Some(expected_identity)
+        });
+        if !matches {
+            return Err(Denial::new(
+                "codex_generation_confirmation_stale",
+                DenialFamily::Disabled,
+                "The Codex connection changed after the confirmation was shown.".into(),
+                "Review the current connection and confirm its request limit again.".into(),
+            ));
+        }
+    }
+    set_codex_real_generation_enabled(config, provider_id, enabled, max_calls)
+}
+
+/// Reserve one admitted Codex API generation attempt. Callers perform the complete model,
+/// identity, generation, protocol, quota and extra-usage admission under the ConfigStore write lock first.
+pub fn reserve_codex_real_generation_call(
+    config: &mut AppConfig,
+    provider_id: &str,
+) -> Result<(), Denial> {
+    let current = config
+        .subscriptions
+        .get(provider_id)
+        .map(|connection| {
+            (
+                connection.connection_instance_id.clone(),
+                connection.generation,
+                connection.identity.clone(),
+            )
+        });
+    let Some(grant) = config.codex_real_generation_grants.get_mut(provider_id) else {
+        return Err(Denial::new(
+            "codex_generation_disabled",
+            DenialFamily::Disabled,
+            "Real Codex generation is disabled for this connection.".into(),
+            "Complete and review the Codex HAND_RUN checklist, then explicitly enable this connection in Providers.".into(),
+        ));
+    };
+    if !grant.enabled
+        || !current.as_ref().is_some_and(|(instance_id, generation, identity)| {
+            grant.connection_instance_id == *instance_id
+                && grant.generation == *generation
+                && identity.as_deref() == Some(grant.identity.as_str())
+        })
+        || grant.used_calls >= grant.max_calls
+    {
+        return Err(Denial::new(
+            "codex_generation_call_limit",
+            DenialFamily::Disabled,
+            "The confirmed Codex request limit has been reached.".into(),
+            "Stop this run. A new finite HAND_RUN confirmation is required before another request.".into(),
+        ));
+    }
+    grant.used_calls += 1;
+    Ok(())
+}
+
 fn evaluate(
     config: &AppConfig,
     provider: &Provider,
     model: Option<&Model>,
     model_id: &str,
     protocol: Protocol,
+    reserved_call: bool,
 ) -> Result<(), Denial> {
     if !is_subscription_provider(provider) {
         return Ok(());
@@ -595,6 +840,27 @@ fn evaluate(
     }
     let connection = connection_check(config, provider)?;
     let evidence = evidence_check(provider, connection)?;
+    if provider.kind == ProviderKind::CodexSubscription
+        && !codex_real_generation_enabled(config, provider)
+    {
+        return Err(Denial::new(
+            "codex_generation_disabled",
+            DenialFamily::Disabled,
+            "Real Codex generation is disabled for this connection.".into(),
+            "Complete and review the Codex HAND_RUN checklist, then explicitly enable this connection in Providers. All identity, model, protocol, quota, and extra-usage checks still apply.".into(),
+        ));
+    }
+    if provider.kind == ProviderKind::CodexSubscription
+        && !reserved_call
+        && codex_real_generation_call_counts(config, provider).is_some_and(|(_, remaining)| remaining == 0)
+    {
+        return Err(Denial::new(
+            "codex_generation_call_limit",
+            DenialFamily::Disabled,
+            "The confirmed Codex request limit has been reached.".into(),
+            "Stop this run. A new finite HAND_RUN confirmation is required before another request.".into(),
+        ));
+    }
     // 资格只看账号目录：同一账号同一世代的读取失败仍算合格（网络失败 ≠ 被移除）。
     // 只读证据里的 `eligible` 是当次读取的原始结果，不再单独构成调用依据。
     let eligibility = crate::subscription_catalog::eligibility(config, &provider.id, model_id);
@@ -617,8 +883,23 @@ fn evaluate(
 }
 
 /// 网关、Debug、服务商测试、模型测试与手动测速共用的准入；API 服务商保持原行为。
-pub fn admit_model(config: &AppConfig, model: &Model, provider: &Provider, protocol: Protocol) -> Result<(), Denial> {
-    evaluate(config, provider, Some(model), &model.model_id, protocol)
+pub fn admit_model(
+    config: &AppConfig,
+    model: &Model,
+    provider: &Provider,
+    protocol: Protocol,
+) -> Result<(), Denial> {
+    evaluate(config, provider, Some(model), &model.model_id, protocol, false)
+}
+
+/// Revalidate the ordinary gates after this HTTP request has already reserved its finite call budget.
+pub fn admit_model_with_reserved_call(
+    config: &AppConfig,
+    model: &Model,
+    provider: &Provider,
+    protocol: Protocol,
+) -> Result<(), Denial> {
+    evaluate(config, provider, Some(model), &model.model_id, protocol, true)
 }
 
 /// 没有模型记录的目标（例如服务商弹窗里的测试模型）使用同一套连接、资格、能力与额度规则。
@@ -629,7 +910,7 @@ pub fn admit_target(config: &AppConfig, provider: &Provider, model_id: &str, pro
         .models
         .iter()
         .find(|model| model.provider_id == provider.id && model.model_id == model_id);
-    evaluate(config, provider, model, model_id, protocol)
+    evaluate(config, provider, model, model_id, protocol, false)
 }
 
 /// 自动选路用的过滤条件：被拒绝的订阅模型不进入候选。
@@ -1478,6 +1759,9 @@ pub fn sync_provider(config: &mut AppConfig, provider_id: &str, kind: &ProviderK
     } else {
         config.subscriptions.remove(provider_id);
     }
+    if *kind != ProviderKind::CodexSubscription {
+        config.codex_real_generation_grants.remove(provider_id);
+    }
 }
 
 /// 服务商标识重命名时迁移连接，保留世代与已核实身份；订阅目录随标识一起迁移。
@@ -1492,12 +1776,23 @@ pub fn rename_provider(config: &mut AppConfig, old_id: &str, new_id: &str) {
         }
         config.subscriptions.insert(new_id.to_owned(), connection);
     }
+    if let Some(grant) = config.codex_real_generation_grants.remove(old_id) {
+        let can_migrate = config.subscriptions.get(new_id).is_some_and(|connection| {
+            connection.connection_instance_id == grant.connection_instance_id
+                && connection.generation == grant.generation
+                && connection.identity.as_deref() == Some(grant.identity.as_str())
+        });
+        if can_migrate {
+            config.codex_real_generation_grants.insert(new_id.to_owned(), grant);
+        }
+    }
     crate::subscription_catalog::rename_provider(config, old_id, new_id);
 }
 
 /// 删除服务商时一并丢弃其连接、证据与订阅目录。
 pub fn forget_provider(config: &mut AppConfig, provider_id: &str) {
     config.subscriptions.remove(provider_id);
+    config.codex_real_generation_grants.remove(provider_id);
     crate::subscription_catalog::forget_provider(config, provider_id);
 }
 
@@ -1727,7 +2022,13 @@ pub struct SubscriptionView {
     pub provider_id: String,
     pub label: String,
     pub generation: u64,
+    pub connection_instance_id: String,
     pub state: ConnectionState,
+    /// Whether Leo explicitly enabled real Codex requests for this current connection generation.
+    pub real_generation_enabled: bool,
+    /// Per-confirmation request ceiling and remaining AutoJev Codex generation requests.
+    pub generation_call_limit: Option<u32>,
+    pub generation_calls_remaining: Option<u32>,
     pub identity: Option<String>,
     pub helper_version: Option<String>,
     pub account_path: Option<String>,
@@ -1792,7 +2093,11 @@ pub fn views(config: &AppConfig, adapter_available: bool, sessions: &SessionStat
                 provider_id: provider.id.clone(),
                 label: label(provider).to_owned(),
                 generation: connection.generation,
+                connection_instance_id: connection.connection_instance_id.clone(),
                 state: connection.state,
+                real_generation_enabled: codex_real_generation_enabled(config, provider),
+                generation_call_limit: codex_real_generation_call_counts(config, provider).map(|(limit, _)| limit),
+                generation_calls_remaining: codex_real_generation_call_counts(config, provider).map(|(_, remaining)| remaining),
                 identity: connection.identity.clone(),
                 helper_version: evidence.and_then(|evidence| evidence.helper_version.clone()),
                 account_path: evidence.and_then(|evidence| evidence.account_path.clone()),
@@ -1893,7 +2198,7 @@ mod admission_tests {
     /// 一个已核实到可派发程度的 Codex 连接；各用例只改动其中一项。
     fn connected(config: &mut AppConfig) {
         let models = vec![DiscoveredModel { model_id: "fixture-model".into(), name: None, eligible: true }];
-        let (identity, generation) = {
+        let (identity, generation, connection_instance_id) = {
             let connection = config.subscriptions.entry(FIXTURE_PROVIDER.to_owned()).or_default();
             let generation = connection.generation;
             connection.state = ConnectionState::Connected;
@@ -1931,7 +2236,7 @@ mod admission_tests {
                 },
                 catalog: CatalogEvidence::default(),
             });
-            (connection.identity.clone().unwrap(), generation)
+            (connection.identity.clone().unwrap(), generation, connection.connection_instance_id.clone())
         };
         // 账号目录是资格来源：已核实身份与当前世代下核对一次，模型才有调用资格。
         crate::subscription_catalog::reconcile(
@@ -1942,6 +2247,19 @@ mod admission_tests {
             &models,
             Some("2026-09-30T00:00:00Z"),
         );
+        if config.providers.iter().any(|provider| provider.id == FIXTURE_PROVIDER && provider.kind == ProviderKind::CodexSubscription) {
+            config.codex_real_generation_grants.insert(
+                FIXTURE_PROVIDER.to_owned(),
+                crate::config::CodexRealGenerationGrant {
+                    connection_instance_id,
+                    generation,
+                    identity: identity.clone(),
+                    max_calls: CODEX_REAL_GENERATION_MAX_CALLS,
+                    used_calls: 0,
+                    enabled: true,
+                },
+            );
+        }
     }
 
     /// 以当前已核实身份与世代重新核对目录（用于制造撤销/移除等资格变化）。
@@ -2070,6 +2388,91 @@ mod admission_tests {
         // 未验证的第二协议仍然被拒绝，能力按协议分别判定。
         let denial = admit_model(&config, &model, &provider, Protocol::Responses).unwrap_err();
         assert_eq!(denial.code, "capability_unverified");
+    }
+
+    #[test]
+    fn codex_real_generation_is_opt_in_and_never_replaces_required_evidence() {
+        let (mut config, provider, model) = fixture(ProviderKind::CodexSubscription);
+        assert!(!codex_real_generation_enabled(&config, &provider));
+        assert_eq!(
+            set_codex_real_generation_enabled(&mut config, &provider.id, true, Some(1)).unwrap_err().code,
+            "not_connected",
+            "the control cannot be armed before a verified connection exists"
+        );
+
+        connected(&mut config);
+        config.codex_real_generation_grants.remove(&provider.id);
+        assert_eq!(
+            admit_model(&config, &model, &provider, Protocol::Chat).unwrap_err().code,
+            "codex_generation_disabled",
+            "the default and an unarmed current connection must stay closed"
+        );
+        set_codex_real_generation_enabled(&mut config, &provider.id, true, Some(1)).unwrap();
+        assert!(codex_real_generation_enabled(&config, &provider));
+
+        let evidence = config.subscriptions.get_mut(&provider.id).unwrap().evidence.as_mut().unwrap();
+        evidence.capabilities[0].status = CapabilityStatus::Unverified;
+        assert_eq!(
+            admit_model(&config, &model, &provider, Protocol::Chat).unwrap_err().code,
+            "capability_unverified",
+            "the opt-in control cannot bypass the model/protocol gate"
+        );
+
+        let evidence = config.subscriptions.get_mut(&provider.id).unwrap().evidence.as_mut().unwrap();
+        evidence.capabilities[0].status = CapabilityStatus::Verified;
+        evidence.quota.buckets[0].permission = QuotaPermission::Unknown;
+        assert_eq!(
+            admit_model(&config, &model, &provider, Protocol::Chat).unwrap_err().code,
+            "quota_unknown",
+            "the opt-in control cannot bypass the included-usage gate"
+        );
+
+        let evidence = config.subscriptions.get_mut(&provider.id).unwrap().evidence.as_mut().unwrap();
+        evidence.quota.buckets[0].permission = QuotaPermission::Allowed;
+        evidence.quota.buckets[0].credits.as_mut().unwrap().permission = QuotaPermission::Unknown;
+        assert_eq!(
+            admit_model(&config, &model, &provider, Protocol::Chat).unwrap_err().code,
+            "extra_usage_permission_unknown",
+            "the opt-in control cannot bypass the extra-credit restriction"
+        );
+    }
+
+    #[test]
+    fn confirmed_codex_request_budget_is_finite_and_reserved_once_per_request() {
+        let (mut config, provider, model) = fixture(ProviderKind::CodexSubscription);
+        connected(&mut config);
+        set_codex_real_generation_enabled(&mut config, &provider.id, true, Some(1)).unwrap();
+        assert_eq!(codex_real_generation_call_counts(&config, &provider), Some((1, 1)));
+        assert!(admit_model(&config, &model, &provider, Protocol::Chat).is_ok());
+
+        reserve_codex_real_generation_call(&mut config, &provider.id).unwrap();
+        assert_eq!(codex_real_generation_call_counts(&config, &provider), Some((1, 0)));
+        assert_eq!(
+            admit_model(&config, &model, &provider, Protocol::Chat).unwrap_err().code,
+            "codex_generation_call_limit",
+            "a new request cannot exceed the confirmed count"
+        );
+        assert!(
+            admit_model_with_reserved_call(&config, &model, &provider, Protocol::Chat).is_ok(),
+            "later pre-dispatch rechecks for the already reserved request must not charge or reject it again"
+        );
+        assert_eq!(
+            reserve_codex_real_generation_call(&mut config, &provider.id).unwrap_err().code,
+            "codex_generation_call_limit",
+            "failed, cancelled and follow-up requests cannot reserve beyond the count"
+        );
+        set_codex_real_generation_enabled(&mut config, &provider.id, false, None).unwrap();
+        assert!(!codex_real_generation_enabled(&config, &provider));
+        assert_eq!(codex_real_generation_call_counts(&config, &provider), Some((1, 0)), "disarming cannot reset spent calls");
+        assert_eq!(
+            set_codex_real_generation_enabled(&mut config, &provider.id, true, Some(1)).unwrap_err().code,
+            "codex_generation_call_limit",
+            "re-arming cannot replenish an exhausted connection-generation budget"
+        );
+        assert_eq!(
+            set_codex_real_generation_enabled(&mut config, &provider.id, true, Some(CODEX_REAL_GENERATION_MAX_CALLS + 1)).unwrap_err().code,
+            "codex_generation_call_limit_invalid"
+        );
     }
 
     #[test]
@@ -2638,6 +3041,15 @@ mod refresh_tests {
         (store, directory)
     }
 
+    /// Arm only the in-memory fake connection when a test is specifically checking a later
+    /// admission gate. This keeps the new opt-in gate in front of those assertions without
+    /// changing the default-off behavior exercised by the other fixtures.
+    fn arm_fixture_generation(store: &ConfigStore) {
+        store.update(|config| {
+            set_codex_real_generation_enabled(config, "codex", true, Some(CODEX_REAL_GENERATION_MAX_CALLS)).unwrap();
+        }).unwrap();
+    }
+
     fn configure_mixed_route(store: &ConfigStore, api_url: &str) {
         store.update(|config| {
             config.providers.iter_mut().find(|provider| provider.id == "openrouter").unwrap().base_url = api_url.into();
@@ -2690,6 +3102,8 @@ mod refresh_tests {
             });
         }).unwrap();
         store.write_secret("provider:openrouter", "fixture-api-key").unwrap();
+        // Mixed-route tests simulate an explicit, finite confirmation for this fake account.
+        arm_fixture_generation(store);
     }
 
     fn switch_codex_test_identity(store: &ConfigStore, identity: &str) {
@@ -2927,13 +3341,15 @@ mod refresh_tests {
                 }
             }).unwrap();
         }));
-        let context = crate::proxy::ForwardTestContext::new(store).unwrap();
+        let context = crate::proxy::ForwardTestContext::new(store.clone()).unwrap();
         let body = serde_json::json!({"model":"autojev/mixed","messages":[{"role":"user","content":"hello"}]});
 
         let response = context.forward(axum::http::HeaderMap::new(), body.clone(), "chat/completions").await;
         assert_eq!(response.status(), axum::http::StatusCode::CONFLICT, "an old-generation rejection must not authorize a handoff");
         assert_eq!(api_calls.load(Ordering::SeqCst), 0, "a late old-account rejection must not fall through to the API account");
 
+        // A fresh confirmation is required before the new fixture account can dispatch.
+        arm_fixture_generation(&store);
         let response = context.forward(axum::http::HeaderMap::new(), body, "chat/completions").await;
         assert_eq!(response.status(), axum::http::StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
@@ -3020,6 +3436,8 @@ mod refresh_tests {
         assert_eq!(api_calls.load(Ordering::SeqCst), 1);
 
         switch_codex_test_identity(&store, "replacement@example.invalid");
+        // The switched account receives a separate explicit fixture confirmation.
+        arm_fixture_generation(&store);
         let response = context.forward(axum::http::HeaderMap::new(), body, "chat/completions").await;
         assert_eq!(response.status(), axum::http::StatusCode::OK);
         let second = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
@@ -3331,6 +3749,7 @@ mod refresh_tests {
         assert!(existing.selected && existing.enabled);
         assert_eq!(catalog.entries[0].internal_id, existing.id);
         // 证据齐备后仍然缺能力记录：未验证能力不会因为一次只读刷新而被视为已验证。
+        arm_fixture_generation(&store);
         let (model, provider) = target(&store.read());
         assert_eq!(admit_model(&store.read(), &model, &provider, Protocol::Chat).unwrap_err().code, "capability_unverified");
         let view = views(&store.read(), true, &SessionState::default()).pop().unwrap();
@@ -3634,6 +4053,7 @@ mod refresh_tests {
             crate::subscription_catalog::eligibility(&store.read(), "codex", "fixture-model"),
             crate::subscription_catalog::Eligibility::Eligible
         );
+        arm_fixture_generation(&store);
         let (model, provider) = target(&store.read());
         assert_eq!(admit_model(&store.read(), &model, &provider, Protocol::Chat).unwrap_err().code, "quota_failed");
     }
@@ -3913,6 +4333,7 @@ mod refresh_tests {
         let adapter = StubAdapter::new();
         let (store, _directory) = fixture_store(adapter.clone());
         refresh(&store, "codex").await.unwrap();
+        arm_fixture_generation(&store);
         store.update(|config| {
             config.subscriptions.get_mut("codex").unwrap().evidence.as_mut().unwrap().capabilities.push(Capability {
                 model_id: "fixture-model".into(),
@@ -3953,6 +4374,7 @@ mod refresh_tests {
         let adapter = StubAdapter::new();
         let (store, _directory) = fixture_store(adapter.clone());
         refresh(&store, "codex").await.unwrap();
+        arm_fixture_generation(&store);
         store
             .update(|config| {
                 let evidence = config.subscriptions.get_mut("codex").unwrap().evidence.as_mut().unwrap();

@@ -14,7 +14,7 @@ import { SearchSelect } from './search-select';
 import { Select } from './select';
 import { DEBUG_PREFERENCES_KEY, parseDebugPreferences } from '../lib/debug-preferences';
 import { connectableRoutes } from '../lib/route-candidates';
-export function DebugPage({ snapshot }: { snapshot: DashboardSnapshot }) {
+export function DebugPage({ snapshot, onRefreshBudgetSnapshot }: { snapshot: DashboardSnapshot; onRefreshBudgetSnapshot: () => Promise<unknown> }) {
   const { t } = usePreferences();
   // 直调清单只要求未停用与服务商启用：取消选择不移出按原模型 ID 直调。
   const models = snapshot.models.filter(m => m.enabled && snapshot.providers.some(p => p.id === m.provider_id && p.enabled));
@@ -102,7 +102,10 @@ export function DebugPage({ snapshot }: { snapshot: DashboardSnapshot }) {
     } catch (e) {
       setMessages(previous => previous.map(message => message.id === userId ? { ...message, status: 'error', raw: reply?.request_body ? JSON.stringify(reply.request_body, null, 2) : message.raw } :
         message.id === assistantId ? { ...message, status: 'error', content: message.content, warning: t(e instanceof Error ? e.message : String(e)), raw: reply?.body, result: reply } : message));
-    } finally { sending.current = false; setBusy(false); }
+    } finally {
+      sending.current = false; setBusy(false);
+      try { await onRefreshBudgetSnapshot(); } catch { /* Keep the completed debug result visible. */ }
+    }
   };
   const addAttachments = async (selected: File[]) => {
     if (!selected.length || busy || reading.current) return;
@@ -144,7 +147,7 @@ export function DebugPage({ snapshot }: { snapshot: DashboardSnapshot }) {
         } catch { setError(t('Invalid or duplicate parameter')); }
       }}>{t('cURL mode')}</button>
     </div>
-    {mode === 'curl' && <div className="debug-mode-panel" id="debug-curl-panel" role="tabpanel" aria-labelledby="debug-curl-tab"><DebugCurl initial={curlInitial} port={snapshot.proxy.port}/></div>}
+    {mode === 'curl' && <div className="debug-mode-panel" id="debug-curl-panel" role="tabpanel" aria-labelledby="debug-curl-tab"><DebugCurl initial={curlInitial} port={snapshot.proxy.port} onRefreshBudgetSnapshot={onRefreshBudgetSnapshot}/></div>}
     <div className="debug-layout" id="debug-chat-panel" role="tabpanel" aria-labelledby="debug-chat-tab" hidden={mode !== 'chat'}>
       <aside className="panel debug-settings"><div className="debug-panel-heading"><h3>{t('Request settings')}</h3></div><fieldset disabled={busy} className="debug-fields">
         <label className="form-field">{t('Model / route')}<SearchSelect label={t('Select model or route')} placeholder={t('Search models or routes…')} empty={t('No matching options')} options={options} value={target} disabled={busy} onChange={value => { setTarget(value); clear(); }}/></label>

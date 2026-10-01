@@ -28,6 +28,7 @@
     "test": "vitest run",
     "test:isolated": "pnpm build && cargo build --locked --manifest-path src-tauri/Cargo.toml --features isolation-check && node scripts/check-isolated-desktop.mjs",
     "test:decision-ui": "node scripts/check-decision-provider-ui.mjs",
+    "test:codex-budget-ui": "pnpm build && node scripts/check-codex-budget-ui.mjs && node scripts/check-codex-budget-entries-ui.mjs",
     "test:ui": "node scripts/check-availability-ui.mjs",
     "test:mixed-route-ui": "node scripts/check-mixed-route-ui.mjs"
   },

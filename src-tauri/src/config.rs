@@ -12,6 +12,21 @@ fn default_selected() -> bool { true }
 pub const DEFAULT_PORT: u16 = 9527;
 pub const DEV_PORT: u16 = 9526;
 
+/// A single, process-memory consent window for manual Codex generation checks.
+/// `used_calls` counts AutoJev requests admitted through the subscription adapter,
+/// including attempts that later fail or are cancelled.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodexRealGenerationGrant {
+    /// Persistent connection instance this volatile grant belongs to.
+    pub connection_instance_id: String,
+    pub generation: u64,
+    /// The verified account identity shown when the user confirmed this finite window.
+    pub identity: String,
+    pub max_calls: u32,
+    pub used_calls: u32,
+    pub enabled: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Provider {
     #[serde(default)]
@@ -174,6 +189,9 @@ pub struct AppConfig {
     /// 因此退出或换号只作废资格，不重建标识、也不丢失配置。
     #[serde(default)]
     pub subscription_catalogs: std::collections::HashMap<String, crate::subscription_catalog::ProviderCatalog>,
+    /// 用户对当前连接世代的一次有限真实生成许可。仅驻留进程内存，重启、退出或换号后不会沿用。
+    #[serde(skip)]
+    pub codex_real_generation_grants: std::collections::HashMap<String, CodexRealGenerationGrant>,
     pub install_id: String,
     pub port: u16,
     pub providers: Vec<Provider>,
@@ -197,6 +215,7 @@ impl Default for AppConfig {
             routes: Vec::new(),
             subscriptions: Default::default(),
             subscription_catalogs: Default::default(),
+            codex_real_generation_grants: Default::default(),
             install_id: Uuid::new_v4().to_string(),
             port: DEFAULT_PORT,
             providers: vec![
@@ -541,14 +560,47 @@ mod storage_tests {
         let round_trip: AppConfig = serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
         assert_eq!(round_trip.subscriptions.len(), 1);
         assert_eq!(round_trip.subscriptions["codex"].generation, 1);
+        assert_eq!(round_trip.subscriptions["codex"].connection_instance_id, saved.subscriptions["codex"].connection_instance_id);
         assert_eq!(round_trip.subscriptions["codex"].state, crate::subscription::ConnectionState::NotConnected);
         assert_eq!(round_trip.providers[0].kind, ProviderKind::Openrouter);
         assert_eq!(round_trip.models.len(), saved.models.len());
+
+        // Pre-token configurations receive a local unique connection token at load time.
+        let legacy_connection = serde_json::json!({
+            "generation": 1,
+            "state": "not_connected",
+            "identity": null,
+            "evidence": null
+        });
+        let upgraded: crate::subscription::Connection = serde_json::from_value(legacy_connection.clone()).unwrap();
+        let upgraded_again: crate::subscription::Connection = serde_json::from_value(legacy_connection).unwrap();
+        assert!(!upgraded.connection_instance_id.is_empty());
+        assert_ne!(upgraded.connection_instance_id, upgraded_again.connection_instance_id);
 
         // 未知的服务商类型仍然整库拒绝，不会被静默降级成 API 服务商。
         let mut unknown = serde_json::to_value(AppConfig::default()).unwrap();
         unknown["providers"][0]["kind"] = serde_json::json!("some_future_subscription");
         assert!(serde_json::from_value::<AppConfig>(unknown).is_err());
+    }
+
+    #[test]
+    fn codex_real_generation_opt_in_is_not_persisted_across_restart() {
+        let mut config = AppConfig::default();
+        config.codex_real_generation_grants.insert(
+            "codex".into(),
+            CodexRealGenerationGrant {
+                connection_instance_id: "fixture-connection".into(),
+                generation: 7,
+                identity: "fixture@example.invalid".into(),
+                max_calls: 3,
+                used_calls: 1,
+                enabled: true,
+            },
+        );
+        let serialized = serde_json::to_string(&config).unwrap();
+        assert!(!serialized.contains("codex_real_generation_grants"));
+        let restored: AppConfig = serde_json::from_str(&serialized).unwrap();
+        assert!(restored.codex_real_generation_grants.is_empty());
     }
 
     #[test]

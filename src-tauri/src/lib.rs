@@ -218,10 +218,50 @@ async fn refresh_subscription(state: State<'_, AppState>, provider_id: String) -
     Ok(snapshot(&state).await)
 }
 
+/// Explicit current-connection opt-in; generation remains subject to every existing subscription gate.
+#[tauri::command]
+async fn set_codex_real_generation_enabled(
+    state: State<'_, AppState>,
+    provider_id: String,
+    enabled: bool,
+    max_calls: Option<u32>,
+    expected_connection_instance_id: String,
+    expected_generation: u64,
+    expected_identity: String,
+) -> Result<DashboardSnapshot, String> {
+    let outcome = state
+        .store
+        .update(|config| {
+            subscription::set_codex_real_generation_enabled_for_snapshot(
+                config,
+                &provider_id,
+                enabled,
+                max_calls,
+                &expected_connection_instance_id,
+                expected_generation,
+                &expected_identity,
+            )
+        })
+        .map_err(|error| error.to_string())?;
+    outcome.map_err(|denial| format!("{}: {}", denial.code, denial.message))?;
+    Ok(snapshot(&state).await)
+}
+
+/// Disarm on any explicit login/logout/switch action. The control is memory-only and account-bound.
+fn disarm_codex_real_generation(store: &ConfigStore, provider_id: &str) -> Result<(), String> {
+    store
+        .update(|config| {
+            subscription::set_codex_real_generation_enabled(config, provider_id, false, None)
+                .expect("disarming a volatile generation grant is always allowed");
+        })
+        .map_err(|error| error.to_string())
+}
+
 /// 开始订阅登录。Grok 由本票内置的 auth 生命周期管理；其它订阅服务商（Codex 等）
 /// 走 Issue #13 的适配器会话。两套实现并存，命令名不变，按 provider kind 分派。
 #[tauri::command]
 async fn begin_subscription_login(state: State<'_, AppState>, provider_id: String) -> Result<DashboardSnapshot, String> {
+    disarm_codex_real_generation(&state.store, &provider_id)?;
     if managed_by_grok_auth(&state.store.read(), &provider_id) {
         subscription::auth::begin(&state.store, &provider_id).await?;
     } else {
@@ -253,6 +293,7 @@ async fn cancel_subscription_login(state: State<'_, AppState>, provider_id: Stri
 /// 退出订阅账号：Grok 走内置 auth 生命周期（本地清除与自有进程回收），其它订阅走适配器退出。
 #[tauri::command]
 async fn logout_subscription(state: State<'_, AppState>, provider_id: String) -> Result<DashboardSnapshot, String> {
+    disarm_codex_real_generation(&state.store, &provider_id)?;
     if managed_by_grok_auth(&state.store.read(), &provider_id) {
         subscription::auth::logout(&state.store, &provider_id).await?;
     } else {
@@ -264,6 +305,7 @@ async fn logout_subscription(state: State<'_, AppState>, provider_id: String) ->
 /// 更换订阅账号：Grok 走内置 auth 生命周期；其它订阅走适配器换号并挂起等待者。
 #[tauri::command]
 async fn switch_subscription_account(state: State<'_, AppState>, provider_id: String) -> Result<DashboardSnapshot, String> {
+    disarm_codex_real_generation(&state.store, &provider_id)?;
     if managed_by_grok_auth(&state.store.read(), &provider_id) {
         subscription::auth::switch_account(&state.store, &provider_id).await?;
     } else {
@@ -1375,6 +1417,7 @@ pub fn run() {
             let handler: fn(tauri::ipc::Invoke<tauri::Wry>) -> bool = tauri::generate_handler![
             get_snapshot,
             refresh_subscription,
+            set_codex_real_generation_enabled,
             begin_subscription_login,
             poll_subscription_login,
             cancel_subscription_login,

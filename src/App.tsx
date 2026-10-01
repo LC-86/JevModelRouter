@@ -1,7 +1,7 @@
 import { AddAgentDialog } from './components/add-agent-dialog';
 import { GatewayActionMenu } from './components/gateway-action-menu';
 import { AGENT_SELECTIONS_KEY, availableAgentSelections, parseAgentSelections } from './lib/agent-selections';
-import { SpeedCell, SpeedTestToolbar, useModelSpeedTests } from './components/model-speed-tests';
+import { SpeedCell, SpeedTestToolbar, useModelSpeedTests, type ModelSpeedTests } from './components/model-speed-tests';
 import { listen } from '@tauri-apps/api/event';
 import { isTauri } from '@tauri-apps/api/core';
 import { openUrl } from '@tauri-apps/plugin-opener';
@@ -13,7 +13,7 @@ import { sortProviders } from './lib/provider-sort';
 import { providerTestError, type ProviderTestStatus } from './lib/provider-test';
 import { providerIdentifier } from './lib/provider-name';
 import { Select } from './components/select';
-import { FormEvent, useEffect, useMemo, useRef, useState } from 'react';
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Activity,
   FilePenLine,
@@ -88,6 +88,7 @@ import {
   resetGatewayHealth,
   importProviders,
   refreshSubscription,
+  setCodexRealGenerationEnabled,
   restoreAgent,
   saveModel,
   saveProvider,
@@ -169,12 +170,19 @@ export default function App() {
     return () => window.removeEventListener('keydown', shortcut);
   }, []);
   const [snapshot, setSnapshot] = useState<DashboardSnapshot | null>(null);
+  const [page, setPage] = useState<Page>('overview');
+  const refreshBudgetSnapshot = useCallback(async () => {
+    const current = await getSnapshot();
+    setSnapshot(current);
+    return current;
+  }, []);
+  const speedTests = useModelSpeedTests(refreshBudgetSnapshot, page === 'models' || (settingsOpen && settingsSection === 'gateway'));
+  useEffect(() => { if (page !== 'models') speedTests.select([]); }, [page, speedTests.select]);
   useEffect(() => {
     let disposed=false; let unlisten: (() => void) | undefined;
     void listen<string>('gateway-lifecycle-error', event => { window.alert(event.payload); }).then(fn => { if(disposed)fn();else unlisten=fn; }).catch(() => {});
     return () => { disposed=true;unlisten?.(); };
   }, []);
-  const [page, setPage] = useState<Page>('overview');
   const [busy, setBusy] = useState(false);
   const [toast, setToastState] = useState('');
   const [toastError, setToastError] = useState(false);
@@ -327,7 +335,9 @@ export default function App() {
                 } catch (error) {
                   setProviderTests((previous) => ({ ...previous, [id]: 'error' }));
                   setToast(providerTestError(error, t), true);
-                  getSnapshot().then(setSnapshot).catch(() => {});
+                } finally {
+                  // Any admitted test attempt consumes the shared per-connection count, even when it fails.
+                  try { await refreshBudgetSnapshot(); } catch { /* Keep the test result visible. */ }
                 }
               }}
             />
@@ -337,6 +347,8 @@ export default function App() {
               onNotify={setToast}
               onChange={setSnapshot}
               snapshot={snapshot}
+              speedTests={speedTests}
+              onRefreshBudgetSnapshot={refreshBudgetSnapshot}
               onAdd={() => setModelModal({ ...EMPTY_MODEL, provider_id: snapshot.providers.find((provider) => provider.enabled)?.id ?? '' })}
               onEdit={(model) => setModelModal({ ...model })}
               onDelete={(id) => setModelDeleteTarget(snapshot.models.find((model) => model.id === id) ?? null)}
@@ -358,12 +370,12 @@ export default function App() {
             />
           )}
           {page === 'activity' && <TrafficPage key="logs" mode="logs" />}
-          {page === 'debug' && <DebugPage snapshot={snapshot} />}
+          {page === 'debug' && <DebugPage snapshot={snapshot} onRefreshBudgetSnapshot={refreshBudgetSnapshot} />}
           {page === 'usage' && <TrafficPage key="usage" mode="usage" />}
         </div>
       </main>
 
-      {settingsOpen && <SettingsDialog snapshot={snapshot} onChange={setSnapshot} section={settingsSection} onSectionChange={setSettingsSection} onClose={() => setSettingsOpen(false)} update={update} />}
+      {settingsOpen && <SettingsDialog snapshot={snapshot} onChange={setSnapshot} speedTests={speedTests} section={settingsSection} onSectionChange={setSettingsSection} onClose={() => setSettingsOpen(false)} update={update} />}
       {deleteTarget && <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget && !deletingProvider) setDeleteTarget(null); }} onKeyDown={(event) => { if (event.key === 'Escape' && !deletingProvider) setDeleteTarget(null); }}>
         <div className="dialog provider-delete-dialog" role="alertdialog" aria-modal="true" aria-labelledby="delete-provider-title" aria-describedby="delete-provider-description">
           <h2 id="delete-provider-title">{t('Delete provider?')}</h2>
@@ -392,7 +404,7 @@ export default function App() {
       </div>}
       {providerModal && (
         <ProviderDialog
-          onTestStatus={(status) => { if (providerModal.id) setProviderTests((previous) => ({ ...previous, [providerModal.id]: status })); if (status === 'error') getSnapshot().then(setSnapshot).catch(() => {}); }}
+          onTestStatus={async (status) => { if (providerModal.id) setProviderTests((previous) => ({ ...previous, [providerModal.id]: status })); if (status === 'success' || status === 'error') { try { await refreshBudgetSnapshot(); } catch { /* Keep the test result visible. */ } } }}
           initial={providerModal}
           subscriptionTargets={providerModal.id ? subscriptionCatalog(subscriptionView(snapshot, providerModal.id)) : []}
           onClose={() => setProviderModal(null)}
@@ -412,7 +424,7 @@ export default function App() {
       />}
       {modelModal && (
         <ModelDialog
-          onTestStatus={(id, status) => { setProviderTests((previous) => ({ ...previous, [id]: status })); if (status === 'error') getSnapshot().then(setSnapshot).catch(() => {}); }}
+          onTestStatus={async (id, status) => { setProviderTests((previous) => ({ ...previous, [id]: status })); if (status === 'success' || status === 'error') { try { await refreshBudgetSnapshot(); } catch { /* Keep the test result visible. */ } } }}
           initial={modelModal}
           providers={snapshot.providers}
           onClose={() => setModelModal(null)}
@@ -548,6 +560,8 @@ function ProvidersPage({ snapshot, onAdd, onEdit, onDelete, onTest, onImport, on
   const [refreshing, setRefreshing] = useState<Record<string, boolean>>({});
   const [subscriptionBusy, setSubscriptionBusy] = useState<Record<string, SubscriptionAction | undefined>>({});
   const [subscriptionErrors, setSubscriptionErrors] = useState<Record<string, string>>({});
+  const [generationBusy, setGenerationBusy] = useState<Record<string, boolean>>({});
+  const [generationCallLimits, setGenerationCallLimits] = useState<Record<string, number>>({});
   const [catalogBusy, setCatalogBusy] = useState<Record<string, boolean>>({});
   // 目录行的选择/停用直接写回模型配置：复用 save_model，写回后以返回的快照为准刷新。
   const toggleCatalogEntry = async (provider: Provider, entry: SubscriptionCatalogEntry, patch: { selected?: boolean; enabled?: boolean }) => {
@@ -572,6 +586,34 @@ function ProvidersPage({ snapshot, onAdd, onEdit, onDelete, onTest, onImport, on
     setToggling((previous) => ({ ...previous, [provider.id]: true }));
     try { await onToggle(provider); }
     finally { setToggling((previous) => ({ ...previous, [provider.id]: false })); }
+  };
+  const toggleCodexGeneration = async (provider: Provider, enabled: boolean) => {
+    if (generationBusy[provider.id]) return;
+    const currentView = subscriptionView(snapshot, provider.id);
+    if (enabled && (!currentView || !currentView.identity?.trim())) {
+      onNotify(t('A current connected account is required before enabling real Codex generation.'), true);
+      return;
+    }
+    // Capture before showing the modal so the backend can reject consent after an account change.
+    const expectedConnectionInstanceId = currentView?.connection_instance_id ?? '';
+    const expectedGeneration = currentView?.generation ?? 0;
+    const expectedIdentity = currentView?.identity ?? '';
+    const generationKey = `${provider.id}:${currentView?.generation ?? 0}`;
+    const maxCalls = generationCallLimits[generationKey] ?? currentView?.generation_call_limit ?? 1;
+    if (enabled && (!Number.isInteger(maxCalls) || maxCalls < 1 || maxCalls > 15)) {
+      onNotify(t('The request limit must be between 1 and 15.'), true);
+      return;
+    }
+    if (enabled && !window.confirm(t('Before enabling real Codex generation, complete the HAND_RUN checklist and confirm the exact model and protocol, fictional input, client-owned tools, total request count, output boundary, possible fees, and allowed steps. This confirmation is limited to {count} AutoJev requests. Failed, cancelled, and client-tool follow-up requests count. The counter is not an upstream billing guarantee. This switch sends no request and does not bypass any admission check; the current 64 KiB collector is not a hard output cap. Continue?', { count: maxCalls }))) return;
+    setGenerationBusy((previous) => ({ ...previous, [provider.id]: true }));
+    try {
+      onSnapshot(await setCodexRealGenerationEnabled(provider.id, enabled, maxCalls, expectedConnectionInstanceId, expectedGeneration, expectedIdentity));
+      onNotify(t(enabled ? 'Real Codex generation armed for this connection.' : 'Real Codex generation disarmed.'));
+    } catch (error) {
+      onNotify(error instanceof Error ? error.message : String(error), true);
+    } finally {
+      setGenerationBusy((previous) => { const next = { ...previous }; delete next[provider.id]; return next; });
+    }
   };
   const refresh = async (provider: Provider) => {
     if (refreshing[provider.id]) return;
@@ -663,6 +705,50 @@ function ProvidersPage({ snapshot, onAdd, onEdit, onDelete, onTest, onImport, on
             ); })}
           </tbody>
         </table>
+        {snapshot.providers.filter((provider) => provider.kind === 'codex_subscription').map((provider) => {
+          const view = subscriptionView(snapshot, provider.id);
+          const enabled = view?.real_generation_enabled === true;
+          const canArm = provider.enabled && view?.state === 'connected' && Boolean(view.identity?.trim());
+          const generationKey = `${provider.id}:${view?.generation ?? 0}`;
+          const maxCalls = generationCallLimits[generationKey] ?? view?.generation_call_limit ?? 1;
+          return <section className="provider-subscription-generation" key={`codex-generation-${provider.id}`} data-testid={`codex-generation-control-${provider.id}`} aria-label={t('Real Codex generation')}>
+            <div>
+              <strong>{t('Real Codex generation')}</strong>
+              <p data-testid={`codex-generation-state-${provider.id}`}>{t(enabled ? 'Armed for this account; admission still required.' : 'Off. Real Codex requests are denied by default.')}</p>
+              <small>{t('Connection generation {generation} · helper {helper}', { generation: view?.generation ?? 0, helper: view?.helper_version || t('Unknown') })}</small>
+            </div>
+            <label className="provider-subscription-generation-limit">{t('Maximum requests for this confirmation')}
+              <input
+                type="number"
+                min={1}
+                max={15}
+                step={1}
+                inputMode="numeric"
+                data-testid={`codex-generation-call-limit-${provider.id}`}
+                aria-label={t('Maximum requests for this confirmation')}
+                disabled={!canArm || view?.generation_call_limit != null || generationBusy[provider.id] === true}
+                value={maxCalls}
+                onChange={(event) => { const value = Number(event.currentTarget.value); setGenerationCallLimits((previous) => ({ ...previous, [generationKey]: value })); }}
+              />
+            </label>
+            <label className="provider-subscription-generation-toggle">
+              <input
+                type="checkbox"
+                data-testid={`codex-real-generation-${provider.id}`}
+                checked={enabled}
+                disabled={!canArm || generationBusy[provider.id] === true || (!enabled && view?.generation_calls_remaining === 0)}
+                onChange={(event) => void toggleCodexGeneration(provider, event.currentTarget.checked)}
+              />
+              <span>{t('Enable real Codex generation for this connection')}</span>
+            </label>
+            <small className="provider-subscription-generation-budget" data-testid={`codex-generation-budget-${provider.id}`}>
+              {view?.generation_call_limit != null
+                ? t('{remaining} of {limit} confirmed AutoJev requests remain.', { remaining: view?.generation_calls_remaining ?? 0, limit: view?.generation_call_limit ?? maxCalls })
+                : t('Each confirmation is limited to 1–15 AutoJev requests; failures, cancellations, and tool-result follow-ups count.')}
+            </small>
+            <p className="provider-subscription-generation-note">{t('This volatile control does not verify identity, models, protocols, quota, or credits. Every existing admission check remains mandatory. The per-connection request count survives disarm/re-arm and resets after restart, sign-out, or account switch.')}</p>
+          </section>;
+        })}
         {snapshot.providers.length === 0 && <EmptyState icon={<Server />} title={t('No providers yet')} body={t('Add a provider or import from CC Switch or Termany.')} />}
         {providers.filter((provider) => isSubscriptionProvider(provider)).map((provider) => {
           const entries = subscriptionCatalog(subscriptionView(snapshot, provider.id));
@@ -711,7 +797,7 @@ function ModelTestErrorDialog({ model, detail, onClose, title = 'Model test fail
   </dialog>;
 }
 
-function ModelsPage({ snapshot, onAdd, onEdit, onDelete, onChange, onNotify }: { onNotify: (message: string, error?: boolean) => void; onChange: (snapshot: DashboardSnapshot) => void; snapshot: DashboardSnapshot; onAdd: () => void; onEdit: (m: Model) => void; onDelete: (id: string) => void }) {
+function ModelsPage({ snapshot, onAdd, onEdit, onDelete, onChange, onNotify, onRefreshBudgetSnapshot, speedTests }: { onNotify: (message: string, error?: boolean) => void; onChange: (snapshot: DashboardSnapshot) => void; onRefreshBudgetSnapshot: () => Promise<DashboardSnapshot>; speedTests: ModelSpeedTests; snapshot: DashboardSnapshot; onAdd: () => void; onEdit: (m: Model) => void; onDelete: (id: string) => void }) {
   const { t } = usePreferences();
   const [health, setHealth] = useState(snapshot.health ?? []);
   const [clearingCooldown, setClearingCooldown] = useState<Record<string, boolean>>({});
@@ -740,7 +826,6 @@ function ModelsPage({ snapshot, onAdd, onEdit, onDelete, onChange, onNotify }: {
     } catch (error) { onNotify(t(String(error instanceof Error ? error.message : error)), true); }
     finally { setClearingCooldown(previous => ({ ...previous, [id]: false })); }
   };
-  const speedTests = useModelSpeedTests();
   const [dismissedSpeedJob, setDismissedSpeedJob] = useState(false);
   useEffect(() => { if (speedTests.view?.job.running) setDismissedSpeedJob(false); }, [speedTests.view?.job.running]);
   const speedError = speedTests.error || (!speedTests.view?.job.running && !dismissedSpeedJob ? speedTests.view?.job.error : '');
@@ -780,7 +865,8 @@ function ModelsPage({ snapshot, onAdd, onEdit, onDelete, onChange, onNotify }: {
     } catch (error) {
       setTests(previous => ({ ...previous, [model.id]: 'error' }));
       onNotify(providerTestError(error, t), true);
-      try { onChange(await getSnapshot()); } catch { /* Keep the test failure visible. */ }
+    } finally {
+      try { onChange(await onRefreshBudgetSnapshot()); } catch { /* Keep the test result visible. */ }
     }
   };
   return (
@@ -1002,7 +1088,7 @@ function normalizeApiType(value?: string) {
   return value === 'responses' || value === 'messages' ? value : 'chat_completions';
 }
 
-function ProviderDialog({ initial, subscriptionTargets, onClose, onSave, onTestStatus }: { onTestStatus: (status: ProviderTestStatus) => void; initial: Provider; subscriptionTargets: SubscriptionCatalogEntry[]; onClose: () => void; onSave: (p: Provider, key?: string, addTestModel?: boolean) => Promise<void> }) {
+function ProviderDialog({ initial, subscriptionTargets, onClose, onSave, onTestStatus }: { onTestStatus: (status: ProviderTestStatus) => void | Promise<void>; initial: Provider; subscriptionTargets: SubscriptionCatalogEntry[]; onClose: () => void; onSave: (p: Provider, key?: string, addTestModel?: boolean) => Promise<void> }) {
   const { t } = usePreferences();
   const edit = Boolean(initial.id);
   const inferred = PROVIDER_PRESETS.find((p) => p.id === initial.preset)?.id
@@ -1048,15 +1134,15 @@ function ProviderDialog({ initial, subscriptionTargets, onClose, onSave, onTestS
   const test = async () => {
     if (testing || !form.current?.reportValidity()) return;
     if (subscription && providerTypeChanged) {
-      setTestFailed(true); setTestResult(t('Save this provider type and refresh its model catalog before testing.')); onTestStatus('error'); return;
+      setTestFailed(true); setTestResult(t('Save this provider type and refresh its model catalog before testing.')); await onTestStatus('error'); return;
     }
-    if (!provider.test_model.trim()) { setTestFailed(true); setTestResult(t('Enter a test model')); onTestStatus('error'); return; }
-    setTestedFingerprint(''); setTesting(true); setTestResult(''); setTestFailed(false); onTestStatus('testing');
-    try { const result = await testProviderDraft({ ...draft(), id: initial.id || draft().id }, apiKey || undefined); setTestedFingerprint(fingerprint()); if (!edit) setProvider(previous => ({ ...previous, enabled: true })); setTestResult(t(result)); onTestStatus('success'); }
+    if (!provider.test_model.trim()) { setTestFailed(true); setTestResult(t('Enter a test model')); await onTestStatus('error'); return; }
+    setTestedFingerprint(''); setTesting(true); setTestResult(''); setTestFailed(false); await onTestStatus('testing');
+    try { const result = await testProviderDraft({ ...draft(), id: initial.id || draft().id }, apiKey || undefined); setTestedFingerprint(fingerprint()); if (!edit) setProvider(previous => ({ ...previous, enabled: true })); setTestResult(t(result)); await onTestStatus('success'); }
     catch (error) {
       setTestFailed(true);
       setTestResult(providerTestError(error, t));
-      onTestStatus('error');
+      await onTestStatus('error');
     }
     finally { setTesting(false); }
   };
@@ -1089,7 +1175,7 @@ function ProviderDialog({ initial, subscriptionTargets, onClose, onSave, onTestS
   </div>;
 }
 
-function ModelDialog({ initial, providers, onClose, onSave, onTestStatus }: { onTestStatus: (id: string, status: ProviderTestStatus) => void; initial: Model; providers: Provider[]; onClose: () => void; onSave: (m: Model) => Promise<void> }) {
+function ModelDialog({ initial, providers, onClose, onSave, onTestStatus }: { onTestStatus: (id: string, status: ProviderTestStatus) => void | Promise<void>; initial: Model; providers: Provider[]; onClose: () => void; onSave: (m: Model) => Promise<void> }) {
   const { t } = usePreferences();
   const enabledProviders = providers.filter((provider) => provider.enabled);
   const initialProvider = enabledProviders.find((p) => p.id === initial.provider_id);
@@ -1112,11 +1198,11 @@ function ModelDialog({ initial, providers, onClose, onSave, onTestStatus }: { on
   };
   const test = async () => {
     if (testing || !form.current?.reportValidity() || !provider) return;
-    setTesting(true); setResult(''); setFailed(false); onTestStatus(provider.id, 'testing');
+    setTesting(true); setResult(''); setFailed(false); await onTestStatus(provider.id, 'testing');
     try {
       const testResult = await testProviderDraft({ ...provider, api_type: isSubscriptionProvider(provider) ? '' : model.api_type, test_model: model.model_id.trim() });
-      setResult(t(testResult)); onTestStatus(provider.id, 'success');
-    } catch (error) { setFailed(true); setResult(providerTestError(error, t)); onTestStatus(provider.id, 'error'); }
+      setResult(t(testResult)); await onTestStatus(provider.id, 'success');
+    } catch (error) { setFailed(true); setResult(providerTestError(error, t)); await onTestStatus(provider.id, 'error'); }
     finally { setTesting(false); }
   };
   return <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget && !testing && !saving) onClose(); }}>

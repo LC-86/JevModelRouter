@@ -2945,6 +2945,16 @@ done
                 );
         }).unwrap();
         store.write_secret("provider:openrouter", "fixture-api-key").unwrap();
+        // Gateway integration fixtures represent a user-confirmed finite fake run. Production
+        // configuration stays default-off; tests that need to reach later admission gates opt in here.
+        store.update(|config| {
+            crate::subscription::set_codex_real_generation_enabled(
+                config,
+                "codex-fixture",
+                true,
+                Some(crate::subscription::CODEX_REAL_GENERATION_MAX_CALLS),
+            ).unwrap();
+        }).unwrap();
         store
     }
 
@@ -3978,7 +3988,7 @@ done
             .unwrap()
             .unwrap();
         assert_eq!(response.status(), axum::http::StatusCode::BAD_GATEWAY,
-            "an adapter startup denial must terminate this request");
+            "logout must invalidate a queued request before it starts a helper turn");
         let result = tokio::time::timeout(std::time::Duration::from_secs(3), logout)
             .await
             .unwrap()
@@ -5302,5 +5312,154 @@ async fn review_pr40_gateway_loopback_http_three_protocols_tools() {
             adapter.logout("codex-fixture", 1).await.unwrap();
         }
     }
+}
+
+fn review_pr44_app_state(store: Arc<crate::config::ConfigStore>) -> crate::AppState {
+    crate::AppState {
+        performance: Arc::new(crate::performance::Runner::default()),
+        store,
+        proxy: Arc::new(tokio::sync::Mutex::new(None)),
+        sessions: Arc::new(tokio::sync::Mutex::new(crate::subscription::SessionState::default())),
+    }
+}
+
+fn review_pr44_budget(store: &crate::config::ConfigStore, limit: u32, used: u32) {
+    store.update(|config| {
+        config.codex_real_generation_grants.remove("codex-fixture");
+        crate::subscription::set_codex_real_generation_enabled(config, "codex-fixture", true, Some(limit)).unwrap();
+        for _ in 0..used {
+            crate::subscription::reserve_codex_real_generation_call(config, "codex-fixture").unwrap();
+        }
+    }).unwrap();
+}
+
+#[tokio::test]
+async fn review_pr44_rename_preserves_spent_budget_for_same_generation() {
+    use tauri::Manager;
+    let home = tempfile::tempdir().unwrap();
+    let adapter = Arc::new(CodexAdapter::with_launch(home.path().to_owned(), fixture_launch(home.path(), &home.path().join("rpc.log"))));
+    let store = admitted_gateway_store(&home.path().join("config.db"), adapter, "http://127.0.0.1:9");
+    review_pr44_budget(&store, 2, 1);
+    let before = store.read().subscriptions["codex-fixture"].clone();
+    let mut provider = store.read().providers.iter().find(|provider| provider.id == "codex-fixture").unwrap().clone();
+    provider.id = "codex-renamed".into();
+    let app = tauri::test::mock_app();
+    app.manage(review_pr44_app_state(store.clone()));
+    crate::save_provider(app.state::<crate::AppState>(), provider.clone(), None, None, Some("codex-fixture".into()), Some(false)).await.unwrap();
+    let after = store.read().subscriptions["codex-renamed"].clone();
+    assert_eq!(after.generation, before.generation);
+    assert_eq!(after.identity, before.identity);
+    crate::set_codex_real_generation_enabled(
+        app.state::<crate::AppState>(), "codex-renamed".into(), true, Some(2), after.connection_instance_id.clone(), after.generation, after.identity.as_deref().unwrap().to_owned(),
+    ).await.unwrap();
+    let actual = crate::subscription::codex_real_generation_call_counts(&store.read(), &provider);
+    assert_eq!(actual, Some((2, 1)), "renaming must not replenish spent requests for the same account and generation");
+}
+
+#[tokio::test]
+async fn review_pr44_failed_login_does_not_replenish_exhausted_budget() {
+    use tauri::Manager;
+    let home = tempfile::tempdir().unwrap();
+    let adapter = Arc::new(CodexAdapter::with_launch(home.path().to_owned(), HelperLaunch { program: home.path().join("missing-fake-helper"), args: vec![] }));
+    let store = admitted_gateway_store(&home.path().join("config.db"), adapter, "http://127.0.0.1:9");
+    review_pr44_budget(&store, 1, 1);
+    let before = store.read().subscriptions["codex-fixture"].clone();
+    let app = tauri::test::mock_app();
+    app.manage(review_pr44_app_state(store.clone()));
+    assert!(crate::begin_subscription_login(app.state::<crate::AppState>(), "codex-fixture".into()).await.is_err());
+    let after = store.read().subscriptions["codex-fixture"].clone();
+    assert_eq!(after.generation, before.generation);
+    assert_eq!(after.identity, before.identity);
+    assert_eq!(after.state, crate::subscription::ConnectionState::Connected);
+    let rearm = crate::set_codex_real_generation_enabled(
+        app.state::<crate::AppState>(), "codex-fixture".into(), true, Some(1), after.connection_instance_id.clone(), after.generation, after.identity.as_deref().unwrap().to_owned(),
+    ).await;
+    assert!(rearm.is_err(), "a failed login attempt cannot renew an exhausted budget in the unchanged generation");
+}
+
+#[tokio::test]
+async fn review_pr44_delete_and_recreate_does_not_inherit_consent() {
+    use tauri::Manager;
+    let home = tempfile::tempdir().unwrap();
+    let adapter = Arc::new(CodexAdapter::with_launch(home.path().to_owned(), fixture_launch(home.path(), &home.path().join("rpc.log"))));
+    let store = admitted_gateway_store(&home.path().join("config.db"), adapter, "http://127.0.0.1:9");
+    review_pr44_budget(&store, 2, 1);
+    let provider = store.read().providers.iter().find(|provider| provider.id == "codex-fixture").unwrap().clone();
+    let app = tauri::test::mock_app();
+    app.manage(review_pr44_app_state(store.clone()));
+    crate::delete_provider(app.state::<crate::AppState>(), provider.id.clone()).await.unwrap();
+    crate::save_provider(app.state::<crate::AppState>(), provider.clone(), None, None, None, Some(true)).await.unwrap();
+    // Local callback fixture: account B confirms identity without OAuth or model dispatch.
+    store.update(|config| {
+        let connection = config.subscriptions.get_mut(&provider.id).unwrap();
+        connection.state = crate::subscription::ConnectionState::Connected;
+        connection.identity = Some("new-account@example.invalid".into());
+    }).unwrap();
+    let config = store.read();
+    assert!(!crate::subscription::codex_real_generation_enabled(&config, &provider), "a recreated provider must start default-off even if its generation number is reused");
+    assert_eq!(crate::subscription::codex_real_generation_call_counts(&config, &provider), None, "a recreated provider must not display the previous account's budget");
+}
+
+#[tokio::test]
+async fn review_pr44_delayed_old_confirmation_cannot_arm_new_generation() {
+    use tauri::Manager;
+    let home = tempfile::tempdir().unwrap();
+    let adapter = Arc::new(CodexAdapter::with_launch(home.path().to_owned(), fixture_launch(home.path(), &home.path().join("rpc.log"))));
+    let store = admitted_gateway_store(&home.path().join("config.db"), adapter, "http://127.0.0.1:9");
+    store.update(|config| { config.codex_real_generation_grants.clear(); }).unwrap();
+    let confirmed = store.read().subscriptions["codex-fixture"].clone();
+    store.update(|config| {
+        let connection = config.subscriptions.get_mut("codex-fixture").unwrap();
+        connection.generation += 1;
+        connection.identity = Some("new-account@example.invalid".into());
+        connection.evidence = None;
+    }).unwrap();
+    let app = tauri::test::mock_app();
+    app.manage(review_pr44_app_state(store.clone()));
+    let result = crate::set_codex_real_generation_enabled(
+        app.state::<crate::AppState>(), "codex-fixture".into(), true, Some(3),
+        confirmed.connection_instance_id.clone(), confirmed.generation, confirmed.identity.as_deref().unwrap().to_owned(),
+    ).await;
+    assert!(result.is_err(), "consent for the old snapshot must not arm a different connection generation");
+}
+
+#[tokio::test]
+async fn review_pr44_recreated_connection_same_account_rejects_old_confirmation() {
+    use tauri::Manager;
+    let home = tempfile::tempdir().unwrap();
+    let log = home.path().join("recreated-same-account.log");
+    let adapter = Arc::new(CodexAdapter::with_launch(home.path().to_owned(), fixture_launch(home.path(), &log)));
+    let store = admitted_gateway_store(&home.path().join("config.db"), adapter, "http://127.0.0.1:9");
+    review_pr44_budget(&store, 1, 1);
+    let confirmed = store.read().subscriptions["codex-fixture"].clone();
+    let provider = store.read().providers.iter().find(|provider| provider.id == "codex-fixture").unwrap().clone();
+    let app = tauri::test::mock_app();
+    app.manage(review_pr44_app_state(store.clone()));
+    crate::delete_provider(app.state::<crate::AppState>(), provider.id.clone()).await.unwrap();
+    crate::save_provider(app.state::<crate::AppState>(), provider.clone(), None, None, None, Some(true)).await.unwrap();
+    crate::begin_subscription_login(app.state::<crate::AppState>(), provider.id.clone()).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while store.read().subscriptions[&provider.id].state != crate::subscription::ConnectionState::Connected {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }).await.expect("the isolated helper must finish the recreated fictional login");
+    let recreated = store.read().subscriptions[&provider.id].clone();
+    assert_eq!(recreated.generation, confirmed.generation, "deleting/recreating the provider reuses numeric generation 1");
+    assert_eq!(recreated.identity, confirmed.identity, "the fictional helper reconnects the same account identity");
+    assert_ne!(recreated.connection_instance_id, confirmed.connection_instance_id, "deleting and recreating a connection must issue a fresh instance token");
+
+    // Same account and numeric generation as before deletion: only the instance token distinguishes this connection.
+    let result = crate::set_codex_real_generation_enabled(
+        app.state::<crate::AppState>(),
+        provider.id.clone(),
+        true,
+        Some(1),
+        confirmed.connection_instance_id.clone(),
+        confirmed.generation,
+        confirmed.identity.clone().unwrap(),
+    ).await;
+    let config = store.read();
+    assert!(result.is_err(), "a confirmation captured before deletion must not arm the recreated connection");
+    assert_eq!(crate::subscription::codex_real_generation_call_counts(&config, &provider), None);
 }
 }
