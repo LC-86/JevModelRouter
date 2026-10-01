@@ -596,7 +596,11 @@ pub fn codex_real_generation_enabled(config: &AppConfig, provider: &Provider) ->
         && config
             .codex_real_generation_grants
             .get(&provider.id)
-            .is_some_and(|grant| grant.enabled && grant.generation == connection.generation)
+            .is_some_and(|grant| {
+                grant.enabled
+                    && grant.generation == connection.generation
+                    && connection.identity.as_deref() == Some(grant.identity.as_str())
+            })
 }
 
 pub fn codex_real_generation_call_counts(
@@ -613,7 +617,10 @@ pub fn codex_real_generation_call_counts(
     config
         .codex_real_generation_grants
         .get(&provider.id)
-        .filter(|grant| grant.generation == connection.generation)
+        .filter(|grant| {
+            grant.generation == connection.generation
+                && connection.identity.as_deref() == Some(grant.identity.as_str())
+        })
         .map(|grant| (grant.max_calls, grant.max_calls.saturating_sub(grant.used_calls)))
 }
 
@@ -626,15 +633,20 @@ pub fn set_codex_real_generation_enabled(
     max_calls: Option<u32>,
 ) -> Result<(), Denial> {
     if !enabled {
-        if let (Some(connection), Some(grant)) = (
-            config.subscriptions.get(provider_id),
-            config.codex_real_generation_grants.get_mut(provider_id),
-        ) {
-            if grant.generation == connection.generation {
+        let current = config.subscriptions.get(provider_id).and_then(|connection| {
+            connection.identity.as_deref().map(|identity| (connection.generation, identity.to_owned()))
+        });
+        let grant_matches = current.as_ref().is_some_and(|(generation, identity)| {
+            config.codex_real_generation_grants.get(provider_id).is_some_and(|grant| {
+                grant.generation == *generation && grant.identity == *identity
+            })
+        });
+        if grant_matches {
+            if let Some(grant) = config.codex_real_generation_grants.get_mut(provider_id) {
                 grant.enabled = false;
-            } else {
-                config.codex_real_generation_grants.remove(provider_id);
             }
+        } else {
+            config.codex_real_generation_grants.remove(provider_id);
         }
         return Ok(());
     }
@@ -668,11 +680,13 @@ pub fn set_codex_real_generation_enabled(
                 "Complete HAND_RUN with a finite request count before arming real generation.".into(),
             )
         })?;
-    let generation = connection_check(config, provider)?.generation;
+    let connection = connection_check(config, provider)?;
+    let generation = connection.generation;
+    let identity = connection.identity.as_deref().expect("connection_check verified the identity").to_owned();
     if let Some(grant) = config
         .codex_real_generation_grants
         .get_mut(provider_id)
-        .filter(|grant| grant.generation == generation)
+        .filter(|grant| grant.generation == generation && grant.identity == identity)
     {
         if max_calls > grant.max_calls || max_calls < grant.used_calls {
             return Err(Denial::new(
@@ -697,6 +711,7 @@ pub fn set_codex_real_generation_enabled(
             provider_id.to_owned(),
             crate::config::CodexRealGenerationGrant {
                 generation,
+                identity,
                 max_calls,
                 used_calls: 0,
                 enabled: true,
@@ -706,16 +721,43 @@ pub fn set_codex_real_generation_enabled(
     Ok(())
 }
 
+/// Apply an opt-in only if the connection still matches the account/generation snapshot
+/// shown when the user confirmed it. The check and mutation run under one ConfigStore update.
+pub fn set_codex_real_generation_enabled_for_snapshot(
+    config: &mut AppConfig,
+    provider_id: &str,
+    enabled: bool,
+    max_calls: Option<u32>,
+    expected_generation: u64,
+    expected_identity: &str,
+) -> Result<(), Denial> {
+    if enabled {
+        let matches = config.subscriptions.get(provider_id).is_some_and(|connection| {
+            connection.generation == expected_generation
+                && connection.identity.as_deref() == Some(expected_identity)
+        });
+        if !matches {
+            return Err(Denial::new(
+                "codex_generation_confirmation_stale",
+                DenialFamily::Disabled,
+                "The Codex account changed after the confirmation was shown.".into(),
+                "Review the current connected account and confirm its request limit again.".into(),
+            ));
+        }
+    }
+    set_codex_real_generation_enabled(config, provider_id, enabled, max_calls)
+}
+
 /// Reserve one admitted Codex API generation attempt. Callers perform the complete model,
 /// identity, generation, protocol, quota and extra-usage admission under the ConfigStore write lock first.
 pub fn reserve_codex_real_generation_call(
     config: &mut AppConfig,
     provider_id: &str,
 ) -> Result<(), Denial> {
-    let generation = config
+    let current = config
         .subscriptions
         .get(provider_id)
-        .map(|connection| connection.generation);
+        .map(|connection| (connection.generation, connection.identity.clone()));
     let Some(grant) = config.codex_real_generation_grants.get_mut(provider_id) else {
         return Err(Denial::new(
             "codex_generation_disabled",
@@ -724,7 +766,11 @@ pub fn reserve_codex_real_generation_call(
             "Complete and review the Codex HAND_RUN checklist, then explicitly enable this connection in Providers.".into(),
         ));
     };
-    if !grant.enabled || Some(grant.generation) != generation || grant.used_calls >= grant.max_calls
+    if !grant.enabled
+        || !current.as_ref().is_some_and(|(generation, identity)| {
+            grant.generation == *generation && identity.as_deref() == Some(grant.identity.as_str())
+        })
+        || grant.used_calls >= grant.max_calls
     {
         return Err(Denial::new(
             "codex_generation_call_limit",
@@ -1672,6 +1718,9 @@ pub fn sync_provider(config: &mut AppConfig, provider_id: &str, kind: &ProviderK
     } else {
         config.subscriptions.remove(provider_id);
     }
+    if *kind != ProviderKind::CodexSubscription {
+        config.codex_real_generation_grants.remove(provider_id);
+    }
 }
 
 /// 服务商标识重命名时迁移连接，保留世代与已核实身份；订阅目录随标识一起迁移。
@@ -1686,12 +1735,22 @@ pub fn rename_provider(config: &mut AppConfig, old_id: &str, new_id: &str) {
         }
         config.subscriptions.insert(new_id.to_owned(), connection);
     }
+    if let Some(grant) = config.codex_real_generation_grants.remove(old_id) {
+        let can_migrate = config.subscriptions.get(new_id).is_some_and(|connection| {
+            connection.generation == grant.generation
+                && connection.identity.as_deref() == Some(grant.identity.as_str())
+        });
+        if can_migrate {
+            config.codex_real_generation_grants.insert(new_id.to_owned(), grant);
+        }
+    }
     crate::subscription_catalog::rename_provider(config, old_id, new_id);
 }
 
 /// 删除服务商时一并丢弃其连接、证据与订阅目录。
 pub fn forget_provider(config: &mut AppConfig, provider_id: &str) {
     config.subscriptions.remove(provider_id);
+    config.codex_real_generation_grants.remove(provider_id);
     crate::subscription_catalog::forget_provider(config, provider_id);
 }
 
@@ -2146,7 +2205,7 @@ mod admission_tests {
         );
         if config.providers.iter().any(|provider| provider.id == FIXTURE_PROVIDER && provider.kind == ProviderKind::CodexSubscription) {
             config.codex_real_generation_grants.insert(FIXTURE_PROVIDER.to_owned(), crate::config::CodexRealGenerationGrant {
-                generation, max_calls: CODEX_REAL_GENERATION_MAX_CALLS, used_calls: 0, enabled: true,
+                generation, identity: identity.clone(), max_calls: CODEX_REAL_GENERATION_MAX_CALLS, used_calls: 0, enabled: true,
             });
         }
     }

@@ -18,6 +18,8 @@ pub const DEV_PORT: u16 = 9526;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CodexRealGenerationGrant {
     pub generation: u64,
+    /// The verified account identity shown when the user confirmed this finite window.
+    pub identity: String,
     pub max_calls: u32,
     pub used_calls: u32,
     pub enabled: bool,
@@ -573,6 +575,7 @@ mod storage_tests {
             "codex".into(),
             CodexRealGenerationGrant {
                 generation: 7,
+                identity: "fixture@example.invalid".into(),
                 max_calls: 3,
                 used_calls: 1,
                 enabled: true,

@@ -225,11 +225,20 @@ async fn set_codex_real_generation_enabled(
     provider_id: String,
     enabled: bool,
     max_calls: Option<u32>,
+    expected_generation: u64,
+    expected_identity: String,
 ) -> Result<DashboardSnapshot, String> {
     let outcome = state
         .store
         .update(|config| {
-            subscription::set_codex_real_generation_enabled(config, &provider_id, enabled, max_calls)
+            subscription::set_codex_real_generation_enabled_for_snapshot(
+                config,
+                &provider_id,
+                enabled,
+                max_calls,
+                expected_generation,
+                &expected_identity,
+            )
         })
         .map_err(|error| error.to_string())?;
     outcome.map_err(|denial| format!("{}: {}", denial.code, denial.message))?;
@@ -240,7 +249,8 @@ async fn set_codex_real_generation_enabled(
 fn disarm_codex_real_generation(store: &ConfigStore, provider_id: &str) -> Result<(), String> {
     store
         .update(|config| {
-            config.codex_real_generation_grants.remove(provider_id);
+            subscription::set_codex_real_generation_enabled(config, provider_id, false, None)
+                .expect("disarming a volatile generation grant is always allowed");
         })
         .map_err(|error| error.to_string())
 }

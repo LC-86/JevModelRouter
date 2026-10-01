@@ -53,9 +53,9 @@
 
 只有第 1 节证据真实、当前模型和协议的既有准入均已通过、Leo 已填完第 2 节并确认可能费用后，才执行此节。每次请求都必须使用计划中的同一账号/世代和模型；运行中不切换来源。
 
-1. 在 `Providers` 页底部的 `Real Codex generation` 区域输入本计划的最大请求数（`1–15`），点 `Enable real Codex generation for this connection`，再确认弹窗。弹窗只确认计划，不发送请求。界面会显示 `x of n confirmed AutoJev requests remain`。关闭再开不会恢复已用预算；预算耗尽后该连接不能再次启用。重启、退出或换号会清除此临时许可。
+1. 在 `Providers` 页底部的 `Real Codex generation` 区域输入本计划的最大请求数（`1–15`），点 `Enable real Codex generation for this connection`，再确认弹窗。弹窗只确认计划，不发送请求。界面会显示 `x of n confirmed AutoJev requests remain`。关闭再开、同世代内失败的登录尝试或重命名不会恢复已用预算；预算耗尽后该世代不能再次启用。成功退出、换号或重启后，必须针对当前连接重新确认。
 2. **单次文本请求：** `Providers` → Codex 行 `Test`。这项订阅测试只使用 Chat Completions 文本；每次点击记 1 个计划请求。若按钮因未选择已发现模型而不可用，或准入拒绝，记下原样拒绝并停止。
-3. **指定协议与流式：** `Debug` → `Model / route` 选已确认的 Codex 目标 → `API type` 选计划协议 → 输入计划中的虚构输入 → 如需流式，点 `Add parameter`，填 `stream` / `true` → `Send test request`。每次发送计 1。先确认助手结果、model、请求 id 和终态；Debug 目前没有单请求 Stop 按钮，不能把关闭窗口当成可靠取消。
+3. **指定协议与流式：** `Debug` → `Model / route` 选已确认的 Codex 目标 → `API type` 选计划协议 → 输入计划中的虚构输入 → 如需流式，点 `Add parameter`，填 `stream` / `true` → `Send test request`。每次发送计 1。记录助手结果与终态；HTTP 响应中的 `model` 是本地请求目标，`id` 由网关生成，二者都不能独立证明实际上游模型或账号。只有另有独立适配器证据时才填写已核实的上游身份，否则记录 `Unknown`。Debug 目前没有单请求 Stop 按钮，不能把关闭窗口当成可靠取消。
 4. **取消尝试：** 当前可见的取消入口是 `Models` 页的 `Speed test` → 只选计划中的一个 Codex 模型 → `Speed test`；正在运行时点 `Stop speed tests`。此测速最多发 3 个流式请求，计划必须预留 3 次；在界面显示完成/停止请求数后如实记录。它只提供本地响应收集限制，不能证明上游停止计量。若不接受可能费用/无法约定停止边界，标记“未测”，不要尝试。
 5. **客户端工具往返：** `Debug` 不会执行客户端工具。只有在 `Agents`/客户端中能选用一个独立、可丢弃的配置，且工具是 Leo 确认的客户端本地安全工具时才排练；不得用日常 Agent、文件/命令/浏览/网络工具。首个工具调用请求计 1，每个包含工具结果的后续请求各计 1。若没有这样的现成隔离客户端，标记“未测”，不临时改主 Agent 配置。
 6. 预算减至 0、界面计数与计划不一致、或任何准入拒绝/响应错误时，停止后续点击。不得再点 `Test`、`Debug Send`、`Speed test`，不得更换模型/协议/账号重试。
@@ -64,7 +64,7 @@
 
 ## 4. 观察字段与停止条件
 
-每次请求单独记一行，记录：provider；固定 helper 版本；非秘密账号别名及连接世代；模型 id；协议；请求序号/总数；工具或 helper 后续轮次；额度来源与读取时间；credits 权限；返回的 model/response identity；最终状态（completed / failed / cancelled / interrupted / 未开始）与可脱敏错误；本机脱敏证据路径；已知 usage/cost 或 `Unknown`。
+每次请求单独记一行，记录：provider；固定 helper 版本；非秘密账号别名及连接世代；计划模型 id；协议；请求序号/总数；工具或 helper 后续轮次；额度来源与读取时间；credits 权限；HTTP 返回的本地请求 model 与网关 response id；若独立上游证据存在，另记其来源和结果，否则写 `Unknown`；最终状态（completed / failed / cancelled / interrupted / 未开始）与可脱敏错误；本机脱敏证据路径；已知 usage/cost 或 `Unknown`。
 
 出现任一项立即停止，不重试、不 failover、不切账单来源：身份/世代/模型/协议与计划不符；计数越界；额度或 credits 异常/未知；无法确认仅用订阅额度；协议或模型准入拒绝；响应身份错、错误或终态缺失；取消状态无法确认；费用超出运行前同意范围。
 
@@ -77,7 +77,7 @@ AutoJev 版本 + commit / Codex helper 版本：
 模型 id + 协议：
 计划请求数 / 实际请求数 / 工具与后续轮次：
 quota 来源 + observed_at / quota permission / credits permission：
-响应 model/identity + terminal/error：
+HTTP 请求 model / 网关 response id / 独立上游 identity 来源与结果（无则 `Unknown`）+ terminal/error：
 已知 usage/cost（未知就写 Unknown）：
 脱敏证据目录：
 停止原因、后续项：

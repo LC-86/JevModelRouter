@@ -807,7 +807,10 @@
       return item?.login?.stage === 'completed' ? item : null;
     }, 'catalog sign-in');
     check(signedIn.identity === 'standin-success@example.invalid', `The controlled directory needs a verified stand-in account: ${signedIn.identity}`);
-    await invoke('set_codex_real_generation_enabled', { providerId, enabled: true, maxCalls: 15 });
+    await invoke('set_codex_real_generation_enabled', {
+      providerId, enabled: true, maxCalls: 15,
+      expectedGeneration: signedIn.generation, expectedIdentity: signedIn.identity,
+    });
     const armed = await view();
     check(armed.real_generation_enabled === true && armed.generation_call_limit === 15 && armed.generation_calls_remaining === 15,
       `The isolated qualification matrix needs an explicit bounded opt-in: ${JSON.stringify(armed)}`);
@@ -999,7 +1002,10 @@
       return item?.login?.stage === 'completed' && item.identity ? item : null;
     }, 'catalog re-sign-in');
     check(reconnected.identity === signedIn.identity, `The switched sign-in must verify the stand-in account: ${reconnected.identity}`);
-    await invoke('set_codex_real_generation_enabled', { providerId, enabled: true, maxCalls: 15 });
+    await invoke('set_codex_real_generation_enabled', {
+      providerId, enabled: true, maxCalls: 15,
+      expectedGeneration: reconnected.generation, expectedIdentity: reconnected.identity,
+    });
     const rearmedAfterSwitch = await view();
     check(rearmedAfterSwitch.generation === reconnected.generation
       && rearmedAfterSwitch.real_generation_enabled === true

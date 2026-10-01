@@ -325,6 +325,8 @@ export default function App() {
                   const result = await testProvider(id);
                   setProviderTests((previous) => ({ ...previous, [id]: 'success' }));
                   setToast(t(result));
+                  // Subscription tests can spend one confirmed real-generation request; refresh its visible budget.
+                  getSnapshot().then(setSnapshot).catch(() => {});
                 } catch (error) {
                   setProviderTests((previous) => ({ ...previous, [id]: 'error' }));
                   setToast(providerTestError(error, t), true);
@@ -579,6 +581,13 @@ function ProvidersPage({ snapshot, onAdd, onEdit, onDelete, onTest, onImport, on
   const toggleCodexGeneration = async (provider: Provider, enabled: boolean) => {
     if (generationBusy[provider.id]) return;
     const currentView = subscriptionView(snapshot, provider.id);
+    if (enabled && (!currentView || !currentView.identity?.trim())) {
+      onNotify(t('A current connected account is required before enabling real Codex generation.'), true);
+      return;
+    }
+    // Capture before showing the modal so the backend can reject consent after an account change.
+    const expectedGeneration = currentView?.generation ?? 0;
+    const expectedIdentity = currentView?.identity ?? '';
     const generationKey = `${provider.id}:${currentView?.generation ?? 0}`;
     const maxCalls = generationCallLimits[generationKey] ?? currentView?.generation_call_limit ?? 1;
     if (enabled && (!Number.isInteger(maxCalls) || maxCalls < 1 || maxCalls > 15)) {
@@ -588,7 +597,7 @@ function ProvidersPage({ snapshot, onAdd, onEdit, onDelete, onTest, onImport, on
     if (enabled && !window.confirm(t('Before enabling real Codex generation, complete the HAND_RUN checklist and confirm the exact model and protocol, fictional input, client-owned tools, total request count, output boundary, possible fees, and allowed steps. This confirmation is limited to {count} AutoJev requests. Failed, cancelled, and client-tool follow-up requests count. The counter is not an upstream billing guarantee. This switch sends no request and does not bypass any admission check; the current 64 KiB collector is not a hard output cap. Continue?', { count: maxCalls }))) return;
     setGenerationBusy((previous) => ({ ...previous, [provider.id]: true }));
     try {
-      onSnapshot(await setCodexRealGenerationEnabled(provider.id, enabled, maxCalls));
+      onSnapshot(await setCodexRealGenerationEnabled(provider.id, enabled, maxCalls, expectedGeneration, expectedIdentity));
       onNotify(t(enabled ? 'Real Codex generation armed for this connection.' : 'Real Codex generation disarmed.'));
     } catch (error) {
       onNotify(error instanceof Error ? error.message : String(error), true);
