@@ -1424,7 +1424,7 @@ impl CodexAdapter {
             None | Some(Value::Null) => None,
             Some(value) => Some(value.as_str().unwrap_or_default()),
         };
-        let active = {
+        {
             let mut logins = self.logins.lock().unwrap();
             let Some(active) = logins
                 .get(provider_id)
@@ -1436,13 +1436,13 @@ impl CodexAdapter {
             if notification_login_id.is_some_and(|login_id| login_id != expected_login_id) {
                 return Ok(None);
             }
+            // Helper notifications have no per-request channel. After the fresh helper's one
+            // initial attempt, an idless event could be late or duplicated; ignore it without
+            // consuming the replacement attempt so its matching loginId can still complete.
+            if notification_login_id.is_none() && !active.allow_unattributed_completion {
+                return Ok(None);
+            }
             logins.remove(provider_id);
-            active
-        };
-        if notification_login_id.is_none() && !active.allow_unattributed_completion {
-            return Ok(Some(LoginResult::Failed(
-                "The Codex helper completion omitted its login id and could not be safely correlated".to_owned(),
-            )));
         }
         let Some(success) = params.get("success").and_then(Value::as_bool) else {
             return Ok(Some(LoginResult::Failed(
@@ -1641,7 +1641,10 @@ impl SubscriptionAdapter for CodexAdapter {
                     return Ok(None);
                 }
                 if let Some(params) = take_deferred(&self.deferred, provider_id, &tracked.login_id) {
-                    return self.complete_login(provider_id, &tracked.login_id, params).await;
+                    if let Some(result) = self.complete_login(provider_id, &tracked.login_id, params).await? {
+                        return Ok(Some(result));
+                    }
+                    continue;
                 }
                 let next = {
                     let mut servers = self.servers.lock().await;
@@ -1670,7 +1673,9 @@ impl SubscriptionAdapter for CodexAdapter {
                         continue;
                     }
                 }
-                return self.complete_login(provider_id, &tracked.login_id, params).await;
+                if let Some(result) = self.complete_login(provider_id, &tracked.login_id, params).await? {
+                    return Ok(Some(result));
+                }
             }
         })
     }
@@ -2808,6 +2813,8 @@ while IFS= read -r line; do
           esac
           case "$scenario" in
             missing-id) ( sleep 0.2; printf '{"jsonrpc":"2.0","method":"account/login/completed","params":{"success":true,"error":null,"onboardingEntrypoint":null}}\n' ) & ;;
+            duplicate-idless) ( sleep 0.2; printf '{"jsonrpc":"2.0","method":"account/login/completed","params":{"loginId":"fixture-login-%s","success":true,"error":null,"onboardingEntrypoint":null}}\n' "$n"; sleep 0.05; printf '{"jsonrpc":"2.0","method":"account/login/completed","params":{"success":true,"error":null,"onboardingEntrypoint":null}}\n' ) & ;;
+            pending) : ;;
             failed-sensitive) ( sleep 0.2; printf '{"jsonrpc":"2.0","method":"account/login/completed","params":{"loginId":"fixture-login-%s","success":false,"error":"authorization_code=SUPERSECRET1234567890 refresh_token=abcdef0123456789abcdef0123456789","onboardingEntrypoint":null}}\n' "$n" ) & ;;
             *) ( sleep 0.2; printf '{"jsonrpc":"2.0","method":"account/login/completed","params":{"loginId":"fixture-login-%s","success":true,"error":null,"onboardingEntrypoint":null}}\n' "$n" ) & ;;
           esac
@@ -4820,7 +4827,7 @@ done
     }
 
     #[tokio::test]
-    async fn a_late_idless_completion_cannot_complete_a_replacement_attempt() {
+    async fn cancelled_attempt_late_idless_completion_is_ignored_until_replacement_completes() {
         let home = tempfile::tempdir().unwrap();
         let log = home.path().join("env.log");
         let mut scenario = log.as_os_str().to_os_string();
@@ -4830,6 +4837,7 @@ done
             CodexAdapter::with_launch(home.path().to_path_buf(), fixture_launch(home.path(), &log));
         adapter.start_login("codex-fixture", 1).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        adapter.cancel_login("codex-fixture", 1).await.unwrap();
         adapter.start_login("codex-fixture", 1).await.unwrap();
 
         let result = tokio::time::timeout(
@@ -4837,12 +4845,126 @@ done
             adapter.login_result("codex-fixture", 1),
         )
         .await
-        .expect("an ambiguous old completion must be settled promptly")
+        .expect("the replacement must keep waiting after an uncorrelated old completion")
+        .unwrap();
+        assert_eq!(
+            result,
+            Some(LoginResult::Completed {
+                identity: "fixture@example.invalid".into()
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_attempt_duplicate_idless_notification_does_not_fail_replacement() {
+        let home = tempfile::tempdir().unwrap();
+        let log = home.path().join("env.log");
+        let mut scenario = log.as_os_str().to_os_string();
+        scenario.push(".login");
+        std::fs::write(PathBuf::from(scenario), "duplicate-idless\ndefault\n").unwrap();
+        let adapter =
+            CodexAdapter::with_launch(home.path().to_path_buf(), fixture_launch(home.path(), &log));
+        adapter.start_login("codex-fixture", 1).await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                adapter.login_result("codex-fixture", 1)
+            )
+            .await
+            .expect("the first identified completion must finish")
+            .unwrap(),
+            Some(LoginResult::Completed {
+                identity: "fixture@example.invalid".into()
+            })
+        );
+
+        adapter.start_login("codex-fixture", 1).await.unwrap();
+        let replacement = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            adapter.login_result("codex-fixture", 1),
+        )
+        .await
+        .expect("a duplicate idless completion must not settle the replacement")
+        .unwrap();
+        assert_eq!(
+            replacement,
+            Some(LoginResult::Completed {
+                identity: "fixture@example.invalid".into()
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn replacement_failure_after_late_idless_notification_remains_terminal_and_redacted() {
+        let home = tempfile::tempdir().unwrap();
+        let log = home.path().join("env.log");
+        let mut scenario = log.as_os_str().to_os_string();
+        scenario.push(".login");
+        std::fs::write(PathBuf::from(scenario), "missing-id\nfailed-sensitive\n").unwrap();
+        let adapter =
+            CodexAdapter::with_launch(home.path().to_path_buf(), fixture_launch(home.path(), &log));
+        adapter.start_login("codex-fixture", 1).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        adapter.cancel_login("codex-fixture", 1).await.unwrap();
+        adapter.start_login("codex-fixture", 1).await.unwrap();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            adapter.login_result("codex-fixture", 1),
+        )
+        .await
+        .expect("the replacement must wait for its matching failure notification")
         .unwrap();
         let Some(LoginResult::Failed(message)) = result else {
-            panic!("an idless completion from an earlier attempt must not connect the replacement: {result:?}");
+            panic!("the replacement's matching failure must remain terminal: {result:?}");
         };
-        assert!(message.contains("safely correlated"), "{message}");
+        assert!(message.contains("[redacted]"), "{message}");
+        assert!(!message.contains("SUPERSECRET"), "{message}");
+        assert_eq!(adapter.login_result("codex-fixture", 1).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn timed_out_login_waiter_can_be_cancelled_before_a_new_attempt() {
+        let home = tempfile::tempdir().unwrap();
+        let log = home.path().join("env.log");
+        let mut scenario = log.as_os_str().to_os_string();
+        scenario.push(".login");
+        std::fs::write(PathBuf::from(scenario), "pending\ndefault\n").unwrap();
+        let adapter =
+            CodexAdapter::with_launch(home.path().to_path_buf(), fixture_launch(home.path(), &log));
+        adapter.start_login("codex-fixture", 1).await.unwrap();
+
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                adapter.login_result("codex-fixture", 1)
+            )
+            .await
+            .is_err(),
+            "the pending fictional attempt should outlive the caller's bounded wait"
+        );
+        adapter.cancel_login("codex-fixture", 1).await.unwrap();
+        adapter.start_login("codex-fixture", 1).await.unwrap();
+
+        assert_eq!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                adapter.login_result("codex-fixture", 1)
+            )
+            .await
+            .expect("the attempt after explicit cancellation should complete")
+            .unwrap(),
+            Some(LoginResult::Completed {
+                identity: "fixture@example.invalid".into()
+            })
+        );
+        let mut call_log = log.as_os_str().to_os_string();
+        call_log.push(".calls");
+        let calls = std::fs::read_to_string(PathBuf::from(call_log)).unwrap();
+        assert!(
+            calls.contains("account/login/cancel"),
+            "the timed-out attempt must be cancelled explicitly"
+        );
     }
 
     #[tokio::test]
