@@ -715,7 +715,7 @@ function ProvidersPage({ snapshot, onAdd, onEdit, onDelete, onTest, onImport, on
             <div>
               <strong>{t('Real Codex generation')}</strong>
               <p data-testid={`codex-generation-state-${provider.id}`}>{t(enabled ? 'Armed for this account; admission still required.' : 'Off. Real Codex requests are denied by default.')}</p>
-              <small>{t('Connection generation {generation} · helper {helper}', { generation: view?.generation ?? 0, helper: view?.helper_version || t('Unknown') })}</small>
+              <small>{t('Connection generation {generation} · helper {helper}', { generation: view?.generation ?? 0, helper: view?.helper_version || t('Unknown') })} · {t('Helper self-report (unverified)')}: {view?.helper?.user_agent || t('Unknown')}</small>
             </div>
             <label className="provider-subscription-generation-limit">{t('Maximum requests for this confirmation')}
               <input

@@ -15,7 +15,7 @@
 | 真实 OAuth／浏览器登录 | **未验证**，属 Leo 手测 |
 | 真实账号身份、套餐权益、订阅内额度 | **未验证**，属 Leo 手测 |
 | 真实生成能力启用 | **保持默认拒绝**，不因登录成功而放行；由 #18／#19／#25 决定 |
-| 固定的官方 Codex 版本与协议来源 | **未记录**：本票只在运行时读取 `initialize.version`，未固定经过评估的官方版本（#10 决策 2 的该项待后续票据） |
+| 固定的官方 Codex 版本与协议来源 | 固定到官方 `rust-v0.159.0` initialize schema：响应有 `userAgent`、`codexHome`、`platformFamily`、`platformOs`，没有 `version`。界面展示 `userAgent` 自述并标为未验证；只有 `codex_cli_rs/<规范 SemVer>` 才提取版本作展示，不提升协议或模型资格。 |
 
 ## 2. Agent 已给出的隔离证据
 
@@ -25,6 +25,7 @@ Agent 侧证据来自假 Codex app-server 替身与隔离桌面验收，**只证
 - 退出与换号使连接世代递增，旧身份、额度、目录与能力缓存被清除，服务商、模型与路由配置保留。
 - 换号失败不自动恢复旧账号。
 - 辅助进程使用专用授权目录（`<应用数据>/.autojev/helpers/codex/<服务商>`），日志与错误中不出现令牌或授权码原文。
+- 离线替身按官方 [0.159.0 initialize schema](https://github.com/openai/codex/blob/rust-v0.159.0/codex-rs/app-server-protocol/schema/json/v1/InitializeResponse.json) 返回 `userAgent` 等固定字段；缺失、类型错误或畸形自述保持未知，完整自述仅作为未验证文本展示。版本只从规范 `codex_cli_rs/<SemVer>` 首词提取，仅供展示，不改变协议、模型资格或生成准入。
 - 退出会删除该专用授权目录：替身写入的虚构凭据文件在注销后消失，而用户真实的 `~/.codex` 存在性与 inode 不变、其中不出现本应用的凭据文件。
 - Grok 订阅行不借用 Codex 辅助进程：状态显示为不可用，点登录得到明确的「未实现」错误且连接状态、世代与身份均不变。
 - 桌面进程正常退出只回收本应用自己拉起的辅助进程，无关进程不受影响。

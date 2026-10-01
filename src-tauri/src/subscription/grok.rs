@@ -575,6 +575,7 @@ impl SubscriptionAdapter for GrokSubscriptionAdapter {
         HelperStatus {
             available: self.available(),
             // 探测不拉起进程，拿不到版本就必须保持未知。
+            user_agent: None,
             version: None,
             // 专用目录按服务商计算，而本方法没有 provider_id；真实路径由 status() 的 account_path 如实给出。
             auth_home: None,
@@ -1333,7 +1334,7 @@ esac
         }
 
         fn helper_status(&self) -> HelperStatus {
-            HelperStatus { available: true, version: Some("9.9.9".into()), auth_home: Some("/tmp/codex-home".into()) }
+            HelperStatus { available: true, user_agent: None, version: Some("9.9.9".into()), auth_home: Some("/tmp/codex-home".into()) }
         }
 
         fn status<'a>(&'a self, _provider_id: &'a str, _generation: u64) -> BoxFuture<'a, Result<ConnectionStatus>> {

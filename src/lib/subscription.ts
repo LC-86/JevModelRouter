@@ -410,7 +410,7 @@ export function denialLabel(denial: SubscriptionDenial | null | undefined, t: Tr
     quota_denied: 'Quota access denied',
     quota_unsupported: 'No quota interface',
     extra_usage_allowed: 'Extra credits are currently allowed',
-    extra_usage_permission_unknown: 'Extra credit restriction unverified',
+    extra_usage_permission_unknown: 'Whole-call extra-credit restriction unverified',
   }[denial.code] ?? denial.code);
 }
 
@@ -549,7 +549,7 @@ export function remoteRevocationLabel(remote: SubscriptionRemoteRevocation, t: T
 }
 
 /**
- * 订阅行固定状态文本：连接状态、世代、已核实身份、辅助进程版本与授权目录；
+ * 订阅行固定状态文本：连接状态、世代、已核实身份、辅助进程自述（未验证）、版本与授权目录；
  * 有退出记录时追加本地清除与远端撤销结果。机器可读 token 与本地化文案同时保留。
  */
 export function subscriptionStatusText(view: SubscriptionView | undefined, t: Translate): string {
@@ -559,6 +559,7 @@ export function subscriptionStatusText(view: SubscriptionView | undefined, t: Tr
     `(${connectionStateLabel(state, t)})`,
     `generation=${view?.generation ?? 0}`,
     `identity=${knownOrUnknown(view?.identity)}`,
+    `helper_user_agent_unverified=${knownOrUnknown(view?.helper?.user_agent)}`,
     `helper=${helperVersionLabel(view)}`,
     `auth_home=${authHomeLabel(view)}`,
   ];
