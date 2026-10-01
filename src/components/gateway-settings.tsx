@@ -1,5 +1,5 @@
 import { CircleCheck, CircleAlert, LoaderCircle, Play } from 'lucide-react';
-import { SpeedTestSettings } from './model-speed-tests';
+import { SpeedTestSettings, type ModelSpeedTests } from './model-speed-tests';
 import { useState } from 'react';
 import type { DashboardSnapshot, DecisionProvider, GatewaySettings } from '../types';
 import { gatewayDefaults, saveGatewaySettings, savePolicy, testJevSettings } from '../lib/bridge';
@@ -11,7 +11,7 @@ const decisionDefaults: Record<DecisionProvider, { jev_endpoint: string; jev_mod
   zenmux: { jev_endpoint: 'https://zenmux.ai/api/v1/systemone', jev_model: 'typesafe/jev-1.13' },
 };
 
-export function GatewaySettingsPanel({ snapshot, onChange, onRefreshBudgetSnapshot }: { snapshot: DashboardSnapshot; onChange: (s: DashboardSnapshot) => void; onRefreshBudgetSnapshot: () => Promise<DashboardSnapshot> }) {
+export function GatewaySettingsPanel({ snapshot, onChange, speedTests }: { snapshot: DashboardSnapshot; onChange: (s: DashboardSnapshot) => void; speedTests: ModelSpeedTests }) {
   const { t } = usePreferences();
   const [gateway, setGateway] = useState(snapshot.gateway ?? gatewayDefaults);
   const [tab, setTab] = useState('jev');
@@ -49,7 +49,7 @@ export function GatewaySettingsPanel({ snapshot, onChange, onRefreshBudgetSnapsh
         }}>{t(label)}</button>)}
     </div>
     <div role="tabpanel" id={`gateway-panel-${tab}`} aria-labelledby={`gateway-tab-${tab}`} className="stack">
-    {tab === 'speed' && <SpeedTestSettings onBudgetSnapshotRefresh={onRefreshBudgetSnapshot}/>}
+    {tab === 'speed' && <SpeedTestSettings tests={speedTests}/>}
     {tab === 'jev' && <>
     <form className="settings-group stack decision-model-form" onChange={() => { setError(''); setMessage(''); }} onSubmit={e => { e.preventDefault(); void act(async () => { const result = await savePolicy(policy, key || undefined); setKey(''); return result; }); }}>
       <div className="form-field"><label htmlFor="decision-provider">{t('Decision provider')}</label><Select id="decision-provider" aria-label={t('Decision provider')} searchable={false} disabled={busy} value={policy.decision_provider} onChange={e => {

@@ -1,7 +1,7 @@
 import { AddAgentDialog } from './components/add-agent-dialog';
 import { GatewayActionMenu } from './components/gateway-action-menu';
 import { AGENT_SELECTIONS_KEY, availableAgentSelections, parseAgentSelections } from './lib/agent-selections';
-import { SpeedCell, SpeedTestToolbar, useModelSpeedTests } from './components/model-speed-tests';
+import { SpeedCell, SpeedTestToolbar, useModelSpeedTests, type ModelSpeedTests } from './components/model-speed-tests';
 import { listen } from '@tauri-apps/api/event';
 import { isTauri } from '@tauri-apps/api/core';
 import { openUrl } from '@tauri-apps/plugin-opener';
@@ -170,17 +170,19 @@ export default function App() {
     return () => window.removeEventListener('keydown', shortcut);
   }, []);
   const [snapshot, setSnapshot] = useState<DashboardSnapshot | null>(null);
+  const [page, setPage] = useState<Page>('overview');
   const refreshBudgetSnapshot = useCallback(async () => {
     const current = await getSnapshot();
     setSnapshot(current);
     return current;
   }, []);
+  const speedTests = useModelSpeedTests(refreshBudgetSnapshot, page === 'models' || (settingsOpen && settingsSection === 'gateway'));
+  useEffect(() => { if (page !== 'models') speedTests.select([]); }, [page, speedTests.select]);
   useEffect(() => {
     let disposed=false; let unlisten: (() => void) | undefined;
     void listen<string>('gateway-lifecycle-error', event => { window.alert(event.payload); }).then(fn => { if(disposed)fn();else unlisten=fn; }).catch(() => {});
     return () => { disposed=true;unlisten?.(); };
   }, []);
-  const [page, setPage] = useState<Page>('overview');
   const [busy, setBusy] = useState(false);
   const [toast, setToastState] = useState('');
   const [toastError, setToastError] = useState(false);
@@ -345,6 +347,7 @@ export default function App() {
               onNotify={setToast}
               onChange={setSnapshot}
               snapshot={snapshot}
+              speedTests={speedTests}
               onRefreshBudgetSnapshot={refreshBudgetSnapshot}
               onAdd={() => setModelModal({ ...EMPTY_MODEL, provider_id: snapshot.providers.find((provider) => provider.enabled)?.id ?? '' })}
               onEdit={(model) => setModelModal({ ...model })}
@@ -372,7 +375,7 @@ export default function App() {
         </div>
       </main>
 
-      {settingsOpen && <SettingsDialog snapshot={snapshot} onChange={setSnapshot} onRefreshBudgetSnapshot={refreshBudgetSnapshot} section={settingsSection} onSectionChange={setSettingsSection} onClose={() => setSettingsOpen(false)} update={update} />}
+      {settingsOpen && <SettingsDialog snapshot={snapshot} onChange={setSnapshot} speedTests={speedTests} section={settingsSection} onSectionChange={setSettingsSection} onClose={() => setSettingsOpen(false)} update={update} />}
       {deleteTarget && <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget && !deletingProvider) setDeleteTarget(null); }} onKeyDown={(event) => { if (event.key === 'Escape' && !deletingProvider) setDeleteTarget(null); }}>
         <div className="dialog provider-delete-dialog" role="alertdialog" aria-modal="true" aria-labelledby="delete-provider-title" aria-describedby="delete-provider-description">
           <h2 id="delete-provider-title">{t('Delete provider?')}</h2>
@@ -794,7 +797,7 @@ function ModelTestErrorDialog({ model, detail, onClose, title = 'Model test fail
   </dialog>;
 }
 
-function ModelsPage({ snapshot, onAdd, onEdit, onDelete, onChange, onNotify, onRefreshBudgetSnapshot }: { onNotify: (message: string, error?: boolean) => void; onChange: (snapshot: DashboardSnapshot) => void; onRefreshBudgetSnapshot: () => Promise<DashboardSnapshot>; snapshot: DashboardSnapshot; onAdd: () => void; onEdit: (m: Model) => void; onDelete: (id: string) => void }) {
+function ModelsPage({ snapshot, onAdd, onEdit, onDelete, onChange, onNotify, onRefreshBudgetSnapshot, speedTests }: { onNotify: (message: string, error?: boolean) => void; onChange: (snapshot: DashboardSnapshot) => void; onRefreshBudgetSnapshot: () => Promise<DashboardSnapshot>; speedTests: ModelSpeedTests; snapshot: DashboardSnapshot; onAdd: () => void; onEdit: (m: Model) => void; onDelete: (id: string) => void }) {
   const { t } = usePreferences();
   const [health, setHealth] = useState(snapshot.health ?? []);
   const [clearingCooldown, setClearingCooldown] = useState<Record<string, boolean>>({});
@@ -823,7 +826,6 @@ function ModelsPage({ snapshot, onAdd, onEdit, onDelete, onChange, onNotify, onR
     } catch (error) { onNotify(t(String(error instanceof Error ? error.message : error)), true); }
     finally { setClearingCooldown(previous => ({ ...previous, [id]: false })); }
   };
-  const speedTests = useModelSpeedTests(onRefreshBudgetSnapshot);
   const [dismissedSpeedJob, setDismissedSpeedJob] = useState(false);
   useEffect(() => { if (speedTests.view?.job.running) setDismissedSpeedJob(false); }, [speedTests.view?.job.running]);
   const speedError = speedTests.error || (!speedTests.view?.job.running && !dismissedSpeedJob ? speedTests.view?.job.error : '');

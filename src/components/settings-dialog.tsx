@@ -1,4 +1,5 @@
 import { GatewaySettingsPanel } from './gateway-settings';
+import type { ModelSpeedTests } from './model-speed-tests';
 import type { DashboardSnapshot } from '../types';
 import { Select } from './select';
 import { useEffect, useRef, useState } from 'react';
@@ -17,7 +18,7 @@ const themes: { id: Theme; label: string; icon: typeof Sun }[] = [{ id: 'light',
 const accents: { id: Accent; label: string; color: string }[] = [{ id: 'orange', label: 'AutoJev orange', color: '#f26122' }, { id: 'blue', label: 'Ocean blue', color: '#3b82f6' }, { id: 'green', label: 'Forest green', color: '#239b72' }, { id: 'violet', label: 'Iris violet', color: '#9b72e8' }];
 const links = [{ label: 'Website', url: 'https://autojev.ai' }, { label: 'Source code', url: 'https://github.com/thinkany-ai/autojev' }, { label: 'Feedback', url: 'https://github.com/thinkany-ai/autojev/issues' }];
 
-export function SettingsDialog({ section, onSectionChange, onClose, update, snapshot, onChange, onRefreshBudgetSnapshot }: { snapshot: DashboardSnapshot; onChange: (s: DashboardSnapshot) => void; onRefreshBudgetSnapshot: () => Promise<DashboardSnapshot>; section: SettingsSection; onSectionChange: (section: SettingsSection) => void; onClose: () => void; update: AppUpdateState }) {
+export function SettingsDialog({ section, onSectionChange, onClose, update, snapshot, onChange, speedTests }: { snapshot: DashboardSnapshot; onChange: (s: DashboardSnapshot) => void; speedTests: ModelSpeedTests; section: SettingsSection; onSectionChange: (section: SettingsSection) => void; onClose: () => void; update: AppUpdateState }) {
   const { preferences, setPreferences, t, storageError } = usePreferences();
   const dialog = useRef<HTMLDialogElement>(null);
   const initialFocus = useRef<HTMLDivElement>(null);
@@ -46,7 +47,7 @@ export function SettingsDialog({ section, onSectionChange, onClose, update, snap
             <p className="settings-description">{t('Closing the window keeps the gateway running. Use the gateway stop button or Quit AutoJev in the tray menu to restore agent configurations.')}</p>
 
           </>}
-          {section === 'gateway' && <GatewaySettingsPanel snapshot={snapshot} onChange={onChange} onRefreshBudgetSnapshot={onRefreshBudgetSnapshot} />}
+          {section === 'gateway' && <GatewaySettingsPanel snapshot={snapshot} onChange={onChange} speedTests={speedTests} />}
           {section === 'appearance' && <>
             <section className="settings-group"><h4>{t('Color theme')}</h4><div className="theme-options" role="group" aria-label={t('Color theme')}>{themes.map(({ id, label, icon: Icon }) => <button key={id} className={`theme-option ${preferences.theme === id ? 'selected' : ''}`} aria-pressed={preferences.theme === id} onClick={() => setPreferences({ theme: id })}><div className={`theme-preview ${id}`}><i /><div><b /><span /><span /><span /></div></div><span><Icon size={15} />{t(label)}{preferences.theme === id && <Check size={14} />}</span></button>)}</div></section>
             <section className="settings-group"><h4>{t('Accent color')}</h4><div className="accent-options" role="group" aria-label={t('Accent color')}>{accents.map(({ id, label, color }) => <button key={id} className={`accent-option ${preferences.accent === id ? 'selected' : ''}`} aria-pressed={preferences.accent === id} onClick={() => setPreferences({ accent: id })}><span className="accent-swatch" style={{ background: color }}>{preferences.accent === id && <Check size={16} />}</span><span>{t(label)}</span></button>)}</div></section>

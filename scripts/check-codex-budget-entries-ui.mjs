@@ -36,6 +36,7 @@ const scenarios = [
   { name: 'debug-curl-success', entry: 'debug-curl' },
   { name: 'debug-curl-cancelled-attempt', entry: 'debug-curl', cancel: true },
   { name: 'speed-three-successes', entry: 'speed', spent: 3 },
+  { name: 'speed-delayed-completion-after-navigation', entry: 'speed', spent: 3, asyncSpeed: true, leaveModels: true },
   { name: 'speed-cancelled-attempt', entry: 'speed', spent: 1, cancel: true },
   { name: 'speed-failed-attempt', entry: 'speed', spent: 1, failure: true },
 ];
@@ -92,8 +93,16 @@ try {
           }
           if (command === 'cancel_debug_curl') { state.finishCurl?.(); return null; }
           if (command === 'start_model_speed_tests') {
-            spend(scenario.spent);
-            Object.assign(job, { running: Boolean(scenario.cancel), cancelled: false, completed: scenario.cancel ? 0 : scenario.spent, total: 3, total_models: 1, completed_models: scenario.cancel ? 0 : 1, current_models: scenario.cancel ? ['codex-model'] : [], error: scenario.failure ? 'Isolated admitted speed attempt failed.' : null });
+            spend(scenario.asyncSpeed ? 1 : scenario.spent);
+            Object.assign(job, { running: Boolean(scenario.cancel || scenario.asyncSpeed), cancelled: false, completed: scenario.cancel ? 0 : scenario.asyncSpeed ? 1 : scenario.spent, total: 3, total_models: 1, completed_models: scenario.cancel || scenario.asyncSpeed ? 0 : 1, current_models: scenario.cancel || scenario.asyncSpeed ? ['codex-model'] : [], error: scenario.failure ? 'Isolated admitted speed attempt failed.' : null });
+            if (scenario.asyncSpeed) {
+              setTimeout(() => {
+                spend(2);
+                Object.assign(job, { running: false, completed: 3, completed_models: 1, current_models: [] });
+                state.backgroundComplete = true;
+                state.calls.push({ command: '[isolated background HTTP attempts 2 and 3 completed]', spentBeforeCall: state.spent });
+              }, 1400);
+            }
             state.completed += 1;
             return null;
           }
@@ -159,6 +168,25 @@ try {
         }
       }
       await page.waitForFunction(() => window.__PR44_ALL_PROOF__.completed === 1);
+      const asyncStages = {};
+      if (scenario.asyncSpeed) {
+        await page.waitForFunction(() => window.__PR44_ALL_PROOF__.calls.some(call => call.command === 'get_snapshot' && call.spentBeforeCall === 1));
+        if (scenario.leaveModels) {
+          await page.getByRole('button', { name: 'Providers', exact: true }).click();
+          await budget.waitFor();
+          asyncStages.afterFirstRequest = await budget.innerText();
+          await page.waitForFunction(() => window.__PR44_ALL_PROOF__.backgroundComplete === true);
+          await page.waitForTimeout(2300);
+          asyncStages.whileOnProviders = await budget.innerText();
+          await page.getByRole('button', { name: 'Models', exact: true }).click();
+          await page.getByRole('button', { name: 'Providers', exact: true }).click();
+          await page.waitForTimeout(2300);
+          asyncStages.afterNavigationBack = await budget.innerText();
+        } else {
+          await page.waitForFunction(() => window.__PR44_ALL_PROOF__.backgroundComplete === true);
+          await page.waitForTimeout(2300);
+        }
+      }
       if (await page.getByRole('dialog').count()) {
         const close = page.getByRole('dialog').getByRole('button', { name: 'Close', exact: true });
         if (await close.count()) await close.click();
@@ -180,8 +208,8 @@ try {
       if (scenario.cancel && scenario.entry === 'debug-curl') assert.equal(state.calls.filter(call => call.command === 'cancel_debug_curl').length, 1);
       assert.deepEqual(errors, []);
       assert.deepEqual(blockedExternal, [], 'The browser must not contact any external auth or model endpoint.');
-      const stale = !after.includes(`${3 - spent} of 3`);
-      const result = { name: scenario.name, spent, before, after, backendRemaining: 3 - spent, stale, snapshotReads: state.calls.filter(call => call.command === 'get_snapshot').length, errors, blockedExternal, calls: state.calls, fakeBoundary: 'Entire browser IPC is mocked; all assets come from the local build; external requests are blocked; no OAuth, quota, model or backend admission call.' };
+      const stale = !after.includes(`${3 - spent} of 3`) || (scenario.asyncSpeed && (!asyncStages.whileOnProviders?.includes('0 of 3') || !asyncStages.afterNavigationBack?.includes('0 of 3')));
+      const result = { name: scenario.name, spent, before, after, backendRemaining: 3 - spent, stale, asyncStages, snapshotReads: state.calls.filter(call => call.command === 'get_snapshot').length, errors, blockedExternal, calls: state.calls, fakeBoundary: 'Entire browser IPC is mocked; all assets come from the local build; external requests are blocked; no OAuth, quota, model or backend admission call.' };
       await writeFile(join(artifacts, `${scenario.name}.json`), JSON.stringify(result, null, 2));
       await page.screenshot({ path: join(artifacts, `${scenario.name}.png`), fullPage: true });
       results.push(result);
