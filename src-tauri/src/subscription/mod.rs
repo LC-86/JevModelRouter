@@ -3112,6 +3112,181 @@ mod refresh_tests {
     }
 
     #[tokio::test]
+    async fn mixed_route_recovery_probe_accepts_a_delivered_success_terminal_before_client_drop() {
+        let protocols = [
+            (
+                "chat/completions",
+                serde_json::json!({"model":"autojev/mixed","messages":[{"role":"user","content":"hello"}]}),
+                "[DONE]",
+            ),
+            (
+                "responses",
+                serde_json::json!({"model":"autojev/mixed","input":"hello"}),
+                "response.completed",
+            ),
+            (
+                "messages",
+                serde_json::json!({"model":"autojev/mixed","messages":[{"role":"user","content":"hello"}]}),
+                "message_stop",
+            ),
+        ];
+
+        for (endpoint, request_body, terminal) in protocols {
+            for drop_after_terminal in [true, false] {
+                let adapter = StubAdapter::new();
+                adapter.generation_events.lock().unwrap().extend([
+                    vec![GenerationEvent::RejectedBeforeStart {
+                        status: 429,
+                        scope: GenerationFailureScope::Account,
+                        retry_after_seconds: Some(60),
+                        message: "seed account cooldown".into(),
+                    }],
+                    if drop_after_terminal {
+                        vec![
+                            GenerationEvent::Started { generation: 1 },
+                            GenerationEvent::Chunk("generated text".into()),
+                            GenerationEvent::Finished { status: 200 },
+                        ]
+                    } else {
+                        vec![
+                            GenerationEvent::Started { generation: 1 },
+                            GenerationEvent::Chunk("partial output".into()),
+                        ]
+                    },
+                ]);
+
+                let (store, _directory) = fixture_store(adapter.clone());
+                let (api_url, api_calls, api) = mixed_route_api_server().await;
+                configure_mixed_route(&store, &api_url);
+                store.update(|config| {
+                    let capabilities = ["fixture-model", "fixture-model-2"]
+                        .into_iter()
+                        .flat_map(|model_id| {
+                            ["chat_completions", "responses", "messages"]
+                                .into_iter()
+                                .map(move |protocol| Capability {
+                                    model_id: model_id.into(),
+                                    protocol: protocol.into(),
+                                    status: CapabilityStatus::Verified,
+                                })
+                        })
+                        .collect();
+                    config
+                        .subscriptions
+                        .get_mut("codex")
+                        .unwrap()
+                        .evidence
+                        .as_mut()
+                        .unwrap()
+                        .capabilities = capabilities;
+                }).unwrap();
+                let context = crate::proxy::ForwardTestContext::new(store).unwrap();
+
+                let seed_body = serde_json::json!({
+                    "model":"autojev/mixed",
+                    "messages":[{"role":"user","content":"seed"}]
+                });
+                let response = context
+                    .forward(axum::http::HeaderMap::new(), seed_body, "chat/completions")
+                    .await;
+                assert_eq!(response.status(), axum::http::StatusCode::OK, "seed request for {endpoint}");
+                let _ = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+                assert_eq!(
+                    api_calls.load(Ordering::SeqCst),
+                    1,
+                    "the confirmed account rejection should seed API fallback for {endpoint}"
+                );
+
+                let statuses = context.health_statuses();
+                let account_key = statuses
+                    .iter()
+                    .find(|status| status.model_id.starts_with("subscription-account:"))
+                    .unwrap()
+                    .model_id
+                    .clone();
+                let model_key = statuses
+                    .iter()
+                    .find(|status| status.model_id == "codex-model" || status.model_id.ends_with(":codex-model"))
+                    .unwrap()
+                    .model_id
+                    .clone();
+                context.expire_health_for_test(&account_key);
+                context.expire_health_for_test(&model_key);
+
+                let mut streaming_body = request_body.clone();
+                streaming_body["stream"] = serde_json::json!(true);
+                let response = context
+                    .forward(axum::http::HeaderMap::new(), streaming_body, endpoint)
+                    .await;
+                let status = response.status();
+                if status != axum::http::StatusCode::OK {
+                    let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+                    panic!("recovery probe for {endpoint}: {status}: {}", String::from_utf8_lossy(&body));
+                }
+                let mut stream = response.into_body().into_data_stream();
+                let mut observed = Vec::new();
+                if drop_after_terminal {
+                    while let Some(chunk) = stream.next().await {
+                        observed.extend_from_slice(&chunk.unwrap());
+                        if String::from_utf8_lossy(&observed).contains(terminal) {
+                            break;
+                        }
+                    }
+                    assert!(
+                        String::from_utf8_lossy(&observed).contains(terminal),
+                        "{endpoint} success terminal must be delivered before the client disconnects"
+                    );
+                } else {
+                    let first = stream.next().await.expect("preterminal event").unwrap();
+                    observed.extend_from_slice(&first);
+                    assert!(
+                        !String::from_utf8_lossy(&observed).contains(terminal),
+                        "the counterexample must disconnect before {endpoint} reaches a terminal frame"
+                    );
+                }
+                drop(stream);
+
+                let account = context
+                    .health_statuses()
+                    .into_iter()
+                    .find(|status| status.model_id == account_key)
+                    .unwrap();
+                let expected_status = if drop_after_terminal { 200 } else { 502 };
+                assert_eq!(
+                    account.state,
+                    if drop_after_terminal { "healthy" } else { "cooldown" },
+                    "account probe for {endpoint} must use terminal completion state"
+                );
+                assert_eq!(account.last_status, expected_status, "account probe status for {endpoint}");
+                assert_eq!(
+                    api_calls.load(Ordering::SeqCst),
+                    1,
+                    "only the seed rejection may use API fallback for {endpoint}"
+                );
+                if drop_after_terminal {
+                    let mut follow_up = request_body.clone();
+                    follow_up["stream"] = serde_json::json!(true);
+                    let response = context
+                        .forward(axum::http::HeaderMap::new(), follow_up, endpoint)
+                        .await;
+                    assert_eq!(response.status(), axum::http::StatusCode::OK, "follow-up request for {endpoint}");
+                    let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+                    assert!(
+                        String::from_utf8_lossy(&body).contains(terminal),
+                        "the recovered account should continue serving {endpoint}"
+                    );
+                    assert_eq!(
+                        api_calls.load(Ordering::SeqCst),
+                        1,
+                        "a confirmed successful terminal must keep the next {endpoint} request on subscription"
+                    );
+                }
+                api.abort();
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn read_only_refresh_binds_evidence_to_the_current_generation() {
         let adapter = StubAdapter::new();
         let (store, _directory) = fixture_store(adapter.clone());

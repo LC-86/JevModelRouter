@@ -2280,6 +2280,7 @@ where S:futures_util::Stream<Item=Result<axum::body::Bytes,E>>+Send,E:std::error
 struct AccountProbeCompletion {
     lease: Option<crate::resilience::Lease>,
     settings: crate::resilience::Settings,
+    capture: crate::traffic::SharedCapture,
 }
 
 impl AccountProbeCompletion {
@@ -2292,8 +2293,18 @@ impl AccountProbeCompletion {
 
 impl Drop for AccountProbeCompletion {
     fn drop(&mut self) {
-        // A client disconnect or dropped body is not a successful account probe.
-        self.complete(502);
+        // A dropped body is healthy only after the response observer has parsed a
+        // successful terminal frame. Disconnects before completion and terminal
+        // error/cancellation frames remain failures.
+        if self.lease.is_some() {
+            let successful_terminal = {
+                let mut capture = self.capture.lock().unwrap();
+                let terminal = capture.terminal;
+                terminal && !capture.failed_body()
+            };
+            let status = if successful_terminal { 200 } else { 502 };
+            self.complete(status);
+        }
     }
 }
 
@@ -2305,7 +2316,11 @@ fn observe_health(
     capture: crate::traffic::SharedCapture,
 ) -> Response {
     let(parts,body)=response.into_parts();
-    let account_probe = AccountProbeCompletion { lease: account_lease, settings: settings.clone() };
+    let account_probe = AccountProbeCompletion {
+        lease: account_lease,
+        settings: settings.clone(),
+        capture: capture.clone(),
+    };
     let stream=futures_util::stream::unfold((body.into_data_stream(),Some(lease),account_probe,settings,capture),|(mut stream,mut lease,mut account_probe,settings,capture)|async move{
         match stream.next().await{
             Some(chunk)=>{if chunk.is_err(){if let Some(l)=lease.take(){l.complete(502,None,&settings);}account_probe.complete(502);}Some((chunk,(stream,lease,account_probe,settings,capture)))}
@@ -2392,6 +2407,33 @@ mod availability_tests {
         let response=Response::new(Body::from_stream(futures_util::stream::iter([Err::<axum::body::Bytes,_>(std::io::Error::other("disconnected"))])));
         let response=observe_health(response,lease,None,settings,capture);
         assert!(axum::body::to_bytes(response.into_body(),1024).await.is_err());assert!(!h.available("model"));
+    }
+
+    #[tokio::test]
+    async fn dropping_a_nonstreaming_account_probe_without_eof_remains_a_failure() {
+        let health = crate::resilience::Health::default();
+        let settings = crate::resilience::Settings::default();
+        health.acquire("subscription-account:codex:1").unwrap()
+            .complete(429, Some(60), &settings);
+        health.expire_for_test("subscription-account:codex:1");
+        let account_lease = health.acquire_recovery_probe("subscription-account:codex:1").unwrap();
+        let model_lease = health.acquire("subscription-model:codex:1:fixture").unwrap();
+        let capture = crate::traffic::Capture::new("chat/completions", &json!({"stream":false}), &HeaderMap::new());
+        let source = futures_util::stream::iter([Ok::<_, std::io::Error>(
+            axum::body::Bytes::from_static(b"{\"choices\":[]}"),
+        )]);
+        let source = crate::traffic::observe(source, capture.clone());
+        let response = Response::new(Body::from_stream(source));
+        let response = observe_health(response, model_lease, Some(account_lease), settings, capture);
+
+        let mut body = response.into_body().into_data_stream();
+        assert!(body.next().await.unwrap().is_ok());
+        drop(body);
+
+        let account = health.statuses().into_iter()
+            .find(|status| status.model_id == "subscription-account:codex:1").unwrap();
+        assert_eq!(account.state, "cooldown");
+        assert_eq!(account.last_status, 502, "an unread nonstreaming body has no successful terminal frame");
     }
 }
 
