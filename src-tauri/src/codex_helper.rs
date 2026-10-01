@@ -5,7 +5,7 @@
 //! `runtime::isolated()`。错误与日志在这里统一脱敏，不输出 token、authorization code 或 refresh token 原文。
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     ffi::OsStr,
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
@@ -1205,6 +1205,8 @@ struct GenerationState {
     request_context: Value,
     issued_tool_calls: HashMap<String, IssuedToolCall>,
     pending_tool_turns: Arc<Mutex<HashMap<String, PendingToolTurn>>>,
+    pending_tool_cleanup: Arc<PendingToolCleanup>,
+    generation_lock: Arc<tokio::sync::Mutex<()>>,
     started: bool,
     terminal: bool,
     deadline: tokio::time::Instant,
@@ -1234,6 +1236,41 @@ struct PendingToolTurn {
     request_context: Value,
     issued_tool_calls: HashMap<String, IssuedToolCall>,
     deadline: tokio::time::Instant,
+}
+
+#[derive(Default)]
+struct PendingToolCleanup {
+    // Body drop removes a pending turn synchronously, but its helper still belongs to
+    // cleanup until interrupt completion or helper reaping has finished.
+    providers: Mutex<HashSet<String>>,
+    changed: tokio::sync::Notify,
+}
+
+impl PendingToolCleanup {
+    fn begin(&self, provider_id: &str) {
+        self.providers.lock().unwrap().insert(provider_id.to_owned());
+    }
+
+    fn is_active(&self, provider_id: &str) -> bool {
+        self.providers.lock().unwrap().contains(provider_id)
+    }
+
+    fn finish(&self, provider_id: &str) {
+        self.providers.lock().unwrap().remove(provider_id);
+        self.changed.notify_waiters();
+    }
+
+    async fn wait_until_clear(&self, provider_id: &str) {
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if !self.is_active(provider_id) {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 fn request_context(request: &CodexTurnRequest) -> Value {
@@ -1276,6 +1313,7 @@ pub struct CodexAdapter {
     /// 已被某个等待者取走、但属于另一次尝试的完成通知；由对应等待者领回，避免串线丢失。
     deferred: Mutex<HashMap<String, VecDeque<(String, Value)>>>,
     pending_tool_turns: Arc<Mutex<HashMap<String, PendingToolTurn>>>,
+    pending_tool_cleanup: Arc<PendingToolCleanup>,
     state: Mutex<AdapterState>,
     /// 仅在测试构建里可显式指定；生产只能走 [`resolve_launch`]。
     launch: Option<HelperLaunch>,
@@ -1301,6 +1339,7 @@ impl CodexAdapter {
             logins: Mutex::new(HashMap::new()),
             deferred: Mutex::new(HashMap::new()),
             pending_tool_turns: Arc::new(Mutex::new(HashMap::new())),
+            pending_tool_cleanup: Arc::new(PendingToolCleanup::default()),
             state: Mutex::new(AdapterState::default()),
             launch: None,
             home_root: None,
@@ -1728,34 +1767,51 @@ impl SubscriptionAdapter for CodexAdapter {
         let model_id = request.model_id.to_owned();
         let pre_dispatch_check = request.pre_dispatch_check.clone();
         let pending_tool_turns = self.pending_tool_turns.clone();
+        let pending_tool_cleanup = self.pending_tool_cleanup.clone();
+        let generation_lock = self.generation_lock(&provider_id);
         Box::pin(async move {
             let generation_request_context = request_context(&turn);
-            let generation_guard = self.generation_lock(&provider_id).lock_owned().await;
             let servers_ref = self.servers.clone();
-            pre_dispatch_check().map_err(anyhow::Error::msg)?;
-            let mut pending = None;
-            let mut tool_responses = Vec::new();
-            let mut discard_error = None;
-            {
-                let mut pending_turns = pending_tool_turns.lock().unwrap();
-                if let Some(snapshot) = pending_turns.get(&provider_id).cloned() {
-                    if !pending_matches_request(&snapshot, &model_id, protocol, &turn) {
-                        bail!("A different Codex tool turn is pending; continue it with its original model, protocol, and tool results before sending another request");
-                    }
-                    let expired = snapshot.generation != generation || tokio::time::Instant::now() >= snapshot.deadline;
-                    pending = pending_turns.remove(&provider_id);
-                    if expired {
-                        discard_error = Some(anyhow::anyhow!("The pending Codex tool turn expired or belongs to an old connection generation; it was discarded"));
+            let (generation_guard, mut pending, tool_responses, discard_error) = loop {
+                pending_tool_cleanup.wait_until_clear(&provider_id).await;
+                let generation_guard = generation_lock.clone().lock_owned().await;
+                pre_dispatch_check().map_err(anyhow::Error::msg)?;
+                let mut pending = None;
+                let mut tool_responses = Vec::new();
+                let mut discard_error = None;
+                let retry_after_cleanup = {
+                    let mut pending_turns = pending_tool_turns.lock().unwrap();
+                    // Abandon can reserve cleanup while this request is queued for the
+                    // generation mutex; don't let it dispatch until that cleanup completes.
+                    if pending_tool_cleanup.is_active(&provider_id) {
+                        true
                     } else {
-                        match validate_tool_followup(pending.as_mut().expect("the matched pending turn was removed"), &turn) {
-                            Ok(responses) => tool_responses = responses,
-                            Err(error) => discard_error = Some(error),
+                        if let Some(snapshot) = pending_turns.get(&provider_id).cloned() {
+                            if !pending_matches_request(&snapshot, &model_id, protocol, &turn) {
+                                bail!("A different Codex tool turn is pending; continue it with its original model, protocol, and tool results before sending another request");
+                            }
+                            let expired = snapshot.generation != generation || tokio::time::Instant::now() >= snapshot.deadline;
+                            pending = pending_turns.remove(&provider_id);
+                            if expired {
+                                discard_error = Some(anyhow::anyhow!("The pending Codex tool turn expired or belongs to an old connection generation; it was discarded"));
+                            } else {
+                                match validate_tool_followup(pending.as_mut().expect("the matched pending turn was removed"), &turn) {
+                                    Ok(responses) => tool_responses = responses,
+                                    Err(error) => discard_error = Some(error),
+                                }
+                            }
+                        } else if turn.has_assistant_history || !turn.tool_calls.is_empty() || !turn.tool_outputs.is_empty() {
+                            bail!("Tool call history requires a matching live Codex turn from this connection generation");
                         }
+                        false
                     }
-                } else if turn.has_assistant_history || !turn.tool_calls.is_empty() || !turn.tool_outputs.is_empty() {
-                    bail!("Tool call history requires a matching live Codex turn from this connection generation");
+                };
+                if retry_after_cleanup {
+                    drop(generation_guard);
+                    continue;
                 }
-            }
+                break (generation_guard, pending, tool_responses, discard_error);
+            };
             if let Some(error) = discard_error {
                 if let Some(pending) = pending.take() {
                     discard_pending_tool_turn(&servers_ref, &provider_id, pending).await;
@@ -1920,6 +1976,8 @@ impl SubscriptionAdapter for CodexAdapter {
                 request_context: generation_request_context,
                 issued_tool_calls,
                 pending_tool_turns: pending_tool_turns.clone(),
+                pending_tool_cleanup: pending_tool_cleanup.clone(),
+                generation_lock: generation_lock.clone(),
                 started: false,
                 terminal: false,
                 deadline: tokio::time::Instant::now() + GENERATION_TIMEOUT,
@@ -2046,6 +2104,8 @@ impl SubscriptionAdapter for CodexAdapter {
                                 ));
                             }
                             let pending_tool_turns = state.pending_tool_turns.clone();
+                            let pending_tool_cleanup = state.pending_tool_cleanup.clone();
+                            let generation_lock = state.generation_lock.clone();
                             let servers = state.servers.clone();
                             let provider_id = state.provider_id.clone();
                             let helper_instance_id = state.cancellation.helper_instance_id.clone().unwrap_or_default();
@@ -2061,13 +2121,16 @@ impl SubscriptionAdapter for CodexAdapter {
                                             && pending.turn_id == turn_id
                                             && pending.deadline == deadline
                                     }) {
+                                        pending_tool_cleanup.begin(&provider_id);
                                         turns.remove(&provider_id)
                                     } else {
                                         None
                                     }
                                 };
                                 if let Some(expired) = expired {
+                                    let _generation_guard = generation_lock.lock_owned().await;
                                     discard_pending_tool_turn(&servers, &provider_id, expired).await;
+                                    pending_tool_cleanup.finish(&provider_id);
                                 }
                             });
                             state.terminal = true;
@@ -2142,6 +2205,7 @@ impl SubscriptionAdapter for CodexAdapter {
         if supplied.len() != call_ids.len() || supplied.is_empty() {
             return;
         }
+        let pending_tool_cleanup = self.pending_tool_cleanup.clone();
         let pending = {
             let mut turns = self.pending_tool_turns.lock().unwrap();
             let Some(current) = turns.get(provider_id) else { return;
@@ -2154,13 +2218,19 @@ impl SubscriptionAdapter for CodexAdapter {
             if current.generation != generation || outstanding != supplied {
                 return;
             }
+            // Reserve before removing the map entry so a same-account request cannot
+            // mistake the temporarily empty map for an idle helper.
+            pending_tool_cleanup.begin(provider_id);
             turns.remove(provider_id)
         };
         if let Some(pending) = pending {
             let servers = self.servers.clone();
             let provider_id = provider_id.to_owned();
+            let generation_lock = self.generation_lock(&provider_id);
             runtime.spawn(async move {
+                let _generation_guard = generation_lock.lock_owned().await;
                 discard_pending_tool_turn(&servers, &provider_id, pending).await;
+                pending_tool_cleanup.finish(&provider_id);
             });
         }
     }
@@ -5005,6 +5075,89 @@ async fn review_pr40_helper_events_preserve_text_before_tool_requests() {
     }
     println!("REGRESSION PASS event ordering: 24/24 helper text deltas precede tool-call terminal responses");
 }
+#[tokio::test]
+async fn review400_cleanup_must_not_consume_the_next_turn_events() {
+    let home = tempfile::tempdir().unwrap();
+    let script = home.path().join("ordered-cleanup-helper.mjs");
+    let log = home.path().join("ordered-cleanup.log");
+    std::fs::write(&script, r#"
+import { createInterface } from 'node:readline';
+import { appendFileSync } from 'node:fs';
+const log = process.argv[2];
+const record = (direction, value) => appendFileSync(log, JSON.stringify({direction, ...value})+'\n');
+const emit = value => { record('out', value); process.stdout.write(JSON.stringify(value)+'\n'); };
+const result = (id, value) => emit({jsonrpc:'2.0', id, result:value});
+const notify = (method, params) => emit({jsonrpc:'2.0', method, params});
+let nextThread = 0;
+createInterface({ input:process.stdin }).on('line', line => {
+  const request = JSON.parse(line); record('in', request);
+  const p = request.params || {};
+  if (request.method === 'initialize') result(request.id, {userAgent:'review-helper-1.0'});
+  if (request.method === 'thread/start') {
+    const id = `thread-review-${++nextThread}`;
+    result(request.id, {thread:{id}, modelProvider:p.modelProvider});
+  }
+  if (request.method === 'turn/start') {
+    const threadId = p.threadId;
+    const turnId = threadId === 'thread-review-1' ? 'turn-A' : 'turn-B';
+    result(request.id, {turn:{id:turnId}});
+    if (turnId === 'turn-A') setTimeout(() => {
+      for (const key of ['one','two']) emit({jsonrpc:'2.0', id:`rpc-${key}`, method:'item/tool/call', params:{threadId, turnId, callId:`internal-${key}`, tool:'lookup', arguments:{key}}});
+    }, 15);
+    else setTimeout(() => {
+      notify('item/agentMessage/delta', {threadId, turnId, itemId:'message-B', delta:'second-text'});
+      notify('turn/completed', {threadId, turn:{id:turnId, status:'completed'}});
+    }, 40);
+  }
+  if (request.method === 'turn/interrupt') {
+    result(request.id, {});
+    setTimeout(() => notify('turn/completed', {threadId:p.threadId, turn:{id:p.turnId, status:'interrupted'}}), 180);
+  }
+  if (request.method === 'account/logout') result(request.id, {});
+});
+"#).unwrap();
+    let node = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|path| path.join("node"))
+        .find(|path| path.is_file())
+        .unwrap();
+    let adapter = Arc::new(CodexAdapter::with_launch(home.path().to_path_buf(), HelperLaunch {
+        program: node,
+        args: vec![script.to_string_lossy().into(), log.to_string_lossy().into()],
+    }));
+    let store = admitted_gateway_store(&home.path().join("cleanup.db"), adapter.clone(), "http://127.0.0.1:9");
+    let first_body = review_pr40_body(Protocol::Chat, "autojev/model/codex-fixture-binding", true);
+    let response = crate::proxy::forward_test_request(store.clone(), first_body, "chat/completions").await;
+    assert_eq!(response.status().as_u16(), 200);
+    let mut chunks = response.into_body().into_data_stream();
+    let mut wire = String::new();
+    loop {
+        let chunk = chunks.next().await.unwrap().unwrap();
+        wire.push_str(std::str::from_utf8(&chunk).unwrap());
+        if review_pr40_decode_sse(Protocol::Chat, &wire)["choices"][0]["message"]["tool_calls"].as_array().unwrap().len() == 2 { break; }
+    }
+    assert!(!wire.contains("[DONE]"));
+    drop(chunks);
+    let next = tokio::time::timeout(std::time::Duration::from_millis(800), crate::proxy::forward_test_request(
+        store.clone(),
+        json!({"model":"autojev/model/codex-fixture-binding","messages":[{"role":"user","content":"independent next request"}]}),
+        "chat/completions",
+    )).await;
+    let observed = match next {
+        Ok(response) => Some(review_pr40_read(response).await),
+        Err(_) => None,
+    };
+    let events: Vec<Value> = std::fs::read_to_string(&log).unwrap().lines()
+        .map(|line| serde_json::from_str(line).unwrap()).collect();
+    let second_started = events.iter().position(|event| event["direction"] == "in" && event["method"] == "turn/start" && event["params"]["threadId"] == "thread-review-2");
+    let old_cleanup_done = events.iter().position(|event| event["direction"] == "out" && event["method"] == "turn/completed" && event["params"]["turn"]["id"] == "turn-A");
+    let second_completed = events.iter().any(|event| event["direction"] == "out" && event["method"] == "turn/completed" && event["params"]["turn"]["id"] == "turn-B" && event["params"]["turn"]["status"] == "completed");
+    adapter.logout("codex-fixture", 1).await.unwrap();
+    assert!(second_started.is_some(), "the next admitted request should run after cleanup completes");
+    assert!(old_cleanup_done.is_some_and(|old| second_started.is_some_and(|new| old < new)), "the old cleanup must finish before the next turn is dispatched");
+    assert!(second_completed, "the helper should complete the next turn");
+    assert!(observed.as_ref().is_some_and(|(status, body)| *status == 200 && body.contains("second-text")), "cleanup consumed or lost the next turn's events: {observed:?}");
+}
+
 #[tokio::test]
 async fn review_pr40_gateway_loopback_http_three_protocols_tools() {
     for protocol in [Protocol::Chat, Protocol::Responses, Protocol::Messages] {
