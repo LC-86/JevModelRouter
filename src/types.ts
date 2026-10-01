@@ -90,9 +90,10 @@ export interface SubscriptionLogoutView {
   observed_at?: string | null;
 }
 
-/** 官方辅助进程的可用性、版本与专用授权目录。 */
+/** 辅助进程的可用性、自述身份（未验证）、版本与专用授权目录。 */
 export interface SubscriptionHelperView {
   available: boolean;
+  user_agent?: string | null;
   version?: string | null;
   auth_home?: string | null;
 }

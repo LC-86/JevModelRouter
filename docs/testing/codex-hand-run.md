@@ -1,6 +1,6 @@
 # Codex #25 HAND_RUN：真人登录与受控生成核对
 
-**状态：Agent 准备已完成；真实账号、权益和生成结果尚未验证。** 本清单交给 Leo 手动执行并回填。Agent 只用隔离替身验收；不得以替身结果代替真实证据，也不得据此关闭 [#25](https://github.com/LC-86/JevModelRouter/issues/25) 或父票 [#10](https://github.com/LC-86/JevModelRouter/issues/10)。
+**状态：隔离替身上的登录闭环、模型目录读取和额度只读读取已验收；真实账号登录、身份、模型目录和额度尚未人工验证；生成未验收且没有发出真实请求。** 本清单交给 Leo 手动执行并回填。不得以替身结果代替真实证据，也不得据此关闭 [#25](https://github.com/LC-86/JevModelRouter/issues/25) 或父票 [#10](https://github.com/LC-86/JevModelRouter/issues/10)。
 
 ## 0. 这版代码的当前拦截项
 
@@ -10,21 +10,22 @@
 
 - 目录发现项当前仍是 `eligible=false`，不能调用；不得在数据库、UI、测试夹具或报告中手填 `eligible=true`。
 - 能力必须按**具体模型 × 协议**真实核验为 `Verified`。未验证或 unsupported 就停止；不得手动改成 `Verified`。
-- `credits.permission` 当前映射缺口会留下 `Unknown`；额度门禁会拒绝。额度或 credits 为 Unknown、Denied、Failed、Stale，或无法确认额外用量已关闭时，**不点生成测试按钮**。
+- 固定的 Codex `rust-v0.159.0` initialize 响应以 `userAgent` 自述身份，不含 `version` 字段；自述及从规范 `codex_cli_rs/<SemVer>` 提取的版本只供展示，绝不自动提升协议或模型资格。
+- 当前没有可核验的证据证明**整次调用**无法使用额外 credits。0.159 额度响应中的 `hasCredits`、`unlimited` 和 `balance` 不证明整次调用的额外消费限制；即使显示余额，也不能改变准入结论。`credits.permission` 保持 `Unknown` 时额度门禁会拒绝；反复刷新或重新登录无法补足整次调用依据。额度或 credits 为 Unknown、Denied、Failed、Stale，或无法确认额外用量已关闭时，**不点生成测试按钮**。
 - 本地并没有硬性输出 token 上限。Codex 请求白名单拒绝 `max_tokens` / `max_output_tokens`；提示词里的“请简短回答”不是硬上限。取消也不能证明上游已停止计量。测速的 64 KiB 只是本地收集限制。
 - `Providers` 中订阅测试只覆盖 Chat Completions 文本；`Models` 的手动测速每模型固定最多发 3 个流式请求。
 
-因此，按当前已知证据，这票可完成身份和只读状态手测；真实生成矩阵应先记为 **未测／准入阻止**。待资格、能力与 credits 证据通过受审变更真实落地后，再继续第 3 节。此文件不授权绕过上述拦截。
+因此，真实生成矩阵应记为 **未测／准入阻止**。只有资格、能力与整次调用 credits 限制都通过受审变更真实落地后，才可重新评估第 3 节。此文件不授权绕过上述拦截。
 
 ## 1. 登录与只读状态（不生成）
 
 1. 启动本票对应桌面版。点侧栏底部 `Settings` → `About`，记录 AutoJev `v...` 和构建类型；在本票报告中另记录交付时给出的 Git commit。不要把令牌、授权码、完整邮箱或 `~/.codex` 内容贴进报告。
 2. 点侧栏 `Providers`，找到 `Codex subscription` 行，记录行内非秘密账号别名、`generation=...` 和 helper 版本。尚未登录时，点该行 `Sign in`，只在官方授权页完成登录；核对授权前后账号确为预期账号。
 3. 如果登录页主机不是 `auth.openai.com` 或 `chatgpt.com`，先停止并记下主机；不要输入账号密码或批准未知站点。授权完成后，确认行内显示身份且状态是 `connected`。界面若不能证明账号身份，停止。
-4. 点同一行的 `Refresh read-only status`。这一步只读账号、模型目录与额度，不发生成请求。记录模型 id、目录来源/时间、每个额度桶的许可/窗口/时间、credits 原始显示与许可状态。截图只保存在本机脱敏目录，遮盖完整账号与任何 URL 查询参数。
-5. 若需检查退出/换号，先确保没有在途 Agent 请求；通过同一行的 `Sign out` 或 `Switch account` 操作，记录退出后身份、世代、目录与额度清理结果。重新登录时重复第 2–4 步。未获 Leo 确认前不要尝试额外 credits、reset、自动充值、付费设置或账号恢复。
+4. 点同一行的 `Refresh read-only status`。这一步只读账号、模型目录与额度，不发生成请求；只用于记录证据，不能解除当前整次调用 credits 阻塞。记录模型 id、目录来源/时间、每个额度桶的许可/窗口/时间、credits 原始显示与许可状态。截图只保存在本机脱敏目录，遮盖完整账号与任何 URL 查询参数。
+5. 若需检查退出/换号，先确保没有在途 Agent 请求；通过同一行的 `Sign out` 或 `Switch account` 操作，记录退出后身份、世代、目录与额度清理结果。只有确需切换账号才重新登录并重复第 2–4 步；不要为解除 credits 阻塞重复刷新或重新登录。未获 Leo 确认前不要尝试额外 credits、reset、自动充值、付费设置或账号恢复。
 
-**截至本分支交付，以上真实登录/只读项都应标为“未测”**；Agent 没有登录，也没有访问真实额度。
+**真实账号登录、身份、模型目录与额度读取仍标为“未测”**；Agent 没有执行真实登录或访问真实额度。隔离替身上的登录/cancel/迟到回调/隔离，以及模型目录和额度读取已通过；这些只读验收与真实生成验收分开，真实生成仍为“未测／准入阻止”。
 
 ## 2. 每次真实生成前：由 Leo 填并复核
 
@@ -88,5 +89,6 @@ Leo 回填真实结果；Agent 不代填、不补跑。完成手测只更新 #25
 ## 依据
 
 - 父规格 [#10](https://github.com/LC-86/JevModelRouter/issues/10)；人工验收 [#25](https://github.com/LC-86/JevModelRouter/issues/25)。
+- 固定的官方 [`rust-v0.159.0 InitializeResponse` schema](https://github.com/openai/codex/blob/rust-v0.159.0/codex-rs/app-server-protocol/schema/json/v1/InitializeResponse.json)：自述身份字段是 `userAgent`，不含 `version`。
 - Codex App Server 当前官方协议说明：[App Server](https://learn.chatgpt.com/docs/app-server)、[`account/rateLimits/read` 等账号协议](https://github.com/openai/codex/blob/main/codex-rs/app-server-protocol/src/protocol/v2/account.rs)、[turn/interrupt 与 turn 事件协议](https://github.com/openai/codex/blob/main/codex-rs/app-server-protocol/src/protocol/v2/turn.rs)。本清单不调用会消费 reset 的接口。
 - 既有本地证据：[Codex 登录交接](codex-login-handoff.md)、[Codex 目录与额度](codex-catalog-quota.md)。

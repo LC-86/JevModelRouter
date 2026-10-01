@@ -171,7 +171,7 @@ const complete = (loginId, scenario, index) => {
   log({ event: 'notification', method: 'account/login/completed', loginId, success, scenario, attempt: index, error: params.error });
 };
 const handlers = {
-  initialize: () => ({ result: { version: '0.0.0-fictional', codexHome } }),
+  initialize: () => ({ result: { userAgent: 'codex_cli_rs/0.159.0 (Test OS; x86_64) rust', codexHome, platformFamily: 'unix', platformOs: 'macos' } }),
   'account/login/start': params => {
     if (params.type !== 'chatgpt') {
       return { error: { code: -32602, message: 'Invalid request: missing field type' } };

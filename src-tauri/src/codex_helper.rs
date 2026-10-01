@@ -208,6 +208,59 @@ fn looks_like_secret(word: &str) -> bool {
     opaque && mixed
 }
 
+/// Keep the initialize self-report display-only. The version parser deliberately accepts only
+/// a canonical `codex_cli_rs/<semver>` first token; no result here affects protocol/model gates.
+fn helper_self_report(response: &Value) -> (Option<String>, Option<String>) {
+    let raw = response.get("userAgent").and_then(Value::as_str);
+    let version = raw.and_then(parse_user_agent_version);
+    let identity = raw.and_then(|text| {
+        let printable = text.chars().filter(|character| !character.is_control()).collect::<String>();
+        let redacted = redact(printable.trim());
+        (!redacted.is_empty()).then_some(redacted)
+    });
+    (identity, version)
+}
+
+fn parse_user_agent_version(user_agent: &str) -> Option<String> {
+    let token = user_agent.split_ascii_whitespace().next()?;
+    let version = token.strip_prefix("codex_cli_rs/")?;
+    is_semver(version).then(|| version.to_owned())
+}
+
+fn is_semver(version: &str) -> bool {
+    let mut build_parts = version.split('+');
+    let Some(prerelease_and_core) = build_parts.next() else { return false };
+    let build = build_parts.next();
+    if build_parts.next().is_some() || build.is_some_and(|part| !valid_semver_identifiers(part, false)) {
+        return false;
+    }
+    let core = match prerelease_and_core.split_once('-') {
+        Some((core, prerelease)) if valid_semver_identifiers(prerelease, true) => core,
+        Some(_) => return false,
+        None => prerelease_and_core,
+    };
+    let components = core.split('.').collect::<Vec<_>>();
+    components.len() == 3 && components.iter().all(|component| valid_semver_number(component))
+}
+
+fn valid_semver_number(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && (value == "0" || !value.starts_with('0'))
+}
+
+fn valid_semver_identifiers(value: &str, reject_numeric_leading_zero: bool) -> bool {
+    !value.is_empty()
+        && value.split('.').all(|identifier| {
+            !identifier.is_empty()
+                && identifier.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                && (!reject_numeric_leading_zero
+                    || !identifier.bytes().all(|byte| byte.is_ascii_digit())
+                    || identifier == "0"
+                    || !identifier.starts_with('0'))
+        })
+}
+
 /// 递归脱敏 JSON：敏感键整体隐藏，其余字符串走 [`redact`]。
 pub fn redact_json(value: &Value) -> Value {
     match value {
@@ -238,6 +291,7 @@ pub struct CodexAppServer {
     child: Option<Child>,
     stdin: Option<ChildStdin>,
     auth_home: PathBuf,
+    user_agent: Option<String>,
     version: Option<String>,
     next_id: u64,
     pending: Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<std::result::Result<Value, String>>>>>,
@@ -834,6 +888,7 @@ impl CodexAppServer {
             child: Some(child),
             stdin: Some(stdin),
             auth_home,
+            user_agent: None,
             version: None,
             next_id: 0,
             pending,
@@ -848,7 +903,7 @@ impl CodexAppServer {
             "version": env!("CARGO_PKG_VERSION"),
         });
         let initialized = server.call("initialize", json!({ "clientInfo": client_info, "capabilities": {"experimentalApi": true} })).await?;
-        server.version = initialized.get("version").and_then(Value::as_str).map(str::to_owned);
+        (server.user_agent, server.version) = helper_self_report(&initialized);
         server.notify("initialized", json!({})).await?;
         Ok(server)
     }
@@ -953,6 +1008,10 @@ impl CodexAppServer {
         self.version.as_deref()
     }
 
+    pub fn user_agent(&self) -> Option<&str> {
+        self.user_agent.as_deref()
+    }
+
     fn instance_id(&self) -> &str {
         &self.instance_id
     }
@@ -1039,6 +1098,7 @@ struct ActiveLogin {
 
 #[derive(Clone, Default)]
 struct AdapterState {
+    user_agent: Option<String>,
     version: Option<String>,
     auth_home: Option<String>,
 }
@@ -1405,6 +1465,7 @@ impl CodexAdapter {
                 _ => CodexAppServer::start(provider_id, launch).await?,
             };
             *self.state.lock().unwrap() = AdapterState {
+                user_agent: server.user_agent().map(str::to_owned),
                 version: server.version().map(str::to_owned),
                 auth_home: Some(server.auth_home().to_string_lossy().into_owned()),
             };
@@ -1529,7 +1590,12 @@ impl SubscriptionAdapter for CodexAdapter {
 
     fn helper_status(&self) -> HelperStatus {
         let state = self.state.lock().unwrap().clone();
-        HelperStatus { available: self.launch().is_ok(), version: state.version, auth_home: state.auth_home }
+        HelperStatus {
+            available: self.launch().is_ok(),
+            user_agent: state.user_agent,
+            version: state.version,
+            auth_home: state.auth_home,
+        }
     }
 
     fn status<'a>(&'a self, provider_id: &'a str, _generation: u64) -> futures_util::future::BoxFuture<'a, Result<ConnectionStatus>> {
@@ -2736,6 +2802,39 @@ mod tests {
     use futures_util::StreamExt;
     use std::os::unix::fs::PermissionsExt;
 
+    #[test]
+    fn initialize_helper_self_report_is_display_only_and_version_requires_canonical_semver() {
+        let fixture = json!({"userAgent":"codex_cli_rs/0.159.0 (Test OS; x86_64) rust"});
+        let (identity, version) = helper_self_report(&fixture);
+        assert_eq!(identity.as_deref(), Some("codex_cli_rs/0.159.0 (Test OS; x86_64) rust"));
+        assert_eq!(version.as_deref(), Some("0.159.0"));
+
+        for response in [
+            json!({}),
+            json!({"version":"9.9.9"}),
+            json!({"userAgent": null}),
+            json!({"userAgent": 7}),
+        ] {
+            let (identity, version) = helper_self_report(&response);
+            assert!(identity.is_none());
+            assert!(version.is_none());
+        }
+
+        for malformed in [
+            "codex_cli_rs/not-a-version (Test OS)",
+            "codex_cli_rs/0.159 (Test OS)",
+            "codex_cli_rs/00.159.0 (Test OS)",
+            "other_helper/0.159.0 (Test OS)",
+            "codex_cli_rs/0.159.0.1 (Test OS)",
+            "codex_cli_rs/0.159.0- (Test OS)",
+            "codex_cli_rs/0.159.0-+build (Test OS)",
+        ] {
+            let (identity, version) = helper_self_report(&json!({"userAgent": malformed}));
+            assert_eq!(identity.as_deref(), Some(malformed));
+            assert!(version.is_none(), "malformed helper version must remain unknown: {malformed}");
+        }
+    }
+
     /// 只存在于 Rust 单测临时目录的假 Codex 辅助进程：不联网、不读任何真实凭据。
     /// 第一个参数是环境记录文件路径，同时也是只读场景队列的基名（`<base>.catalog` / `<base>.quota`，
     /// 每行一个场景名，依次消费；没有队列文件时走各方法的默认场景）。
@@ -2770,7 +2869,7 @@ while IFS= read -r line; do
   printf '%s\n' "$method" >> "$queue.calls"
   printf '%s\n' "$line" >> "$queue.rpc"
   case "$line" in
-    *'"method":"initialize"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"version":"fixture-helper-1.0","codexHome":"%s"}}\n' "$id" "$CODEX_HOME" ;;
+    *'"method":"initialize"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"userAgent":"codex_cli_rs/0.159.0 (Test OS; x86_64) rust","codexHome":"%s","platformFamily":"unix","platformOs":"macos"}}\n' "$id" "$CODEX_HOME" ;;
     *'"method":"account/read"'*)
       scenario=$(next_scenario "$queue.account")
       case "$scenario" in
@@ -3258,7 +3357,8 @@ done
         let home = tempfile::tempdir().unwrap();
         let log = home.path().join("env.log");
         let mut server = CodexAppServer::start_in(home.path(), "codex-fixture", fixture_launch(home.path(), &log)).await.unwrap();
-        assert_eq!(server.version(), Some("fixture-helper-1.0"));
+        assert_eq!(server.version(), Some("0.159.0"));
+        assert_eq!(server.user_agent(), Some("codex_cli_rs/0.159.0 (Test OS; x86_64) rust"));
         let expected = helper_home_in(home.path(), "codex-fixture");
         assert_eq!(server.auth_home(), expected.as_path());
         assert!(expected.starts_with(home.path().join(".autojev/helpers/codex")));
@@ -3319,7 +3419,8 @@ done
         assert_eq!(start.login_id, "fixture-login-1");
         assert_eq!(start.authorization_url.as_deref(), Some("https://example.invalid/auth"));
         let status = adapter.helper_status();
-        assert_eq!(status.version.as_deref(), Some("fixture-helper-1.0"));
+        assert_eq!(status.user_agent.as_deref(), Some("codex_cli_rs/0.159.0 (Test OS; x86_64) rust"));
+        assert_eq!(status.version.as_deref(), Some("0.159.0"));
         assert!(status.auth_home.as_deref().unwrap_or_default().contains("codex-fixture"));
         let result = adapter.login_result("codex-fixture", 1).await.unwrap();
         assert_eq!(
@@ -4268,6 +4369,56 @@ done
     }
 
     #[tokio::test]
+    async fn unknown_extra_credit_permission_blocks_provider_and_speed_tests_before_helper_dispatch() {
+        let home = tempfile::tempdir().unwrap();
+        let log = home.path().join("unknown-credits-helper.log");
+        let adapter = Arc::new(CodexAdapter::with_launch(
+            home.path().to_path_buf(),
+            fixture_launch(home.path(), &log),
+        ));
+        let store = admitted_gateway_store(
+            home.path().join("unknown-credits.db").as_path(),
+            adapter.clone(),
+            "http://127.0.0.1:9",
+        );
+        store.update(|config| {
+            config.providers.iter_mut().find(|provider| provider.id == "codex-fixture").unwrap().test_model = "codex-fixture-model".into();
+            config.subscriptions.get_mut("codex-fixture").unwrap().evidence.as_mut().unwrap().quota.buckets[0]
+                .credits.as_mut().unwrap().permission = crate::subscription::QuotaPermission::Unknown;
+        }).unwrap();
+
+        let provider_test = crate::test_subscription_target(store.clone(), "codex-fixture", "codex-fixture-model").await.unwrap_err();
+        assert!(provider_test.contains("whole call"), "{provider_test}");
+        let speed_test = crate::performance::probe(&store, "codex-fixture-binding").await.unwrap_err().to_string();
+        assert!(speed_test.contains("whole call"), "{speed_test}");
+
+        let config = store.read();
+        let provider = config.providers.iter().find(|provider| provider.id == "codex-fixture").unwrap().clone();
+        let model = config.models.iter().find(|model| model.id == "codex-fixture-binding").unwrap().clone();
+        let admission_store = store.clone();
+        let admission_provider = provider.clone();
+        let admission_model = model.clone();
+        let generation = adapter.generate(GenerationRequest {
+            provider_id: &provider.id,
+            generation: config.subscriptions["codex-fixture"].generation,
+            model_id: &model.model_id,
+            protocol: Protocol::Chat,
+            body: serde_json::json!({"model":model.model_id,"messages":[{"role":"user","content":"fixture"}]}),
+            pre_dispatch_check: Arc::new(move || {
+                let current = admission_store.read();
+                crate::subscription::admit_model(&current, &admission_model, &admission_provider, Protocol::Chat)
+                    .map(|_| ())
+                    .map_err(|denial| denial.summary())
+            }),
+        }).await.err().expect("unknown credits permission must reject the direct helper generation before dispatch").to_string();
+        assert!(generation.contains("whole call"), "{generation}");
+
+        let calls = std::fs::read_to_string(format!("{}.calls", log.to_string_lossy())).unwrap_or_default();
+        assert!(!calls.lines().any(|method| method == "turn/start"), "denied tests must not start any helper turn: {calls}");
+        assert!(store.request_logs("").unwrap().iter().all(|request| request.status != "success"));
+    }
+
+    #[tokio::test]
     async fn unsaved_subscription_provider_kind_change_is_rejected_before_helper_dispatch() {
         use tauri::Manager;
 
@@ -5104,6 +5255,7 @@ done
         assert_eq!(credits.balance.as_deref(), Some("12.5 credits"));
         assert_eq!(credits.has_credits, Some(true));
         assert_eq!(credits.unlimited, Some(false));
+        assert_eq!(credits.permission, QuotaPermission::Unknown, "the real-shaped balance is not a whole-call extra-credit prohibition");
         assert!(credits.missing_fields.is_empty());
     }
 

@@ -73,7 +73,7 @@ describe('subscription views', () => {
     expect(denialLabel(denied.denial, t)).toBe('未连接');
     expect(denialLabel({ code: 'quota_failed', family: 'quota', message: '', recovery: '' }, t)).toBe('额度读取失败');
     expect(denialLabel({ code: 'extra_usage_allowed', family: 'quota', message: '', recovery: '' }, t)).toBe('上游当前允许使用额外 credits');
-    expect(denialLabel({ code: 'extra_usage_permission_unknown', family: 'quota', message: '', recovery: '' }, t)).toBe('尚未核实上游是否禁止额外 credits');
+    expect(denialLabel({ code: 'extra_usage_permission_unknown', family: 'quota', message: '', recovery: '' }, t)).toBe('没有可核验依据证明整次调用无法使用额外 credits');
     // #17 的四种账号资格拒绝码必须登记文案，否则界面只会显示裸 code。
     expect(denialLabel({ code: 'model_not_discovered', family: 'not_eligible', message: '', recovery: '' }, t)).toBe('当前账号目录中没有该模型');
     expect(denialLabel({ code: 'model_removed', family: 'not_eligible', message: '', recovery: '' }, t)).toBe('上游目录已移除该模型');
@@ -127,6 +127,7 @@ describe('subscription login and logout lifecycle', () => {
     expect(text).toContain('未连接');
     expect(text).toContain('generation=7');
     expect(text).toContain('identity=Unknown');
+    expect(text).toContain('helper_user_agent_unverified=Unknown');
     expect(text).toContain('helper=Unknown');
     expect(text).toContain('auth_home=Unknown');
 
@@ -134,13 +135,14 @@ describe('subscription login and logout lifecycle', () => {
       generation: 12,
       state: 'connected',
       identity: 'fixture@example.invalid',
-      helper: { available: true, version: '0.4.0', auth_home: '/home/fixture/.autojev/helpers/codex/codex' },
+      helper: { available: true, user_agent: 'codex_cli_rs/0.159.0 (Test OS; x86_64) rust', version: '0.159.0', auth_home: '/home/fixture/.autojev/helpers/codex/codex' },
     }), t);
     expect(connected).toContain('state=connected');
     expect(connected).toContain('已连接');
     expect(connected).toContain('generation=12');
     expect(connected).toContain('identity=fixture@example.invalid');
-    expect(connected).toContain('helper=0.4.0');
+    expect(connected).toContain('helper_user_agent_unverified=codex_cli_rs/0.159.0 (Test OS; x86_64) rust');
+    expect(connected).toContain('helper=0.159.0');
     expect(connected).toContain('auth_home=/home/fixture/.autojev/helpers/codex/codex');
     expect(connected).not.toContain('local=');
   });
@@ -178,12 +180,12 @@ describe('subscription login and logout lifecycle', () => {
       denial: null,
       admission_denial: {
         code: 'extra_usage_permission_unknown', family: 'quota',
-        message: 'No evidence extra credits are prohibited.', recovery: 'Refresh read-only evidence.',
+        message: 'No verifiable evidence prevents extra-credit use for the whole call.', recovery: 'Use an API provider until a reviewed integration can verify the whole call.',
       },
     });
     expect(connectionStateLabel(connected.state, t)).toBe('已连接');
-    expect(subscriptionReason(connected, t)).toBe('No evidence extra credits are prohibited. Refresh read-only evidence.');
-    expect(denialLabel(connected.admission_denial, t)).toBe('尚未核实上游是否禁止额外 credits');
+    expect(subscriptionReason(connected, t)).toBe('No verifiable evidence prevents extra-credit use for the whole call. Use an API provider until a reviewed integration can verify the whole call.');
+    expect(denialLabel(connected.admission_denial, t)).toBe('没有可核验依据证明整次调用无法使用额外 credits');
   });
 
   it('derives button availability from the connection state only', () => {

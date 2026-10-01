@@ -571,8 +571,8 @@ fn extra_usage_denial(provider: &Provider, permission: QuotaPermission) -> Optio
         QuotaPermission::Unknown => Some(Denial::new(
             "extra_usage_permission_unknown",
             DenialFamily::Quota,
-            format!("{name} has no current evidence that extra-credit use is prohibited."),
-            "Refresh read-only evidence after confirming extra usage is disabled upstream, or use an API provider.".into(),
+            format!("{name} has no verifiable evidence that the whole call is prevented from using extra credits."),
+            "Use an API provider until a reviewed integration can verify that extra credits cannot be used for the whole call.".into(),
         )),
     }
 }
@@ -1066,6 +1066,8 @@ pub struct LogoutOutcome {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct HelperStatus {
     pub available: bool,
+    #[serde(default)]
+    pub user_agent: Option<String>,
     pub version: Option<String>,
     pub auth_home: Option<String>,
 }
@@ -1123,6 +1125,7 @@ pub struct SubscriptionLogoutView {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct SubscriptionHelperView {
     pub available: bool,
+    pub user_agent: Option<String>,
     pub version: Option<String>,
     pub auth_home: Option<String>,
 }
@@ -2135,6 +2138,14 @@ pub fn views(config: &AppConfig, adapter_available: bool, sessions: &SessionStat
                     } else {
                         None
                     },
+                    user_agent: if supported {
+                        match helper {
+                            Some(helper) => helper.user_agent.clone(),
+                            None => sessions.helper.user_agent.clone(),
+                        }
+                    } else {
+                        None
+                    },
                     auth_home: if supported {
                         match helper {
                             Some(helper) => helper.auth_home.clone(),
@@ -2497,11 +2508,12 @@ mod admission_tests {
             ..QuotaBucket::default()
         };
         config.subscriptions.get_mut(FIXTURE_PROVIDER).unwrap().evidence.as_mut().unwrap().quota.buckets = vec![primary];
-        assert_eq!(
-            admit_model(&config, &model, &provider, Protocol::Chat).unwrap_err().code,
-            "extra_usage_permission_unknown",
-            "a positive credits balance does not prove extra usage is prohibited"
-        );
+        let denial = admit_model(&config, &model, &provider, Protocol::Chat).unwrap_err();
+        assert_eq!(denial.code, "extra_usage_permission_unknown", "a positive credits balance does not prove extra usage is prohibited");
+        assert!(denial.message.contains("whole call"));
+        assert!(denial.recovery.contains("reviewed integration"));
+        assert!(!denial.recovery.to_ascii_lowercase().contains("refresh"));
+        assert!(!denial.recovery.to_ascii_lowercase().contains("sign in"));
         assert!(connection_denial(&config, &provider).is_none());
         assert_eq!(provider_admission_denial(&config, &provider).unwrap().code, "extra_usage_permission_unknown");
 
@@ -2976,6 +2988,7 @@ mod refresh_tests {
         fn helper_status(&self) -> HelperStatus {
             HelperStatus {
                 available: true,
+                user_agent: None,
                 version: Some("fixture-helper-1.0".into()),
                 auth_home: Some("/tmp/fixture-account".into()),
             }
@@ -4540,6 +4553,7 @@ mod lifecycle_tests {
             Arc::new(Self {
                 helper: HelperStatus {
                     available: true,
+                    user_agent: None,
                     version: Some("fixture-helper-1.0".into()),
                     auth_home: Some("/tmp/fixture-helper-home".into()),
                 },
@@ -5158,6 +5172,7 @@ mod lifecycle_tests {
         let mut sessions = SessionState::default();
         sessions.helper = HelperStatus {
             available: true,
+            user_agent: Some("codex_cli_rs/9.9.0".into()),
             version: Some("1.2.3".into()),
             auth_home: Some("/tmp/fixture-helper-home".into()),
         };
@@ -5237,21 +5252,24 @@ mod lifecycle_tests {
         let mut sessions = SessionState::default();
         sessions.helper = HelperStatus {
             available: true,
+            user_agent: Some("codex_cli_rs/9.9.0".into()),
             version: Some("codex-global-9.9".into()),
             auth_home: Some("/tmp/codex-global-home".into()),
         };
         sessions.supported_providers = vec!["codex".into(), "grok".into()];
         sessions.helpers.insert(
             "codex".into(),
-            HelperStatus { available: true, version: Some("codex-1.0".into()), auth_home: Some("/tmp/codex-owned-home".into()) },
+            HelperStatus { available: true, user_agent: Some("codex_cli_rs/1.0.0".into()), version: Some("codex-1.0".into()), auth_home: Some("/tmp/codex-owned-home".into()) },
         );
         // Grok 的自述恒把版本与授权目录留未知：探测不拉起进程，证据不绑定官方版本号。
-        sessions.helpers.insert("grok".into(), HelperStatus { available: true, version: None, auth_home: None });
+        sessions.helpers.insert("grok".into(), HelperStatus { available: true, user_agent: None, version: None, auth_home: None });
         let all = views(&config, true, &sessions);
         let codex = all.iter().find(|view| view.provider_id == "codex").unwrap();
         let grok = all.iter().find(|view| view.provider_id == "grok").unwrap();
         assert_eq!(codex.helper.version.as_deref(), Some("codex-1.0"));
+        assert_eq!(codex.helper.user_agent.as_deref(), Some("codex_cli_rs/1.0.0"));
         assert_eq!(codex.helper.auth_home.as_deref(), Some("/tmp/codex-owned-home"));
+        assert!(grok.helper.user_agent.is_none(), "Grok cannot borrow the Codex self-report");
         assert!(grok.helper.version.is_none(), "Grok 行不得借全局版本：{:?}", grok.helper.version);
         assert!(grok.helper.auth_home.is_none(), "Grok 行不得借全局授权目录：{:?}", grok.helper.auth_home);
         // available 的既有语义不变：条目级值 + supported 守卫。
@@ -5266,6 +5284,7 @@ mod lifecycle_tests {
         let mut sessions = SessionState::default();
         sessions.helper = HelperStatus {
             available: true,
+            user_agent: Some("codex_cli_rs/1.0.0".into()),
             version: Some("legacy-1.0".into()),
             auth_home: Some("/tmp/legacy-home".into()),
         };
@@ -5275,6 +5294,7 @@ mod lifecycle_tests {
         let codex = all.iter().find(|view| view.provider_id == "codex").unwrap();
         let grok = all.iter().find(|view| view.provider_id == "grok").unwrap();
         assert_eq!(codex.helper.version.as_deref(), Some("legacy-1.0"));
+        assert_eq!(codex.helper.user_agent.as_deref(), Some("codex_cli_rs/1.0.0"));
         assert_eq!(codex.helper.auth_home.as_deref(), Some("/tmp/legacy-home"));
         assert!(codex.helper.available);
         assert!(!grok.helper.available && grok.helper.version.is_none() && grok.helper.auth_home.is_none());
@@ -5406,6 +5426,7 @@ mod lifecycle_tests {
         let mut state = SessionState::default();
         state.helper = HelperStatus {
             available: true,
+            user_agent: Some("codex_cli_rs/0.159.0".into()),
             version: Some("fixture-helper-1.0".into()),
             auth_home: Some("/tmp/fixture-helper-home".into()),
         };
