@@ -310,6 +310,7 @@ export async function setCodexRealGenerationEnabled(
   providerId: string,
   enabled: boolean,
   maxCalls: number,
+  expectedConnectionInstanceId: string,
   expectedGeneration: number,
   expectedIdentity: string,
 ): Promise<DashboardSnapshot> {
@@ -318,6 +319,7 @@ export async function setCodexRealGenerationEnabled(
     providerId,
     enabled,
     maxCalls: enabled ? maxCalls : null,
+    expectedConnectionInstanceId,
     expectedGeneration,
     expectedIdentity,
   });

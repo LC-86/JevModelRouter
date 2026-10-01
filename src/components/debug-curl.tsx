@@ -5,7 +5,7 @@ import { cancelDebugCurl, executeDebugCurl, type CurlResult } from '../lib/bridg
 import { parseCurl } from '../lib/debug-curl';
 import { usePreferences } from '../lib/preferences-context';
 
-export function DebugCurl({ initial, port }: { initial: string; port: number }) {
+export function DebugCurl({ initial, port, onRefreshBudgetSnapshot }: { initial: string; port: number; onRefreshBudgetSnapshot: () => Promise<unknown> }) {
   const { t } = usePreferences();
   const [command, setCommand] = useState(initial);
   const [output, setOutput] = useState('');
@@ -37,7 +37,11 @@ export function DebugCurl({ initial, port }: { initial: string; port: number }) 
       });
       if (mounted.current) { setResult(reply); setOutput(reply.body); }
     } catch (e) { if (mounted.current) { setOutput(previous => previous + decoder.decode()); setError(t(String(e))); } }
-    finally { active.current = null; if (mounted.current) { setBusy(false); setStarted(false); } }
+    finally {
+      active.current = null;
+      if (mounted.current) { setBusy(false); setStarted(false); }
+      try { await onRefreshBudgetSnapshot(); } catch { /* Keep the cURL result visible. */ }
+    }
   };
   let display = output;
   if (formatted) { try { display = JSON.stringify(JSON.parse(output), null, 2); } catch { /* SSE and non-JSON remain raw. */ } }
@@ -45,7 +49,7 @@ export function DebugCurl({ initial, port }: { initial: string; port: number }) 
     <section className="panel curl-panel">
       <div className="debug-panel-heading"><h3>{t('cURL request')}</h3><button className="button ghost small" onClick={async () => { try { await navigator.clipboard.writeText(command); setCopied(true); } catch { setError(t('Could not copy request')); } }}><Copy size={14}/>{t(copied ? 'Copied' : 'Copy request')}</button></div>
       <textarea wrap="off" className="curl-editor" aria-label={t('cURL request')} spellCheck={false} autoCapitalize="none" value={command} disabled={busy} onChange={e => { setCommand(e.target.value); setCopied(false); }}/>
-      <div className="curl-toolbar">{busy ? <button className="button ghost" disabled={!started} onClick={() => { if (active.current) void cancelDebugCurl(active.current).catch(e => setError(String(e))); }}><Square size={14}/>{t('Stop')}</button> : <button className="button primary" onClick={() => void run()} disabled={!command.trim()}><Play size={14}/>{t('Execute')}</button>}</div>
+      <div className="curl-toolbar">{busy ? <button className="button ghost" disabled={!started} onClick={() => { if (active.current) void cancelDebugCurl(active.current).finally(() => onRefreshBudgetSnapshot().catch(() => {})).catch(e => setError(String(e))); }}><Square size={14}/>{t('Stop')}</button> : <button className="button primary" onClick={() => void run()} disabled={!command.trim()}><Play size={14}/>{t('Execute')}</button>}</div>
     </section>
     <section className="panel curl-panel">
       <div className="debug-panel-heading"><h3>{t('cURL output')}</h3><label className="curl-format"><input type="checkbox" checked={formatted} onChange={e => setFormatted(e.target.checked)}/>{t('Format JSON')}</label></div>

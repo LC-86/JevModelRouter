@@ -182,6 +182,8 @@ export interface SubscriptionView {
   provider_id: string;
   label: string;
   generation: number;
+  /** Persistent unique identity for this stored connection instance; prevents delete/recreate aliasing. */
+  connection_instance_id: string;
   state: SubscriptionConnectionState;
   /** Leo's explicit, volatile real-generation opt-in for this Codex connection generation. */
   real_generation_enabled?: boolean;

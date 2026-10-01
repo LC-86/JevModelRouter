@@ -225,6 +225,7 @@ async fn set_codex_real_generation_enabled(
     provider_id: String,
     enabled: bool,
     max_calls: Option<u32>,
+    expected_connection_instance_id: String,
     expected_generation: u64,
     expected_identity: String,
 ) -> Result<DashboardSnapshot, String> {
@@ -236,6 +237,7 @@ async fn set_codex_real_generation_enabled(
                 &provider_id,
                 enabled,
                 max_calls,
+                &expected_connection_instance_id,
                 expected_generation,
                 &expected_identity,
             )

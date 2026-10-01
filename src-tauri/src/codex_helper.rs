@@ -5350,7 +5350,7 @@ async fn review_pr44_rename_preserves_spent_budget_for_same_generation() {
     assert_eq!(after.generation, before.generation);
     assert_eq!(after.identity, before.identity);
     crate::set_codex_real_generation_enabled(
-        app.state::<crate::AppState>(), "codex-renamed".into(), true, Some(2), after.generation, after.identity.as_deref().unwrap().to_owned(),
+        app.state::<crate::AppState>(), "codex-renamed".into(), true, Some(2), after.connection_instance_id.clone(), after.generation, after.identity.as_deref().unwrap().to_owned(),
     ).await.unwrap();
     let actual = crate::subscription::codex_real_generation_call_counts(&store.read(), &provider);
     assert_eq!(actual, Some((2, 1)), "renaming must not replenish spent requests for the same account and generation");
@@ -5372,7 +5372,7 @@ async fn review_pr44_failed_login_does_not_replenish_exhausted_budget() {
     assert_eq!(after.identity, before.identity);
     assert_eq!(after.state, crate::subscription::ConnectionState::Connected);
     let rearm = crate::set_codex_real_generation_enabled(
-        app.state::<crate::AppState>(), "codex-fixture".into(), true, Some(1), after.generation, after.identity.as_deref().unwrap().to_owned(),
+        app.state::<crate::AppState>(), "codex-fixture".into(), true, Some(1), after.connection_instance_id.clone(), after.generation, after.identity.as_deref().unwrap().to_owned(),
     ).await;
     assert!(rearm.is_err(), "a failed login attempt cannot renew an exhausted budget in the unchanged generation");
 }
@@ -5418,8 +5418,48 @@ async fn review_pr44_delayed_old_confirmation_cannot_arm_new_generation() {
     app.manage(review_pr44_app_state(store.clone()));
     let result = crate::set_codex_real_generation_enabled(
         app.state::<crate::AppState>(), "codex-fixture".into(), true, Some(3),
-        confirmed.generation, confirmed.identity.as_deref().unwrap().to_owned(),
+        confirmed.connection_instance_id.clone(), confirmed.generation, confirmed.identity.as_deref().unwrap().to_owned(),
     ).await;
     assert!(result.is_err(), "consent for the old snapshot must not arm a different connection generation");
+}
+
+#[tokio::test]
+async fn review_pr44_recreated_connection_same_account_rejects_old_confirmation() {
+    use tauri::Manager;
+    let home = tempfile::tempdir().unwrap();
+    let log = home.path().join("recreated-same-account.log");
+    let adapter = Arc::new(CodexAdapter::with_launch(home.path().to_owned(), fixture_launch(home.path(), &log)));
+    let store = admitted_gateway_store(&home.path().join("config.db"), adapter, "http://127.0.0.1:9");
+    review_pr44_budget(&store, 1, 1);
+    let confirmed = store.read().subscriptions["codex-fixture"].clone();
+    let provider = store.read().providers.iter().find(|provider| provider.id == "codex-fixture").unwrap().clone();
+    let app = tauri::test::mock_app();
+    app.manage(review_pr44_app_state(store.clone()));
+    crate::delete_provider(app.state::<crate::AppState>(), provider.id.clone()).await.unwrap();
+    crate::save_provider(app.state::<crate::AppState>(), provider.clone(), None, None, None, Some(true)).await.unwrap();
+    crate::begin_subscription_login(app.state::<crate::AppState>(), provider.id.clone()).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while store.read().subscriptions[&provider.id].state != crate::subscription::ConnectionState::Connected {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }).await.expect("the isolated helper must finish the recreated fictional login");
+    let recreated = store.read().subscriptions[&provider.id].clone();
+    assert_eq!(recreated.generation, confirmed.generation, "deleting/recreating the provider reuses numeric generation 1");
+    assert_eq!(recreated.identity, confirmed.identity, "the fictional helper reconnects the same account identity");
+    assert_ne!(recreated.connection_instance_id, confirmed.connection_instance_id, "deleting and recreating a connection must issue a fresh instance token");
+
+    // Same account and numeric generation as before deletion: only the instance token distinguishes this connection.
+    let result = crate::set_codex_real_generation_enabled(
+        app.state::<crate::AppState>(),
+        provider.id.clone(),
+        true,
+        Some(1),
+        confirmed.connection_instance_id.clone(),
+        confirmed.generation,
+        confirmed.identity.clone().unwrap(),
+    ).await;
+    let config = store.read();
+    assert!(result.is_err(), "a confirmation captured before deletion must not arm the recreated connection");
+    assert_eq!(crate::subscription::codex_real_generation_call_counts(&config, &provider), None);
 }
 }

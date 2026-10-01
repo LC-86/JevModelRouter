@@ -14,7 +14,7 @@ try {
   fixture.models = [];
   fixture.agents = [];
   fixture.subscriptions = [{
-    provider_id: 'codex-fixture', label: 'Codex', generation: 7, state: 'connected', identity: 'fictional@example.invalid',
+    provider_id: 'codex-fixture', label: 'Codex', generation: 7, connection_instance_id: 'fixture-instance-7', state: 'connected', identity: 'fictional@example.invalid',
     helper_version: 'fixture-1', models: [], capabilities: [], catalog_entries: [],
     quota: { state: 'unknown' }, catalog: { state: 'unknown' }, adapter_available: true,
     real_generation_enabled: true, generation_call_limit: 3, generation_calls_remaining: 3,

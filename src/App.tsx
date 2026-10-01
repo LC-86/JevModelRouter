@@ -13,7 +13,7 @@ import { sortProviders } from './lib/provider-sort';
 import { providerTestError, type ProviderTestStatus } from './lib/provider-test';
 import { providerIdentifier } from './lib/provider-name';
 import { Select } from './components/select';
-import { FormEvent, useEffect, useMemo, useRef, useState } from 'react';
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Activity,
   FilePenLine,
@@ -170,6 +170,11 @@ export default function App() {
     return () => window.removeEventListener('keydown', shortcut);
   }, []);
   const [snapshot, setSnapshot] = useState<DashboardSnapshot | null>(null);
+  const refreshBudgetSnapshot = useCallback(async () => {
+    const current = await getSnapshot();
+    setSnapshot(current);
+    return current;
+  }, []);
   useEffect(() => {
     let disposed=false; let unlisten: (() => void) | undefined;
     void listen<string>('gateway-lifecycle-error', event => { window.alert(event.payload); }).then(fn => { if(disposed)fn();else unlisten=fn; }).catch(() => {});
@@ -325,12 +330,12 @@ export default function App() {
                   const result = await testProvider(id);
                   setProviderTests((previous) => ({ ...previous, [id]: 'success' }));
                   setToast(t(result));
-                  // Subscription tests can spend one confirmed real-generation request; refresh its visible budget.
-                  getSnapshot().then(setSnapshot).catch(() => {});
                 } catch (error) {
                   setProviderTests((previous) => ({ ...previous, [id]: 'error' }));
                   setToast(providerTestError(error, t), true);
-                  getSnapshot().then(setSnapshot).catch(() => {});
+                } finally {
+                  // Any admitted test attempt consumes the shared per-connection count, even when it fails.
+                  try { await refreshBudgetSnapshot(); } catch { /* Keep the test result visible. */ }
                 }
               }}
             />
@@ -340,6 +345,7 @@ export default function App() {
               onNotify={setToast}
               onChange={setSnapshot}
               snapshot={snapshot}
+              onRefreshBudgetSnapshot={refreshBudgetSnapshot}
               onAdd={() => setModelModal({ ...EMPTY_MODEL, provider_id: snapshot.providers.find((provider) => provider.enabled)?.id ?? '' })}
               onEdit={(model) => setModelModal({ ...model })}
               onDelete={(id) => setModelDeleteTarget(snapshot.models.find((model) => model.id === id) ?? null)}
@@ -361,12 +367,12 @@ export default function App() {
             />
           )}
           {page === 'activity' && <TrafficPage key="logs" mode="logs" />}
-          {page === 'debug' && <DebugPage snapshot={snapshot} />}
+          {page === 'debug' && <DebugPage snapshot={snapshot} onRefreshBudgetSnapshot={refreshBudgetSnapshot} />}
           {page === 'usage' && <TrafficPage key="usage" mode="usage" />}
         </div>
       </main>
 
-      {settingsOpen && <SettingsDialog snapshot={snapshot} onChange={setSnapshot} section={settingsSection} onSectionChange={setSettingsSection} onClose={() => setSettingsOpen(false)} update={update} />}
+      {settingsOpen && <SettingsDialog snapshot={snapshot} onChange={setSnapshot} onRefreshBudgetSnapshot={refreshBudgetSnapshot} section={settingsSection} onSectionChange={setSettingsSection} onClose={() => setSettingsOpen(false)} update={update} />}
       {deleteTarget && <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget && !deletingProvider) setDeleteTarget(null); }} onKeyDown={(event) => { if (event.key === 'Escape' && !deletingProvider) setDeleteTarget(null); }}>
         <div className="dialog provider-delete-dialog" role="alertdialog" aria-modal="true" aria-labelledby="delete-provider-title" aria-describedby="delete-provider-description">
           <h2 id="delete-provider-title">{t('Delete provider?')}</h2>
@@ -395,7 +401,7 @@ export default function App() {
       </div>}
       {providerModal && (
         <ProviderDialog
-          onTestStatus={(status) => { if (providerModal.id) setProviderTests((previous) => ({ ...previous, [providerModal.id]: status })); if (status === 'error') getSnapshot().then(setSnapshot).catch(() => {}); }}
+          onTestStatus={async (status) => { if (providerModal.id) setProviderTests((previous) => ({ ...previous, [providerModal.id]: status })); if (status === 'success' || status === 'error') { try { await refreshBudgetSnapshot(); } catch { /* Keep the test result visible. */ } } }}
           initial={providerModal}
           subscriptionTargets={providerModal.id ? subscriptionCatalog(subscriptionView(snapshot, providerModal.id)) : []}
           onClose={() => setProviderModal(null)}
@@ -415,7 +421,7 @@ export default function App() {
       />}
       {modelModal && (
         <ModelDialog
-          onTestStatus={(id, status) => { setProviderTests((previous) => ({ ...previous, [id]: status })); if (status === 'error') getSnapshot().then(setSnapshot).catch(() => {}); }}
+          onTestStatus={async (id, status) => { setProviderTests((previous) => ({ ...previous, [id]: status })); if (status === 'success' || status === 'error') { try { await refreshBudgetSnapshot(); } catch { /* Keep the test result visible. */ } } }}
           initial={modelModal}
           providers={snapshot.providers}
           onClose={() => setModelModal(null)}
@@ -586,6 +592,7 @@ function ProvidersPage({ snapshot, onAdd, onEdit, onDelete, onTest, onImport, on
       return;
     }
     // Capture before showing the modal so the backend can reject consent after an account change.
+    const expectedConnectionInstanceId = currentView?.connection_instance_id ?? '';
     const expectedGeneration = currentView?.generation ?? 0;
     const expectedIdentity = currentView?.identity ?? '';
     const generationKey = `${provider.id}:${currentView?.generation ?? 0}`;
@@ -597,7 +604,7 @@ function ProvidersPage({ snapshot, onAdd, onEdit, onDelete, onTest, onImport, on
     if (enabled && !window.confirm(t('Before enabling real Codex generation, complete the HAND_RUN checklist and confirm the exact model and protocol, fictional input, client-owned tools, total request count, output boundary, possible fees, and allowed steps. This confirmation is limited to {count} AutoJev requests. Failed, cancelled, and client-tool follow-up requests count. The counter is not an upstream billing guarantee. This switch sends no request and does not bypass any admission check; the current 64 KiB collector is not a hard output cap. Continue?', { count: maxCalls }))) return;
     setGenerationBusy((previous) => ({ ...previous, [provider.id]: true }));
     try {
-      onSnapshot(await setCodexRealGenerationEnabled(provider.id, enabled, maxCalls, expectedGeneration, expectedIdentity));
+      onSnapshot(await setCodexRealGenerationEnabled(provider.id, enabled, maxCalls, expectedConnectionInstanceId, expectedGeneration, expectedIdentity));
       onNotify(t(enabled ? 'Real Codex generation armed for this connection.' : 'Real Codex generation disarmed.'));
     } catch (error) {
       onNotify(error instanceof Error ? error.message : String(error), true);
@@ -787,7 +794,7 @@ function ModelTestErrorDialog({ model, detail, onClose, title = 'Model test fail
   </dialog>;
 }
 
-function ModelsPage({ snapshot, onAdd, onEdit, onDelete, onChange, onNotify }: { onNotify: (message: string, error?: boolean) => void; onChange: (snapshot: DashboardSnapshot) => void; snapshot: DashboardSnapshot; onAdd: () => void; onEdit: (m: Model) => void; onDelete: (id: string) => void }) {
+function ModelsPage({ snapshot, onAdd, onEdit, onDelete, onChange, onNotify, onRefreshBudgetSnapshot }: { onNotify: (message: string, error?: boolean) => void; onChange: (snapshot: DashboardSnapshot) => void; onRefreshBudgetSnapshot: () => Promise<DashboardSnapshot>; snapshot: DashboardSnapshot; onAdd: () => void; onEdit: (m: Model) => void; onDelete: (id: string) => void }) {
   const { t } = usePreferences();
   const [health, setHealth] = useState(snapshot.health ?? []);
   const [clearingCooldown, setClearingCooldown] = useState<Record<string, boolean>>({});
@@ -816,7 +823,7 @@ function ModelsPage({ snapshot, onAdd, onEdit, onDelete, onChange, onNotify }: {
     } catch (error) { onNotify(t(String(error instanceof Error ? error.message : error)), true); }
     finally { setClearingCooldown(previous => ({ ...previous, [id]: false })); }
   };
-  const speedTests = useModelSpeedTests();
+  const speedTests = useModelSpeedTests(onRefreshBudgetSnapshot);
   const [dismissedSpeedJob, setDismissedSpeedJob] = useState(false);
   useEffect(() => { if (speedTests.view?.job.running) setDismissedSpeedJob(false); }, [speedTests.view?.job.running]);
   const speedError = speedTests.error || (!speedTests.view?.job.running && !dismissedSpeedJob ? speedTests.view?.job.error : '');
@@ -856,7 +863,8 @@ function ModelsPage({ snapshot, onAdd, onEdit, onDelete, onChange, onNotify }: {
     } catch (error) {
       setTests(previous => ({ ...previous, [model.id]: 'error' }));
       onNotify(providerTestError(error, t), true);
-      try { onChange(await getSnapshot()); } catch { /* Keep the test failure visible. */ }
+    } finally {
+      try { onChange(await onRefreshBudgetSnapshot()); } catch { /* Keep the test result visible. */ }
     }
   };
   return (
@@ -1078,7 +1086,7 @@ function normalizeApiType(value?: string) {
   return value === 'responses' || value === 'messages' ? value : 'chat_completions';
 }
 
-function ProviderDialog({ initial, subscriptionTargets, onClose, onSave, onTestStatus }: { onTestStatus: (status: ProviderTestStatus) => void; initial: Provider; subscriptionTargets: SubscriptionCatalogEntry[]; onClose: () => void; onSave: (p: Provider, key?: string, addTestModel?: boolean) => Promise<void> }) {
+function ProviderDialog({ initial, subscriptionTargets, onClose, onSave, onTestStatus }: { onTestStatus: (status: ProviderTestStatus) => void | Promise<void>; initial: Provider; subscriptionTargets: SubscriptionCatalogEntry[]; onClose: () => void; onSave: (p: Provider, key?: string, addTestModel?: boolean) => Promise<void> }) {
   const { t } = usePreferences();
   const edit = Boolean(initial.id);
   const inferred = PROVIDER_PRESETS.find((p) => p.id === initial.preset)?.id
@@ -1124,15 +1132,15 @@ function ProviderDialog({ initial, subscriptionTargets, onClose, onSave, onTestS
   const test = async () => {
     if (testing || !form.current?.reportValidity()) return;
     if (subscription && providerTypeChanged) {
-      setTestFailed(true); setTestResult(t('Save this provider type and refresh its model catalog before testing.')); onTestStatus('error'); return;
+      setTestFailed(true); setTestResult(t('Save this provider type and refresh its model catalog before testing.')); await onTestStatus('error'); return;
     }
-    if (!provider.test_model.trim()) { setTestFailed(true); setTestResult(t('Enter a test model')); onTestStatus('error'); return; }
-    setTestedFingerprint(''); setTesting(true); setTestResult(''); setTestFailed(false); onTestStatus('testing');
-    try { const result = await testProviderDraft({ ...draft(), id: initial.id || draft().id }, apiKey || undefined); setTestedFingerprint(fingerprint()); if (!edit) setProvider(previous => ({ ...previous, enabled: true })); setTestResult(t(result)); onTestStatus('success'); }
+    if (!provider.test_model.trim()) { setTestFailed(true); setTestResult(t('Enter a test model')); await onTestStatus('error'); return; }
+    setTestedFingerprint(''); setTesting(true); setTestResult(''); setTestFailed(false); await onTestStatus('testing');
+    try { const result = await testProviderDraft({ ...draft(), id: initial.id || draft().id }, apiKey || undefined); setTestedFingerprint(fingerprint()); if (!edit) setProvider(previous => ({ ...previous, enabled: true })); setTestResult(t(result)); await onTestStatus('success'); }
     catch (error) {
       setTestFailed(true);
       setTestResult(providerTestError(error, t));
-      onTestStatus('error');
+      await onTestStatus('error');
     }
     finally { setTesting(false); }
   };
@@ -1165,7 +1173,7 @@ function ProviderDialog({ initial, subscriptionTargets, onClose, onSave, onTestS
   </div>;
 }
 
-function ModelDialog({ initial, providers, onClose, onSave, onTestStatus }: { onTestStatus: (id: string, status: ProviderTestStatus) => void; initial: Model; providers: Provider[]; onClose: () => void; onSave: (m: Model) => Promise<void> }) {
+function ModelDialog({ initial, providers, onClose, onSave, onTestStatus }: { onTestStatus: (id: string, status: ProviderTestStatus) => void | Promise<void>; initial: Model; providers: Provider[]; onClose: () => void; onSave: (m: Model) => Promise<void> }) {
   const { t } = usePreferences();
   const enabledProviders = providers.filter((provider) => provider.enabled);
   const initialProvider = enabledProviders.find((p) => p.id === initial.provider_id);
@@ -1188,11 +1196,11 @@ function ModelDialog({ initial, providers, onClose, onSave, onTestStatus }: { on
   };
   const test = async () => {
     if (testing || !form.current?.reportValidity() || !provider) return;
-    setTesting(true); setResult(''); setFailed(false); onTestStatus(provider.id, 'testing');
+    setTesting(true); setResult(''); setFailed(false); await onTestStatus(provider.id, 'testing');
     try {
       const testResult = await testProviderDraft({ ...provider, api_type: isSubscriptionProvider(provider) ? '' : model.api_type, test_model: model.model_id.trim() });
-      setResult(t(testResult)); onTestStatus(provider.id, 'success');
-    } catch (error) { setFailed(true); setResult(providerTestError(error, t)); onTestStatus(provider.id, 'error'); }
+      setResult(t(testResult)); await onTestStatus(provider.id, 'success');
+    } catch (error) { setFailed(true); setResult(providerTestError(error, t)); await onTestStatus(provider.id, 'error'); }
     finally { setTesting(false); }
   };
   return <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget && !testing && !saving) onClose(); }}>

@@ -809,6 +809,7 @@
     check(signedIn.identity === 'standin-success@example.invalid', `The controlled directory needs a verified stand-in account: ${signedIn.identity}`);
     await invoke('set_codex_real_generation_enabled', {
       providerId, enabled: true, maxCalls: 15,
+      expectedConnectionInstanceId: signedIn.connection_instance_id,
       expectedGeneration: signedIn.generation, expectedIdentity: signedIn.identity,
     });
     const armed = await view();
@@ -1004,6 +1005,7 @@
     check(reconnected.identity === signedIn.identity, `The switched sign-in must verify the stand-in account: ${reconnected.identity}`);
     await invoke('set_codex_real_generation_enabled', {
       providerId, enabled: true, maxCalls: 15,
+      expectedConnectionInstanceId: reconnected.connection_instance_id,
       expectedGeneration: reconnected.generation, expectedIdentity: reconnected.identity,
     });
     const rearmedAfterSwitch = await view();

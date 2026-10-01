@@ -16,7 +16,7 @@ const t = (message: string, values?: Record<string, string | number>) => transla
 
 function view(patch: Partial<SubscriptionView> = {}): SubscriptionView {
   return {
-    provider_id: 'codex', label: 'Codex', generation: 1, state: 'not_connected', identity: null,
+    provider_id: 'codex', label: 'Codex', generation: 1, connection_instance_id: 'fixture-instance', state: 'not_connected', identity: null,
     models: [], capabilities: [], quota: { state: 'unknown' }, denial: null, adapter_available: false,
     ...patch,
   };

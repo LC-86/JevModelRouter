@@ -17,6 +17,8 @@ pub const DEV_PORT: u16 = 9526;
 /// including attempts that later fail or are cancelled.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CodexRealGenerationGrant {
+    /// Persistent connection instance this volatile grant belongs to.
+    pub connection_instance_id: String,
     pub generation: u64,
     /// The verified account identity shown when the user confirmed this finite window.
     pub identity: String,
@@ -558,9 +560,22 @@ mod storage_tests {
         let round_trip: AppConfig = serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
         assert_eq!(round_trip.subscriptions.len(), 1);
         assert_eq!(round_trip.subscriptions["codex"].generation, 1);
+        assert_eq!(round_trip.subscriptions["codex"].connection_instance_id, saved.subscriptions["codex"].connection_instance_id);
         assert_eq!(round_trip.subscriptions["codex"].state, crate::subscription::ConnectionState::NotConnected);
         assert_eq!(round_trip.providers[0].kind, ProviderKind::Openrouter);
         assert_eq!(round_trip.models.len(), saved.models.len());
+
+        // Pre-token configurations receive a local unique connection token at load time.
+        let legacy_connection = serde_json::json!({
+            "generation": 1,
+            "state": "not_connected",
+            "identity": null,
+            "evidence": null
+        });
+        let upgraded: crate::subscription::Connection = serde_json::from_value(legacy_connection.clone()).unwrap();
+        let upgraded_again: crate::subscription::Connection = serde_json::from_value(legacy_connection).unwrap();
+        assert!(!upgraded.connection_instance_id.is_empty());
+        assert_ne!(upgraded.connection_instance_id, upgraded_again.connection_instance_id);
 
         // 未知的服务商类型仍然整库拒绝，不会被静默降级成 API 服务商。
         let mut unknown = serde_json::to_value(AppConfig::default()).unwrap();
@@ -574,6 +589,7 @@ mod storage_tests {
         config.codex_real_generation_grants.insert(
             "codex".into(),
             CodexRealGenerationGrant {
+                connection_instance_id: "fixture-connection".into(),
                 generation: 7,
                 identity: "fixture@example.invalid".into(),
                 max_calls: 3,
