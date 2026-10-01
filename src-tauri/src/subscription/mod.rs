@@ -708,6 +708,9 @@ pub struct GenerationRequest<'a> {
 pub enum GenerationEvent {
     Started { generation: u64 },
     Chunk(String),
+    /// Client-owned function calls. This is terminal for the current HTTP response; callers run
+    /// these tools and submit their matching results in a subsequent request.
+    ToolCalls { calls: Vec<crate::codex_helper::ClientToolCall> },
     Finished { status: u16 },
     /// The helper completed at an API-visible limit that callers need to preserve.
     #[allow(dead_code)]

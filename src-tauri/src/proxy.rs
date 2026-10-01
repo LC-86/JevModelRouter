@@ -16,8 +16,8 @@ use tower_http::{cors::CorsLayer, trace::TraceLayer};
 
 use crate::{
     config::{ConfigStore, Model, Provider, ProviderKind, RouteEvent},
-    router::{decide, ResolvedRoute, RoutePreviewInput},
     protocol::{self, Protocol},
+    router::{decide, ResolvedRoute, RoutePreviewInput},
 };
 
 #[derive(Clone)]
@@ -62,13 +62,11 @@ pub async fn start(store: Arc<ConfigStore>) -> anyhow::Result<ProxyHandle> {
         health: circuit_health.clone(),
         store,
         client,
-        sessions: Arc::new(Mutex::new(HashMap::new())),
-    };
+        sessions: Arc::new(Mutex::new(HashMap::new())) };
     let cors = CorsLayer::new()
         .allow_origin([
             "http://localhost".parse::<HeaderValue>()?,
-            "tauri://localhost".parse::<HeaderValue>()?,
-        ])
+            "tauri://localhost".parse::<HeaderValue>()?])
         .allow_methods([Method::GET, Method::POST])
         .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE, header::ACCEPT]);
     let paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -96,8 +94,7 @@ pub async fn start(store: Arc<ConfigStore>) -> anyhow::Result<ProxyHandle> {
     Ok(ProxyHandle {
         port,
         health: circuit_health, task, paused,
-        shutdown: Some(shutdown_tx),
-    })
+        shutdown: Some(shutdown_tx) })
 }
 
 fn paused_response() -> Response {
@@ -128,16 +125,15 @@ fn rejected_request(context: &ProxyContext, headers: &HeaderMap, endpoint: &str,
 async fn chat_completions(
     State(context): State<ProxyContext>,
     headers: HeaderMap,
-    body: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
-) -> Response {
-    let body = match body { Ok(Json(body)) => body, Err(error) => return rejected_request(&context, &headers, "chat/completions", error) };
+    body: Result<Json<Value>, axum::extract::rejection::JsonRejection>) -> Response {
+    let body = match body { Ok(Json(body)) => body, Err(error) => return rejected_request(&context, &headers, "chat/completions", error),
+    };
     forward(
         context,
         headers,
         body,
         "/v1/chat/completions",
-        "chat/completions",
-    )
+        "chat/completions")
     .await
 }
 
@@ -146,7 +142,8 @@ async fn gemini(
     axum::extract::Path(operation): axum::extract::Path<String>,
     headers: HeaderMap, body: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    let body = match body { Ok(Json(body)) => body, Err(error) => return rejected_request(&context, &headers, &format!("v1beta/models/{operation}"), error) };
+    let body = match body { Ok(Json(body)) => body, Err(error) => return rejected_request(&context, &headers, &format!("v1beta/models/{operation}"), error),
+    };
     let mut metadata = json!({});
     metadata["model"] = json!(operation.rsplit_once(':').map(|(m,_)|m).unwrap_or(""));
     metadata["stream"] = json!(operation.ends_with(":streamGenerateContent"));
@@ -175,10 +172,12 @@ async fn gemini_captured(context: ProxyContext, operation: String, headers: Head
     };
     let converted = serde_json::from_slice(&bytes).map_err(anyhow::Error::from).and_then(|v|crate::gemini_bridge::response(&v));
     match converted {
-        Ok(v) if action=="streamGenerateContent" => (
+        Ok(v) if action=="streamGenerateContent" => {
+            (
             [(header::CONTENT_TYPE,"text/event-stream"),(header::CACHE_CONTROL,"no-cache")],
             format!("data: {}\n\n",v)
-        ).into_response(),
+        ).into_response()
+        }
         Ok(v)=>Json(v).into_response(),
         Err(_)=>error_response(StatusCode::BAD_GATEWAY,"Invalid upstream completion"),
     }
@@ -187,18 +186,18 @@ async fn gemini_captured(context: ProxyContext, operation: String, headers: Head
 async fn responses(
     State(context): State<ProxyContext>,
     headers: HeaderMap,
-    body: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
-) -> Response {
-    let body = match body { Ok(Json(body)) => body, Err(error) => return rejected_request(&context, &headers, "responses", error) };
+    body: Result<Json<Value>, axum::extract::rejection::JsonRejection>) -> Response {
+    let body = match body { Ok(Json(body)) => body, Err(error) => return rejected_request(&context, &headers, "responses", error),
+    };
     forward(context, headers, body, "/v1/responses", "responses").await
 }
 
 async fn messages(
     State(context): State<ProxyContext>,
     headers: HeaderMap,
-    body: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
-) -> Response {
-    let body = match body { Ok(Json(body)) => body, Err(error) => return rejected_request(&context, &headers, "messages", error) };
+    body: Result<Json<Value>, axum::extract::rejection::JsonRejection>) -> Response {
+    let body = match body { Ok(Json(body)) => body, Err(error) => return rejected_request(&context, &headers, "messages", error),
+    };
     forward(context, headers, body, "/v1/messages", "messages").await
 }
 
@@ -207,8 +206,7 @@ async fn forward(
     headers: HeaderMap,
     body: Value,
     _upstream_path: &str,
-    endpoint: &str,
-) -> Response {
+    endpoint: &str) -> Response {
     let capture = crate::traffic::Capture::new(endpoint, &body, &headers);
     let store = context.store.clone();
     let response = forward_captured(context, headers, body, endpoint, capture.clone()).await;
@@ -219,8 +217,7 @@ async fn forward(
 pub(crate) async fn forward_test_request(
     store: Arc<ConfigStore>,
     body: Value,
-    endpoint: &str,
-) -> Response {
+    endpoint: &str) -> Response {
     let client = match store.read().gateway.client() {
         Ok(client) => client,
         Err(error) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
@@ -238,8 +235,7 @@ pub(crate) async fn forward_test_request(
 pub(crate) async fn gemini_test_request(
     store: Arc<ConfigStore>,
     operation: &str,
-    body: Value,
-) -> Response {
+    body: Value) -> Response {
     let client = match store.read().gateway.client() {
         Ok(client) => client,
         Err(error) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
@@ -265,7 +261,8 @@ async fn forward_captured(context: ProxyContext, headers: HeaderMap, body: Value
 }
 
 async fn forward_captured_with_subscription_policy(context: ProxyContext, headers: HeaderMap, body: Value, endpoint: &str,
-    capture: crate::traffic::SharedCapture, allow_subscription_protocol: bool) -> Response {
+    capture: crate::traffic::SharedCapture, allow_subscription_protocol: bool,
+) -> Response {
     let config = context.store.read();
     let canonical = crate::router::normalize_requested_model(&config, body["model"].as_str()).ok().flatten().unwrap_or_default();
     let mut binding = canonical.strip_prefix("autojev/").unwrap_or("").to_owned();
@@ -274,7 +271,9 @@ async fn forward_captured_with_subscription_policy(context: ProxyContext, header
         if let Some(entry) = config.agent_catalogs.get(agent).and_then(|c|c.iter().find(|e| e.id == body["model"].as_str().unwrap_or(""))) {binding = entry.binding.clone();}
     }
     let attempts = config.routes.iter().find(|r| r.id == binding && r.enabled && matches!(r.strategy.as_str(), "round_robin" | "jev"))
-        .map_or(1, |r| config.models.iter().filter(|m| m.selected && crate::router::rule_includes_model(&config, r, m) && m.enabled && config.providers.iter().any(|p|p.id == m.provider_id && p.enabled)).count().max(1));
+        .map_or(1, |r| {
+            config.models.iter().filter(|m| m.selected && crate::router::rule_includes_model(&config, r, m) && m.enabled && config.providers.iter().any(|p|p.id == m.provider_id && p.enabled)).count().max(1)
+        });
     let attempts = attempts.min(config.gateway.max_attempts);
     let mut tried = std::collections::HashSet::new();
     let mut last_response = None;
@@ -283,7 +282,8 @@ async fn forward_captured_with_subscription_policy(context: ProxyContext, header
         let mut lease = None;
         let mut allow_retry = true;
         let started = std::time::Instant::now();
-        let mut response = forward_attempt(context.clone(), headers.clone(), body.clone(), endpoint, capture.clone(), &mut tried, &mut lease, &mut allow_retry, allow_subscription_protocol).await;
+        let mut response = forward_attempt(context.clone(), headers.clone(), body.clone(), endpoint, capture.clone(), &mut tried, &mut lease, &mut allow_retry, allow_subscription_protocol,
+        ).await;
         if tried.len() == before && last_response.is_some() {return last_response.unwrap();}
         let status = response.status().as_u16();
         if let Some(lease) = lease {
@@ -317,7 +317,8 @@ fn request_compatible(body: &Value, source: Protocol, model: &crate::config::Mod
 }
 
 async fn forward_attempt(context: ProxyContext, headers: HeaderMap, body: Value, endpoint: &str,
-    capture: crate::traffic::SharedCapture, tried: &mut std::collections::HashSet<String>, lease: &mut Option<crate::resilience::Lease>, allow_retry: &mut bool, allow_subscription_protocol: bool) -> Response {
+    capture: crate::traffic::SharedCapture, tried: &mut std::collections::HashSet<String>, lease: &mut Option<crate::resilience::Lease>, allow_retry: &mut bool, allow_subscription_protocol: bool,
+) -> Response {
     let mut input = inspect_request(&body, endpoint);
     if let Some(binding) = headers.get("x-autojev-binding").and_then(|v| v.to_str().ok()) {
         input.requested_model = Some(format!("autojev/{binding}"));
@@ -370,8 +371,10 @@ async fn forward_attempt(context: ProxyContext, headers: HeaderMap, body: Value,
     let pinned = binding.and_then(|id| id.strip_prefix("model/")).map(str::to_owned);
     let denied: std::collections::HashSet<String> = config.models.iter()
         .filter(|model| Some(&model.id) != pinned.as_ref())
-        .filter(|model| config.providers.iter().find(|provider| provider.id == model.provider_id)
-            .is_some_and(|_provider| !crate::subscription::generation_ready(&config, model, source)))
+        .filter(|model| {
+            config.providers.iter().find(|provider| provider.id == model.provider_id)
+            .is_some_and(|_provider| !crate::subscription::generation_ready(&config, model, source))
+        })
         .map(|model| model.id.clone())
         .collect();
     config.models.retain(|model| !denied.contains(&model.id));
@@ -379,8 +382,10 @@ async fn forward_attempt(context: ProxyContext, headers: HeaderMap, body: Value,
     // 先按绑定定下作用域内的模型 ID，再改动 config.models：避免同时借用配置的冲突。
     let scoped_ids: Option<std::collections::HashSet<String>> = match binding {
         Some(id) if id.starts_with("model/") => Some(std::iter::once(id.trim_start_matches("model/").to_owned()).collect()),
-        Some(id) => config.routes.iter().find(|r|r.id==id).map(|r| config.models.iter()
-            .filter(|m| crate::router::rule_includes_model(&config, r, m)).map(|m|m.id.clone()).collect()),
+        Some(id) => config.routes.iter().find(|r|r.id==id).map(|r| {
+            config.models.iter()
+            .filter(|m| crate::router::rule_includes_model(&config, r, m)).map(|m|m.id.clone()).collect()
+        }),
         None => None,
     };
     config.models.retain(|model| {
@@ -388,7 +393,7 @@ async fn forward_attempt(context: ProxyContext, headers: HeaderMap, body: Value,
         let Some(provider)=config.providers.iter().find(|p|p.id==model.provider_id) else { return false; };
         match request_compatible(&body,source,model,provider) {
             Ok(()) => true,
-            Err(error) => {conversion_error=Some(error.to_string());false},
+            Err(error) => {conversion_error=Some(error.to_string());false}
         }
     });
     if let Some(error)=conversion_error {
@@ -436,9 +441,7 @@ async fn forward_attempt(context: ProxyContext, headers: HeaderMap, body: Value,
                 }
                 route
             }
-            Err(error) => {
-                return error_response(StatusCode::UNPROCESSABLE_ENTITY, &error.to_string())
-            }
+            Err(error) => return error_response(StatusCode::UNPROCESSABLE_ENTITY, &error.to_string()),
         },
     };
 
@@ -450,6 +453,12 @@ async fn forward_attempt(context: ProxyContext, headers: HeaderMap, body: Value,
         if !allow_subscription_protocol {
             return protocol_error_response(StatusCode::UNPROCESSABLE_ENTITY, source,
                 "Gemini protocol is not supported by subscription providers.");
+        }
+        if resolved.provider.kind == ProviderKind::CodexSubscription
+            && body.get("tools").and_then(Value::as_array).is_some_and(|tools| !tools.is_empty())
+            && !resolved.model.supports_tools
+        {
+            return protocol_error_response(StatusCode::FORBIDDEN, source, "Codex client function tools have not been verified for this model; tool calls remain unavailable.");
         }
     }
     if let Err(denial) = crate::subscription::admit_model(&config, &resolved.model, &resolved.provider, source) {
@@ -470,19 +479,18 @@ async fn forward_attempt(context: ProxyContext, headers: HeaderMap, body: Value,
             return protocol_error_response(StatusCode::NOT_IMPLEMENTED, source,
                 "Generation through this subscription provider is not implemented.");
         }
+        let Some(connection) = config.subscriptions.get(&resolved.provider.id) else {
+            return protocol_error_response(StatusCode::PRECONDITION_REQUIRED, source, "The subscription connection changed before dispatch.");
+        };
+        let generation = connection.generation;
         let validation = match resolved.provider.kind {
-            ProviderKind::CodexSubscription => crate::codex_helper::validate_generation_request(source, &body),
+            ProviderKind::CodexSubscription => crate::codex_helper::validate_generation_request(source, &body, generation),
             ProviderKind::GrokSubscription => crate::subscription::grok::validate_generation_request(source, &body, &resolved.model.model_id),
             _ => unreachable!(),
         };
         if let Err(error) = validation {
             return protocol_error_response(StatusCode::UNPROCESSABLE_ENTITY, source, &error.to_string());
         }
-        let Some(connection) = config.subscriptions.get(&resolved.provider.id) else {
-            return protocol_error_response(StatusCode::PRECONDITION_REQUIRED, source,
-                "The subscription connection changed before dispatch.");
-        };
-        let generation = connection.generation;
         let identity = connection.identity.clone();
         let pre_dispatch_check = codex_admission_check(
             resolved.provider.kind.clone(),
@@ -498,8 +506,7 @@ async fn forward_attempt(context: ProxyContext, headers: HeaderMap, body: Value,
         let request_metadata = capture.lock().unwrap().log.clone();
         let response = codex_subscription_response(
             &context, &resolved.provider, &resolved.model, generation, source, body, streaming,
-            &resolved.decision.source, pre_dispatch_check, capture,
-        ).await;
+            &resolved.decision.source, pre_dispatch_check, capture).await;
         let _ = context.store.add_event(RouteEvent {
             id: request_metadata.id,
             created_at: request_metadata.created_at,
@@ -538,7 +545,8 @@ async fn forward_attempt(context: ProxyContext, headers: HeaderMap, body: Value,
         let Some(key) = context.store.read_secret(&account) else {
             return (StatusCode::PRECONDITION_REQUIRED, Json(source.error(&format!(
                 "{} requires an API key. Add it in AutoJev → Providers.", resolved.provider.name
-            )))).into_response();
+            ))),
+            ).into_response();
         };
         request = if target == Protocol::Messages { request.header("x-api-key", key) } else { request.bearer_auth(key) };
     }
@@ -556,22 +564,20 @@ async fn forward_attempt(context: ProxyContext, headers: HeaderMap, body: Value,
     }
 
     let upstream = match tokio::time::timeout(std::time::Duration::from_secs(config.gateway.response_timeout_seconds), context.store.dispatcher.send(crate::dispatch::Target {
-        provider: &resolved.provider, model_id: &resolved.model.model_id, protocol: target,
-    }, request)).await {
+        provider: &resolved.provider, model_id: &resolved.model.model_id, protocol: target }, request),
+    ).await {
         Ok(Ok(response)) => response,
         Err(_) => return error_response(StatusCode::GATEWAY_TIMEOUT, "Upstream response timed out"),
-        Ok(Err(error)) => {
-            return error_response(
+        Ok(Err(error)) => return error_response(
                 StatusCode::BAD_GATEWAY,
-                &format!("Could not reach {}: {error}", resolved.provider.name),
-            )
-        }
+                &format!("Could not reach {}: {error}", resolved.provider.name)),
     };
     let status = upstream.status();
     let response_headers = upstream.headers().clone();
     let success = status.is_success();
     capture.lock().unwrap().upstream(target, response_headers.get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok()).is_some_and(|v| v.starts_with("text/event-stream")));
+        .and_then(|v| v.to_str().ok()).is_some_and(|v| v.starts_with("text/event-stream")),
+    );
 
     let request_metadata = capture.lock().unwrap().log.clone();
     let _ = context.store.add_event(RouteEvent {
@@ -618,7 +624,8 @@ async fn forward_attempt(context: ProxyContext, headers: HeaderMap, body: Value,
             }
             return builder.header(header::CONTENT_TYPE, "text/event-stream")
                 .header(header::CACHE_CONTROL, "no-cache")
-                .body(Body::from_stream(protocol::converted_stream_observed(crate::traffic::observe(timed_stream(upstream.bytes_stream(), config.gateway.stream_idle_seconds), capture.clone()), target, source, resolved.model.model_id, tool_map, { let capture = capture.clone(); move || capture.lock().unwrap().log.error = "Response conversion failed".into() }))).unwrap();
+                .body(Body::from_stream(protocol::converted_stream_observed(crate::traffic::observe(timed_stream(upstream.bytes_stream(), config.gateway.stream_idle_seconds), capture.clone()), target, source, resolved.model.model_id, tool_map, { let capture = capture.clone(); move || capture.lock().unwrap().log.error = "Response conversion failed".into() },
+                ))).unwrap();
         }
         let converted = match read_upstream_json(upstream, capture.clone(), config.gateway.stream_idle_seconds).await.and_then(|body|
             protocol::convert_response(&body, target, source, &resolved.model.model_id, &tool_map)) {
@@ -636,14 +643,12 @@ async fn forward_attempt(context: ProxyContext, headers: HeaderMap, body: Value,
                     builder=builder.status(StatusCode::from_u16(code).unwrap());
                 }
                 builder.header(header::CONTENT_TYPE,"application/json").body(Body::from(body.to_string())).unwrap()
-            },
-            Err(_)=>error_response(StatusCode::BAD_GATEWAY,"Upstream returned invalid JSON or the response body timed out")
+            }
+            Err(_)=>error_response(StatusCode::BAD_GATEWAY,"Upstream returned invalid JSON or the response body timed out"),
         };
     }
     let stream = crate::traffic::observe(timed_stream(upstream.bytes_stream(), config.gateway.stream_idle_seconds), capture).map(|chunk| chunk.map_err(std::io::Error::other));
-    builder.body(Body::from_stream(stream)).unwrap_or_else(|_| {
-        error_response(StatusCode::INTERNAL_SERVER_ERROR, "Could not construct upstream response")
-    })
+    builder.body(Body::from_stream(stream)).unwrap_or_else(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "Could not construct upstream response"))
 }
 
 const MAX_CODEX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
@@ -690,8 +695,7 @@ fn codex_text_completion(
     protocol: Protocol,
     model: &str,
     output: &str,
-    finish_reason: Option<crate::subscription::GenerationFinishReason>,
-) -> Value {
+    finish_reason: Option<crate::subscription::GenerationFinishReason>) -> Value {
     let suffix = uuid::Uuid::new_v4().simple().to_string();
     let created = chrono::Utc::now().timestamp();
     match protocol {
@@ -722,6 +726,39 @@ fn codex_text_completion(
             "stop_sequence": null
         }),
     }
+}
+
+fn codex_tool_completion(protocol: Protocol, model: &str, output: &str, calls: &[crate::codex_helper::ClientToolCall]) -> anyhow::Result<Value> {
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let created = chrono::Utc::now().timestamp();
+    Ok(match protocol {
+        Protocol::Chat => json!({
+            "id":format!("chatcmpl-{suffix}"), "object":"chat.completion", "created":created, "model":model,
+            "choices":[{"index":0,"message":{"role":"assistant","content":if output.is_empty(){Value::Null}else{output.into()},
+                "tool_calls":calls.iter().map(|call|json!({"id":call.id,"type":"function","function":{"name":call.name,"arguments":call.arguments}})).collect::<Vec<_>>()},"finish_reason":"tool_calls"}]
+        }),
+        Protocol::Responses => {
+            let mut items = Vec::new();
+            if !output.is_empty() {
+                items.push(json!({"id":format!("msg_{suffix}"),"type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":output,"annotations":[]}]}));
+            }
+            for (index, call) in calls.iter().enumerate() {
+                items.push(json!({"id":format!("fc_{suffix}_{index}"),"type":"function_call","status":"completed","call_id":call.id,"name":call.name,"arguments":call.arguments}));
+            }
+            json!({"id":format!("resp_{suffix}"),"object":"response","created_at":created,"status":"completed","error":null,"incomplete_details":null,"model":model,"output":items})
+        }
+        Protocol::Messages => {
+            let mut content = Vec::new();
+            if !output.is_empty() {
+                content.push(json!({"type":"text","text":output}));
+            }
+            for call in calls {
+                let input: Value = serde_json::from_str(&call.arguments)?;
+                content.push(json!({"type":"tool_use","id":call.id,"name":call.name,"input":input}));
+            }
+            json!({"id":format!("msg_{suffix}"),"type":"message","role":"assistant","model":model,"content":content,"stop_reason":"tool_use","stop_sequence":null})
+        }
+    })
 }
 
 fn subscription_generation_label(kind: &ProviderKind) -> &'static str {
@@ -769,26 +806,66 @@ async fn codex_subscription_response(
             }),
         ).await {
             Ok(Ok(events)) => events,
-            Ok(Err(_)) => return codex_json_response(StatusCode::BAD_GATEWAY, protocol,
-                model, route_source, protocol.error(&format!("Could not start {provider_label} generation.")), capture),
-            Err(_) => return codex_json_response(StatusCode::GATEWAY_TIMEOUT, protocol,
-                model, route_source, protocol.error(&format!("{provider_label} did not start generation before the gateway timeout.")), capture),
+            Ok(Err(_)) => {
+                return codex_json_response(StatusCode::BAD_GATEWAY, protocol,
+                model, route_source, protocol.error(&format!("Could not start {provider_label} generation.")), capture,
+                )
+            }
+            Err(_) => {
+                return codex_json_response(StatusCode::GATEWAY_TIMEOUT, protocol,
+                model, route_source, protocol.error(&format!("{provider_label} did not start generation before the gateway timeout.")), capture,
+                )
+            }
         };
         let mut output = String::new();
         loop {
             let event = match tokio::time::timeout_at(response_deadline, events.next()).await {
                 Ok(Some(event)) => event,
                 Ok(None) => break,
-                Err(_) => return codex_json_response(StatusCode::GATEWAY_TIMEOUT, protocol, model,
-                    route_source, protocol.error(&format!("{provider_label} generation exceeded the gateway response timeout.")), capture),
+                Err(_) => {
+                    return codex_json_response(StatusCode::GATEWAY_TIMEOUT, protocol, model,
+                    route_source, protocol.error(&format!("{provider_label} generation exceeded the gateway response timeout.")), capture,
+                    )
+                }
             };
             match event {
                 crate::subscription::GenerationEvent::Chunk(delta) => {
                     if output.len().saturating_add(delta.len()) > MAX_CODEX_OUTPUT_BYTES {
                         return codex_json_response(StatusCode::BAD_GATEWAY, protocol, model, route_source,
-                            protocol.error(&format!("{provider_label} text output exceeded the gateway response limit.")), capture);
+                            protocol.error(&format!("{provider_label} text output exceeded the gateway response limit.")), capture,
+                        );
                     }
                     output.push_str(&delta);
+                }
+                crate::subscription::GenerationEvent::ToolCalls { calls } => {
+                    let call_bytes = calls
+                        .iter()
+                        .map(|call| call.id.len().saturating_add(call.name.len()).saturating_add(call.arguments.len()))
+                        .fold(0usize, usize::saturating_add);
+                    if output.len().saturating_add(call_bytes) > MAX_CODEX_OUTPUT_BYTES {
+                        return codex_json_response(
+                            StatusCode::BAD_GATEWAY,
+                            protocol,
+                            model,
+                            route_source,
+                            protocol.error(&format!("{provider_label} tool-call output exceeded the gateway response limit.")),
+                            capture,
+                        );
+                    }
+                    let body = match codex_tool_completion(protocol, &model.model_id, &output, &calls) {
+                        Ok(body) => body,
+                        Err(_) => {
+                            return codex_json_response(
+                                StatusCode::BAD_GATEWAY,
+                                protocol,
+                                model,
+                                route_source,
+                                protocol.error(&format!("{provider_label} returned an invalid function-call payload.")),
+                                capture,
+                            )
+                        }
+                    };
+                    return codex_json_response(StatusCode::OK, protocol, model, route_source, body, capture);
                 }
                 crate::subscription::GenerationEvent::Failed { .. } => {
                     return codex_json_response(StatusCode::BAD_GATEWAY, protocol, model, route_source,
@@ -809,17 +886,20 @@ async fn codex_subscription_response(
                 }
                 crate::subscription::GenerationEvent::Finished { .. } => {
                     return codex_json_response(StatusCode::BAD_GATEWAY, protocol, model, route_source,
-                        protocol.error(&format!("{provider_label} generation did not complete.")), capture);
+                        protocol.error(&format!("{provider_label} generation did not complete.")), capture,
+                    );
                 }
                 crate::subscription::GenerationEvent::FinishedWithReason { .. } => {
                     return codex_json_response(StatusCode::BAD_GATEWAY, protocol, model, route_source,
-                        protocol.error(&format!("{provider_label} generation did not complete.")), capture);
+                        protocol.error(&format!("{provider_label} generation did not complete.")), capture,
+                    );
                 }
                 crate::subscription::GenerationEvent::Started { .. } => {}
             }
         }
         return codex_json_response(StatusCode::BAD_GATEWAY, protocol, model, route_source,
-            protocol.error(&format!("{provider_label} ended the turn without a terminal status.")), capture);
+            protocol.error(&format!("{provider_label} ended the turn without a terminal status.")), capture,
+        );
     }
 
     let provider_id = provider.id.clone();
@@ -863,19 +943,31 @@ async fn codex_subscription_response(
                 for frame in frames { if tx.send(frame).await.is_err() { return; } }
                 break;
             };
-            if let crate::subscription::GenerationEvent::Chunk(delta) = &event {
-                output_bytes = output_bytes.saturating_add(delta.len());
+            let additional_bytes = match &event {
+                crate::subscription::GenerationEvent::Chunk(delta) => delta.len(),
+                crate::subscription::GenerationEvent::ToolCalls { calls } => calls
+                    .iter()
+                    .map(|call| call.id.len().saturating_add(call.name.len()).saturating_add(call.arguments.len()))
+                    .fold(0usize, usize::saturating_add),
+                _ => 0,
+            };
+            output_bytes = output_bytes.saturating_add(additional_bytes);
                 if output_bytes > output_limit {
-                    let frames = encoder.frames(
-                        crate::subscription::GenerationEvent::Failed { message: format!("{provider_label} text output exceeded the gateway response limit.") },
+                let kind = if matches!(event, crate::subscription::GenerationEvent::ToolCalls { .. }) {
+                    "tool-call"
+                } else {
+                    "text"
+                };
+                let frames = encoder.frames(
+                        crate::subscription::GenerationEvent::Failed { message: format!("{provider_label} {kind} output exceeded the gateway response limit.") },
                         &capture_for_task,
                     );
                     for frame in frames { if tx.send(frame).await.is_err() { return; } }
                     break;
                 }
-            }
             let terminal = matches!(event,
-                crate::subscription::GenerationEvent::Finished { .. }
+                crate::subscription::GenerationEvent::ToolCalls { .. }
+                    | crate::subscription::GenerationEvent::Finished { .. }
                 | crate::subscription::GenerationEvent::FinishedWithReason { .. }
                 | crate::subscription::GenerationEvent::Failed { .. }
                 | crate::subscription::GenerationEvent::Cancelled
@@ -887,17 +979,20 @@ async fn codex_subscription_response(
     });
 
     match tokio::time::timeout(
-        std::time::Duration::from_secs(context.store.read().gateway.response_timeout_seconds), ready_rx,
-    ).await {
+        std::time::Duration::from_secs(context.store.read().gateway.response_timeout_seconds), ready_rx).await {
         Ok(Ok(Ok(()))) => {}
         Ok(Ok(Err(message))) => return codex_json_response(StatusCode::BAD_GATEWAY, protocol, model,
             route_source, protocol.error(&message), capture),
-        Ok(Err(_)) => return codex_json_response(StatusCode::BAD_GATEWAY, protocol, model,
-            route_source, protocol.error(&format!("{provider_label} generation stopped before it became ready.")), capture),
+        Ok(Err(_)) => {
+            return codex_json_response(StatusCode::BAD_GATEWAY, protocol, model,
+            route_source, protocol.error(&format!("{provider_label} generation stopped before it became ready.")), capture,
+            )
+        }
         Err(_) => {
             task.abort();
             return codex_json_response(StatusCode::GATEWAY_TIMEOUT, protocol, model, route_source,
-                protocol.error(&format!("{provider_label} did not start generation before the gateway timeout.")), capture);
+                protocol.error(&format!("{provider_label} did not start generation before the gateway timeout.")), capture,
+            );
         }
     }
 
@@ -938,6 +1033,7 @@ struct CodexSseEncoder {
     model: String,
     created: i64,
     output: String,
+    tool_calls: Vec<crate::codex_helper::ClientToolCall>,
     started: bool,
     content_started: bool,
     terminal: bool,
@@ -956,7 +1052,10 @@ impl CodexSseEncoder {
             Protocol::Responses => format!("resp_{suffix}"),
             Protocol::Messages => format!("msg_{suffix}"),
         };
-        Self { protocol, provider_label, id, suffix, model: model.into(), created: chrono::Utc::now().timestamp(), output: String::new(), started: false, content_started: false, terminal: false }
+        Self { protocol, provider_label, id, suffix, model: model.into(), created: chrono::Utc::now().timestamp(), output: String::new(),
+            tool_calls: Vec::new(),
+            started: false, content_started: false, terminal: false,
+        }
     }
 
     fn frame(&self, event: &str, mut value: Value) -> Bytes {
@@ -971,9 +1070,13 @@ impl CodexSseEncoder {
 
     fn response_value(&self, status: &str, error: Option<Value>) -> Value {
         let output_completed = matches!(status, "completed" | "incomplete");
-        let output = if self.content_started {
-            json!([{"id":format!("msg_{}",self.suffix),"type":"message","status":if output_completed {"completed"} else {"in_progress"},"role":"assistant","content":[{"type":"output_text","text":self.output,"annotations":[]}]}])
-        } else { json!([]) };
+        let mut output = Vec::new();
+        if self.content_started {
+            output.push(json!({"id":format!("msg_{}",self.suffix),"type":"message","status":if output_completed {"completed"} else {"in_progress"},"role":"assistant","content":[{"type":"output_text","text":self.output,"annotations":[]}]}));
+        }
+        for (index, call) in self.tool_calls.iter().enumerate() {
+            output.push(json!({"id":format!("fc_{}_{}",self.suffix,index),"type":"function_call","status":if output_completed {"completed"} else {"in_progress"},"call_id":call.id,"name":call.name,"arguments":call.arguments}));
+        }
         json!({"id":self.id,"object":"response","created_at":self.created,"status":status,"error":error,"incomplete_details":null,"model":self.model,"output":output})
     }
 
@@ -1015,7 +1118,7 @@ impl CodexSseEncoder {
         self.terminal = true;
         match self.protocol {
             Protocol::Chat => {
-                frames.push(self.frame("", json!({"id":self.id,"object":"chat.completion.chunk","created":self.created,"model":self.model,"choices":[{"index":0,"delta":{},"finish_reason":if limited {"length"} else {"stop"}}]})));
+                frames.push(self.frame("", json!({"id":self.id,"object":"chat.completion.chunk","created":self.created,"model":self.model,"choices":[{"index":0,"delta":{},"finish_reason":if limited {"length"} else if self.tool_calls.is_empty() {"stop"} else {"tool_calls"}}]})));
                 frames.push(Bytes::from_static(b"data: [DONE]\n\n"));
             }
             Protocol::Responses => {
@@ -1024,7 +1127,14 @@ impl CodexSseEncoder {
                     let part = json!({"type":"output_text","text":self.output,"annotations":[]});
                     frames.push(self.frame("response.output_text.done", json!({"item_id":item_id,"output_index":0,"content_index":0,"text":self.output})));
                     frames.push(self.frame("response.content_part.done", json!({"item_id":item_id,"output_index":0,"content_index":0,"part":part})));
-                    frames.push(self.frame("response.output_item.done", json!({"output_index":0,"item":{"id":item_id,"type":"message","status":"completed","role":"assistant","content":[part]}})));
+                    frames.push(self.frame("response.output_item.done", json!({"output_index":0,"item":{"id":item_id,"type":"message","status":"completed","role":"assistant","content":[part]}}),
+                    ));
+                }
+                for (index, call) in self.tool_calls.iter().enumerate() {
+                    let output_index = usize::from(self.content_started) + index;
+                    let item = json!({"id":format!("fc_{}_{}",self.suffix,index),"type":"function_call","status":"completed","call_id":call.id,"name":call.name,"arguments":call.arguments});
+                    frames.push(self.frame("response.function_call_arguments.done", json!({"item_id":item["id"],"output_index":output_index,"arguments":call.arguments})));
+                    frames.push(self.frame("response.output_item.done", json!({"output_index":output_index,"item":item})));
                 }
                 if limited {
                     let mut response = self.response_value("incomplete", None);
@@ -1036,7 +1146,11 @@ impl CodexSseEncoder {
             }
             Protocol::Messages => {
                 if self.content_started { frames.push(self.frame("content_block_stop", json!({"index":0}))); }
-                frames.push(self.frame("message_delta", json!({"delta":{"stop_reason":if limited {"max_tokens"} else {"end_turn"},"stop_sequence":null}})));
+                for index in 0..self.tool_calls.len() {
+                    frames.push(self.frame("content_block_stop", json!({"index":usize::from(self.content_started)+index})));
+                }
+                frames.push(self.frame("message_delta", json!({"delta":{"stop_reason":if limited {"max_tokens"} else if self.tool_calls.is_empty() {"end_turn"} else {"tool_use"},"stop_sequence":null}}),
+                ));
                 frames.push(self.frame("message_stop", json!({"type":"message_stop"})));
             }
         }
@@ -1072,6 +1186,37 @@ impl CodexSseEncoder {
                 }
                 frames
             }
+            Event::ToolCalls { calls } => {
+                if self.terminal || calls.is_empty() {
+                    return Vec::new();
+                }
+                let mut frames = self.start_frames();
+                for call in calls {
+                    let index = self.tool_calls.len();
+                    let Ok(arguments_value) = serde_json::from_str::<Value>(&call.arguments) else {
+                        return self.error_frames("Codex returned invalid function-call arguments.", false, capture);
+                    };
+                    self.tool_calls.push(call);
+                    let call = &self.tool_calls[index];
+                    let output_index = usize::from(self.content_started) + index;
+                    match self.protocol {
+                        Protocol::Chat => frames.push(self.frame("", json!({"id":self.id,"object":"chat.completion.chunk","created":self.created,"model":self.model,"choices":[{"index":0,"delta":{"tool_calls":[{"index":index,"id":call.id,"type":"function","function":{"name":call.name,"arguments":call.arguments}}]},"finish_reason":null}]}))),
+                        Protocol::Responses => {
+                            let item = json!({"id":format!("fc_{}_{}",self.suffix,index),"type":"function_call","status":"in_progress","call_id":call.id,"name":call.name,"arguments":""});
+                            frames.push(self.frame("response.output_item.added", json!({"output_index":output_index,"item":item})));
+                            frames.push(self.frame("response.function_call_arguments.delta", json!({"item_id":item["id"],"output_index":output_index,"delta":call.arguments})));
+                        }
+                        Protocol::Messages => {
+                            let block_index = usize::from(self.content_started) + index;
+                            frames.push(self.frame("content_block_start", json!({"index":block_index,"content_block":{"type":"tool_use","id":call.id,"name":call.name,"input":{}}})));
+                            frames.push(self.frame("content_block_delta", json!({"index":block_index,"delta":{"type":"input_json_delta","partial_json":call.arguments}})));
+                        }
+                    }
+                    drop(arguments_value);
+                }
+                frames.extend(self.finish_frames(None));
+                frames
+            }
             Event::Finished { status: 200 } => self.finish_frames(None),
             Event::FinishedWithReason { status: 200, reason } => self.finish_frames(Some(reason)),
             Event::Finished { status } => self.error_frames(&format!("{} turn ended with status {status}.", self.provider_label), false, capture),
@@ -1091,8 +1236,7 @@ mod codex_sse_tests {
         let capture = crate::traffic::Capture::new(
             crate::subscription::protocol_key(protocol),
             &json!({"stream":true}),
-            &HeaderMap::new(),
-        );
+            &HeaderMap::new());
         {
             let mut capture = capture.lock().unwrap();
             capture.upstream(protocol, true);
@@ -1122,7 +1266,9 @@ mod codex_sse_tests {
             assert!(wire.contains("partial"), "{protocol:?}: {wire}");
             match protocol {
                 Protocol::Chat => assert!(wire.contains("data: [DONE]"), "{wire}"),
-                Protocol::Responses => assert!(wire.contains("\"type\":\"response.completed\""), "{wire}"),
+                Protocol::Responses => {
+                    assert!(wire.contains("\"type\":\"response.completed\""), "{wire}")
+                }
                 Protocol::Messages => assert!(wire.contains("\"type\":\"message_stop\""), "{wire}"),
             }
             assert_eq!(success_capture.lock().unwrap().finish(true).status, "success", "{protocol:?}");
@@ -1150,6 +1296,46 @@ mod codex_sse_tests {
                 Protocol::Messages => assert!(wire.contains("event: error") && wire.contains("event: message_stop"), "{wire}"),
             }
             assert_eq!(cancelled_capture.lock().unwrap().finish(true).status, "error", "{protocol:?}");
+        }
+    }
+
+    #[test]
+    fn all_codex_protocols_return_client_tool_calls_as_terminal_tool_use() {
+        let calls = vec![
+            crate::codex_helper::ClientToolCall { id: "call_ajv1_4_one".into(), name: "lookup".into(), arguments: r#"{"key":"one"}"#.into() },
+            crate::codex_helper::ClientToolCall { id: "call_ajv1_4_two".into(), name: "lookup".into(), arguments: r#"{"key":"two"}"#.into() },
+        ];
+        for protocol in [Protocol::Chat, Protocol::Responses, Protocol::Messages] {
+            let body = codex_tool_completion(protocol, "fixture-model", "", &calls).unwrap();
+            match protocol {
+                Protocol::Chat => {
+                    assert_eq!(body.pointer("/choices/0/finish_reason"), Some(&json!("tool_calls")));
+                    assert_eq!(body.pointer("/choices/0/message/tool_calls/1/id"), Some(&json!(calls[1].id)));
+                }
+                Protocol::Responses => {
+                    assert_eq!(body.pointer("/output/1/type"), Some(&json!("function_call")));
+                    assert_eq!(body.pointer("/output/1/call_id"), Some(&json!(calls[1].id)));
+                }
+                Protocol::Messages => {
+                    assert_eq!(body.pointer("/stop_reason"), Some(&json!("tool_use")));
+                    assert_eq!(body.pointer("/content/1/id"), Some(&json!(calls[1].id)));
+                }
+            }
+
+            let capture = captured(protocol);
+            let mut encoder = CodexSseEncoder::new(protocol, "fixture-model");
+            let wire =
+                collect(&mut encoder, GenerationEvent::Started { generation: 4 }, &capture) + &collect(&mut encoder, GenerationEvent::ToolCalls { calls: calls.clone() }, &capture);
+            assert!(encoder.terminal, "{protocol:?} tool-call event must terminate the HTTP stream");
+            assert!(wire.contains("call_ajv1_4_one") && wire.contains("call_ajv1_4_two"), "{protocol:?}: {wire}");
+            match protocol {
+                Protocol::Chat => {
+                    assert!(wire.contains("\"finish_reason\":\"tool_calls\""), "{wire}")
+                }
+                Protocol::Responses => assert!(wire.contains("response.function_call_arguments.done") && wire.contains("response.completed"), "{wire}"),
+                Protocol::Messages => assert!(wire.contains("\"stop_reason\":\"tool_use\"") && wire.contains("message_stop"), "{wire}"),
+            }
+            assert_eq!(capture.lock().unwrap().finish(true).status, "success", "{protocol:?}");
         }
     }
 }
@@ -1280,33 +1466,24 @@ fn session_id(headers: &HeaderMap, body: &Value) -> Option<String> {
         .get("x-autojev-session-id")
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned)
-        .or_else(|| {
-            body.pointer("/metadata/user_id")
+        .or_else(|| body.pointer("/metadata/user_id")
                 .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
-        .or_else(|| {
-            body.get("conversation")
+                .map(str::to_owned))
+        .or_else(|| body.get("conversation")
                 .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
-        .or_else(|| {
-            body.get("prompt_cache_key")
+                .map(str::to_owned))
+        .or_else(|| body.get("prompt_cache_key")
                 .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
-        .or_else(|| {
-            body.get("previous_response_id")
+                .map(str::to_owned))
+        .or_else(|| body.get("previous_response_id")
                 .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
+                .map(str::to_owned))
 }
 
 fn still_eligible(
     route: &ResolvedRoute,
     input: &RoutePreviewInput,
-    config: &crate::config::AppConfig,
-) -> bool {
+    config: &crate::config::AppConfig) -> bool {
     let speed_route = input.requested_model.as_deref().and_then(|id|id.strip_prefix("autojev/"))
         .and_then(|id|config.routes.iter().find(|r|r.id==id && r.strategy=="jev"))
         .is_some_and(|r|r.automatic_policy.as_ref().unwrap_or(&config.policy).decision_preference=="speed");
@@ -1418,9 +1595,7 @@ mod tests {
                     vec![crate::agent_catalog::Entry {
                         binding: "model/kept".into(),
                         id: "kept/frozen-model".into(),
-                        name: "Frozen".into(),
-                    }],
-                );
+                        name: "Frozen".into() }]);
             })
             .unwrap();
         let gateway = start(store.clone()).await.unwrap();
@@ -1488,7 +1663,8 @@ mod tests {
             ("responses", json!({"input":[{"role":"user","content":[{"type":"input_image","image_url":"https://example.com/a.png"}]}]})),
             ("chat/completions", json!({"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.com/a.png"}}]}]})),
             ("messages", json!({"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","data":"abc"}}]}]})),
-            ("messages", json!({"messages":[{"role":"user","content":[{"type":"tool_result","content":[{"type":"image","source":{"type":"base64","data":"abc"}}]}]}]})),
+            ("messages", json!({"messages":[{"role":"user","content":[{"type":"tool_result","content":[{"type":"image","source":{"type":"base64","data":"abc"}}]}]}]}),
+            ),
         ] { assert!(inspect_request(&body, endpoint).requires_vision, "{endpoint}"); }
     }
 
@@ -1547,7 +1723,9 @@ mod route_forward_tests {
                     if model == "primary" { (StatusCode::TOO_MANY_REQUESTS, Json(json!({"error":{"message":"busy"}}))).into_response() }
                     else {Json(json!({"model":model,"choices":[]})).into_response()}
                 }
-            }))).await.unwrap();
+            }),
+                ),
+            ).await.unwrap();
         });
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(ConfigStore::load(dir.path().join("test.db")).unwrap());
@@ -1559,11 +1737,13 @@ mod route_forward_tests {
             config.models.push(backup);
             config.routes = vec![crate::config::RouteRule { all_models: false, automatic_policy: None,id:"fallback".into(),name:"Fallback".into(),strategy:"round_robin".into(),enabled:true,
                 model_ids:config.models.iter().map(|m|m.id.clone()).collect(),
-                model_settings: std::collections::HashMap::from([(config.models[0].id.clone(),crate::config::RouteModelSettings{priority:10,weight:1})])}];
+                model_settings: std::collections::HashMap::from([(config.models[0].id.clone(),crate::config::RouteModelSettings{priority:10,weight:1})]),
+                }];
         }).unwrap();
         store.write_secret("provider:openrouter", "test-only-key").unwrap();
         let context = ProxyContext {store,client:Client::new(),sessions:Default::default(),health:Default::default()};
-        let response = forward(context,HeaderMap::new(),json!({"model":"autojev/fallback","messages":[{"role":"user","content":"hello"}]}),"/v1/chat/completions","chat/completions").await;
+        let response = forward(context,HeaderMap::new(),json!({"model":"autojev/fallback","messages":[{"role":"user","content":"hello"}]}),"/v1/chat/completions","chat/completions",
+        ).await;
         assert_eq!(response.status(),StatusCode::OK);
         let bytes = axum::body::to_bytes(response.into_body(),4096).await.unwrap();
         assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap()["model"],"backup");
@@ -1578,7 +1758,9 @@ mod route_forward_tests {
             axum::serve(listener, Router::new().route("/v1/chat/completions", post(|headers: HeaderMap, Json(body): Json<Value>| async move {
                 assert!(headers.get("x-autojev-agent").is_none());
                 Json(json!({"model":body["model"],"choices":[]}))
-            }))).await.unwrap();
+            }),
+                ),
+            ).await.unwrap();
         });
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(ConfigStore::load(dir.path().join("test.db")).unwrap());
@@ -1593,7 +1775,8 @@ mod route_forward_tests {
             config.agent_catalogs.insert("hermes".into(), crate::agent_catalog::build(config, &bindings).unwrap());
         }).unwrap();
         store.write_secret("provider:openrouter", "test-only-key").unwrap();
-        let context = ProxyContext {store:store.clone(),client:Client::new(),sessions:Default::default(),health:Default::default()};
+        let context = ProxyContext {store:store.clone(),client:Client::new(),sessions:Default::default(),health:Default::default(),
+        };
         let mut headers = HeaderMap::new();
         headers.insert("x-autojev-agent", HeaderValue::from_static("hermes"));
         headers.insert("x-autojev-session-id", HeaderValue::from_static("same-session"));
@@ -1620,7 +1803,9 @@ mod route_forward_tests {
                     assert_eq!(headers.get("authorization").unwrap(), "Bearer test-only-key");
                     assert!(headers.get("x-autojev-binding").is_none());
                     Json(json!({"model": body["model"], "choices": []}))
-                }))).await.unwrap();
+                }),
+                ),
+            ).await.unwrap();
         });
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("routes.db");
@@ -1629,11 +1814,13 @@ mod route_forward_tests {
             config.providers[0].base_url = format!("http://127.0.0.1:{port}");
             config.models.truncate(1);
             config.routes = vec![crate::config::RouteRule { all_models: false, automatic_policy: None, model_settings: Default::default(), id: "daily".into(), name: "Daily".into(),
-                enabled: true, strategy: "fixed".into(), model_ids: vec![config.models[0].id.clone()] }];
+                enabled: true, strategy: "fixed".into(), model_ids: vec![config.models[0].id.clone()],
+                }];
         }).unwrap();
         store.write_secret("provider:openrouter", "test-only-key").unwrap();
         assert_eq!(ConfigStore::load(path).unwrap().read().routes[0].id, "daily");
-        let context = ProxyContext { store: store.clone(), client: Client::new(), sessions: Default::default(), health: Default::default() };
+        let context = ProxyContext { store: store.clone(), client: Client::new(), sessions: Default::default(), health: Default::default(),
+        };
         let body = json!({"model":"public-model-id", "messages":[{"role":"user","content":"hello"}]});
         let mut headers = HeaderMap::new();
         headers.insert("x-autojev-binding", HeaderValue::from_static("daily"));
@@ -1689,7 +1876,9 @@ mod protocol_forward_tests {
                             let chunks = wire(target).as_bytes().chunks(7).map(|bytes| Ok::<_, std::io::Error>(axum::body::Bytes::copy_from_slice(bytes))).collect::<Vec<_>>();
                             ([("content-type", "text/event-stream")], Body::from_stream(futures_util::stream::iter(chunks))).into_response()
                         } else { Json(response(target)).into_response() }
-                    }))).await.unwrap();
+                    }),
+                        ),
+                    ).await.unwrap();
                 });
                 let dir = tempfile::tempdir().unwrap();
                 let store = Arc::new(ConfigStore::load(dir.path().join("protocol.db")).unwrap());
@@ -1716,7 +1905,8 @@ mod protocol_forward_tests {
                     if streaming {
                         assert!(content_type.starts_with("text/event-stream"));
                         let text = String::from_utf8(bytes.to_vec()).unwrap();
-                        assert!(text.contains(match source { Protocol::Chat => "[DONE]", Protocol::Responses => "response.completed", Protocol::Messages => "message_stop" }), "{text}");
+                        assert!(text.contains(match source { Protocol::Chat => "[DONE]", Protocol::Responses => "response.completed", Protocol::Messages => "message_stop",
+                            }), "{text}");
                     } else {
                         let body: Value = serde_json::from_slice(&bytes).unwrap();
                         assert!(body.to_string().contains("call_2"));
@@ -1744,7 +1934,8 @@ mod protocol_forward_tests {
         let server = tokio::spawn(async move {
             axum::serve(listener, Router::new().route("/v1/chat/completions", post(|| async {
                 (StatusCode::TOO_MANY_REQUESTS, Json(json!({"error":{"message":"rate limited"}})))
-            }))).await.unwrap();
+            })),
+            ).await.unwrap();
         });
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(ConfigStore::load(dir.path().join("errors.db")).unwrap());
@@ -1752,7 +1943,8 @@ mod protocol_forward_tests {
         store.write_secret("provider:openrouter", "test-only-key").unwrap();
         let mut body = request(Protocol::Messages, false);
         body["model"] = "auto".into();
-        let reply = forward(ProxyContext { store, client: Client::new(), sessions: Default::default(), health: Default::default() }, HeaderMap::new(), body, "/v1/messages", "messages").await;
+        let reply = forward(ProxyContext { store, client: Client::new(), sessions: Default::default(), health: Default::default() }, HeaderMap::new(), body, "/v1/messages", "messages",
+        ).await;
         assert_eq!(reply.status(), StatusCode::TOO_MANY_REQUESTS);
         let body: Value = serde_json::from_slice(&axum::body::to_bytes(reply.into_body(), 1024).await.unwrap()).unwrap();
         assert_eq!(body["type"], "error");
@@ -1762,11 +1954,12 @@ mod protocol_forward_tests {
 }
 
 fn timed_stream<S,E>(stream:S,seconds:u64)->impl futures_util::Stream<Item=Result<axum::body::Bytes,std::io::Error>>+Send
-where S:futures_util::Stream<Item=Result<axum::body::Bytes,E>>+Send,E:std::error::Error+Send+Sync+'static {
+where S:futures_util::Stream<Item=Result<axum::body::Bytes,E>>+Send,E:std::error::Error+Send+Sync+'static,
+{
     futures_util::stream::unfold((Box::pin(stream),false),move |(mut stream,done)|async move{
         if done{return None;}
         match tokio::time::timeout(std::time::Duration::from_secs(seconds),stream.next()).await {
-            Ok(Some(chunk))=>{let failed=chunk.is_err();Some((chunk.map_err(std::io::Error::other),(stream,failed)))},
+            Ok(Some(chunk))=>{let failed=chunk.is_err();Some((chunk.map_err(std::io::Error::other),(stream,failed)))}
             Ok(None)=>None,
             Err(_)=>Some((Err(std::io::Error::new(std::io::ErrorKind::TimedOut,"Upstream idle timeout")),(stream,true))),
         }
@@ -1776,7 +1969,7 @@ fn observe_health(response:Response,lease:crate::resilience::Lease,settings:crat
     let(parts,body)=response.into_parts();
     let stream=futures_util::stream::unfold((body.into_data_stream(),Some(lease),settings,capture),|(mut stream,mut lease,settings,capture)|async move{
         match stream.next().await{
-            Some(chunk)=>{if chunk.is_err(){if let Some(l)=lease.take(){l.complete(502,None,&settings);}}Some((chunk,(stream,lease,settings,capture)))},
+            Some(chunk)=>{if chunk.is_err(){if let Some(l)=lease.take(){l.complete(502,None,&settings);}}Some((chunk,(stream,lease,settings,capture)))}
             None=>{let failed=capture.lock().unwrap().failed_body();if let Some(l)=lease.take(){l.complete(if failed{502}else{200},None,&settings);}None}
         }
     });Response::from_parts(parts,Body::from_stream(stream))
@@ -1816,13 +2009,17 @@ mod availability_tests {
                 calls.fetch_add(1,std::sync::atomic::Ordering::SeqCst);
                 if body["model"]=="primary" {(StatusCode::from_u16(status).unwrap(),[("retry-after","60")],Json(json!({"error":{"message":"test failure"}}))).into_response()}
                 else{Json(json!({"choices":[{"message":{"content":"ok"}}]})).into_response()}
-            }}))).await.unwrap();});
+            }}),
+                    ),
+                ).await.unwrap();});
             let dir=tempfile::tempdir().unwrap();let store=Arc::new(ConfigStore::load(dir.path().join("test.db")).unwrap());
             store.update(|c|{c.models.truncate(1);c.models[0].model_id="primary".into();c.providers[0].base_url=format!("http://127.0.0.1:{port}");c.gateway.max_attempts=max;
                 let mut backup=c.models[0].clone();backup.id="backup".into();backup.model_id="backup".into();c.models.push(backup);
-                c.routes=vec![crate::config::RouteRule{ all_models: false,id:"test".into(),name:"test".into(),enabled:true,strategy:"round_robin".into(),automatic_policy:None,model_ids:c.models.iter().map(|m|m.id.clone()).collect(),model_settings:HashMap::from([(c.models[0].id.clone(),crate::config::RouteModelSettings{priority:10,weight:1})])}];}).unwrap();
+                c.routes=vec![crate::config::RouteRule{ all_models: false,id:"test".into(),name:"test".into(),enabled:true,strategy:"round_robin".into(),automatic_policy:None,model_ids:c.models.iter().map(|m|m.id.clone()).collect(),model_settings:HashMap::from([(c.models[0].id.clone(),crate::config::RouteModelSettings{priority:10,weight:1})]),
+                    }];}).unwrap();
             store.write_secret("provider:openrouter","test").unwrap();let primary=store.read().models[0].id.clone();
-            let context=ProxyContext{store:store.clone(),client:Client::new(),sessions:Default::default(),health:Default::default()};
+            let context=ProxyContext{store:store.clone(),client:Client::new(),sessions:Default::default(),health:Default::default(),
+            };
             let response=forward(context.clone(),HeaderMap::new(),json!({"model":"autojev/test","messages":[]}),"/v1/chat/completions","chat/completions").await;
             assert_eq!(response.status().as_u16(),if expected==2{200}else{status});
             axum::body::to_bytes(response.into_body(),4096).await.unwrap();
@@ -1865,7 +2062,8 @@ mod pause_tests {
     #[tokio::test]
     async fn pause_retains_listener_state_and_returns_not_found_with_retry_hint() {
         let task = tokio::spawn(std::future::pending::<()>());
-        let handle = ProxyHandle { port: 0, shutdown: None, health: Default::default(), task, paused: Arc::new(std::sync::atomic::AtomicBool::new(false)) };
+        let handle = ProxyHandle { port: 0, shutdown: None, health: Default::default(), task, paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
         handle.set_paused(true);
         assert!(handle.running());
         assert!(handle.paused());

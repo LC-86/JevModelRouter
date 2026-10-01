@@ -16,12 +16,12 @@ use std::{
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
-use crate::{config::ProviderKind, protocol::Protocol};
 use crate::subscription::{
     quota_state, CatalogRead, ConnectionState, ConnectionStatus, DiscoveredModel, EvidenceState, GenerationEvent,
     GenerationRequest, GenerationStream, HelperStatus, LoginResult, LoginStart, LogoutOutcome, QuotaBucket,
     QuotaCredits, QuotaEvidence, QuotaPermission, QuotaView, QuotaWindow, RemoteRevocation, SubscriptionAdapter,
 };
+use crate::{config::ProviderKind, protocol::Protocol};
 
 /// 用户主目录下由本应用独占的辅助进程根目录。
 const HELPER_ROOT: &str = ".autojev/helpers/codex";
@@ -31,8 +31,7 @@ const COMMON_CODEX_LOCATIONS: &[&str] = &[
     "/opt/homebrew/bin/codex",
     "/usr/local/bin/codex",
     "/usr/bin/codex",
-    "/bin/codex",
-];
+    "/bin/codex"];
 #[cfg(not(unix))]
 const COMMON_CODEX_LOCATIONS: &[&str] = &[];
 
@@ -65,13 +64,10 @@ fn helper_home_in(home: &Path, provider_id: &str) -> PathBuf {
 fn sanitize_provider_id(provider_id: &str) -> String {
     let sanitized: String = provider_id
         .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '_' | '-') {
+        .map(|character| if character.is_ascii_alphanumeric() || matches!(character, '_' | '-') {
                 character
             } else {
-                '_'
-            }
-        })
+                '_' })
         .collect();
     if sanitized.is_empty() {
         "provider".to_owned()
@@ -200,9 +196,7 @@ fn redact_word(word: &str) -> String {
 
 /// 长且同时含字母与数字的紧致串按秘密处理；短词保留可读性。
 fn looks_like_secret(word: &str) -> bool {
-    let cleaned = word.trim_matches(|character: char| {
-        !(character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '+' | '='))
-    });
+    let cleaned = word.trim_matches(|character: char| !(character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '+' | '=')));
     if cleaned.len() < 24 {
         return false;
     }
@@ -248,15 +242,47 @@ pub struct CodexAppServer {
     next_id: u64,
     pending: Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<std::result::Result<Value, String>>>>>,
     notifications: tokio::sync::mpsc::UnboundedReceiver<Value>,
+    server_requests: tokio::sync::mpsc::UnboundedReceiver<Value>,
 }
 
-/// Text-only subset understood by the official app-server. Fields without an exact app-server
-/// equivalent are rejected before starting a turn instead of being silently dropped.
+enum HelperMessage {
+    Notification(Value),
+    ServerRequest(Value),
+}
+
+/// A function call returned to the API client. The client owns execution and result handling.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClientToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ClientToolResult {
+    id: String,
+    output: Vec<String>,
+    is_error: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ToolCallReference {
+    id: String,
+    name: String,
+    arguments: Value,
+}
+
+/// The verified subset of a caller request that maps to app-server's text and dynamic-function
+/// interface. Unsupported API controls are rejected instead of being silently dropped.
 #[derive(Default)]
 struct CodexTurnRequest {
     base_instructions: Option<String>,
     developer_instructions: Option<String>,
     input: Vec<Value>,
+    dynamic_tools: Vec<Value>,
+    tool_calls: Vec<ToolCallReference>,
+    tool_outputs: Vec<ClientToolResult>,
+    has_assistant_history: bool,
     effort: Option<String>,
     summary: Option<String>,
     service_tier: Option<String>,
@@ -312,44 +338,175 @@ fn append_instruction(target: &mut Option<String>, text: String) {
     }
 }
 
-/// Convert only the well-defined text subset to app-server's text UserInput values.
+fn parse_dynamic_tools(protocol: Protocol, body: &Value) -> Result<Vec<Value>> {
+    let empty = vec![];
+    let tools = match body.get("tools") {
+        None | Some(Value::Null) => &empty,
+        Some(value) => value.as_array().context("`tools` must be an array")?,
+    };
+    anyhow::ensure!(tools.len() <= 64, "Codex supports at most 64 client function tools per request");
+    let mut result = Vec::with_capacity(tools.len());
+    let mut names = std::collections::HashSet::new();
+    for tool in tools {
+        let function = match protocol {
+            Protocol::Chat => {
+                reject_unknown_fields(tool, &["type", "function"])?;
+                anyhow::ensure!(tool["type"] == "function", "Only client function tools are supported");
+                reject_unknown_fields(&tool["function"], &["name", "description", "parameters", "strict"])?;
+                &tool["function"]
+            }
+            Protocol::Responses => {
+                reject_unknown_fields(tool, &["type", "name", "description", "parameters", "strict"])?;
+                anyhow::ensure!(tool["type"] == "function", "Only Responses function tools are supported");
+                tool
+            }
+            Protocol::Messages => {
+                reject_unknown_fields(tool, &["name", "description", "input_schema"])?;
+                tool
+            }
+        };
+        let name = function
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty() && name.len() <= 64 && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-')))
+            .context("Function tool names must be 1–64 ASCII letters, digits, underscores, or hyphens")?;
+        anyhow::ensure!(names.insert(name.to_owned()), "Function tool names must be unique");
+        if protocol != Protocol::Messages {
+            let strict = function.get("strict").and_then(Value::as_bool).unwrap_or(false);
+            anyhow::ensure!(!strict, "Strict function schema enforcement is not supported by this Codex adapter");
+        }
+        let schema_key = if protocol == Protocol::Messages { "input_schema" } else { "parameters" };
+        let schema = function.get(schema_key).cloned().unwrap_or_else(|| json!({"type":"object","properties":{}}));
+        anyhow::ensure!(
+            schema.is_object() && schema["type"] == "object",
+            "Function tool schemas must be JSON Schema objects with `type: object`"
+        );
+        result.push(json!({
+            "type":"function",
+            "name":name,
+            "description":function.get("description").and_then(Value::as_str).unwrap_or(""),
+            "inputSchema":schema
+        }));
+    }
+    result.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
+    let choice = body.get("tool_choice").filter(|choice| !choice.is_null());
+    if let Some(choice) = choice {
+        let auto = choice.as_str() == Some("auto") || choice.get("type").and_then(Value::as_str) == Some("auto");
+        anyhow::ensure!(auto, "Only automatic client function selection is supported");
+        if choice.get("disable_parallel_tool_use").and_then(Value::as_bool) == Some(true) {
+            bail!("Disabling parallel tool calls is not supported by this Codex adapter");
+        }
+    }
+    if body.get("parallel_tool_calls").and_then(Value::as_bool) == Some(false) {
+        bail!("Disabling parallel tool calls is not supported by this Codex adapter");
+    }
+    Ok(result)
+}
+
+fn parse_call_reference(id: &Value, name: &Value, arguments: &Value) -> Result<ToolCallReference> {
+    let id = id.as_str().filter(|id| !id.is_empty()).context("Tool calls require a non-empty call ID")?.to_owned();
+    let name = name.as_str().filter(|name| !name.is_empty()).context("Tool calls require a non-empty function name")?.to_owned();
+    let arguments = match arguments {
+        Value::String(text) => serde_json::from_str::<Value>(text).context("Tool call arguments must be valid JSON")?,
+        value => value.clone(),
+    };
+    anyhow::ensure!(arguments.is_object(), "Tool call arguments must be a JSON object");
+    Ok(ToolCallReference { id, name, arguments })
+}
+
+fn parse_tool_result(id: &Value, output: &Value, is_error: bool) -> Result<ClientToolResult> {
+    let id = id.as_str().filter(|id| !id.is_empty()).context("Tool results require a non-empty call ID")?.to_owned();
+    let output = match output {
+        Value::String(text) => vec![text.clone()],
+        Value::Array(items) => {
+            let mut text = Vec::with_capacity(items.len());
+            for item in items {
+                reject_unknown_fields(item, &["type", "text"])?;
+                if !matches!(item["type"].as_str(), Some("text" | "input_text" | "output_text")) {
+                    bail!("Only text tool results are supported by the Codex dynamic tool interface");
+                }
+                text.push(item["text"].as_str().context("Text tool result blocks require string `text`")?.to_owned());
+            }
+            text
+        }
+        _ => bail!("Tool results must be text or an array of text blocks"),
+    };
+    anyhow::ensure!(
+        output.iter().map(String::len).sum::<usize>() <= MAX_GENERATION_INPUT_BYTES,
+        "Tool result exceeds the 32 KiB request limit"
+    );
+    Ok(ClientToolResult { id, output, is_error })
+}
+
+fn optional_text_content(value: &Value, field: &str) -> Result<String> {
+    if value.is_null() {
+        Ok(String::new())
+    } else {
+        text_content(value, field)
+    }
+}
+
+fn validate_tool_controls(body: &Value, protocol: Protocol) -> Result<Vec<Value>> {
+    let tools = parse_dynamic_tools(protocol, body)?;
+    let total = tools.iter().map(Value::to_string).map(|value| value.len()).sum::<usize>();
+    anyhow::ensure!(total <= MAX_GENERATION_INPUT_BYTES, "Codex function schemas exceed the 32 KiB request limit");
+    Ok(tools)
+}
+
+/// Convert text, client function schemas, and previously emitted tool result pairs. Prior tool
+/// calls are only meaningful when the adapter still holds the matching live app-server turn.
 fn codex_turn_request(protocol: Protocol, body: &Value) -> Result<CodexTurnRequest> {
     let mut request = CodexTurnRequest::default();
+    request.dynamic_tools = validate_tool_controls(body, protocol)?;
     let input = |text: String| json!({"type":"text","text":text});
     match protocol {
         Protocol::Chat => {
-            reject_unknown_fields(body, &["model", "stream", "messages", "reasoning_effort", "service_tier"])?;
+            reject_unknown_fields(body, &["model", "stream", "messages", "reasoning_effort", "service_tier",
+                    "tools",
+                    "tool_choice",
+                    "parallel_tool_calls",
+                ],
+            )?;
             if body.get("stream").is_some_and(|value| !value.is_boolean()) {
                 bail!("`stream` must be a boolean");
             }
             if let Some(effort) = body.get("reasoning_effort") {
-                request.effort = Some(effort.as_str().filter(|value| !value.is_empty()).ok_or_else(|| {
-                    anyhow::anyhow!("`reasoning_effort` must be a non-empty string")
-                })?.to_owned());
+                request.effort = Some(effort.as_str().filter(|value| !value.is_empty()).ok_or_else(|| anyhow::anyhow!("`reasoning_effort` must be a non-empty string"))?.to_owned(),
+                );
             }
             if let Some(tier) = body.get("service_tier") {
-                request.service_tier = Some(tier.as_str().filter(|value| !value.is_empty()).ok_or_else(|| {
-                    anyhow::anyhow!("`service_tier` must be a non-empty string")
-                })?.to_owned());
+                request.service_tier = Some(tier.as_str().filter(|value| !value.is_empty()).ok_or_else(|| anyhow::anyhow!("`service_tier` must be a non-empty string"))?.to_owned());
             }
             let messages = body["messages"].as_array().context("Chat Completions requires a `messages` array")?;
             for message in messages {
-                reject_unknown_fields(message, &["role", "content"])?;
+                reject_unknown_fields(message, &["role", "content", "tool_calls", "tool_call_id"])?;
                 let role = message["role"].as_str().context("Each message requires a string `role`")?;
-                let content = text_content(&message["content"], "messages[].content")?;
+                let content = optional_text_content(&message["content"], "messages[].content")?;
                 match role {
                     "system" => append_instruction(&mut request.base_instructions, content),
                     "developer" => append_instruction(&mut request.developer_instructions, content),
                     "user" => request.input.push(input(content)),
-                    "assistant" => return Err(unsupported_generation_field(
-                        "messages[].role=assistant", "app-server turns accept user input, not assistant history",
-                    )),
+                    "assistant" => {
+                        request.has_assistant_history = true;
+                        for call in message.get("tool_calls").and_then(Value::as_array).into_iter().flatten() {
+                            reject_unknown_fields(call, &["id", "type", "function"])?;
+                            anyhow::ensure!(call["type"] == "function", "Only function tool-call history is supported");
+                            reject_unknown_fields(&call["function"], &["name", "arguments"])?;
+                            request.tool_calls.push(parse_call_reference(&call["id"], &call["function"]["name"], &call["function"]["arguments"])?);
+                        }
+                    }
+                    "tool" => request.tool_outputs.push(parse_tool_result(&message["tool_call_id"], &message["content"], false)?),
                     _ => return Err(unsupported_generation_field("messages[].role", role)),
                 }
             }
         }
         Protocol::Responses => {
-            reject_unknown_fields(body, &["model", "stream", "input", "instructions", "reasoning", "service_tier"])?;
+            reject_unknown_fields(body, &["model", "stream", "input", "instructions", "reasoning", "service_tier",
+                    "tools",
+                    "tool_choice",
+                    "parallel_tool_calls",
+                ],
+            )?;
             if body.get("stream").is_some_and(|value| !value.is_boolean()) {
                 bail!("`stream` must be a boolean");
             }
@@ -364,46 +521,54 @@ fn codex_turn_request(protocol: Protocol, body: &Value) -> Result<CodexTurnReque
                     bail!("`reasoning` must be an object");
                 }
                 if let Some(value) = reasoning.get("effort") {
-                    request.effort = Some(value.as_str().filter(|value| !value.is_empty()).ok_or_else(|| {
-                        anyhow::anyhow!("`reasoning.effort` must be a non-empty string")
-                    })?.to_owned());
+                    request.effort = Some(value.as_str().filter(|value| !value.is_empty()).ok_or_else(|| anyhow::anyhow!("`reasoning.effort` must be a non-empty string"))?.to_owned());
                 }
                 if let Some(value) = reasoning.get("summary") {
-                    request.summary = Some(value.as_str().filter(|value| !value.is_empty()).ok_or_else(|| {
-                        anyhow::anyhow!("`reasoning.summary` must be a non-empty string")
-                    })?.to_owned());
+                    request.summary = Some(value.as_str().filter(|value| !value.is_empty()).ok_or_else(|| anyhow::anyhow!("`reasoning.summary` must be a non-empty string"))?.to_owned(),
+                    );
                 }
-                if let Some(field) = reasoning.as_object().and_then(|object| {
-                    object.keys().find(|field| !["effort", "summary"].contains(&field.as_str()))
-                }) {
+                if let Some(field) = reasoning.as_object().and_then(|object| object.keys().find(|field| !["effort", "summary"].contains(&field.as_str()))) {
                     return Err(unsupported_generation_field(&format!("reasoning.{field}"), "the behavior has not been verified"));
                 }
             }
             if let Some(tier) = body.get("service_tier") {
-                request.service_tier = Some(tier.as_str().filter(|value| !value.is_empty()).ok_or_else(|| {
-                    anyhow::anyhow!("`service_tier` must be a non-empty string")
-                })?.to_owned());
+                request.service_tier = Some(tier.as_str().filter(|value| !value.is_empty()).ok_or_else(|| anyhow::anyhow!("`service_tier` must be a non-empty string"))?.to_owned());
             }
             match &body["input"] {
                 Value::String(text) => request.input.push(input(text.clone())),
-                Value::Array(items) => for item in items {
+                Value::Array(items) => {
+                    for item in items {
+                        match item["type"].as_str().unwrap_or("message") {
+                            "message" => {
                     reject_unknown_fields(item, &["type", "role", "content"])?;
-                    if !matches!(item["type"].as_str(), None | Some("message")) {
-                        return Err(unsupported_generation_field("input[].type", item["type"].as_str().unwrap_or("unknown")));
+                                let role = item["role"].as_str().context("Each Responses message requires a string `role`")?;
+                                let content = text_content(&item["content"], "input[].content")?;
+                                match role {
+                                    "user" => request.input.push(input(content)),
+                                    "system" => append_instruction(&mut request.base_instructions, content),
+                                    "developer" => append_instruction(&mut request.developer_instructions, content),
+                                    "assistant" => request.has_assistant_history = true,
+                                    _ => return Err(unsupported_generation_field("input[].role", role)),
+                                }
+                            }
+                            "function_call" => {
+                                reject_unknown_fields(item, &["type", "id", "call_id", "name", "arguments", "status"])?;
+                                request.has_assistant_history = true;
+                                request.tool_calls.push(parse_call_reference(&item["call_id"], &item["name"], &item["arguments"])?);
+                }
+                            "function_call_output" => {
+                                reject_unknown_fields(item, &["type", "id", "call_id", "output"])?;
+                                request.tool_outputs.push(parse_tool_result(&item["call_id"], &item["output"], false)?);
+                            }
+                            kind => return Err(unsupported_generation_field("input[].type", kind)),
+                        }
                     }
-                    let role = item["role"].as_str().context("Each Responses message requires a string `role`")?;
-                    if role != "user" {
-                        return Err(unsupported_generation_field(
-                            "input[].role", "app-server turns accept user input, not assistant history",
-                        ));
-                    }
-                    request.input.push(input(text_content(&item["content"], "input[].content")?));
-                },
+                }
                 _ => bail!("Responses requires text `input`"),
             }
         }
         Protocol::Messages => {
-            reject_unknown_fields(body, &["model", "stream", "system", "messages"])?;
+            reject_unknown_fields(body, &["model", "stream", "system", "messages", "tools", "tool_choice", "parallel_tool_calls"])?;
             if body.get("stream").is_some_and(|value| !value.is_boolean()) {
                 bail!("`stream` must be a boolean");
             }
@@ -414,25 +579,199 @@ fn codex_turn_request(protocol: Protocol, body: &Value) -> Result<CodexTurnReque
             for message in messages {
                 reject_unknown_fields(message, &["role", "content"])?;
                 let role = message["role"].as_str().context("Each message requires a string `role`")?;
-                if role != "user" {
-                    return Err(unsupported_generation_field(
-                        "messages[].role", "app-server turns accept user input, not assistant history",
-                    ));
+                if let Some(text) = message["content"].as_str() {
+                    match role {
+                        "user" => request.input.push(input(text.to_owned())),
+                        "assistant" => request.has_assistant_history = true,
+                        _ => return Err(unsupported_generation_field("messages[].role", role)),
+                    }
+                    continue;
                 }
-                request.input.push(input(text_content(&message["content"], "messages[].content")?));
+                let content = message["content"].as_array().context("Messages content must be a string or an array of blocks")?;
+                match role {
+                    "user" => {
+                        let mut user_text = Vec::new();
+                        for block in content {
+                            match block["type"].as_str() {
+                                Some("tool_result") => {
+                                    reject_unknown_fields(block, &["type", "tool_use_id", "content", "is_error"])?;
+                                    let is_error = block.get("is_error").map(|value| value.as_bool().context("`is_error` must be a boolean")).transpose()?.unwrap_or(false);
+                                    request.tool_outputs.push(parse_tool_result(&block["tool_use_id"], &block["content"], is_error)?);
+                                }
+                                Some("text") => {
+                                    reject_unknown_fields(block, &["type", "text"])?;
+                                    user_text.push(block["text"].as_str().context("Text blocks require a string `text`")?.to_owned());
+                                }
+                                kind => return Err(unsupported_generation_field("messages[].content[].type", kind.unwrap_or("unknown"))),
+                            }
+                        }
+                        if !user_text.is_empty() {
+                            request.input.push(input(user_text.join("")));
+                        }
+                    }
+                    "assistant" => {
+                        request.has_assistant_history = true;
+                        for block in content {
+                            match block["type"].as_str() {
+                                Some("tool_use") => {
+                                    reject_unknown_fields(block, &["type", "id", "name", "input"])?;
+                                    request.tool_calls.push(parse_call_reference(&block["id"], &block["name"], &block["input"])?);
+                                }
+                                Some("text") => {
+                                    reject_unknown_fields(block, &["type", "text"])?;
+                                    block["text"].as_str().context("Text blocks require a string `text`")?;
+                                }
+                                kind => return Err(unsupported_generation_field("messages[].content[].type", kind.unwrap_or("unknown"))),
+                            }
+                        }
+                    }
+                    _ => return Err(unsupported_generation_field("messages[].role", role)),
+                }
             }
         }
     }
-    if request.input.is_empty() {
-        bail!("Codex app-server requires at least one text user message");
+    if request.input.is_empty() && request.tool_outputs.is_empty() {
+        bail!("Codex app-server requires a text user message or a client tool result");
     }
     Ok(request)
 }
 
 /// Validate the same strict text subset before the gateway creates an HTTP response. The
 /// adapter repeats conversion at its own boundary so direct callers cannot bypass it.
-pub(crate) fn validate_generation_request(protocol: Protocol, body: &Value) -> Result<()> {
-    codex_turn_request(protocol, body).map(|_| ())
+pub(crate) fn validate_generation_request(protocol: Protocol, body: &Value, generation: u64) -> Result<()> {
+    let parsed = codex_turn_request(protocol, body)?;
+    for result in &parsed.tool_outputs {
+        anyhow::ensure!(
+            result.id.starts_with(&format!("call_ajv1_{generation}_")),
+            "Tool result belongs to a stale or unknown Codex connection generation"
+        );
+    }
+    for call in &parsed.tool_calls {
+        anyhow::ensure!(
+            call.id.starts_with(&format!("call_ajv1_{generation}_")),
+            "Tool call history belongs to a stale or unknown Codex connection generation"
+        );
+    }
+    Ok(())
+}
+
+fn validate_tool_followup(pending: &mut PendingToolTurn, request: &CodexTurnRequest) -> Result<Vec<(Value, Value)>> {
+    anyhow::ensure!(
+        request.dynamic_tools == pending.dynamic_tools,
+        "The function schemas changed while a Codex tool call was pending; the turn was discarded"
+    );
+    let generation_prefix = format!("call_ajv1_{}_", pending.generation);
+    let mut seen_calls = std::collections::HashSet::new();
+    for call in &request.tool_calls {
+        anyhow::ensure!(
+            call.id.starts_with(&generation_prefix),
+            "Tool call history belongs to a stale connection generation"
+        );
+        anyhow::ensure!(seen_calls.insert(call.id.as_str()), "Tool call history contains a duplicate call ID");
+        let Some(issued) = pending.issued_tool_calls.get(&call.id) else {
+            bail!("Tool call history does not match a call issued by the current Codex turn");
+        };
+        anyhow::ensure!(
+            issued.name == call.name && issued.arguments == call.arguments,
+            "Tool call history was changed after Codex issued the call"
+        );
+    }
+
+    let mut supplied = HashMap::<&str, &ClientToolResult>::new();
+    for output in &request.tool_outputs {
+        anyhow::ensure!(output.id.starts_with(&generation_prefix), "Tool result belongs to a stale connection generation");
+        anyhow::ensure!(supplied.insert(&output.id, output).is_none(), "A tool result was repeated in the request");
+        anyhow::ensure!(
+            pending.issued_tool_calls.contains_key(&output.id),
+            "Tool result does not match a call issued by the current Codex turn"
+        );
+    }
+    let expected: std::collections::HashSet<_> = pending.issued_tool_calls.iter().filter_map(|(id, call)| (!call.answered).then_some(id.as_str())).collect();
+    let supplied_pending: std::collections::HashSet<_> = supplied.keys().copied().filter(|id| pending.issued_tool_calls.get(*id).is_some_and(|call| !call.answered)).collect();
+    anyhow::ensure!(!expected.is_empty(), "The Codex turn has no pending client tool calls");
+    anyhow::ensure!(
+        expected == supplied_pending,
+        "The tool results were incomplete or repeated; the Codex turn was discarded and calls will not be replayed"
+    );
+
+    let mut responses = Vec::with_capacity(expected.len());
+    for (id, output) in supplied {
+        let issued = pending.issued_tool_calls.get_mut(id).expect("the result was validated above");
+        if issued.answered {
+            continue;
+        }
+        let content_items: Vec<_> = output.output.iter().map(|text| json!({"type":"inputText","text":text})).collect();
+        let result = json!({"success":!output.is_error,"contentItems":content_items});
+        responses.push((issued.request_id.clone(), result));
+        issued.answered = true;
+    }
+    Ok(responses)
+}
+
+fn client_tool_calls_from_requests(
+    requests: Vec<Value>,
+    thread_id: &str,
+    turn_id: &str,
+    generation: u64,
+    dynamic_tools: &[Value],
+    issued: &mut HashMap<String, IssuedToolCall>,
+) -> Result<Vec<ClientToolCall>> {
+    anyhow::ensure!(
+        !requests.is_empty() && requests.len() <= 64,
+        "Codex returned an empty or oversized dynamic tool batch"
+    );
+    let mut calls = Vec::with_capacity(requests.len());
+    let mut internal_ids = std::collections::HashSet::new();
+    let mut rpc_ids = std::collections::HashSet::new();
+    let mut output_bytes = 0usize;
+    for request in requests {
+        anyhow::ensure!(request["method"] == "item/tool/call", "Codex requested an unsupported helper-side operation");
+        let params = &request["params"];
+        anyhow::ensure!(
+            params["threadId"].as_str() == Some(thread_id) && params["turnId"].as_str() == Some(turn_id),
+            "Codex returned a dynamic tool call for a different turn"
+        );
+        let internal_call_id = params["callId"].as_str().filter(|id| !id.is_empty()).context("Codex dynamic tool request omitted its call ID")?.to_owned();
+        anyhow::ensure!(internal_ids.insert(internal_call_id.clone()), "Codex repeated a dynamic tool call ID");
+        anyhow::ensure!(
+            issued.values().all(|call| call.internal_call_id != internal_call_id),
+            "Codex repeated a dynamic tool call ID in the same turn"
+        );
+        let name = params["tool"].as_str().filter(|name| !name.is_empty()).context("Codex dynamic tool request omitted its function name")?.to_owned();
+        anyhow::ensure!(
+            dynamic_tools.iter().any(|tool| tool["name"].as_str() == Some(name.as_str())),
+            "Codex requested a function that the API client did not provide"
+        );
+        let arguments = params.get("arguments").cloned().context("Codex dynamic tool request omitted arguments")?;
+        anyhow::ensure!(arguments.is_object(), "Codex function arguments must be a JSON object");
+        let id = format!("call_ajv1_{generation}_{}", uuid::Uuid::new_v4().simple());
+        let arguments_text = arguments.to_string();
+        let rpc_id = request.get("id").cloned().context("Codex dynamic tool request omitted its JSON-RPC id")?;
+        anyhow::ensure!(
+            rpc_id.as_str().is_some_and(|id| !id.is_empty()) || rpc_id.is_number(),
+            "Codex dynamic tool request returned an invalid JSON-RPC id"
+        );
+        anyhow::ensure!(
+            rpc_ids.insert(rpc_id.clone()) && issued.values().all(|call| &call.request_id != &rpc_id),
+            "Codex repeated a dynamic tool JSON-RPC id"
+        );
+        output_bytes = output_bytes.saturating_add(id.len()).saturating_add(name.len()).saturating_add(arguments_text.len());
+        anyhow::ensure!(
+            output_bytes <= MAX_TOOL_CALL_OUTPUT_BYTES,
+            "Codex function-call output exceeds the 16 MiB response limit"
+        );
+        anyhow::ensure!(
+            issued
+                .insert(
+                    id.clone(),
+                    IssuedToolCall { request_id: rpc_id, internal_call_id, name: name.clone(), arguments, answered: false }
+                )
+                .is_none(),
+            "Codex generated a duplicate API call ID"
+        );
+        calls.push(ClientToolCall { id, name, arguments: arguments_text });
+    }
+    Ok(calls)
 }
 
 impl CodexAppServer {
@@ -466,7 +805,8 @@ impl CodexAppServer {
         let stdout = child.stdout.take().context("The Codex helper has no stdout")?;
         let pending = Arc::new(Mutex::new(HashMap::new()));
         let (sender, notifications) = tokio::sync::mpsc::unbounded_channel();
-        spawn_reader(stdout, pending.clone(), sender);
+        let (request_sender, server_requests) = tokio::sync::mpsc::unbounded_channel();
+        spawn_reader(stdout, pending.clone(), sender, request_sender);
         let mut server = CodexAppServer {
             instance_id: uuid::Uuid::new_v4().to_string(),
             child: Some(child),
@@ -476,6 +816,7 @@ impl CodexAppServer {
             next_id: 0,
             pending,
             notifications,
+            server_requests,
         };
         // 官方 app-server 握手：`initialize` 带客户端自述，收到响应后再发一条无 id 的 `initialized` 通知。
         let client_info = json!({
@@ -483,7 +824,7 @@ impl CodexAppServer {
             "title": CLIENT_INFO_TITLE,
             "version": env!("CARGO_PKG_VERSION"),
         });
-        let initialized = server.call("initialize", json!({ "clientInfo": client_info })).await?;
+        let initialized = server.call("initialize", json!({ "clientInfo": client_info, "capabilities": {"experimentalApi": true} })).await?;
         server.version = initialized.get("version").and_then(Value::as_str).map(str::to_owned);
         server.notify("initialized", json!({})).await?;
         Ok(server)
@@ -543,6 +884,35 @@ impl CodexAppServer {
         self.notifications.recv().await
     }
 
+    async fn next_message(&mut self) -> Option<HelperMessage> {
+        tokio::select! {
+            value = self.notifications.recv() => value.map(HelperMessage::Notification),
+            value = self.server_requests.recv() => value.map(HelperMessage::ServerRequest),
+        }
+    }
+
+    async fn collect_server_requests(&mut self, first: Value) -> Vec<Value> {
+        let mut requests = vec![first];
+        // The app-server emits one request per client tool call. Allow the reader a brief quiet
+        // interval so a parallel batch is returned as one API tool_calls result.
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_millis(20), self.server_requests.recv()).await {
+                Ok(Some(request)) => requests.push(request),
+                Ok(None) | Err(_) => break,
+            }
+        }
+        requests
+    }
+
+    pub async fn respond_server_request(&mut self, id: Value, result: Value) -> Result<()> {
+        let response = json!({"jsonrpc":"2.0","id":id,"result":result});
+        let stdin = self.stdin.as_mut().context("The Codex helper is not running")?;
+        let mut line = serde_json::to_vec(&response)?;
+        line.push(b'\n');
+        stdin.write_all(&line).and_then(|_| stdin.flush()).context("Write the client-owned tool result to the Codex helper")?;
+        Ok(())
+    }
+
     pub fn auth_home(&self) -> &Path {
         &self.auth_home
     }
@@ -592,11 +962,19 @@ fn spawn_reader(
     stdout: ChildStdout,
     pending: Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<std::result::Result<Value, String>>>>>,
     notifications: tokio::sync::mpsc::UnboundedSender<Value>,
+    server_requests: tokio::sync::mpsc::UnboundedSender<Value>,
 ) {
     std::thread::spawn(move || {
         for line in BufReader::new(stdout).lines() {
             let Ok(line) = line else { break };
-            let Ok(value) = serde_json::from_str::<Value>(&line) else { continue };
+            let Ok(value) = serde_json::from_str::<Value>(&line) else { continue;
+            };
+            if value.get("method").is_some() && value.get("id").is_some() {
+                if server_requests.send(value).is_err() {
+                    break;
+                }
+                continue;
+            }
             match value.get("id").and_then(Value::as_u64) {
                 Some(id) => {
                     if let Some(sender) = pending.lock().unwrap().remove(&id) {
@@ -636,6 +1014,7 @@ struct AdapterState {
 const GENERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 const TURN_COMPLETION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const MAX_GENERATION_INPUT_BYTES: usize = 32 * 1024;
+const MAX_TOOL_CALL_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 
 type GenerationGuardCell = Arc<Mutex<Option<tokio::sync::OwnedMutexGuard<()>>>>;
 
@@ -723,11 +1102,18 @@ impl TurnCancellation {
         self.armed.store(false, std::sync::atomic::Ordering::SeqCst);
         self.generation_guard.lock().unwrap().take();
     }
+
+    fn release_for_tool_handoff(&mut self) -> Option<PathBuf> {
+        self.armed.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.generation_guard.lock().unwrap().take();
+        self.workspace.take()
+    }
 }
 
 impl Drop for TurnCancellation {
     fn drop(&mut self) {
-        let Some(workspace) = self.workspace.take() else { return };
+        let Some(workspace) = self.workspace.take() else { return;
+        };
         let armed = self.armed.swap(false, std::sync::atomic::Ordering::SeqCst);
         if !armed {
             self.generation_guard.lock().unwrap().take();
@@ -786,11 +1172,48 @@ struct GenerationState {
     thread_id: String,
     turn_id: String,
     generation: u64,
+    dynamic_tools: Vec<Value>,
+    request_context: Value,
+    issued_tool_calls: HashMap<String, IssuedToolCall>,
+    pending_tool_turns: Arc<Mutex<HashMap<String, PendingToolTurn>>>,
     started: bool,
     terminal: bool,
     deadline: tokio::time::Instant,
     cancel: tokio::sync::watch::Receiver<TurnCancelStatus>,
     cancellation: TurnCancellation,
+}
+
+#[derive(Clone, Debug)]
+struct IssuedToolCall {
+    request_id: Value,
+    internal_call_id: String,
+    name: String,
+    arguments: Value,
+    answered: bool,
+}
+
+struct PendingToolTurn {
+    generation: u64,
+    helper_instance_id: String,
+    thread_id: String,
+    turn_id: String,
+    workspace: PathBuf,
+    dynamic_tools: Vec<Value>,
+    request_context: Value,
+    issued_tool_calls: HashMap<String, IssuedToolCall>,
+    deadline: tokio::time::Instant,
+}
+
+fn request_context(request: &CodexTurnRequest) -> Value {
+    json!({
+        "baseInstructions":request.base_instructions,
+        "developerInstructions":request.developer_instructions,
+        "input":request.input,
+        "dynamicTools":request.dynamic_tools,
+        "effort":request.effort,
+        "summary":request.summary,
+        "serviceTier":request.service_tier
+    })
 }
 
 fn generation_workspace() -> Result<PathBuf> {
@@ -812,6 +1235,7 @@ pub struct CodexAdapter {
     logins: Mutex<HashMap<String, ActiveLogin>>,
     /// 已被某个等待者取走、但属于另一次尝试的完成通知；由对应等待者领回，避免串线丢失。
     deferred: Mutex<HashMap<String, VecDeque<(String, Value)>>>,
+    pending_tool_turns: Arc<Mutex<HashMap<String, PendingToolTurn>>>,
     state: Mutex<AdapterState>,
     /// 仅在测试构建里可显式指定；生产只能走 [`resolve_launch`]。
     launch: Option<HelperLaunch>,
@@ -836,6 +1260,7 @@ impl CodexAdapter {
             active_turns: Arc::new(Mutex::new(HashMap::new())),
             logins: Mutex::new(HashMap::new()),
             deferred: Mutex::new(HashMap::new()),
+            pending_tool_turns: Arc::new(Mutex::new(HashMap::new())),
             state: Mutex::new(AdapterState::default()),
             launch: None,
             home_root: None,
@@ -880,15 +1305,13 @@ impl CodexAdapter {
 
     /// 保证该服务商有一个已握手的辅助进程，并把整个会话交给调用方使用。
     async fn servers(
-        &self,
-    ) -> tokio::sync::MutexGuard<'_, HashMap<String, CodexAppServer>> {
+        &self) -> tokio::sync::MutexGuard<'_, HashMap<String, CodexAppServer>> {
         self.servers.lock().await
     }
 
     async fn server_for(
         &self,
-        provider_id: &str,
-    ) -> Result<tokio::sync::MutexGuard<'_, HashMap<String, CodexAppServer>>> {
+        provider_id: &str) -> Result<tokio::sync::MutexGuard<'_, HashMap<String, CodexAppServer>>> {
         let mut servers = self.servers.lock().await;
         if !servers.contains_key(provider_id) {
             let launch = self.launch()?;
@@ -926,15 +1349,13 @@ impl CodexAdapter {
         let mut servers = self.servers.lock().await;
         let Some(server) = servers.get_mut(provider_id) else {
             return Ok(Some(LoginResult::Failed(
-                "The Codex helper exited before the account could be verified".to_owned(),
-            )));
+                "The Codex helper exited before the account could be verified".to_owned())));
         };
         let verified = server.call("account/read", json!({})).await;
         let identity = verified.as_ref().ok().and_then(account_email);
         let Some(identity) = identity else {
             return Ok(Some(LoginResult::Failed(
-                "The Codex helper did not confirm a signed-in account".to_owned(),
-            )));
+                "The Codex helper did not confirm a signed-in account".to_owned())));
         };
         let reported = params.get("account").and_then(|account| account.get("email")).and_then(Value::as_str);
         if reported.is_some_and(|reported| reported != identity) {
@@ -1043,8 +1464,7 @@ impl SubscriptionAdapter for CodexAdapter {
                 .to_owned();
             self.logins.lock().unwrap().insert(
                 provider_id.to_owned(),
-                ActiveLogin { login_id: login_id.clone(), generation },
-            );
+                ActiveLogin { login_id: login_id.clone(), generation });
             Ok(LoginStart {
                 login_id,
                 authorization_url: result.get("authorizationUrl").and_then(Value::as_str).map(str::to_owned),
@@ -1146,13 +1566,11 @@ impl SubscriptionAdapter for CodexAdapter {
                     std::fs::create_dir_all(parent)
                         .with_context(|| format!("Prepare the helper root {}", parent.display()))?;
                 }
-                std::fs::rename(&old_home, &new_home).with_context(|| {
-                    format!(
+                std::fs::rename(&old_home, &new_home).with_context(|| format!(
                         "Move the dedicated helper home {} to {}",
                         old_home.display(),
                         new_home.display()
-                    )
-                })?;
+                    ))?;
             }
             drop(servers);
             if let Some(login) = self.logins.lock().unwrap().remove(old_id) {
@@ -1175,6 +1593,10 @@ impl SubscriptionAdapter for CodexAdapter {
             // revocation with generation so queued old requests recheck and fail before dispatch.
             // Signal and interrupt the active turn before waiting for the lock: the stream consumer
             // may be backpressured and unable to poll its cancellation event itself.
+            let pending = self.pending_tool_turns.lock().unwrap().remove(provider_id);
+            if let Some(pending) = pending {
+                discard_pending_tool_turn(&self.servers, provider_id, pending).await;
+            }
             let active = self.active_turns.lock().unwrap().get(provider_id).cloned()
                 .filter(|active| active.armed.load(std::sync::atomic::Ordering::SeqCst) || active.turn_id.is_none());
             let mut transferred_generation_guard = None;
@@ -1252,9 +1674,11 @@ impl SubscriptionAdapter for CodexAdapter {
         let mut input_bytes = turn.input.iter().map(Value::to_string).map(|text| text.len()).sum::<usize>();
         input_bytes += turn.base_instructions.as_ref().map_or(0, String::len);
         input_bytes += turn.developer_instructions.as_ref().map_or(0, String::len);
+        input_bytes += turn.dynamic_tools.iter().map(Value::to_string).map(|text| text.len()).sum::<usize>();
+        input_bytes += turn.tool_outputs.iter().flat_map(|result| &result.output).map(String::len).sum::<usize>();
         if input_bytes > MAX_GENERATION_INPUT_BYTES {
             return Box::pin(async {
-                Err(anyhow::anyhow!("Codex text input exceeds the 32 KiB limit; context compaction is not enabled"))
+                Err(anyhow::anyhow!("Codex request input exceeds the 32 KiB limit; context compaction is not enabled"))
             });
         }
 
@@ -1262,35 +1686,67 @@ impl SubscriptionAdapter for CodexAdapter {
         let generation = request.generation;
         let model_id = request.model_id.to_owned();
         let pre_dispatch_check = request.pre_dispatch_check.clone();
+        let pending_tool_turns = self.pending_tool_turns.clone();
         Box::pin(async move {
+            let generation_request_context = request_context(&turn);
             let generation_guard = self.generation_lock(&provider_id).lock_owned().await;
-            pre_dispatch_check().map_err(anyhow::Error::msg)?;
-            let workspace = generation_workspace()?;
             let servers_ref = self.servers.clone();
+            let mut pending = pending_tool_turns.lock().unwrap().remove(&provider_id);
+            if let Err(error) = pre_dispatch_check() {
+                if let Some(pending) = pending.take() {
+                    discard_pending_tool_turn(&servers_ref, &provider_id, pending).await;
+                }
+                return Err(anyhow::Error::msg(error));
+            }
+            if pending
+                .as_ref()
+                .is_some_and(|pending| pending.generation != generation || tokio::time::Instant::now() >= pending.deadline || request_context(&turn) != pending.request_context)
+            {
+                let pending = pending.take().expect("the pending turn exists");
+                discard_pending_tool_turn(&servers_ref, &provider_id, pending).await;
+                bail!("The pending Codex tool turn expired or no longer matches this request or connection generation; it was discarded");
+            }
+            let tool_responses = if pending.is_some() {
+                match validate_tool_followup(pending.as_mut().expect("checked above"), &turn) {
+                    Ok(responses) => responses,
+                    Err(error) => {
+                        let pending = pending.take().expect("the pending turn exists");
+                        discard_pending_tool_turn(&servers_ref, &provider_id, pending).await;
+                        return Err(error);
+                    }
+                }
+            } else {
+                if turn.has_assistant_history || !turn.tool_calls.is_empty() || !turn.tool_outputs.is_empty() {
+                    bail!("Tool call history requires a matching live Codex turn from this connection generation");
+                }
+                Vec::new()
+            };
+            let workspace = pending.as_ref().map(|pending| pending.workspace.clone()).map_or_else(generation_workspace, Ok)?;
             let generation_guard = Arc::new(Mutex::new(Some(generation_guard)));
-            let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let armed = Arc::new(std::sync::atomic::AtomicBool::new(pending.is_some()));
             let request_id = uuid::Uuid::new_v4().to_string();
             let (cancel, mut cancel_receiver) = tokio::sync::watch::channel(TurnCancelStatus::Running);
             self.active_turns.lock().unwrap().insert(provider_id.clone(), ActiveTurnControl {
                 request_id: request_id.clone(),
                 cancel,
-                helper_instance_id: None,
-                thread_id: None,
-                turn_id: None,
+                helper_instance_id: pending.as_ref().map(|pending| pending.helper_instance_id.clone()),
+                thread_id: pending.as_ref().map(|pending| pending.thread_id.clone()),
+                turn_id: pending.as_ref().map(|pending| pending.turn_id.clone()),
                 armed: armed.clone(),
                 generation_guard: generation_guard.clone(),
-            });
+            },
+            );
             let active_registration = ActiveTurnRegistration {
                 active_turns: self.active_turns.clone(),
                 provider_id: provider_id.clone(),
-                request_id,
-            };
+                request_id };
+            let previous = pending.as_ref();
             let mut cancellation = TurnCancellation {
                 servers: servers_ref.clone(),
                 provider_id: provider_id.clone(),
-                helper_instance_id: None,
-                thread_id: None,
-                turn_id: None,
+                helper_instance_id: previous.map(|pending| pending.helper_instance_id.clone()),
+                thread_id: previous.map(|pending| pending.thread_id.clone()),
+                turn_id: previous.map(|pending| pending.turn_id.clone()),
                 workspace: Some(workspace.clone()),
                 armed,
                 generation_guard: generation_guard.clone(),
@@ -1301,22 +1757,34 @@ impl SubscriptionAdapter for CodexAdapter {
             let mut servers = self.server_for(&provider_id).await?;
             let server = servers.get_mut(&provider_id).expect("server_for inserted the Codex helper");
             let helper_instance_id = server.instance_id().to_owned();
+            if pending.as_ref().is_some_and(|pending| pending.helper_instance_id != helper_instance_id) {
+                bail!("The helper that owns the pending Codex tool call has changed; the turn was discarded");
+            }
             cancellation.helper_instance_id = Some(helper_instance_id.clone());
             cancellation.active_registration.set_helper_instance(helper_instance_id);
             pre_dispatch_check().map_err(anyhow::Error::msg)?;
             if *cancel_receiver.borrow() != TurnCancelStatus::Running {
-                anyhow::bail!("The Codex generation was cancelled before thread start");
+                anyhow::bail!("The Codex generation was cancelled before dispatch");
             }
-            let mut developer_instructions = String::from(
-                "Use only the request text and instructions below. Do not inspect files, use tools, browse, delegate, or continue with follow-up turns. Return assistant text only.",
-            );
-            if let Some(user_instructions) = turn.developer_instructions.as_deref() {
+            let (thread_id, turn_id, dynamic_tools, issued_tool_calls) = if let Some(pending) = pending.take() {
+                for (rpc_id, result) in tool_responses {
+                    tokio::select! {
+                        response = server.respond_server_request(rpc_id, result) => response?,
+                        _ = wait_for_turn_cancellation(&mut cancel_receiver) => anyhow::bail!("The Codex tool-result handoff was cancelled"),
+                    }
+                }
+                (pending.thread_id, pending.turn_id, pending.dynamic_tools, pending.issued_tool_calls)
+            } else {
+                let mut developer_instructions = turn.developer_instructions.clone().unwrap_or_default();
+                if !developer_instructions.is_empty() {
                 developer_instructions.push_str("\n\n");
-                developer_instructions.push_str(user_instructions);
-            }
-            // These field names are from the pinned Codex version's ModelProviderInfo. A
-            // request-scoped custom provider avoids mutating the built-in OpenAI configuration.
-            let retry_provider_id = format!("autojev_no_retry_{}", uuid::Uuid::new_v4().simple());
+                }
+                if turn.dynamic_tools.is_empty() {
+                    developer_instructions.push_str("Application constraints: Use only the request text. Do not inspect files, use tools, browse, delegate, or continue with follow-up turns. Return assistant text only.");
+            } else {
+                    developer_instructions.push_str("Application constraints: Never inspect files, execute commands, browse, delegate, or use built-in tools. You may call only the client-provided functions. Return assistant text or client function calls and stop for the client to continue.");
+                }
+                let retry_provider_id = format!("autojev_no_retry_{}", uuid::Uuid::new_v4().simple());
             let mut thread_params = json!({
                 "model": model_id,
                 "ephemeral": true,
@@ -1340,14 +1808,18 @@ impl SubscriptionAdapter for CodexAdapter {
                     "unbounded_connection_retries": false
                 }}
             });
-            let mut retry_providers = serde_json::Map::new();
+                if !turn.dynamic_tools.is_empty() {
+                    thread_params["dynamicTools"] = turn.dynamic_tools.clone().into();
+                }
+                let mut retry_providers = serde_json::Map::new();
             retry_providers.insert(retry_provider_id.clone(), json!({
                 "name": "OpenAI",
                 "requires_openai_auth": true,
                 "request_max_retries": 0,
                 "stream_max_retries": 0,
                 "supports_websockets": false
-            }));
+            }),
+                );
             thread_params["modelProvider"] = retry_provider_id.clone().into();
             thread_params["config"]["model_providers"] = Value::Object(retry_providers);
             if let Some(tier) = turn.service_tier.as_deref() {
@@ -1355,10 +1827,8 @@ impl SubscriptionAdapter for CodexAdapter {
             }
             let thread_result = tokio::select! {
                 result = server.call("thread/start", thread_params) => result?,
-                _ = wait_for_turn_cancellation(&mut cancel_receiver) => {
-                    anyhow::bail!("The Codex generation was cancelled while starting its thread");
-                }
-            };
+                _ = wait_for_turn_cancellation(&mut cancel_receiver) => anyhow::bail!("The Codex generation was cancelled while starting its thread"),
+                };
             let thread_id = thread_result.pointer("/thread/id").and_then(Value::as_str)
                 .context("The Codex helper did not return a thread id")?.to_owned();
             cancellation.thread_id = Some(thread_id.clone());
@@ -1384,19 +1854,17 @@ impl SubscriptionAdapter for CodexAdapter {
             if let Some(tier) = turn.service_tier.as_deref() {
                 turn_params["serviceTierForTurn"] = tier.into();
             }
-            // Arm before the RPC write: a lost or delayed acknowledgement cannot leave work running
-            // without a guard; without turnId, cancel by reaping this application's owned helper.
-            cancellation.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+                cancellation.armed.store(true, std::sync::atomic::Ordering::SeqCst);
             let turn_result = tokio::select! {
                 result = server.call("turn/start", turn_params) => result?,
-                _ = wait_for_turn_cancellation(&mut cancel_receiver) => {
-                    anyhow::bail!("The Codex generation was cancelled while starting its turn");
-                }
-            };
+                _ = wait_for_turn_cancellation(&mut cancel_receiver) => anyhow::bail!("The Codex generation was cancelled while starting its turn"),
+                };
             let turn_id = turn_result.pointer("/turn/id").and_then(Value::as_str)
                 .context("The Codex helper did not return a turn id")?.to_owned();
             cancellation.turn_id = Some(turn_id.clone());
             cancellation.active_registration.set_turn(turn_id.clone());
+                (thread_id, turn_id, turn.dynamic_tools.clone(), HashMap::new())
+            };
             drop(servers);
 
             let state = GenerationState {
@@ -1405,6 +1873,10 @@ impl SubscriptionAdapter for CodexAdapter {
                 thread_id: thread_id.clone(),
                 turn_id: turn_id.clone(),
                 generation,
+                dynamic_tools,
+                request_context: generation_request_context,
+                issued_tool_calls,
+                pending_tool_turns: pending_tool_turns.clone(),
                 started: false,
                 terminal: false,
                 deadline: tokio::time::Instant::now() + GENERATION_TIMEOUT,
@@ -1433,8 +1905,7 @@ impl SubscriptionAdapter for CodexAdapter {
                                 &state.provider_id,
                                 helper_instance_id,
                                 &state.thread_id,
-                                &state.turn_id,
-                            ).await;
+                                &state.turn_id).await;
                         }
                         state.cancellation.disarm_and_release();
                         state.terminal = true;
@@ -1450,7 +1921,7 @@ impl SubscriptionAdapter for CodexAdapter {
                         next = async {
                             let mut servers = state.servers.lock().await;
                             match servers.get_mut(&state.provider_id) {
-                                Some(server) => Some(tokio::time::timeout(POLL_SLICE, server.next_notification()).await),
+                                Some(server) => Some(tokio::time::timeout(POLL_SLICE, server.next_message()).await),
                                 None => None,
                             }
                         } => next,
@@ -1460,13 +1931,102 @@ impl SubscriptionAdapter for CodexAdapter {
                         state.terminal = true;
                         return Some((GenerationEvent::Failed { message: "The Codex helper exited during generation".into() }, state));
                     };
-                    let value = match next {
+                    let message = match next {
                         Err(_) => continue,
-                        Ok(Some(value)) => value,
+                        Ok(Some(message)) => message,
                         Ok(None) => {
                             state.cancellation.disarm_and_release();
                             state.terminal = true;
-                            return Some((GenerationEvent::Failed { message: "The Codex helper stopped before completing the turn".into() }, state));
+                            return Some((GenerationEvent::Failed { message: "The Codex helper stopped before completing the turn".into() },
+                                state,
+                            ));
+                        }
+                    };
+                    let value = match message {
+                        HelperMessage::Notification(value) => value,
+                        HelperMessage::ServerRequest(first) => {
+                            let requests = {
+                                let mut servers = state.servers.lock().await;
+                                match servers.get_mut(&state.provider_id) {
+                                    Some(server) if server.instance_id() == state.cancellation.helper_instance_id.as_deref().unwrap_or("") => {
+                                        server.collect_server_requests(first).await
+                                    }
+                                    _ => vec![first],
+                                }
+                            };
+                            let calls = match client_tool_calls_from_requests(
+                                requests,
+                                &state.thread_id,
+                                &state.turn_id,
+                                state.generation,
+                                &state.dynamic_tools,
+                                &mut state.issued_tool_calls,
+                            ) {
+                                Ok(calls) => calls,
+                                Err(error) => {
+                                    if let Some(helper_instance_id) = state.cancellation.helper_instance_id.as_deref() {
+                                        stop_active_turn(&state.servers, &state.provider_id, helper_instance_id, &state.thread_id, &state.turn_id).await;
+                                    }
+                                    state.cancellation.disarm_and_release();
+                                    state.terminal = true;
+                                    return Some((GenerationEvent::Failed { message: redact(&error.to_string()) }, state));
+                                }
+                            };
+                            let Some(workspace) = state.cancellation.release_for_tool_handoff() else {
+                                state.terminal = true;
+                                return Some((
+                                    GenerationEvent::Failed { message: "The Codex tool handoff could not preserve its request workspace".into() },
+                                    state,
+                                ));
+                            };
+                            let deadline = tokio::time::Instant::now() + GENERATION_TIMEOUT;
+                            let pending = PendingToolTurn {
+                                generation: state.generation,
+                                helper_instance_id: state.cancellation.helper_instance_id.clone().unwrap_or_default(),
+                                thread_id: state.thread_id.clone(),
+                                turn_id: state.turn_id.clone(),
+                                workspace,
+                                dynamic_tools: state.dynamic_tools.clone(),
+                                request_context: state.request_context.clone(),
+                                issued_tool_calls: state.issued_tool_calls.clone(),
+                                deadline,
+                            };
+                            let replaced = state.pending_tool_turns.lock().unwrap().insert(state.provider_id.clone(), pending);
+                            if let Some(replaced) = replaced {
+                                discard_pending_tool_turn(&state.servers, &state.provider_id, replaced).await;
+                                state.terminal = true;
+                                return Some((
+                                    GenerationEvent::Failed { message: "Another Codex tool turn was pending; the earlier turn was discarded".into() },
+                                    state,
+                                ));
+                            }
+                            let pending_tool_turns = state.pending_tool_turns.clone();
+                            let servers = state.servers.clone();
+                            let provider_id = state.provider_id.clone();
+                            let helper_instance_id = state.cancellation.helper_instance_id.clone().unwrap_or_default();
+                            let thread_id = state.thread_id.clone();
+                            let turn_id = state.turn_id.clone();
+                            tokio::spawn(async move {
+                                tokio::time::sleep_until(deadline).await;
+                                let expired = {
+                                    let mut turns = pending_tool_turns.lock().unwrap();
+                                    if turns.get(&provider_id).is_some_and(|pending| {
+                                        pending.helper_instance_id == helper_instance_id
+                                            && pending.thread_id == thread_id
+                                            && pending.turn_id == turn_id
+                                            && pending.deadline == deadline
+                                    }) {
+                                        turns.remove(&provider_id)
+                                    } else {
+                                        None
+                                    }
+                                };
+                                if let Some(expired) = expired {
+                                    discard_pending_tool_turn(&servers, &provider_id, expired).await;
+                                }
+                            });
+                            state.terminal = true;
+                            return Some((GenerationEvent::ToolCalls { calls }, state));
                         }
                     };
                     let params = &value["params"];
@@ -1498,7 +2058,7 @@ impl SubscriptionAdapter for CodexAdapter {
                         method if method.starts_with("item/") && params["turnId"].as_str() == Some(state.turn_id.as_str()) => {
                             let ordinary_lifecycle = matches!(method, "item/started" | "item/completed")
                                 && matches!(params.pointer("/item/type").and_then(Value::as_str),
-                                    Some("userMessage" | "agentMessage" | "reasoning" | "plan"));
+                                    Some("userMessage" | "agentMessage" | "reasoning" | "plan" | "dynamicToolCall"));
                             let reasoning_notification = matches!(method,
                                 "item/reasoning/summaryTextDelta"
                                 | "item/reasoning/summaryPartAdded"
@@ -1513,12 +2073,12 @@ impl SubscriptionAdapter for CodexAdapter {
                                     &state.provider_id,
                                     helper_instance_id,
                                     &state.thread_id,
-                                    &state.turn_id,
-                                ).await;
+                                    &state.turn_id).await;
                             }
                             state.cancellation.disarm_and_release();
                             state.terminal = true;
-                            return Some((GenerationEvent::Failed { message: "Codex tool activity or unknown item activity is not accepted by this gateway".into() }, state));
+                            return Some((GenerationEvent::Failed { message: "Codex tool activity or unknown item activity is not accepted by this gateway".into() }, state,
+                            ));
                         }
                         _ => continue,
                     }
@@ -1557,7 +2117,8 @@ async fn wait_for_turn_completion(
     loop {
         let next = {
             let mut servers = servers.lock().await;
-            let Some(server) = servers.get_mut(provider_id) else { return false };
+            let Some(server) = servers.get_mut(provider_id) else { return false;
+            };
             if server.instance_id() != helper_instance_id { return false; }
             tokio::time::timeout_at(deadline, server.next_notification()).await
         };
@@ -1579,8 +2140,7 @@ async fn stop_active_turn(
     provider_id: &str,
     helper_instance_id: &str,
     thread_id: &str,
-    turn_id: &str,
-) {
+    turn_id: &str) {
     if interrupt_active_turn(servers, provider_id, helper_instance_id, thread_id, turn_id).await
         && wait_for_turn_completion(servers, provider_id, helper_instance_id, thread_id, turn_id).await
     {
@@ -1590,6 +2150,11 @@ async fn stop_active_turn(
     // notification never arrives, kill and reap this exact app-owned helper before its
     // per-account generation guard can be released.
     reap_owned_helper(servers, provider_id, helper_instance_id).await;
+}
+
+async fn discard_pending_tool_turn(servers: &Arc<tokio::sync::Mutex<HashMap<String, CodexAppServer>>>, provider_id: &str, pending: PendingToolTurn) {
+    stop_active_turn(servers, provider_id, &pending.helper_instance_id, &pending.thread_id, &pending.turn_id).await;
+    let _ = std::fs::remove_dir_all(pending.workspace);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1607,7 +2172,8 @@ async fn interrupt_active_turn(
     turn_id: &str,
 ) -> bool {
     let mut servers = servers.lock().await;
-    let Some(server) = servers.get_mut(provider_id) else { return false };
+    let Some(server) = servers.get_mut(provider_id) else { return false;
+    };
     if server.instance_id() != helper_instance_id {
         return false;
     }
@@ -1617,8 +2183,7 @@ async fn interrupt_active_turn(
 async fn reap_owned_helper(
     servers: &Arc<tokio::sync::Mutex<HashMap<String, CodexAppServer>>>,
     provider_id: &str,
-    helper_instance_id: &str,
-) -> ReapResult {
+    helper_instance_id: &str) -> ReapResult {
     let mut servers = servers.lock().await;
     match servers.get(provider_id) {
         Some(server) if server.instance_id() != helper_instance_id => ReapResult::DifferentInstance,
@@ -1716,7 +2281,8 @@ fn parse_catalog(result: &Value) -> Result<CatalogRead> {
         // 发现 ≠ 资格：固定版本没有任何资格布尔字段，本票一律保持 false（资格由 #17 定义）。
         models.push(DiscoveredModel { model_id, name, eligible: false });
     }
-    Ok(CatalogRead { state: EvidenceState::Available, models, source: Some(CATALOG_SOURCE.to_owned()), observed_at: Some(observed_at_now()), missing_fields })
+    Ok(CatalogRead { state: EvidenceState::Available, models, source: Some(CATALOG_SOURCE.to_owned()), observed_at: Some(observed_at_now()), missing_fields,
+    })
 }
 
 // CHUNK-QUOTA
@@ -1752,7 +2318,8 @@ fn parse_quota(result: &Value) -> QuotaEvidence {
         let malformed_buckets = malformed && buckets.is_empty();
         (QuotaView::RateLimitsByLimitId, QUOTA_SOURCE_BY_LIMIT_ID, buckets, malformed_buckets)
     } else if let Some(snapshot) = result.get("rateLimits").filter(|snapshot| snapshot.is_object()) {
-        (QuotaView::RateLimits, QUOTA_SOURCE_RATE_LIMITS, vec![parse_bucket("", snapshot, root_permission.as_ref())], false)
+        (QuotaView::RateLimits, QUOTA_SOURCE_RATE_LIMITS, vec![parse_bucket("", snapshot, root_permission.as_ref())], false,
+        )
     } else {
         // 读取成功但既无多桶也无旧版单桶：证据为 Unknown，顶层缺失字段由下面补齐。
         (QuotaView::Unknown, QUOTA_SOURCE_BASE, Vec::new(), false)
@@ -1971,9 +2538,14 @@ next_scenario() {
   if [ -f "$file" ]; then sed -n "${n}p" "$file"; fi
 }
 while IFS= read -r line; do
+  method=$(printf '%s' "$line" | sed -n 's/.*"method":"\([^"]*\)".*/\1/p')
+  if [ -z "$method" ]; then
+    rpc_id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+    if [ -n "$rpc_id" ]; then printf '%s\n' "$line" >> "$queue.tool-responses"; fi
+    continue
+  fi
   id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
   if [ -z "$id" ]; then continue; fi
-  method=$(printf '%s' "$line" | sed -n 's/.*"method":"\([^"]*\)".*/\1/p')
   printf '%s\n' "$method" >> "$queue.calls"
   printf '%s\n' "$line" >> "$queue.rpc"
   case "$line" in
@@ -2055,6 +2627,11 @@ while IFS= read -r line; do
         elif [ "$scenario" = tool-interrupt-fails ]; then
           printf '%s\n' "$helper_pid" > "$queue.active"
           printf '{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"%s","turnId":"%s","startedAtMs":1,"item":{"type":"commandExecution","id":"fixture-command","command":"echo blocked","cwd":"/tmp","commandActions":[],"status":"inProgress"}}}\n' "$thread_id" "$turn_id"
+        elif [ "$scenario" = dynamic-tools ]; then
+          printf '{"jsonrpc":"2.0","id":"tool-rpc-1","method":"item/tool/call","params":{"threadId":"%s","turnId":"%s","callId":"internal-1","tool":"lookup","arguments":{"key":"one"}}}\n' "$thread_id" "$turn_id"
+          printf '{"jsonrpc":"2.0","id":"tool-rpc-2","method":"item/tool/call","params":{"threadId":"%s","turnId":"%s","callId":"internal-2","tool":"lookup","arguments":{"key":"two"}}}\n' "$thread_id" "$turn_id"
+          while [ ! -f "$queue.tool-responses" ] || [ "$(wc -l < "$queue.tool-responses")" -lt 2 ]; do sleep 0.01; done
+          printf '{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"%s","turnId":"%s","itemId":"fixture-item","delta":"continued"}}\n' "$thread_id" "$turn_id"
         elif [ "$scenario" = partial-disconnect ]; then
           printf '{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"%s","turnId":"%s","itemId":"fixture-item","delta":"partial"}}\n' "$thread_id" "$turn_id"
           sleep 0.05
@@ -2113,11 +2690,8 @@ done
     struct RecordingDispatcher(Arc<Mutex<Vec<ApiDispatchSeen>>>);
 
     impl crate::dispatch::Dispatcher for RecordingDispatcher {
-        fn send<'a>(
-            &'a self,
-            target: crate::dispatch::Target<'a>,
-            request: reqwest::RequestBuilder,
-        ) -> futures_util::future::BoxFuture<'a, anyhow::Result<reqwest::Response>> {
+        fn send<'a>(&'a self,
+            target: crate::dispatch::Target<'a>, request: reqwest::RequestBuilder) -> futures_util::future::BoxFuture<'a, anyhow::Result<reqwest::Response>> {
             let seen = self.0.clone();
             let provider_id = target.provider.id.clone();
             let model_id = target.model_id.to_owned();
@@ -2129,8 +2703,7 @@ done
                 let body = request.body().and_then(reqwest::Body::as_bytes)
                     .and_then(|bytes| serde_json::from_slice(bytes).ok()).unwrap_or(Value::Null);
                 seen.lock().unwrap().push(ApiDispatchSeen {
-                    provider_id, model_id, protocol, url: request.url().to_string(), authorization, body,
-                });
+                    provider_id, model_id, protocol, url: request.url().to_string(), authorization, body });
                 anyhow::bail!("controlled dispatcher stopped at the API boundary")
             })
         }
@@ -2139,14 +2712,12 @@ done
     fn admitted_gateway_store(
         database: &Path,
         adapter: Arc<CodexAdapter>,
-        api_base_url: &str,
-    ) -> Arc<crate::config::ConfigStore> {
+        api_base_url: &str) -> Arc<crate::config::ConfigStore> {
         admitted_gateway_store_with_dispatcher(
             database,
             adapter,
             Arc::new(crate::dispatch::ApiDispatcher { loopback_only: false }),
-            api_base_url,
-        )
+            api_base_url)
     }
 
     fn admitted_gateway_store_with_dispatcher(
@@ -2162,8 +2733,7 @@ done
         let store = Arc::new(crate::config::ConfigStore::load_with_adapters(
             database.to_path_buf(),
             dispatcher,
-            adapter,
-        ).unwrap());
+            adapter).unwrap());
         store.update(|config| {
             config.port = 0;
             config.gateway.proxy_mode = "direct".into();
@@ -2225,7 +2795,8 @@ done
                     first_seen: Some("fixture".into()), last_confirmed: Some("fixture".into()),
                     confirmed_generation: Some(connection.generation), account: connection.identity.clone(),
                 }],
-            });
+            },
+                );
         }).unwrap();
         store.write_secret("provider:openrouter", "fixture-api-key").unwrap();
         store
@@ -2249,8 +2820,7 @@ done
         let log = home.path().join("env.log");
         std::fs::write(log.with_extension("log.account"), accounts.join("\n")).unwrap();
         let adapter = std::sync::Arc::new(CodexAdapter::with_launch(
-            home.path().to_path_buf(), fixture_launch(home.path(), &log),
-        ));
+            home.path().to_path_buf(), fixture_launch(home.path(), &log)));
         let store = crate::config::ConfigStore::load_with_adapters(
             home.path().join("app.db"),
             std::sync::Arc::new(crate::dispatch::ApiDispatcher { loopback_only: true }), adapter,
@@ -2272,7 +2842,7 @@ done
 
     #[tokio::test]
     async fn refresh_helper_disconnect_invalidates_connected_account_without_app_logout() {
-        use crate::subscription::{refresh, admit_model};
+        use crate::subscription::{admit_model, refresh};
         let (store, _home, log) = refresh_fixture(&["connected", "signed-out"]);
         let before = refresh(&store, "codex").await.unwrap();
         assert_eq!(before.state, ConnectionState::Connected);
@@ -2327,7 +2897,8 @@ done
     #[test]
     fn account_status_distinguishes_signed_out_from_incomplete_and_auth_requirement() {
         for (response, connected, incomplete) in [
-            (json!({"account":{"type":"chatgpt","email":"A@example.invalid"},"requiresOpenaiAuth":true}), true, false),
+            (json!({"account":{"type":"chatgpt","email":"A@example.invalid"},"requiresOpenaiAuth":true}), true, false,
+            ),
             (json!({"account":null,"requiresOpenaiAuth":true}), false, false),
             (json!({"requiresAuth":true}), false, false),
             (json!({"account":{"type":"chatgpt","email":null},"requiresOpenaiAuth":true}), false, true),
@@ -2532,6 +3103,179 @@ done
     }
 
     #[tokio::test]
+    async fn adapter_round_trips_parallel_client_tools_through_the_live_helper_turn() {
+        let home = tempfile::tempdir().unwrap();
+        let log = home.path().join("tools.log");
+        std::fs::write(format!("{}.generation", log.to_string_lossy()), "dynamic-tools").unwrap();
+        let adapter = CodexAdapter::with_launch(home.path().to_path_buf(), fixture_launch(home.path(), &log));
+        let tools = json!([{"type":"function","function":{"name":"lookup","description":"Lookup a value","parameters":{"type":"object","properties":{"key":{"type":"string"}},"required":["key"]}}}]);
+        let initial_body = json!({"model":"fixture-model","messages":[{"role":"user","content":"lookup"}],"tools":tools});
+        let mut initial = adapter
+            .generate(GenerationRequest {
+                provider_id: "codex-tools",
+                generation: 9,
+                model_id: "fixture-model",
+                protocol: Protocol::Chat,
+                body: initial_body,
+                pre_dispatch_check: Arc::new(|| Ok(())),
+            })
+            .await
+            .unwrap();
+        assert_eq!(initial.next().await, Some(GenerationEvent::Started { generation: 9 }));
+        let calls = match initial.next().await {
+            Some(GenerationEvent::ToolCalls { calls }) => calls,
+            other => panic!("expected client-owned tool calls, got {other:?}"),
+        };
+        assert_eq!(calls.len(), 2, "parallel helper requests belong to the same API tool-call batch");
+        assert!(calls.iter().all(|call| call.name == "lookup" && call.id.starts_with("call_ajv1_9_")));
+        let call_by_key: HashMap<_, _> = calls
+            .iter()
+            .map(|call| {
+                let arguments: Value = serde_json::from_str(&call.arguments).unwrap();
+                (arguments["key"].as_str().unwrap().to_owned(), call.id.clone())
+            })
+            .collect();
+        assert_eq!(call_by_key.len(), 2);
+
+        let call_history: Vec<_> = calls
+            .iter()
+            .map(|call| {
+                json!({
+                    "id":call.id,"type":"function","function":{"name":call.name,"arguments":call.arguments}
+                })
+            })
+            .collect();
+        let mut messages = vec![
+            json!({"role":"user","content":"lookup"}),
+            json!({"role":"assistant","content":null,"tool_calls":call_history}),
+        ];
+        messages.push(json!({"role":"tool","tool_call_id":call_by_key["one"],"content":"one-result"}));
+        messages.push(json!({"role":"tool","tool_call_id":call_by_key["two"],"content":"two-result"}));
+        let mut followup = adapter
+            .generate(GenerationRequest {
+                provider_id: "codex-tools",
+                generation: 9,
+                model_id: "fixture-model",
+                protocol: Protocol::Chat,
+                body: json!({"model":"fixture-model","messages":messages,"tools":tools}),
+                pre_dispatch_check: Arc::new(|| Ok(())),
+            })
+            .await
+            .unwrap();
+        let mut completed = Vec::new();
+        while let Some(event) = followup.next().await {
+            completed.push(event);
+        }
+        assert_eq!(
+            completed,
+            vec![
+                GenerationEvent::Started { generation: 9 },
+                GenerationEvent::Chunk("continued".into()),
+                GenerationEvent::Finished { status: 200 },
+            ]
+        );
+
+        let rpc_lines = std::fs::read_to_string(format!("{}.rpc", log.to_string_lossy())).unwrap();
+        let rpc: Vec<Value> = rpc_lines.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        let starts: Vec<_> = rpc.iter().filter(|value| value["method"] == "thread/start").collect();
+        assert_eq!(starts.len(), 1, "the tool continuation must resume rather than replay a turn");
+        assert_eq!(starts[0].pointer("/params/dynamicTools/0/name"), Some(&json!("lookup")));
+        assert_eq!(rpc.iter().filter(|value| value["method"] == "turn/start").count(), 1);
+        assert_eq!(adapter.pending_tool_turns.lock().unwrap().len(), 0);
+
+        let responses = std::fs::read_to_string(format!("{}.tool-responses", log.to_string_lossy())).unwrap();
+        let responses: Vec<Value> = responses.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(responses.len(), 2);
+        let by_rpc_id: HashMap<_, _> = responses.iter().map(|response| (response["id"].as_str().unwrap(), &response["result"])).collect();
+        for (rpc_id, expected) in [("tool-rpc-1", "one-result"), ("tool-rpc-2", "two-result")] {
+            assert_eq!(by_rpc_id[rpc_id]["success"], true);
+            assert_eq!(by_rpc_id[rpc_id]["contentItems"][0]["text"], expected);
+        }
+        assert!(
+            rpc.iter().all(|value| value["method"] != "commandExecution" && value["method"] != "item/commandExecution"),
+            "client functions stay client-owned; the helper must not execute local commands"
+        );
+        adapter.logout("codex-tools", 9).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn adapter_discards_partial_tool_results_without_replaying_the_call() {
+        let home = tempfile::tempdir().unwrap();
+        let log = home.path().join("partial-tools.log");
+        std::fs::write(format!("{}.generation", log.to_string_lossy()), "dynamic-tools").unwrap();
+        let adapter = CodexAdapter::with_launch(home.path().to_path_buf(), fixture_launch(home.path(), &log));
+        let tools = json!([{"type":"function","function":{"name":"lookup","parameters":{"type":"object","properties":{"key":{"type":"string"}}}}}]);
+        let mut initial = adapter
+            .generate(GenerationRequest {
+                provider_id: "codex-partial-tools",
+                generation: 12,
+                model_id: "fixture-model",
+                protocol: Protocol::Chat,
+                body: json!({"model":"fixture-model","messages":[{"role":"user","content":"lookup"}],"tools":tools.clone()}),
+                pre_dispatch_check: Arc::new(|| Ok(())),
+            })
+            .await
+            .unwrap();
+        assert_eq!(initial.next().await, Some(GenerationEvent::Started { generation: 12 }));
+        let calls = match initial.next().await {
+            Some(GenerationEvent::ToolCalls { calls }) => calls,
+            other => panic!("expected client-owned tool calls, got {other:?}"),
+        };
+        assert_eq!(calls.len(), 2);
+        let history: Vec<_> = calls
+            .iter()
+            .map(|call| {
+                json!({
+                    "id":call.id,"type":"function","function":{"name":call.name,"arguments":call.arguments}
+                })
+            })
+            .collect();
+        let body = json!({"model":"fixture-model","messages":[
+            {"role":"user","content":"lookup"},
+            {"role":"assistant","content":null,"tool_calls":history},
+            {"role":"tool","tool_call_id":calls[0].id,"content":"only one result"}
+        ],"tools":tools});
+        let partial = match adapter
+            .generate(GenerationRequest {
+                provider_id: "codex-partial-tools",
+                generation: 12,
+                model_id: "fixture-model",
+                protocol: Protocol::Chat,
+                body: body.clone(),
+                pre_dispatch_check: Arc::new(|| Ok(())),
+            })
+            .await
+        {
+            Ok(_) => panic!("an incomplete tool-result batch must be rejected"),
+            Err(error) => error,
+        };
+        assert!(partial.to_string().contains("incomplete"), "{partial}");
+        assert!(adapter.pending_tool_turns.lock().unwrap().is_empty());
+
+        let replay = match adapter
+            .generate(GenerationRequest {
+                provider_id: "codex-partial-tools",
+                generation: 12,
+                model_id: "fixture-model",
+                protocol: Protocol::Chat,
+                body,
+                pre_dispatch_check: Arc::new(|| Ok(())),
+            })
+            .await
+        {
+            Ok(_) => panic!("discarded client tool calls must never be replayed"),
+            Err(error) => error,
+        };
+        assert!(replay.to_string().contains("matching live Codex turn"), "{replay}");
+        let rpc_lines = std::fs::read_to_string(format!("{}.rpc", log.to_string_lossy())).unwrap();
+        let rpc: Vec<Value> = rpc_lines.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(rpc.iter().filter(|value| value["method"] == "thread/start").count(), 1);
+        assert_eq!(rpc.iter().filter(|value| value["method"] == "turn/start").count(), 1);
+        assert_eq!(adapter.pending_tool_turns.lock().unwrap().len(), 0);
+        adapter.logout("codex-partial-tools", 12).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn generation_keeps_partial_failure_terminal() {
         let home = tempfile::tempdir().unwrap();
         let log = home.path().join("env.log");
@@ -2584,8 +3328,7 @@ done
 
         std::fs::write(
             format!("{}.generation", log.to_string_lossy()),
-            "tool-activity",
-        )
+            "tool-activity")
         .unwrap();
         let mut events = adapter
             .generate(GenerationRequest {
@@ -2614,8 +3357,7 @@ done
         std::fs::write(format!("{}.generation", log.to_string_lossy()), "hold").unwrap();
         let adapter = Arc::new(CodexAdapter::with_launch(
             home.path().to_path_buf(),
-            fixture_launch(home.path(), &log),
-        ));
+            fixture_launch(home.path(), &log)));
         let mut active = adapter
             .generate(GenerationRequest {
                 provider_id: "codex-queued-admission",
@@ -2709,8 +3451,7 @@ done
         std::fs::write(format!("{}.generation", log.to_string_lossy()), "hold").unwrap();
         let adapter = Arc::new(CodexAdapter::with_launch(
             home.path().to_path_buf(),
-            fixture_launch(home.path(), &log),
-        ));
+            fixture_launch(home.path(), &log)));
         let mut events = adapter
             .generate(GenerationRequest {
                 provider_id: "codex-logout-lock",
@@ -2760,13 +3501,11 @@ done
         let log = home.path().join("turn-start-ack.log");
         std::fs::write(
             format!("{}.generation", log.to_string_lossy()),
-            "delayed-start-ack",
-        )
+            "delayed-start-ack")
         .unwrap();
         let adapter = Arc::new(CodexAdapter::with_launch(
             home.path().to_path_buf(),
-            fixture_launch(home.path(), &log),
-        ));
+            fixture_launch(home.path(), &log)));
         let mut events = adapter
             .generate(GenerationRequest {
                 provider_id: "codex-delayed-ack",
@@ -2795,15 +3534,13 @@ done
         let _ = std::fs::remove_file(&accepted);
         std::fs::write(
             format!("{}.generation", log.to_string_lossy()),
-            "lost-start-ack",
-        )
+            "lost-start-ack")
         .unwrap();
         let (cleanup_started_tx, cleanup_started_rx) = tokio::sync::oneshot::channel();
         let (cleanup_release_tx, cleanup_release_rx) = tokio::sync::oneshot::channel();
         *adapter.cleanup_gate.lock().unwrap() = Some(CancellationCleanupGate {
             started: cleanup_started_tx,
-            release: cleanup_release_rx,
-        });
+            release: cleanup_release_rx });
         let adapter_for_call = adapter.clone();
         let request = GenerationRequest {
             provider_id: "codex-lost-ack",
@@ -2897,8 +3634,7 @@ done
         let log = home.path().join("retry-policy.log");
         std::fs::write(
             format!("{}.generation", log.to_string_lossy()),
-            "partial-disconnect",
-        )
+            "partial-disconnect")
         .unwrap();
         let adapter =
             CodexAdapter::with_launch(home.path().to_path_buf(), fixture_launch(home.path(), &log));
@@ -3007,13 +3743,19 @@ done
 
     fn gateway_text_request(protocol: Protocol, model: &str, streaming: bool) -> Value {
         match protocol {
-            Protocol::Chat => json!({"model":model,"stream":streaming,"reasoning_effort":"medium","service_tier":"priority","messages":[
+            Protocol::Chat => {
+                json!({"model":model,"stream":streaming,"reasoning_effort":"medium","service_tier":"priority","messages":[
                 {"role":"system","content":"chat system instruction"},
                 {"role":"developer","content":"chat developer instruction"},
                 {"role":"user","content":"chat user text"}
-            ]}),
-            Protocol::Responses => json!({"model":model,"stream":streaming,"instructions":"responses developer instruction","service_tier":"priority","reasoning":{"effort":"high","summary":"auto"},"input":"responses user text"}),
-            Protocol::Messages => json!({"model":model,"stream":streaming,"system":"messages system instruction","messages":[{"role":"user","content":"messages user text"}]}),
+            ]})
+            }
+            Protocol::Responses => {
+                json!({"model":model,"stream":streaming,"instructions":"responses developer instruction","service_tier":"priority","reasoning":{"effort":"high","summary":"auto"},"input":"responses user text"})
+            }
+            Protocol::Messages => {
+                json!({"model":model,"stream":streaming,"system":"messages system instruction","messages":[{"role":"user","content":"messages user text"}]})
+            }
         }
     }
 
@@ -3028,8 +3770,7 @@ done
         std::fs::write(format!("{}.generation", log.to_string_lossy()), "hold").unwrap();
         let adapter = Arc::new(CodexAdapter::with_launch(
             home.path().to_path_buf(),
-            fixture_launch(home.path(), &log),
-        ));
+            fixture_launch(home.path(), &log)));
         let mut active = adapter
             .generate(GenerationRequest {
                 provider_id: "codex-fixture",
@@ -3047,16 +3788,14 @@ done
         let store = admitted_gateway_store(
             home.path().join("queued-gateway.db").as_path(),
             adapter.clone(),
-            "http://127.0.0.1:9",
-        );
+            "http://127.0.0.1:9");
         let queued = {
             let store = store.clone();
             tokio::spawn(async move {
                 crate::proxy::forward_test_request(
                     store,
                     json!({"model":"autojev/model/codex-fixture-binding","input":"queued"}),
-                    "responses",
-                )
+                    "responses")
                 .await
             })
         };
@@ -3145,7 +3884,9 @@ done
             while let Some(chunk) = stream.next().await { wire.push_str(std::str::from_utf8(&chunk.unwrap()).unwrap()); }
             match protocol {
                 Protocol::Chat => { assert!(wire.contains("\"finish_reason\":\"stop\""), "{wire}"); assert!(wire.contains("data: [DONE]"), "{wire}"); }
-                Protocol::Responses => assert!(wire.contains("event: response.completed"), "{wire}"),
+                Protocol::Responses => {
+                    assert!(wire.contains("event: response.completed"), "{wire}")
+                }
                 Protocol::Messages => assert!(wire.contains("event: message_stop"), "{wire}"),
             }
         }
@@ -3177,16 +3918,22 @@ done
         for (protocol, body) in [
             (Protocol::Chat, json!({"model":model,"messages":[{"role":"user","content":"x"}],"temperature":0.2})),
             (Protocol::Responses, json!({"model":model,"max_output_tokens":20,"input":"x"})),
-            (Protocol::Messages, json!({"model":model,"max_tokens":20,"system":"instructions","messages":[{"role":"user","content":"x"}]})),
-            (Protocol::Chat, json!({"model":model,"tools":[],"messages":[{"role":"user","content":"x"}]})),
+            (Protocol::Messages, json!({"model":model,"max_tokens":20,"system":"instructions","messages":[{"role":"user","content":"x"}]}),
+            ),
+            (Protocol::Chat, json!({"model":model,"tool_choice":"required","messages":[{"role":"user","content":"x"}]}),
+            ),
             (Protocol::Chat, json!({"model":model,"messages":[{"role":"user","name":"Ada","content":"x"}]})),
-            (Protocol::Responses, json!({"model":model,"input":[{"type":"message","role":"user","metadata":{"source":"x"},"content":"x"}]})),
-            (Protocol::Messages, json!({"model":model,"messages":[{"role":"user","content":[{"type":"text","text":"x","annotations":[]}]}]})),
-            (Protocol::Chat, json!({"model":model,"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}]}]})),
+            (Protocol::Responses, json!({"model":model,"input":[{"type":"message","role":"user","metadata":{"source":"x"},"content":"x"}]}),
+            ),
+            (Protocol::Messages, json!({"model":model,"messages":[{"role":"user","content":[{"type":"text","text":"x","annotations":[]}]}]}),
+            ),
+            (Protocol::Chat, json!({"model":model,"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}]}]}),
+            ),
             (Protocol::Responses, json!({"model":model,"previous_response_id":"resp_fixture","input":"x"})),
         ] {
+            let body_for_assert = body.clone();
             let reply = crate::proxy::forward_test_request(store.clone(), body, gateway_endpoint(protocol)).await;
-            assert_eq!(reply.status(), axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(reply.status(), axum::http::StatusCode::UNPROCESSABLE_ENTITY, "{protocol:?}: {body_for_assert}");
             let _ = axum::body::to_bytes(reply.into_body(), 4096).await.unwrap();
         }
         let calls = std::fs::read_to_string(format!("{}.calls", log.to_string_lossy())).unwrap();
@@ -3273,7 +4020,9 @@ done
                 match stream.next().await {
                     Some(Ok(bytes)) => saw_output |= !bytes.is_empty(),
                     Some(Err(error)) => break error.to_string(),
-                    None => panic!("the stalled Codex body must fail with the configured idle timeout"),
+                    None => {
+                        panic!("the stalled Codex body must fail with the configured idle timeout")
+                    }
                 }
             }
         }).await.expect("the Codex HTTP body must apply stream_idle_seconds after partial output");
@@ -3348,7 +4097,8 @@ done
         std::fs::write(format!("{}.generation", log.to_string_lossy()), "hold").unwrap();
         let adapter = Arc::new(CodexAdapter::with_launch(home.path().to_path_buf(), fixture_launch(home.path(), &log)));
         let store = admitted_gateway_store(home.path().join("gateway.db").as_path(), adapter, "http://127.0.0.1:9");
-        let response = crate::proxy::forward_test_request(store, gateway_text_request(Protocol::Responses, "autojev/model/codex-fixture-binding", true), gateway_endpoint(Protocol::Responses)).await;
+        let response = crate::proxy::forward_test_request(store, gateway_text_request(Protocol::Responses, "autojev/model/codex-fixture-binding", true), gateway_endpoint(Protocol::Responses),
+        ).await;
         let mut stream = response.into_body().into_data_stream();
         let mut text = String::new();
         loop {
@@ -3392,8 +4142,7 @@ done
         let seen = Arc::new(Mutex::new(Vec::new()));
         let dispatcher = Arc::new(RecordingDispatcher(seen.clone()));
         let store = admitted_gateway_store_with_dispatcher(
-            home.path().join("gateway.db").as_path(), adapter, dispatcher, "http://127.0.0.1:9",
-        );
+            home.path().join("gateway.db").as_path(), adapter, dispatcher, "http://127.0.0.1:9");
         let api_model = store.read().models.iter().find(|model| model.provider_id == "openrouter").unwrap().clone();
         let response = crate::proxy::forward_test_request(
             store,
@@ -3442,7 +4191,8 @@ done
                 automatic_policy: None,
             });
         }).unwrap();
-        let reply = crate::proxy::forward_test_request(store.clone(), gateway_text_request(Protocol::Chat, "autojev/codex-first", false), gateway_endpoint(Protocol::Chat)).await;
+        let reply = crate::proxy::forward_test_request(store.clone(), gateway_text_request(Protocol::Chat, "autojev/codex-first", false), gateway_endpoint(Protocol::Chat),
+        ).await;
         assert_eq!(reply.status(), axum::http::StatusCode::BAD_GATEWAY);
         let bytes = axum::body::to_bytes(reply.into_body(), 4096).await.unwrap();
         let body: Value = serde_json::from_slice(&bytes).unwrap();
@@ -3484,12 +4234,94 @@ done
         for (protocol, body) in [
             (crate::protocol::Protocol::Chat, json!({"max_tokens":16,"messages":[{"role":"user","content":"x"}]})),
             (crate::protocol::Protocol::Responses, json!({"max_output_tokens":16,"input":"x"})),
-            (crate::protocol::Protocol::Messages, json!({"max_tokens":16,"messages":[{"role":"user","content":"x"}]})),
-            (crate::protocol::Protocol::Chat, json!({"tools":[],"messages":[{"role":"user","content":"x"}]})),
+            (crate::protocol::Protocol::Messages, json!({"max_tokens":16,"messages":[{"role":"user","content":"x"}]}),
+            ),
+            (crate::protocol::Protocol::Chat, json!({"tool_choice":"required","messages":[{"role":"user","content":"x"}]}),
+            ),
             (crate::protocol::Protocol::Responses, json!({"previous_response_id":"resp-old","input":"x"})),
-            (crate::protocol::Protocol::Messages, json!({"messages":[{"role":"assistant","content":"history"},{"role":"user","content":"x"}]})),
         ] {
             assert!(codex_turn_request(protocol, &body).is_err(), "{protocol:?}: {body}");
+        }
+    }
+
+    #[test]
+    fn codex_turn_request_accepts_client_function_tools() {
+        let request = codex_turn_request(crate::protocol::Protocol::Chat,
+            &json!({
+                "model":"requested",
+                "messages":[{"role":"user","content":"look this up"}],
+                "tools":[{"type":"function","function":{
+                    "name":"lookup",
+                    "description":"Look up a value",
+                    "parameters":{"type":"object","properties":{"key":{"type":"string"}},"required":["key"],"additionalProperties":false}
+                }}]
+            }),
+        );
+        assert!(
+            request.is_ok(),
+            "a validated function schema must reach the Codex tool adapter: {:?}",
+            request.err()
+        );
+    }
+
+    #[test]
+    fn all_codex_protocols_normalize_function_schemas_and_tool_result_pairs() {
+        let generation = 7;
+        let first = format!("call_ajv1_{generation}_first");
+        let second = format!("call_ajv1_{generation}_second");
+        let schema = json!({"type":"object","properties":{"key":{"type":"string"}},"required":["key"]});
+        let cases = [
+            (
+                Protocol::Chat,
+                json!({"messages":[{"role":"user","content":"lookup"}],"tools":[{"type":"function","function":{"name":"lookup","parameters":schema}}]}),
+                json!({"messages":[{"role":"user","content":"lookup"},{"role":"assistant","content":null,"tool_calls":[
+                    {"id":first,"type":"function","function":{"name":"lookup","arguments":r#"{"key":"one"}"#}},
+                    {"id":second,"type":"function","function":{"name":"lookup","arguments":r#"{"key":"two"}"#}}
+                ]},{"role":"tool","tool_call_id":first,"content":"one-result"},{"role":"tool","tool_call_id":second,"content":"two-result"}],"tools":[{"type":"function","function":{"name":"lookup","parameters":schema}}]}),
+            ),
+            (
+                Protocol::Responses,
+                json!({"input":"lookup","tools":[{"type":"function","name":"lookup","parameters":schema}]}),
+                json!({"input":[{"type":"message","role":"user","content":"lookup"},
+                    {"type":"function_call","id":"fc1","call_id":first,"name":"lookup","arguments":r#"{"key":"one"}"#},
+                    {"type":"function_call","id":"fc2","call_id":second,"name":"lookup","arguments":r#"{"key":"two"}"#},
+                    {"type":"function_call_output","call_id":first,"output":"one-result"},
+                    {"type":"function_call_output","call_id":second,"output":"two-result"}],"tools":[{"type":"function","name":"lookup","parameters":schema}]}),
+            ),
+            (
+                Protocol::Messages, json!({"messages":[{"role":"user","content":"lookup"}],"tools":[{"name":"lookup","input_schema":schema}]}),
+                json!({"messages":[{"role":"user","content":"lookup"},
+                    {"role":"assistant","content":[{"type":"tool_use","id":first,"name":"lookup","input":{"key":"one"}},{"type":"tool_use","id":second,"name":"lookup","input":{"key":"two"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":first,"content":"one-result"},{"type":"tool_result","tool_use_id":second,"content":"two-result"}]}],"tools":[{"name":"lookup","input_schema":schema}]}),
+            ),
+        ];
+        for (protocol, initial, followup) in cases {
+            let initial = codex_turn_request(protocol, &initial).unwrap();
+            assert_eq!(initial.dynamic_tools.len(), 1, "{protocol:?}");
+            assert_eq!(initial.dynamic_tools[0]["type"], "function");
+            assert_eq!(initial.dynamic_tools[0]["inputSchema"], schema);
+
+            let followup = codex_turn_request(protocol, &followup).unwrap();
+            assert!(followup.has_assistant_history, "{protocol:?}");
+            assert_eq!(followup.tool_calls.len(), 2, "{protocol:?}");
+            assert_eq!(followup.tool_outputs.len(), 2, "{protocol:?}");
+            assert_eq!(followup.tool_calls[0].id, first);
+            assert_eq!(followup.tool_calls[1].id, second);
+            assert_eq!(followup.tool_outputs[0].id, first);
+            assert_eq!(followup.tool_outputs[1].id, second);
+        }
+        let stale_id = "call_ajv1_6_old";
+        for (protocol, body) in [
+            (Protocol::Chat, json!({"messages":[{"role":"tool","tool_call_id":stale_id,"content":"old result"}]})),
+            (
+                Protocol::Responses,
+                json!({"input":[{"type":"function_call_output","call_id":stale_id,"output":"old result"}]}),
+            ),
+            (
+                Protocol::Messages,
+                json!({"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":stale_id,"content":"old result"}]}]}),
+            ),
+        ] {
+            assert!(validate_generation_request(protocol, &body, generation).is_err(), "{protocol:?}: {body}");
         }
     }
 
