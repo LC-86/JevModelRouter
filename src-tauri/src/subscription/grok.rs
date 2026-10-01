@@ -41,6 +41,34 @@ const CODE_HELPER_MISSING: &str = "helper_missing";
 const CODE_HELPER_TIMEOUT: &str = "helper_timeout";
 const CODE_HELPER_EXITED: &str = "helper_exited";
 
+#[cfg(test)]
+#[derive(Clone)]
+pub(super) struct PendingClientToolCall {
+    pub call: crate::codex_helper::ClientToolCall,
+    pub arguments: Value,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(super) struct PendingClientToolTurn {
+    pub protocol: crate::protocol::Protocol,
+    pub model_id: String,
+    pub tools: Vec<Value>,
+    pub allow_parallel: bool,
+    pub user_text: Vec<String>,
+    pub assistant_history: Vec<String>,
+    pub calls: Vec<PendingClientToolCall>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct CompletedClientToolExchange {
+    pub name: String,
+    pub arguments: Value,
+    pub output: String,
+    pub is_error: bool,
+}
+
 /// 稳定的失败说明：错误必须脱敏后才进入日志或界面。
 fn refusal(code: &str, message: impl std::fmt::Display) -> String {
     helper::redact(&format!("{code}: {message}"))
@@ -149,12 +177,21 @@ pub struct GrokSubscriptionAdapter {
     /// 账号世代改变时取消该世代的子进程。
     active_generations: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<(String, u64), std::collections::HashMap<String, tokio::sync::watch::Sender<bool>>>>>,
     #[cfg(test)]
+    pending_tool_turns: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<(String, u64, String), PendingClientToolTurn>>>,
+    #[cfg(test)]
+    completed_tool_exchanges: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<(String, u64, String), CompletedClientToolExchange>>>,
+    #[cfg(test)]
     test_generation: bool,
 }
 
 /// Validate the strict ACP text subset before creating an HTTP response.
-pub(crate) fn validate_generation_request(protocol: crate::protocol::Protocol, body: &Value, model_id: &str) -> Result<()> {
-    generation::validate_generation_request(protocol, body, model_id)
+pub(crate) fn validate_generation_request(
+    protocol: crate::protocol::Protocol,
+    body: &Value,
+    model_id: &str,
+    generation: u64,
+) -> Result<()> {
+    generation::validate_generation_request(protocol, body, model_id, generation)
 }
 
 impl GrokSubscriptionAdapter {
@@ -180,6 +217,10 @@ impl GrokSubscriptionAdapter {
             #[cfg(test)]
             generation_timeout: Duration::from_secs(120),
             active_generations: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            #[cfg(test)]
+            pending_tool_turns: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            #[cfg(test)]
+            completed_tool_exchanges: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             #[cfg(test)]
             test_generation: false,
         }
@@ -615,11 +656,45 @@ impl SubscriptionAdapter for GrokSubscriptionAdapter {
     }
 
     fn cancel_generation(&self, provider_id: &str, generation: u64) {
+        #[cfg(test)]
+        self.pending_tool_turns.lock().unwrap().retain(|(provider, current, _), _| {
+            provider != provider_id || *current != generation
+        });
+        #[cfg(test)]
+        self.completed_tool_exchanges.lock().unwrap().retain(|(provider, current, _), _| {
+            provider != provider_id || *current != generation
+        });
         if let Some(senders) = self.active_generations.lock().unwrap().get(&(provider_id.to_owned(), generation)) {
             for sender in senders.values() {
                 let _ = sender.send(true);
             }
         }
+    }
+
+    fn abandon_client_tool_calls(&self, provider_id: &str, generation: u64, call_ids: &[String]) {
+        #[cfg(test)]
+        {
+            let mut pending = self.pending_tool_turns.lock().unwrap();
+            let matches_batch = pending.iter().any(|((provider, current, _), turn)| {
+                if provider != provider_id || *current != generation {
+                    return false;
+                }
+                let expected: std::collections::HashSet<_> =
+                    turn.calls.iter().map(|call| call.call.id.as_str()).collect();
+                let supplied: std::collections::HashSet<_> = call_ids.iter().map(String::as_str).collect();
+                expected == supplied
+                    && turn.calls.iter().all(|call| {
+                        pending.contains_key(&(provider_id.to_owned(), generation, call.call.id.clone()))
+                    })
+            });
+            if matches_batch {
+                for call_id in call_ids {
+                    pending.remove(&(provider_id.to_owned(), generation, call_id.clone()));
+                }
+            }
+        }
+        #[cfg(not(test))]
+        let _ = (provider_id, generation, call_ids);
     }
 
     fn start_login<'a>(&'a self, _provider_id: &'a str, _generation: u64) -> BoxFuture<'a, Result<LoginStart>> {

@@ -485,7 +485,7 @@ async fn forward_attempt(context: ProxyContext, headers: HeaderMap, body: Value,
         let generation = connection.generation;
         let validation = match resolved.provider.kind {
             ProviderKind::CodexSubscription => crate::codex_helper::validate_generation_request(source, &body, generation),
-            ProviderKind::GrokSubscription => crate::subscription::grok::validate_generation_request(source, &body, &resolved.model.model_id),
+            ProviderKind::GrokSubscription => crate::subscription::grok::validate_generation_request(source, &body, &resolved.model.model_id, generation),
             _ => unreachable!(),
         };
         if let Err(error) = validation {
@@ -869,11 +869,13 @@ async fn codex_subscription_response(
                     output.push_str(&delta);
                 }
                 crate::subscription::GenerationEvent::ToolCalls { calls } => {
+                    let call_ids: Vec<_> = calls.iter().map(|call| call.id.clone()).collect();
                     let call_bytes = calls
                         .iter()
                         .map(|call| call.id.len().saturating_add(call.name.len()).saturating_add(call.arguments.len()))
                         .fold(0usize, usize::saturating_add);
                     if output.len().saturating_add(call_bytes) > MAX_CODEX_OUTPUT_BYTES {
+                        adapter.abandon_client_tool_calls(&provider.id, generation, &call_ids);
                         return codex_json_response(
                             StatusCode::BAD_GATEWAY,
                             protocol,
@@ -886,6 +888,7 @@ async fn codex_subscription_response(
                     let body = match codex_tool_completion(protocol, &model.model_id, &output, &calls) {
                         Ok(body) => body,
                         Err(_) => {
+                            adapter.abandon_client_tool_calls(&provider.id, generation, &call_ids);
                             return codex_json_response(
                                 StatusCode::BAD_GATEWAY,
                                 protocol,
@@ -896,7 +899,10 @@ async fn codex_subscription_response(
                             )
                         }
                     };
-                    return codex_json_response(StatusCode::OK, protocol, model, route_source, body, capture);
+                    return codex_json_tool_response(
+                        protocol, model, route_source, body, capture, adapter.clone(),
+                        provider.id.clone(), generation, call_ids,
+                    );
                 }
                 crate::subscription::GenerationEvent::Failed { .. } => {
                     return codex_json_response(StatusCode::BAD_GATEWAY, protocol, model, route_source,
@@ -1015,6 +1021,11 @@ async fn codex_subscription_response(
                 | crate::subscription::GenerationEvent::Failed { .. }
                 | crate::subscription::GenerationEvent::Cancelled
             );
+            let client_tool_call_ids = if let crate::subscription::GenerationEvent::ToolCalls { calls } = &event {
+                Some(calls.iter().map(|call| call.id.clone()).collect::<Vec<_>>())
+            } else {
+                None
+            };
             if let crate::subscription::GenerationEvent::ToolCalls { calls } = &event {
                 if calls.iter().all(|call| serde_json::from_str::<Value>(&call.arguments).is_ok()) {
                     *pending_call_ids_for_task.lock().unwrap() = Some(calls.iter().map(|call| call.id.clone()).collect());
@@ -1026,7 +1037,13 @@ async fn codex_subscription_response(
             let frames = encoder.frames(event, &capture_for_task);
             let final_frame = frames.len().saturating_sub(1);
             for (index, frame) in frames.into_iter().enumerate() {
-                if tx.send(CodexSseFrame { bytes: frame, terminal: terminal && index == final_frame }).await.is_err() { return; }
+                if tx.send(CodexSseFrame { bytes: frame, terminal: terminal && index == final_frame }).await.is_err() {
+                    if let Some(call_ids) = client_tool_call_ids.as_ref() {
+                        adapter_for_task.abandon_client_tool_calls(&provider_id, generation, call_ids);
+                        pending_call_ids_for_task.lock().unwrap().take();
+                    }
+                    return;
+                }
             }
             if terminal { break; }
         }
@@ -1089,6 +1106,35 @@ fn codex_json_response(status: StatusCode, protocol: Protocol, model: &Model, ro
     capture.lock().unwrap().bytes(encoded.as_bytes());
     let mut response = Response::new(Body::from(encoded));
     *response.status_mut() = status;
+    response.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    response.headers_mut().insert("x-should-retry", HeaderValue::from_static("false"));
+    if let Ok(value) = HeaderValue::from_str(&model.model_id) { response.headers_mut().insert("x-autojev-model", value); }
+    if let Ok(value) = HeaderValue::from_str(route_source) { response.headers_mut().insert("x-autojev-route-source", value); }
+    let _ = protocol;
+    response
+}
+
+fn codex_json_tool_response(
+    protocol: Protocol,
+    model: &Model,
+    route_source: &str,
+    body: Value,
+    capture: crate::traffic::SharedCapture,
+    adapter: Arc<dyn crate::subscription::SubscriptionAdapter>,
+    provider_id: String,
+    generation: u64,
+    call_ids: Vec<String>,
+) -> Response {
+    let encoded = body.to_string();
+    capture.lock().unwrap().bytes(encoded.as_bytes());
+    let guard = PendingToolBodyGuard { adapter, provider_id, generation, call_ids: Arc::new(std::sync::Mutex::new(Some(call_ids))), delivered: false };
+    let stream = futures_util::stream::once(async move {
+        let mut guard = guard;
+        guard.mark_delivered();
+        Ok::<Bytes, std::io::Error>(Bytes::from(encoded))
+    });
+    let mut response = Response::new(Body::from_stream(stream));
+    *response.status_mut() = StatusCode::OK;
     response.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
     response.headers_mut().insert("x-should-retry", HeaderValue::from_static("false"));
     if let Ok(value) = HeaderValue::from_str(&model.model_id) { response.headers_mut().insert("x-autojev-model", value); }
