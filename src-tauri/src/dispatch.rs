@@ -1,6 +1,7 @@
 //! The generation transport seam. Callers retain protocol conversion, capture and errors.
 use crate::{config::Provider, protocol::Protocol};
 use futures_util::future::BoxFuture;
+use serde_json::Value;
 
 pub struct Target<'a> {
     pub provider: &'a Provider,
@@ -18,6 +19,39 @@ pub trait Dispatcher: Send + Sync {
 
 pub struct ApiDispatcher {
     pub loopback_only: bool,
+}
+
+/// Build a request to an explicitly selected target through the local gateway.
+/// This seam never accepts upstream URLs or API credentials: subscription tests
+/// and manual probes use the same generation path as ordinary client requests.
+pub fn local_gateway_request(
+    port: u16,
+    protocol: Protocol,
+    body: &Value,
+) -> anyhow::Result<reqwest::RequestBuilder> {
+    anyhow::ensure!(port != 0, "The local gateway is not running");
+    let target = body["model"].as_str().unwrap_or_default();
+    anyhow::ensure!(
+        target.starts_with("autojev/") && target.len() > "autojev/".len(),
+        "A specific AutoJev model or route target is required"
+    );
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+    let accept = if body["stream"].as_bool() == Some(true) {
+        "text/event-stream"
+    } else {
+        "application/json"
+    };
+    let mut request = client
+        .post(format!("http://127.0.0.1:{port}{}", protocol.path()))
+        .header(reqwest::header::ACCEPT, accept)
+        .json(body);
+    if protocol == Protocol::Messages {
+        request = request.header("anthropic-version", "2023-06-01");
+    }
+    Ok(request)
 }
 
 impl Dispatcher for ApiDispatcher {

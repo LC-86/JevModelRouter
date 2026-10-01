@@ -487,7 +487,7 @@ try {
   for (const pid of helperPidsSeen) assert.ok(!alive(pid), `Stand-in child ${pid} must be reaped after the desktop exits`);
   // 既有 #11 断言：真实上游仍只收到固定回环替身的请求。
   assert.ok(requests.some(r => r.headers['user-agent'] === 'AutoJev/ProviderTest' && r.body.messages[0].content === 'Say OK'));
-  assert.equal(requests.filter(r => r.headers['user-agent'] === 'AutoJev/ModelTest').length, 3);
+  assert.equal(requests.filter(r => r.headers['user-agent'] === 'AutoJev/ModelSpeedTest').length, 3);
   assert.equal(requests.filter(r => r.headers['user-agent'] === 'AutoJev/Debug').length, 3);
   assert.ok(requests.filter(r => !r.path.startsWith('/redirect/')).every(r => r.body.model === 'fixture-model' && r.headers.authorization === 'Bearer fixture-key'));
   // AC4 收尾：全部运行结束后专用授权目录仍然为空，且用户真实 ~/.codex 未被创建或修改（只看元数据）。

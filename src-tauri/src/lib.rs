@@ -186,6 +186,12 @@ async fn get_model_performance(state: State<'_, AppState>) -> Result<performance
 }
 #[tauri::command]
 async fn start_model_speed_tests(state: State<'_, AppState>, ids: Vec<String>) -> Result<(),String> {
+    let config = state.store.read();
+    if ids.iter().any(|id| config.models.iter().find(|model| &model.id == id)
+        .and_then(|model| config.providers.iter().find(|provider| provider.id == model.provider_id))
+        .is_some_and(subscription::is_subscription_provider)) {
+        ensure_proxy_running(&state).await?;
+    }
     state.performance.start(state.store.clone(),ids).map_err(|e|e.to_string())
 }
 #[tauri::command]
@@ -789,6 +795,16 @@ async fn start_proxy(state: State<'_, AppState>) -> Result<DashboardSnapshot, St
     Ok(snapshot(&state).await)
 }
 
+async fn ensure_proxy_running(state: &AppState) -> Result<(), String> {
+    let mut service = state.proxy.lock().await;
+    if let Some(proxy) = service.as_ref().filter(|proxy| proxy.running()) {
+        if proxy.paused() { return Err("The local proxy is paused".into()); }
+        return Ok(());
+    }
+    *service = Some(proxy::start(state.store.clone()).await.map_err(|error| error.to_string())?);
+    Ok(())
+}
+
 #[tauri::command]
 async fn pause_proxy(state: State<'_, AppState>) -> Result<DashboardSnapshot, String> {
     let handle = state.proxy.lock().await;
@@ -841,12 +857,12 @@ async fn debug_request(state: State<'_, AppState>, target: String, endpoint: Str
         }
     }
     let start = std::time::Instant::now();
-    let mut response = dispatch::send_http(Client::builder().build().map_err(|e|e.to_string())?
-        .post(format!("http://127.0.0.1:{}/v1/{endpoint}", state.store.read().port))
+    let request_protocol = protocol::Protocol::parse(&endpoint).map_err(|e| e.to_string())?;
+    let mut response = dispatch::send_http(dispatch::local_gateway_request(state.store.read().port, request_protocol, &body)
+        .map_err(|e| e.to_string())?
         .timeout(std::time::Duration::from_secs(90))
         .header("x-autojev-session-id", session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()))
-        .header("user-agent", "AutoJev/Debug")
-        .header("anthropic-version", "2023-06-01").json(&body), runtime::isolated()).await.map_err(|_| "Debug request failed or timed out".to_string())?;
+        .header("user-agent", "AutoJev/Debug"), true).await.map_err(|_| "Debug request failed or timed out".to_string())?;
     let is_sse = response.headers().get("content-type").and_then(|v| v.to_str().ok()).is_some_and(|v| v.contains("text/event-stream"));
     let status = response.status().as_u16();
     let request_id = response.headers().get("x-autojev-request-id").and_then(|v| v.to_str().ok()).unwrap_or("").to_owned();
@@ -1073,12 +1089,17 @@ async fn test_provider_draft(state: State<'_, AppState>, provider: Provider, api
     if provider.test_model.trim().is_empty() { return Err("Enter a test model".into()); }
     // 订阅服务商的测试入口共用订阅准入，且不经过 API Key 与 base_url 路径。
     if subscription::is_subscription_provider(&provider) {
-        // 订阅条目不带 API 类型，测试按首版唯一的客户端协议语义走 Chat Completions 准入。
-        let config = state.store.read();
-        return Err(match subscription::admit_target(&config, &provider, provider.test_model.trim(), protocol::Protocol::Chat) {
-            Err(denial) => denial.summary(),
-            Ok(()) => "Subscription generation requires the native helper, which this build does not provide.".into(),
-        });
+        let stored = state.store.read().providers.into_iter()
+            .find(|saved| saved.id == provider.id)
+            .ok_or_else(|| "Subscription provider not found".to_string())?;
+        if !subscription::is_subscription_provider(&stored) || stored.kind != provider.kind {
+            return Err("Save this subscription provider type and refresh its model catalog before testing".into());
+        }
+        if !api_key.as_deref().unwrap_or_default().trim().is_empty() {
+            return Err("Subscription tests do not accept API keys".into());
+        }
+        ensure_proxy_running(&state).await?;
+        return test_subscription_target(state.store.clone(), &stored.id, provider.test_model.trim()).await;
     }
     let key = api_key.filter(|k| !k.trim().is_empty()).or_else(|| {
         state.store.read().providers.iter().find(|p| p.id == provider.id)
@@ -1109,6 +1130,46 @@ async fn test_provider_draft(state: State<'_, AppState>, provider: Provider, api
         return Err(error);
     }
     Ok("Test request succeeded.".into())
+}
+
+#[cfg(test)]
+mod subscription_provider_test_contract_tests {
+    use super::*;
+
+    #[test]
+    fn subscription_test_is_explicitly_chat_text_only() {
+        assert_eq!(SUBSCRIPTION_TEST_PROTOCOL, protocol::Protocol::Chat);
+        assert!(SUBSCRIPTION_TEST_SUCCESS_MESSAGE.contains("Chat text test succeeded"));
+        assert!(SUBSCRIPTION_TEST_SUCCESS_MESSAGE.contains("does not verify other protocols"));
+    }
+}
+
+const SUBSCRIPTION_TEST_PROTOCOL: protocol::Protocol = protocol::Protocol::Chat;
+const SUBSCRIPTION_TEST_SUCCESS_MESSAGE: &str =
+    "Subscription Chat text test succeeded. This does not verify other protocols.";
+
+pub(crate) async fn test_subscription_target(store: Arc<ConfigStore>, provider_id: &str, model_id: &str) -> Result<String, String> {
+    let config = store.read();
+    let provider = config.providers.iter().find(|provider| provider.id == provider_id && subscription::is_subscription_provider(provider))
+        .ok_or_else(|| "Subscription provider not found".to_string())?;
+    // Service and model test actions use the exact shared gate before constructing a local gateway request.
+    subscription::admit_target(&config, provider, model_id, SUBSCRIPTION_TEST_PROTOCOL)
+        .map_err(|denial| denial.summary())?;
+    let model = config.models.iter().find(|model| model.provider_id == provider.id && model.model_id == model_id.trim())
+        .ok_or_else(|| "Refresh this subscription model's catalog before testing it".to_string())?;
+    let target = format!("autojev/model/{}", model.id);
+    let body = serde_json::json!({
+        "model": target,
+        "messages": [{"role":"user","content":"Say OK"}],
+        "stream": false
+    });
+    let request = dispatch::local_gateway_request(config.port, SUBSCRIPTION_TEST_PROTOCOL, &body)
+        .map_err(|error| error.to_string())?
+        .header("user-agent", "AutoJev/ProviderTest")
+        .timeout(std::time::Duration::from_secs(30));
+    let response = dispatch::send_http(request, true).await.map_err(|_| "Subscription test request failed or timed out".to_string())?;
+    provider_test::check_response(response, None).await?;
+    Ok(SUBSCRIPTION_TEST_SUCCESS_MESSAGE.into())
 }
 
 #[tauri::command]

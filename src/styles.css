@@ -642,6 +642,7 @@ main.debug-main { height: 100dvh; min-height: 0; overflow: hidden; }
 
 .model-speed-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .model-speed-count { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.model-speed-help { flex-basis: 100%; color: var(--muted); font-size: 11px; line-height: 1.5; }
 .model-speed-cell { white-space: nowrap; font-family: var(--mono); font-size: 12px; font-variant-numeric: tabular-nums; }
 .model-speed-cell small { color: var(--muted); font-family: inherit; font-size: inherit; }
 

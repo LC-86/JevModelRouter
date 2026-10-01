@@ -9,6 +9,28 @@ use crate::{
 use axum::{http::HeaderMap, response::IntoResponse, routing::post, Json, Router};
 use std::sync::Arc;
 
+#[test]
+fn local_generation_requests_keep_an_explicit_local_target_and_protocol_headers() {
+    for protocol in [Protocol::Chat, Protocol::Responses, Protocol::Messages] {
+        let body = serde_json::json!({
+            "model": "autojev/model/fixture",
+            "stream": true,
+            "messages": [{"role":"user","content":"fixture"}]
+        });
+        let request = crate::dispatch::local_gateway_request(9527, protocol, &body)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(request.url().as_str(), format!("http://127.0.0.1:9527{}", protocol.path()));
+        assert_eq!(request.headers()["accept"], "text/event-stream");
+        assert!(request.headers().get("authorization").is_none());
+        assert!(request.headers().get("x-api-key").is_none());
+        assert_eq!(request.headers().get("anthropic-version").is_some(), protocol == Protocol::Messages);
+    }
+    assert!(crate::dispatch::local_gateway_request(0, Protocol::Chat, &serde_json::json!({"model":"autojev/model/fixture"})).is_err());
+    assert!(crate::dispatch::local_gateway_request(9527, Protocol::Chat, &serde_json::json!({"model":"upstream-model"})).is_err());
+}
+
 #[tokio::test]
 async fn isolated_dispatch_preserves_deadlines_for_headers_and_body() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

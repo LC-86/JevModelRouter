@@ -398,7 +398,7 @@ export async function testJevSettings(policy: RoutingPolicy, apiKey?: string): P
 }
 
 export async function getModelPerformance(): Promise<import('../types').PerformanceView> {
-  if (!isTauri()) return { settings: { enabled: true, interval_minutes: 30 }, models: {}, job: { running: false, completed: 0, total: 0, completed_models: 0, total_models: 0, current_models: [], error: null } };
+  if (!isTauri()) return { settings: { enabled: true, interval_minutes: 30 }, models: {}, job: { running: false, cancelled: false, completed: 0, total: 0, completed_models: 0, total_models: 0, current_models: [], error: null } };
   return invoke('get_model_performance');
 }
 export async function startModelSpeedTests(ids: string[]): Promise<void> {

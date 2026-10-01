@@ -2,7 +2,7 @@
 use crate::{
     config::{AppConfig, ConfigStore, Model, Provider, ProviderKind},
     protocol::Protocol,
-    traffic::{Capture, RequestLog},
+    traffic::{Capture, RequestLog, SUBSCRIPTION_PROBE_RESPONSE_LIMIT_BYTES},
 };
 use anyhow::{ensure, Result};
 use futures_util::StreamExt;
@@ -18,6 +18,9 @@ use std::{
 };
 
 pub const FRESH_MS: i64 = 30 * 60 * 1000;
+const MANUAL_PROBES_PER_MODEL: usize = 3;
+const PROBE_MAX_OUTPUT_TOKENS: u64 = 24;
+const PROBE_PROMPT: &str = "Return the numbers 1 through 8 separated by spaces. No other text.";
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -61,6 +64,7 @@ pub struct Summary {
 #[derive(Clone, Serialize, Default)]
 pub struct Job {
     pub running: bool,
+    pub cancelled: bool,
     pub completed: usize,
     pub completed_models: usize,
     pub total_models: usize,
@@ -278,6 +282,9 @@ impl Runner {
     }
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::SeqCst);
+        let mut job = self.job.lock().unwrap();
+        if job.running { job.cancelled = true; }
+        drop(job);
         self.wake.notify_one();
     }
     pub fn start(self: &Arc<Self>, store: Arc<ConfigStore>, ids: Vec<String>) -> Result<()> {
@@ -306,7 +313,7 @@ impl Runner {
         let _ = self.wake.notified().now_or_never();
         *self.job.lock().unwrap() = Job {
             running: true,
-            total: ids.len() * 3,
+            total: ids.len() * MANUAL_PROBES_PER_MODEL,
             total_models: ids.len(),
             ..Default::default()
         };
@@ -318,7 +325,7 @@ impl Runner {
                 async move {
                     if runner.cancel.load(Ordering::SeqCst) { return; }
                     runner.job.lock().unwrap().current_models.push(id.clone());
-                    for _ in 0..3 {
+                    for _ in 0..MANUAL_PROBES_PER_MODEL {
                         if runner.cancel.load(Ordering::SeqCst) { break; }
                         let result = probe(&store, &id).await;
                         let mut job = runner.job.lock().unwrap();
@@ -359,7 +366,7 @@ fn denied_probe_log(model: &crate::config::Model, provider: &crate::config::Prov
     log
 }
 
-async fn probe(store: &ConfigStore, id: &str) -> Result<()> {
+pub(crate) async fn probe(store: &ConfigStore, id: &str) -> Result<()> {
     let config = store.read();
     let model = config
         .models
@@ -379,20 +386,18 @@ async fn probe(store: &ConfigStore, id: &str) -> Result<()> {
         record_log(store, &log, true)?;
         return Err(anyhow::anyhow!(reason));
     }
-    let prompt = "Count from 1 to 40, separated by spaces. Do not explain.";
-    let body = match protocol {
-        Protocol::Responses => {
-            json!({"model":model.model_id,"input":prompt,"max_output_tokens":128,"stream":true})
-        }
-        Protocol::Messages => {
-            json!({"model":model.model_id,"messages":[{"role":"user","content":prompt}],"max_tokens":128,"stream":true})
-        }
-        Protocol::Chat => {
-            json!({"model":model.model_id,"messages":[{"role":"user","content":prompt}],"max_tokens":128,"stream":true,"stream_options":{"include_usage":true}})
-        }
+    let is_subscription = crate::subscription::is_subscription_provider(provider);
+    let target = if is_subscription {
+        format!("autojev/model/{}", model.id)
+    } else {
+        model.model_id.clone()
     };
+    let body = probe_body(protocol, &target, !is_subscription);
+    if is_subscription {
+        return probe_subscription_gateway(store, &config, model, provider, protocol, &body).await;
+    }
     let mut test_headers = axum::http::HeaderMap::new();
-    test_headers.insert("user-agent", "AutoJev/ModelTest".parse().unwrap());
+    test_headers.insert("user-agent", "AutoJev/ModelSpeedTest".parse().unwrap());
     let capture = Capture::new(
         protocol.path().trim_start_matches("/v1/"),
         &body,
@@ -412,7 +417,7 @@ async fn probe(store: &ConfigStore, id: &str) -> Result<()> {
             ))
             .json(&body)
             .header("accept", "text/event-stream")
-            .header("user-agent", "AutoJev/ModelTest")
+            .header("user-agent", "AutoJev/ModelSpeedTest")
             .header("HTTP-Referer", "https://autojev.ai")
             .header("X-Title", "AutoJev");
         if protocol == Protocol::Messages {
@@ -461,6 +466,81 @@ async fn probe(store: &ConfigStore, id: &str) -> Result<()> {
         log.status == "success" && log.first_content_ms.is_some(),
         "Speed test did not return measurable content"
     );
+    Ok(())
+}
+
+fn probe_body(protocol: Protocol, target: &str, supports_token_limit: bool) -> serde_json::Value {
+    let mut body = match protocol {
+        Protocol::Responses => json!({
+            "model": target,
+            "input": PROBE_PROMPT,
+            "stream": true
+        }),
+        Protocol::Messages => json!({
+            "model": target,
+            "messages": [{"role":"user","content":PROBE_PROMPT}],
+            "stream": true
+        }),
+        Protocol::Chat => json!({
+            "model": target,
+            "messages": [{"role":"user","content":PROBE_PROMPT}],
+            "stream": true
+        }),
+    };
+    if supports_token_limit {
+        let key = if protocol == Protocol::Responses { "max_output_tokens" } else { "max_tokens" };
+        body[key] = json!(PROBE_MAX_OUTPUT_TOKENS);
+        if protocol == Protocol::Chat { body["stream_options"] = json!({"include_usage":true}); }
+    }
+    body
+}
+
+async fn probe_subscription_gateway(
+    store: &ConfigStore,
+    config: &AppConfig,
+    model: &Model,
+    provider: &Provider,
+    protocol: Protocol,
+    body: &serde_json::Value,
+) -> Result<()> {
+    let target = body["model"].as_str().unwrap_or_default();
+    let request = crate::dispatch::local_gateway_request(config.port, protocol, body)?
+        .header("user-agent", "AutoJev/ModelSpeedTest")
+        .timeout(Duration::from_secs(20));
+    let response = crate::dispatch::send_http(request, true).await?;
+    let status = response.status();
+    let denied = response
+        .headers()
+        .contains_key("x-autojev-subscription-denial");
+    let mut bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        ensure!(bytes.len() + chunk.len() <= SUBSCRIPTION_PROBE_RESPONSE_LIMIT_BYTES, "Subscription speed test response exceeded the 64 KiB output limit");
+        bytes.extend_from_slice(&chunk);
+    }
+    if !status.is_success() {
+        let reason = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|value| value.pointer("/error/message").and_then(serde_json::Value::as_str).map(str::to_owned))
+            .filter(|message| !message.is_empty())
+            .unwrap_or_else(|| format!("Speed test HTTP failure ({status})"));
+        if denied {
+            let log = denied_probe_log(model, provider, protocol, &reason);
+            record_log(store, &log, true)?;
+        }
+        return Err(anyhow::anyhow!(reason));
+    }
+    let completed = crate::protocol::collect_debug_stream(&bytes, protocol, target)
+        .map_err(|error| anyhow::anyhow!("Speed test response was incomplete: {error}"))?;
+    let has_text = match protocol {
+        Protocol::Chat => completed.pointer("/choices/0/message/content").and_then(serde_json::Value::as_str).is_some_and(|text| !text.trim().is_empty()),
+        Protocol::Responses => completed.pointer("/output").and_then(serde_json::Value::as_array)
+            .is_some_and(|items| items.iter().any(|item| item.pointer("/content/0/text").and_then(serde_json::Value::as_str).is_some_and(|text| !text.trim().is_empty()))),
+        Protocol::Messages => completed.pointer("/content").and_then(serde_json::Value::as_array)
+            .is_some_and(|items| items.iter().any(|item| item["type"] == "text" && item["text"].as_str().is_some_and(|text| !text.trim().is_empty()))),
+    };
+    ensure!(has_text, "Speed test did not return measurable content");
     Ok(())
 }
 /// 自动测速的到期模型。订阅模型永不参加：应用不在后台主动消耗订阅额度。
@@ -763,6 +843,7 @@ mod tests {
         })
         .await
         .unwrap();
+        assert!(runner.view(&store.read()).job.cancelled);
         assert!(store.read().performance_samples.is_empty());
         server.abort();
     }
@@ -890,6 +971,20 @@ mod tests {
         assert!(due.iter().any(|id| id == &config.models[0].id));
         // 手动测速仍可指定该模型，只是会先被订阅准入拒绝。
         assert!(config.models.iter().any(|m| m.id == "codex-subscription-model" && m.enabled));
+    }
+
+    #[test]
+    fn manual_speed_probe_bounds_output_and_leaves_subscription_limit_to_the_gateway_guard() {
+        for protocol in [Protocol::Chat, Protocol::Responses, Protocol::Messages] {
+            let api = probe_body(protocol, "provider-model", true);
+            let key = if protocol == Protocol::Responses { "max_output_tokens" } else { "max_tokens" };
+            assert_eq!(api[key], PROBE_MAX_OUTPUT_TOKENS);
+            let subscription = probe_body(protocol, "autojev/model/subscription-model", false);
+            assert!(subscription.get(key).is_none());
+            assert_eq!(subscription["stream"], true);
+        }
+        assert_eq!(MANUAL_PROBES_PER_MODEL, 3);
+        assert_eq!(SUBSCRIPTION_PROBE_RESPONSE_LIMIT_BYTES, 64 * 1024);
     }
 
     #[tokio::test]

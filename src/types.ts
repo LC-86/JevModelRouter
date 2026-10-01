@@ -332,5 +332,5 @@ export interface ModelPerformance {
 }
 export interface PerformanceView {
   settings: PerformanceSettings; models: Record<string, ModelPerformance>;
-  job: { running: boolean; completed: number; total: number; completed_models: number; total_models: number; current_models: string[]; error: string | null };
+  job: { running: boolean; cancelled: boolean; completed: number; total: number; completed_models: number; total_models: number; current_models: string[]; error: string | null };
 }
