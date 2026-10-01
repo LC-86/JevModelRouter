@@ -480,6 +480,7 @@
   "Remove model": "移除模型",
   "Select model": "选择模型",
   "Higher priority numbers go first. Equal priorities share traffic by weight. Failed requests try remaining candidates.": "优先级数值越大越优先；同优先级按权重分配，失败后尝试后续候选。",
+  "Higher priority numbers go first. Equal priorities share traffic by weight. Only confirmed failures before generation starts try remaining candidates.": "优先级数值越大越优先；同优先级按权重分配，仅在明确确认生成尚未开始的失败后尝试后续候选。",
   "New sessions are distributed by priority and weight. Requests in the same session keep their model.": "新会话按优先级和权重分配；同一会话优先保持原模型。",
   "Automatic selection": "自动选择",
   "Calls the Jev model to choose among candidates. Configure Jev access below; if unavailable, local selection is used.": "调用 Jev 模型从候选中做决策。请在下方配置 Jev 接入；未配置或调用失败时回退到本地选择。",

@@ -232,6 +232,26 @@ pub(crate) async fn forward_test_request(
 }
 
 #[cfg(test)]
+pub(crate) struct ForwardTestContext(ProxyContext);
+
+#[cfg(test)]
+impl ForwardTestContext {
+    pub(crate) fn new(store: Arc<ConfigStore>) -> anyhow::Result<Self> {
+        let client = store.read().gateway.client()?;
+        Ok(Self(ProxyContext {
+            store,
+            client,
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            health: crate::resilience::Health::default(),
+        }))
+    }
+
+    pub(crate) async fn forward(&self, headers: HeaderMap, body: Value, endpoint: &str) -> Response {
+        forward(self.0.clone(), headers, body, endpoint, endpoint).await
+    }
+}
+
+#[cfg(test)]
 pub(crate) async fn gemini_test_request(
     store: Arc<ConfigStore>,
     operation: &str,
@@ -276,13 +296,14 @@ async fn forward_captured_with_subscription_policy(context: ProxyContext, header
         });
     let attempts = attempts.min(config.gateway.max_attempts);
     let mut tried = std::collections::HashSet::new();
+    let mut excluded_subscription_accounts = std::collections::HashSet::new();
     let mut last_response = None;
     for attempt in 0..attempts {
         let before = tried.len();
         let mut lease = None;
         let mut allow_retry = true;
         let started = std::time::Instant::now();
-        let mut response = forward_attempt(context.clone(), headers.clone(), body.clone(), endpoint, capture.clone(), &mut tried, &mut lease, &mut allow_retry, allow_subscription_protocol,
+        let mut response = forward_attempt(context.clone(), headers.clone(), body.clone(), endpoint, capture.clone(), &mut tried, &mut excluded_subscription_accounts, &mut lease, &mut allow_retry, allow_subscription_protocol,
         ).await;
         if tried.len() == before && last_response.is_some() {return last_response.unwrap();}
         let status = response.status().as_u16();
@@ -317,7 +338,7 @@ fn request_compatible(body: &Value, source: Protocol, model: &crate::config::Mod
 }
 
 async fn forward_attempt(context: ProxyContext, headers: HeaderMap, body: Value, endpoint: &str,
-    capture: crate::traffic::SharedCapture, tried: &mut std::collections::HashSet<String>, lease: &mut Option<crate::resilience::Lease>, allow_retry: &mut bool, allow_subscription_protocol: bool,
+    capture: crate::traffic::SharedCapture, tried: &mut std::collections::HashSet<String>, excluded_subscription_accounts: &mut std::collections::HashSet<String>, lease: &mut Option<crate::resilience::Lease>, allow_retry: &mut bool, allow_subscription_protocol: bool,
 ) -> Response {
     let mut input = inspect_request(&body, endpoint);
     if let Some(binding) = headers.get("x-autojev-binding").and_then(|v| v.to_str().ok()) {
@@ -326,7 +347,15 @@ async fn forward_attempt(context: ProxyContext, headers: HeaderMap, body: Value,
     let (mut config, decision_key) = context.store.read_with_decision_key();
     crate::traffic::resolve_requested_model(&mut capture.lock().unwrap().log, &config, input.requested_model.as_deref().unwrap_or(""));
     let session_config = serde_json::to_string(&(&config.routes, &config.models, &config.providers, &config.policy)).unwrap_or_default();
-    config.models.retain(|m| !tried.contains(&m.id) && context.health.available(&m.id));
+    config.models.retain(|m| {
+        !tried.contains(&m.id)
+            && context.health.available(&m.id)
+            && config.providers.iter().find(|provider| provider.id == m.provider_id).is_none_or(|provider| {
+                !crate::subscription::is_subscription_provider(provider)
+                    || (!excluded_subscription_accounts.contains(&provider.id)
+                        && context.health.available(&subscription_account_health_id(&provider.id)))
+            })
+    });
     if config.models.is_empty() {
         let mut response = error_response(StatusCode::SERVICE_UNAVAILABLE, "All candidate models are cooling down or unavailable. Retry shortly.");
         response.headers_mut().insert("retry-after", HeaderValue::from_static("5"));
@@ -506,7 +535,7 @@ async fn forward_attempt(context: ProxyContext, headers: HeaderMap, body: Value,
         let request_metadata = capture.lock().unwrap().log.clone();
         let response = codex_subscription_response(
             &context, &resolved.provider, &resolved.model, generation, source, body, streaming,
-            &resolved.decision.source, pre_dispatch_check, capture).await;
+            &resolved.decision.source, pre_dispatch_check, capture, allow_retry, excluded_subscription_accounts).await;
         let _ = context.store.add_event(RouteEvent {
             id: request_metadata.id,
             created_at: request_metadata.created_at,
@@ -800,6 +829,43 @@ impl Drop for PendingToolBodyGuard {
     }
 }
 
+fn subscription_account_health_id(provider_id: &str) -> String {
+    format!("subscription-account:{provider_id}")
+}
+
+fn confirmed_pre_start_failure(
+    context: &ProxyContext,
+    provider: &Provider,
+    model: &Model,
+    protocol: Protocol,
+    route_source: &str,
+    status: u16,
+    scope: crate::subscription::GenerationFailureScope,
+    retry_after_seconds: Option<u64>,
+    message: &str,
+    capture: crate::traffic::SharedCapture,
+    allow_retry: &mut bool,
+    excluded_subscription_accounts: &mut std::collections::HashSet<String>,
+) -> Response {
+    let status_is_retryable = crate::resilience::retryable(status);
+    *allow_retry = status_is_retryable
+        && scope != crate::subscription::GenerationFailureScope::Unknown;
+    if status_is_retryable && scope == crate::subscription::GenerationFailureScope::Account {
+        excluded_subscription_accounts.insert(provider.id.clone());
+        let account_health = subscription_account_health_id(&provider.id);
+        if let Some(lease) = context.health.acquire(&account_health) {
+            lease.complete(status, retry_after_seconds, &context.store.read().gateway);
+        }
+    }
+    let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+    let detail = if message.trim().is_empty() {
+        format!("{} rejected generation before it started.", subscription_generation_label(&provider.kind))
+    } else {
+        format!("{} rejected generation before it started: {}", subscription_generation_label(&provider.kind), message.trim())
+    };
+    codex_json_response(status, protocol, model, route_source, protocol.error(&detail), capture)
+}
+
 async fn codex_subscription_response(
     context: &ProxyContext,
     provider: &Provider,
@@ -811,6 +877,8 @@ async fn codex_subscription_response(
     route_source: &str,
     pre_dispatch_check: Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
     capture: crate::traffic::SharedCapture,
+    allow_retry: &mut bool,
+    excluded_subscription_accounts: &mut std::collections::HashSet<String>,
 ) -> Response {
     let provider_label = subscription_generation_label(&provider.kind);
     let Some(adapter) = context.store.subscription.for_kind(&provider.kind).cloned() else {
@@ -849,6 +917,7 @@ async fn codex_subscription_response(
             }
         };
         let mut output = String::new();
+        let mut generation_started = false;
         loop {
             let event = match tokio::time::timeout_at(response_deadline, events.next()).await {
                 Ok(Some(event)) => event,
@@ -860,7 +929,19 @@ async fn codex_subscription_response(
                 }
             };
             match event {
+                crate::subscription::GenerationEvent::RejectedBeforeStart { status, scope, retry_after_seconds, message }
+                    if !generation_started && output.is_empty() => {
+                        return confirmed_pre_start_failure(
+                            context, provider, model, protocol, route_source, status, scope,
+                            retry_after_seconds, &message, capture, allow_retry, excluded_subscription_accounts,
+                        );
+                    }
+                crate::subscription::GenerationEvent::RejectedBeforeStart { message, .. } => {
+                    return codex_json_response(StatusCode::BAD_GATEWAY, protocol, model, route_source,
+                        protocol.error(&format!("{provider_label} reported a pre-start rejection after generation state became ambiguous: {message}")), capture);
+                }
                 crate::subscription::GenerationEvent::Chunk(delta) => {
+                    generation_started = true;
                     if output.len().saturating_add(delta.len()) > MAX_CODEX_OUTPUT_BYTES {
                         return codex_json_response(StatusCode::BAD_GATEWAY, protocol, model, route_source,
                             protocol.error(&format!("{provider_label} text output exceeded the gateway response limit.")), capture,
@@ -931,7 +1012,7 @@ async fn codex_subscription_response(
                         protocol.error(&format!("{provider_label} generation did not complete.")), capture,
                     );
                 }
-                crate::subscription::GenerationEvent::Started { .. } => {}
+                crate::subscription::GenerationEvent::Started { .. } => generation_started = true,
             }
         }
         return codex_json_response(StatusCode::BAD_GATEWAY, protocol, model, route_source,
@@ -949,7 +1030,7 @@ async fn codex_subscription_response(
     let pending_call_ids = Arc::new(std::sync::Mutex::new(None::<Vec<String>>));
     let pending_call_ids_for_task = pending_call_ids.clone();
     let (tx, rx) = tokio::sync::mpsc::channel::<CodexSseFrame>(8);
-    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<crate::subscription::GenerationEvent, String>>();
     let task = tokio::spawn(async move {
         let request = crate::subscription::GenerationRequest {
             provider_id: &provider_id,
@@ -966,13 +1047,26 @@ async fn codex_subscription_response(
                 return;
             }
         };
-        if ready_tx.send(Ok(())).is_err() { return; }
+        let first_event = tokio::select! {
+            _ = tx.closed() => return,
+            first = events.next() => first.unwrap_or_else(|| crate::subscription::GenerationEvent::Failed {
+                message: format!("{provider_label} ended the turn without a terminal status."),
+            }),
+        };
+        let rejected_before_start = matches!(first_event, crate::subscription::GenerationEvent::RejectedBeforeStart { .. });
+        if ready_tx.send(Ok(first_event.clone())).is_err() { return; }
+        if rejected_before_start { return; }
+        let mut first_event = Some(first_event);
         let mut encoder = CodexSseEncoder::new_for_provider(protocol, &model_id, provider_label);
         let mut output_bytes = 0usize;
         loop {
-            let next = tokio::select! {
-                _ = tx.closed() => break,
-                next = events.next() => next,
+            let next = if first_event.is_some() {
+                first_event.take()
+            } else {
+                tokio::select! {
+                    _ = tx.closed() => break,
+                    next = events.next() => next,
+                }
             };
             let Some(event) = next else {
                 let frames = encoder.frames(
@@ -1051,7 +1145,13 @@ async fn codex_subscription_response(
 
     match tokio::time::timeout(
         std::time::Duration::from_secs(context.store.read().gateway.response_timeout_seconds), ready_rx).await {
-        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Ok(crate::subscription::GenerationEvent::RejectedBeforeStart { status, scope, retry_after_seconds, message }))) => {
+            return confirmed_pre_start_failure(
+                context, provider, model, protocol, route_source, status, scope,
+                retry_after_seconds, &message, capture, allow_retry, excluded_subscription_accounts,
+            );
+        }
+        Ok(Ok(Ok(_))) => {}
         Ok(Ok(Err(message))) => return codex_json_response(StatusCode::BAD_GATEWAY, protocol, model,
             route_source, protocol.error(&message), capture),
         Ok(Err(_)) => {
@@ -1278,6 +1378,7 @@ impl CodexSseEncoder {
     fn frames(&mut self, event: crate::subscription::GenerationEvent, capture: &crate::traffic::SharedCapture) -> Vec<Bytes> {
         use crate::subscription::GenerationEvent as Event;
         match event {
+            Event::RejectedBeforeStart { message, .. } => self.error_frames(&message, false, capture),
             Event::Started { .. } => self.start_frames(),
             Event::Chunk(delta) => {
                 if self.terminal || delta.is_empty() { return Vec::new(); }
