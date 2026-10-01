@@ -769,6 +769,37 @@ fn subscription_generation_label(kind: &ProviderKind) -> &'static str {
     }
 }
 
+struct CodexSseFrame {
+    bytes: Bytes,
+    terminal: bool,
+}
+
+struct PendingToolBodyGuard {
+    adapter: Arc<dyn crate::subscription::SubscriptionAdapter>,
+    provider_id: String,
+    generation: u64,
+    call_ids: Arc<std::sync::Mutex<Option<Vec<String>>>>,
+    delivered: bool,
+}
+
+impl PendingToolBodyGuard {
+    fn mark_delivered(&mut self) {
+        self.delivered = true;
+        self.call_ids.lock().unwrap().take();
+    }
+}
+
+impl Drop for PendingToolBodyGuard {
+    fn drop(&mut self) {
+        if self.delivered {
+            return;
+        }
+        if let Some(call_ids) = self.call_ids.lock().unwrap().take() {
+            self.adapter.abandon_client_tool_calls(&self.provider_id, self.generation, &call_ids);
+        }
+    }
+}
+
 async fn codex_subscription_response(
     context: &ProxyContext,
     provider: &Provider,
@@ -909,7 +940,9 @@ async fn codex_subscription_response(
     let adapter_for_task = adapter.clone();
     let capture_for_task = capture.clone();
     let pre_dispatch_check_for_task = pre_dispatch_check;
-    let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(8);
+    let pending_call_ids = Arc::new(std::sync::Mutex::new(None::<Vec<String>>));
+    let pending_call_ids_for_task = pending_call_ids.clone();
+    let (tx, rx) = tokio::sync::mpsc::channel::<CodexSseFrame>(8);
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
     let task = tokio::spawn(async move {
         let request = crate::subscription::GenerationRequest {
@@ -940,7 +973,10 @@ async fn codex_subscription_response(
                     crate::subscription::GenerationEvent::Failed { message: format!("{provider_label} ended the turn without a terminal status.") },
                     &capture_for_task,
                 );
-                for frame in frames { if tx.send(frame).await.is_err() { return; } }
+                let final_frame = frames.len().saturating_sub(1);
+                for (index, frame) in frames.into_iter().enumerate() {
+                    if tx.send(CodexSseFrame { bytes: frame, terminal: index == final_frame }).await.is_err() { return; }
+                }
                 break;
             };
             let additional_bytes = match &event {
@@ -953,6 +989,10 @@ async fn codex_subscription_response(
             };
             output_bytes = output_bytes.saturating_add(additional_bytes);
                 if output_bytes > output_limit {
+                if let crate::subscription::GenerationEvent::ToolCalls { calls } = &event {
+                    let call_ids = calls.iter().map(|call| call.id.clone()).collect::<Vec<_>>();
+                    adapter_for_task.abandon_client_tool_calls(&provider_id, generation, &call_ids);
+                }
                 let kind = if matches!(event, crate::subscription::GenerationEvent::ToolCalls { .. }) {
                     "tool-call"
                 } else {
@@ -962,7 +1002,10 @@ async fn codex_subscription_response(
                         crate::subscription::GenerationEvent::Failed { message: format!("{provider_label} {kind} output exceeded the gateway response limit.") },
                         &capture_for_task,
                     );
-                    for frame in frames { if tx.send(frame).await.is_err() { return; } }
+                    let final_frame = frames.len().saturating_sub(1);
+                    for (index, frame) in frames.into_iter().enumerate() {
+                        if tx.send(CodexSseFrame { bytes: frame, terminal: index == final_frame }).await.is_err() { return; }
+                    }
                     break;
                 }
             let terminal = matches!(event,
@@ -972,8 +1015,19 @@ async fn codex_subscription_response(
                 | crate::subscription::GenerationEvent::Failed { .. }
                 | crate::subscription::GenerationEvent::Cancelled
             );
+            if let crate::subscription::GenerationEvent::ToolCalls { calls } = &event {
+                if calls.iter().all(|call| serde_json::from_str::<Value>(&call.arguments).is_ok()) {
+                    *pending_call_ids_for_task.lock().unwrap() = Some(calls.iter().map(|call| call.id.clone()).collect());
+                } else {
+                    let call_ids = calls.iter().map(|call| call.id.clone()).collect::<Vec<_>>();
+                    adapter_for_task.abandon_client_tool_calls(&provider_id, generation, &call_ids);
+                }
+            }
             let frames = encoder.frames(event, &capture_for_task);
-            for frame in frames { if tx.send(frame).await.is_err() { return; } }
+            let final_frame = frames.len().saturating_sub(1);
+            for (index, frame) in frames.into_iter().enumerate() {
+                if tx.send(CodexSseFrame { bytes: frame, terminal: terminal && index == final_frame }).await.is_err() { return; }
+            }
             if terminal { break; }
         }
     });
@@ -996,8 +1050,26 @@ async fn codex_subscription_response(
         }
     }
 
-    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
-        rx.recv().await.map(|bytes| (Ok::<Bytes, std::io::Error>(bytes), rx))
+    let guard = PendingToolBodyGuard {
+        adapter: adapter.clone(),
+        provider_id: provider.id.clone(),
+        generation,
+        call_ids: pending_call_ids,
+        delivered: false,
+    };
+    let stream = futures_util::stream::unfold((rx, guard), |(mut rx, mut guard)| async move {
+        match rx.recv().await {
+            Some(frame) => {
+                if frame.terminal {
+                    guard.mark_delivered();
+                }
+                Some((Ok::<Bytes, std::io::Error>(frame.bytes), (rx, guard)))
+            }
+            None => {
+                guard.mark_delivered();
+                None
+            }
+        }
     });
     let stream = timed_stream(stream, stream_idle_seconds);
     let stream = crate::traffic::observe(stream, capture.clone());

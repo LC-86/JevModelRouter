@@ -1320,6 +1320,9 @@ pub trait SubscriptionAdapter: Send + Sync {
     fn models<'a>(&'a self, provider_id: &'a str, generation: u64) -> BoxFuture<'a, Result<CatalogRead>>;
     fn quota<'a>(&'a self, provider_id: &'a str, generation: u64) -> BoxFuture<'a, Result<QuotaEvidence>>;
     fn generate<'a>(&'a self, request: GenerationRequest<'a>) -> BoxFuture<'a, Result<GenerationStream<'a>>>;
+    /// Revoke a client-owned tool handoff if the HTTP body that carried it was abandoned.
+    /// The IDs scope cleanup to the exact pending tool batch and cannot cancel another turn.
+    fn abandon_client_tool_calls(&self, _provider_id: &str, _generation: u64, _call_ids: &[String]) {}
     /// Signal one connection generation to stop before its identity or provider-owned home changes.
     fn cancel_generation(&self, _provider_id: &str, _generation: u64) {}
     /// 发起一次浏览器登录；世代与尝试一起绑定，结果迟到即整体丢弃。
