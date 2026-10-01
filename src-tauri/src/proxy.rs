@@ -253,6 +253,10 @@ impl ForwardTestContext {
     pub(crate) fn health_statuses(&self) -> Vec<crate::resilience::Status> {
         self.0.health.statuses()
     }
+
+    pub(crate) fn expire_health_for_test(&self, id: &str) {
+        self.0.health.expire_for_test(id);
+    }
 }
 
 #[cfg(test)]
@@ -312,12 +316,19 @@ async fn forward_captured_with_subscription_policy(context: ProxyContext, header
         ).await;
         if tried.len() == before && last_response.is_some() {return last_response.unwrap();}
         let status = response.status().as_u16();
-        if let Some(lease) = lease {
-            if response.status().is_success() {response=observe_health(response,lease,config.gateway.clone(),capture.clone());}
-            else {lease.complete(status, crate::resilience::retry_after(response.headers()), &config.gateway);}
-        }
-        if let Some(account_lease) = account_lease.take() {
-            account_lease.complete(status, crate::resilience::retry_after(response.headers()), &config.gateway);
+        if response.status().is_success() {
+            if let Some(lease) = lease.take() {
+                response = observe_health(response, lease, account_lease.take(), config.gateway.clone(), capture.clone());
+            } else if let Some(account_lease) = account_lease.take() {
+                account_lease.complete(status, crate::resilience::retry_after(response.headers()), &config.gateway);
+            }
+        } else {
+            if let Some(lease) = lease.take() {
+                lease.complete(status, crate::resilience::retry_after(response.headers()), &config.gateway);
+            }
+            if let Some(account_lease) = account_lease.take() {
+                account_lease.complete(status, crate::resilience::retry_after(response.headers()), &config.gateway);
+            }
         }
         { let mut c = capture.lock().unwrap();
           let provider = c.log.provider_name.clone(); let model = c.log.model_id.clone();
@@ -355,9 +366,11 @@ async fn forward_attempt(context: ProxyContext, headers: HeaderMap, body: Value,
     let (mut config, decision_key) = context.store.read_with_decision_key();
     crate::traffic::resolve_requested_model(&mut capture.lock().unwrap().log, &config, input.requested_model.as_deref().unwrap_or(""));
     let session_config = serde_json::to_string(&(&config.routes, &config.models, &config.providers, &config.policy)).unwrap_or_default();
+    let model_health_ids = config.models.iter().map(|model| (model.id.clone(), model_health_id(&config, model)))
+        .collect::<HashMap<_, _>>();
     config.models.retain(|m| {
         !tried.contains(&m.id)
-            && context.health.available(&m.id)
+            && context.health.available(&model_health_ids[&m.id])
             && config.providers.iter().find(|provider| provider.id == m.provider_id).is_none_or(|provider| {
                 !crate::subscription::is_subscription_provider(provider)
                     || config.subscriptions.get(&provider.id).is_none_or(|connection| {
@@ -505,7 +518,7 @@ async fn forward_attempt(context: ProxyContext, headers: HeaderMap, body: Value,
         return subscription_denial(denial, source);
     }
 
-    *lease = context.health.acquire(&resolved.model.id);
+    *lease = context.health.acquire(&model_health_id(&config, &resolved.model));
     if lease.is_none() {return error_response(StatusCode::SERVICE_UNAVAILABLE, "Candidate is being probed by another request. Retry shortly.");}
     tried.insert(resolved.model.id.clone());
     { let mut c=capture.lock().unwrap();c.route(&resolved);c.log.performance_context_tokens=input.estimated_context_tokens;c.log.performance_requires_vision=input.requires_vision; }
@@ -546,7 +559,7 @@ async fn forward_attempt(context: ProxyContext, headers: HeaderMap, body: Value,
         let request_metadata = capture.lock().unwrap().log.clone();
         let response = codex_subscription_response(
             &context, &resolved.provider, &resolved.model, generation, identity, source, body, streaming,
-            &resolved.decision.source, pre_dispatch_check, capture, allow_retry, excluded_subscription_accounts, account_lease).await;
+            &resolved.decision.source, pre_dispatch_check, capture, allow_retry, excluded_subscription_accounts, lease, account_lease).await;
         let _ = context.store.add_event(RouteEvent {
             id: request_metadata.id,
             created_at: request_metadata.created_at,
@@ -844,6 +857,17 @@ fn subscription_account_health_id(provider_id: &str, generation: u64) -> String 
     format!("subscription-account:{provider_id}:{generation}")
 }
 
+fn model_health_id(config: &crate::config::AppConfig, model: &Model) -> String {
+    let Some(provider) = config.providers.iter().find(|provider| provider.id == model.provider_id) else {
+        return model.id.clone();
+    };
+    if !crate::subscription::is_subscription_provider(provider) {
+        return model.id.clone();
+    }
+    let generation = config.subscriptions.get(&provider.id).map_or(0, |connection| connection.generation);
+    format!("subscription-model:{}:{generation}:{}", provider.id, model.id)
+}
+
 fn subscription_request_is_current(
     context: &ProxyContext,
     provider: &Provider,
@@ -896,7 +920,11 @@ fn confirmed_pre_start_failure(
         excluded_subscription_accounts.insert(account_health.clone());
         let health_lease = account_lease.take().or_else(|| context.health.acquire(&account_health));
         if let Some(lease) = health_lease {
-            lease.complete(status, retry_after_seconds, &context.store.read().gateway);
+            if scope == crate::subscription::GenerationFailureScope::Unknown {
+                lease.complete_conservatively(status, retry_after_seconds, &context.store.read().gateway);
+            } else {
+                lease.complete(status, retry_after_seconds, &context.store.read().gateway);
+            }
         }
     } else if let Some(lease) = account_lease.take() {
         let account_status = if scope == crate::subscription::GenerationFailureScope::Model { 200 } else { status };
@@ -931,6 +959,7 @@ async fn codex_subscription_response(
     capture: crate::traffic::SharedCapture,
     allow_retry: &mut bool,
     excluded_subscription_accounts: &mut std::collections::HashSet<String>,
+    lease: &mut Option<crate::resilience::Lease>,
     account_lease: &mut Option<crate::resilience::Lease>,
 ) -> Response {
     let provider_label = subscription_generation_label(&provider.kind);
@@ -943,8 +972,11 @@ async fn codex_subscription_response(
             "The subscription adapter is unavailable.");
     }
     let account_health = subscription_account_health_id(&provider.id, generation);
-    *account_lease = context.health.acquire_if_present(&account_health);
+    *account_lease = context.health.acquire_recovery_probe(&account_health);
     if account_lease.is_none() && !context.health.available(&account_health) {
+        *allow_retry = false;
+        account_lease.take();
+        lease.take();
         return protocol_error_response(StatusCode::SERVICE_UNAVAILABLE, protocol,
             "The subscription account is being checked after its cooldown. Retry shortly.");
     }
@@ -2245,12 +2277,39 @@ where S:futures_util::Stream<Item=Result<axum::body::Bytes,E>>+Send,E:std::error
         }
     })
 }
-fn observe_health(response:Response,lease:crate::resilience::Lease,settings:crate::resilience::Settings,capture:crate::traffic::SharedCapture)->Response {
+struct AccountProbeCompletion {
+    lease: Option<crate::resilience::Lease>,
+    settings: crate::resilience::Settings,
+}
+
+impl AccountProbeCompletion {
+    fn complete(&mut self, status: u16) {
+        if let Some(lease) = self.lease.take() {
+            lease.complete(status, None, &self.settings);
+        }
+    }
+}
+
+impl Drop for AccountProbeCompletion {
+    fn drop(&mut self) {
+        // A client disconnect or dropped body is not a successful account probe.
+        self.complete(502);
+    }
+}
+
+fn observe_health(
+    response: Response,
+    lease: crate::resilience::Lease,
+    account_lease: Option<crate::resilience::Lease>,
+    settings: crate::resilience::Settings,
+    capture: crate::traffic::SharedCapture,
+) -> Response {
     let(parts,body)=response.into_parts();
-    let stream=futures_util::stream::unfold((body.into_data_stream(),Some(lease),settings,capture),|(mut stream,mut lease,settings,capture)|async move{
+    let account_probe = AccountProbeCompletion { lease: account_lease, settings: settings.clone() };
+    let stream=futures_util::stream::unfold((body.into_data_stream(),Some(lease),account_probe,settings,capture),|(mut stream,mut lease,mut account_probe,settings,capture)|async move{
         match stream.next().await{
-            Some(chunk)=>{if chunk.is_err(){if let Some(l)=lease.take(){l.complete(502,None,&settings);}}Some((chunk,(stream,lease,settings,capture)))}
-            None=>{let failed=capture.lock().unwrap().failed_body();if let Some(l)=lease.take(){l.complete(if failed{502}else{200},None,&settings);}None}
+            Some(chunk)=>{if chunk.is_err(){if let Some(l)=lease.take(){l.complete(502,None,&settings);}account_probe.complete(502);}Some((chunk,(stream,lease,account_probe,settings,capture)))}
+            None=>{let status=if capture.lock().unwrap().failed_body(){502}else{200};if let Some(l)=lease.take(){l.complete(status,None,&settings);}account_probe.complete(status);None}
         }
     });Response::from_parts(parts,Body::from_stream(stream))
 }
@@ -2331,7 +2390,7 @@ mod availability_tests {
         let h=crate::resilience::Health::default();let mut settings=crate::resilience::Settings::default();settings.failure_threshold=1;
         let lease=h.acquire("model").unwrap();let capture=crate::traffic::Capture::new("chat/completions",&json!({}),&HeaderMap::new());
         let response=Response::new(Body::from_stream(futures_util::stream::iter([Err::<axum::body::Bytes,_>(std::io::Error::other("disconnected"))])));
-        let response=observe_health(response,lease,settings,capture);
+        let response=observe_health(response,lease,None,settings,capture);
         assert!(axum::body::to_bytes(response.into_body(),1024).await.is_err());assert!(!h.available("model"));
     }
 }
