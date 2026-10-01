@@ -1129,12 +1129,28 @@ async fn test_provider_draft(state: State<'_, AppState>, provider: Provider, api
     Ok("Test request succeeded.".into())
 }
 
+#[cfg(test)]
+mod subscription_provider_test_contract_tests {
+    use super::*;
+
+    #[test]
+    fn subscription_test_is_explicitly_chat_text_only() {
+        assert_eq!(SUBSCRIPTION_TEST_PROTOCOL, protocol::Protocol::Chat);
+        assert!(SUBSCRIPTION_TEST_SUCCESS_MESSAGE.contains("Chat text test succeeded"));
+        assert!(SUBSCRIPTION_TEST_SUCCESS_MESSAGE.contains("does not verify other protocols"));
+    }
+}
+
+const SUBSCRIPTION_TEST_PROTOCOL: protocol::Protocol = protocol::Protocol::Chat;
+const SUBSCRIPTION_TEST_SUCCESS_MESSAGE: &str =
+    "Subscription Chat text test succeeded. This does not verify other protocols.";
+
 pub(crate) async fn test_subscription_target(store: Arc<ConfigStore>, provider_id: &str, model_id: &str) -> Result<String, String> {
     let config = store.read();
     let provider = config.providers.iter().find(|provider| provider.id == provider_id && subscription::is_subscription_provider(provider))
         .ok_or_else(|| "Subscription provider not found".to_string())?;
     // Service and model test actions use the exact shared gate before constructing a local gateway request.
-    subscription::admit_target(&config, provider, model_id, protocol::Protocol::Chat)
+    subscription::admit_target(&config, provider, model_id, SUBSCRIPTION_TEST_PROTOCOL)
         .map_err(|denial| denial.summary())?;
     let model = config.models.iter().find(|model| model.provider_id == provider.id && model.model_id == model_id.trim())
         .ok_or_else(|| "Refresh this subscription model's catalog before testing it".to_string())?;
@@ -1144,13 +1160,13 @@ pub(crate) async fn test_subscription_target(store: Arc<ConfigStore>, provider_i
         "messages": [{"role":"user","content":"Say OK"}],
         "stream": false
     });
-    let request = dispatch::local_gateway_request(config.port, protocol::Protocol::Chat, &body)
+    let request = dispatch::local_gateway_request(config.port, SUBSCRIPTION_TEST_PROTOCOL, &body)
         .map_err(|error| error.to_string())?
         .header("user-agent", "AutoJev/ProviderTest")
         .timeout(std::time::Duration::from_secs(30));
     let response = dispatch::send_http(request, true).await.map_err(|_| "Subscription test request failed or timed out".to_string())?;
     provider_test::check_response(response, None).await?;
-    Ok("Test request succeeded.".into())
+    Ok(SUBSCRIPTION_TEST_SUCCESS_MESSAGE.into())
 }
 
 #[tauri::command]

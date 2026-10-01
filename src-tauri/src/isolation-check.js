@@ -15,6 +15,10 @@
     Object.getOwnPropertyDescriptor(Object.getPrototypeOf(element), 'value').set.call(element, value);
     element.dispatchEvent(new Event('input', { bubbles: true }));
   };
+  const setSelectValue = (element, value) => {
+    Object.getOwnPropertyDescriptor(Object.getPrototypeOf(element), 'value').set.call(element, value);
+    element.dispatchEvent(new Event('change', { bubbles: true }));
+  };
   const report = { ok: false, layer: 'native-desktop-loopback', checks: [] };
   const passed = name => report.checks.push(name);
   const rejected = async (command, args, text) => {
@@ -775,7 +779,12 @@
     await click('.sidebar [aria-busy]');
     const gateway = await wait(async () => { const current = await snapshot(); return current.proxy.running ? current.proxy : null; }, 'local gateway');
     check(gateway.port !== 9526 && gateway.port !== 9527 && gateway.port !== 0, `The gateway must use an independent port: ${gateway.port}`);
-    const refreshed = await invoke('refresh_subscription', { providerId });
+    const subscriptionRow = await wait(() => [...document.querySelectorAll('tbody tr')].find(item => item.textContent.includes(providerId)), 'subscription provider row before catalog refresh');
+    (await wait(() => subscriptionRow.querySelector(`[data-testid="sub-refresh-${providerId}"]`), 'subscription catalog refresh action')).click();
+    const refreshed = await wait(async () => {
+      const next = await snapshot();
+      return next.subscriptions.find(item => item.provider_id === providerId)?.catalog_entries?.some(item => item.model_id === catalogModelId) ? next : null;
+    }, 'UI-refreshed subscription catalog');
     const discovered = await entry();
     check(discovered.availability === 'available', `A successful directory read must confirm the entry: ${JSON.stringify(discovered)}`);
     check(discovered.eligibility === 'eligible', `A confirmed entry must be eligible: ${JSON.stringify(discovered)}`);
@@ -784,6 +793,35 @@
     check(Boolean(discoveredRow), 'A discovered model must be materialized as a model row');
     check(discoveredRow.id === discovered.internal_id, `The internal ID must be the model row ID: ${JSON.stringify({ row: discoveredRow.id, entry: discovered.internal_id })}`);
     check(discoveredRow.selected === false && discoveredRow.enabled === true, `The materialized row must start unselected and enabled: ${JSON.stringify(discoveredRow)}`);
+    // Provider list and edit dialog must both expose a real test command whose exact target is selected
+    // from this verified directory. The native fixture supplies a fictional helper and account; no live
+    // provider, OAuth session, subscription allowance, or model endpoint is contacted.
+    await nav(1);
+    const providerRow = await wait(() => [...document.querySelectorAll('tbody tr')].find(item => item.textContent.includes(providerId)), 'provider row for subscription test');
+    (await wait(() => providerRow.querySelector(`[data-testid="provider-configure-${providerId}"]`), 'configure subscription provider')).click();
+    const providerDialog = await wait(() => document.querySelector('.provider-dialog'), 'subscription provider dialog');
+    const providerTarget = await wait(() => providerDialog.querySelector('[data-testid="provider-subscription-test-model"]'), 'subscription test target selector');
+    check([...providerTarget.options].some(option => option.value === catalogModelId), `The provider dialog must offer the discovered target: ${JSON.stringify([...providerTarget.options].map(option => option.value))}`);
+    check(/may consume subscription allowance|可能消耗订阅额度/i.test(providerDialog.textContent), `The provider dialog must warn about subscription allowance: ${providerDialog.textContent}`);
+    setSelectValue(providerTarget, catalogModelId);
+    await click('[data-testid="provider-subscription-test-action"]');
+    const providerTestResult = await wait(() => providerDialog.querySelector('.provider-test-result')?.textContent?.trim(), 'provider dialog test result');
+    check(providerTestResult.length > 0, 'The provider dialog test must return an explicit result');
+    await click('.provider-dialog-actions button[type="submit"]');
+    await wait(() => !document.querySelector('.provider-dialog'), 'saved subscription provider test target');
+    const savedProvider = (await snapshot()).providers.find(item => item.id === providerId);
+    check(savedProvider?.test_model === catalogModelId, `Saving must keep the selected directory target: ${JSON.stringify(savedProvider)}`);
+    const savedProviderRow = await wait(() => [...document.querySelectorAll('tbody tr')].find(item => item.textContent.includes(providerId)), 'saved provider row');
+    const providerRowTest = await wait(() => savedProviderRow.querySelector(`[data-testid="provider-test-${providerId}"]`), 'provider row test action');
+    check(!providerRowTest.disabled, 'The saved provider row test action must be enabled for its selected target');
+    const previousToast = document.querySelector('.toast')?.textContent?.trim() || '';
+    providerRowTest.click();
+    const listTestResult = await wait(() => {
+      const message = document.querySelector('.toast')?.textContent?.trim() || '';
+      return message && message !== previousToast ? message : null;
+    }, 'provider row test result');
+    check(listTestResult.length > 0, 'The provider row test must invoke the saved test target and report its result');
+    passed('subscription provider directory target is saved and tested from both the dialog and provider row');
     const unselectedList = await publicCatalog();
     check(!unselectedList.ids.includes(catalogPublicId), `An unselected model must stay out of the public catalog: ${JSON.stringify(unselectedList)}`);
     record('discovered', {
@@ -796,17 +834,27 @@
     record('unselected', { publicCatalog: unselectedList.ids, containsDiscovered: unselectedList.ids.includes(catalogPublicId) });
     passed('a newly discovered subscription model stays unselected and out of the public catalog');
     // 2. 勾选：进入公共目录；直调准入结论不变。
-    await setModel({ selected: true });
-    const selected = await entry();
+    await click(`[data-testid="sub-select-${providerId}-${discovered.internal_id}"]`);
+    const selected = await wait(async () => { const current = await entry(); return current.selected ? current : null; }, 'catalog selection persisted');
     check(selected.selected === true, `Selecting must reach the user configuration: ${JSON.stringify(selected)}`);
     const selectedList = await publicCatalog();
     check(selectedList.ids.includes(catalogPublicId), `A selected model must appear in the public catalog: ${JSON.stringify(selectedList)}`);
+    await nav(2);
+    const selectedModelRow = await wait(() => [...document.querySelectorAll('.models-table tbody tr')].find(item => item.textContent.includes(catalogModelId)), 'selected subscription model row');
+    (await wait(() => selectedModelRow.querySelector(`[data-testid="model-configure-${selected.internal_id}"]`), 'configure selected subscription model')).click();
+    const modelDialog = await wait(() => document.querySelector('.provider-dialog'), 'subscription model dialog');
+    const protocolNote = await wait(() => modelDialog.querySelector('[data-testid="subscription-test-protocol-note"]')?.textContent?.trim(), 'subscription Chat-only test note');
+    check(/locked to Chat Completions text|固定使用 Chat Completions 文本/i.test(protocolNote) && /not verified by this test|本测试不会验证该协议/i.test(protocolNote), `A visible routing API type must not imply protocol test coverage: ${protocolNote}`);
+    await click('[data-testid="model-dialog-close"]');
+    await wait(() => !document.querySelector('.provider-dialog'), 'closed subscription model dialog');
+    await nav(1);
     const admittedWhileSelected = await admission('selected');
     record('selected', { publicCatalog: selectedList.ids, internal_id: selected.internal_id });
     passed('selecting the discovered model puts it into the public catalog');
     // 3. 取消选择：移出公共目录；显式原 ID 直调的准入结论必须与已选时完全一致。
-    await setModel({ selected: false });
-    const deselected = await entry();
+    await nav(1);
+    await click(`[data-testid="sub-select-${providerId}-${discovered.internal_id}"]`);
+    const deselected = await wait(async () => { const current = await entry(); return !current.selected ? current : null; }, 'catalog deselection persisted');
     check(deselected.selected === false && deselected.disabled === false, `Deselecting must only change the selection flag: ${JSON.stringify(deselected)}`);
     const deselectedList = await publicCatalog();
     check(!deselectedList.ids.includes(catalogPublicId), `Deselecting must remove the model from the public catalog: ${JSON.stringify(deselectedList)}`);

@@ -12,6 +12,8 @@ use std::{
     time::Instant,
 };
 
+pub(crate) const SUBSCRIPTION_PROBE_RESPONSE_LIMIT_BYTES: usize = 64 * 1024;
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RequestLog {
@@ -63,6 +65,8 @@ pub fn resolve_requested_model(log: &mut RequestLog, config: &crate::config::App
 pub struct Capture {
     pub log: RequestLog,
     performance_probe: bool,
+    subscription_probe_over_budget: bool,
+    subscription_probe_bytes: Option<usize>,
     start: Instant,
     upstream_start: Instant,
     protocol: Protocol,
@@ -100,6 +104,8 @@ impl Capture {
             .get("user-agent")
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| value.eq_ignore_ascii_case("AutoJev/ModelSpeedTest"));
+        let subscription_probe = performance_probe
+            && body["model"].as_str().is_some_and(|model| model.starts_with("autojev/model/"));
         let agent = headers
             .get("x-autojev-agent")
             .and_then(|v| v.to_str().ok())
@@ -141,6 +147,8 @@ impl Capture {
                 ..Default::default()
             },
             performance_probe,
+            subscription_probe_over_budget: false,
+            subscription_probe_bytes: subscription_probe.then_some(0),
             frame_data: vec![],
             start: Instant::now(),
             upstream_start: Instant::now(),
@@ -285,6 +293,12 @@ impl Capture {
         }
     }
     pub fn bytes(&mut self, bytes: &[u8]) {
+        if let Some(seen) = &mut self.subscription_probe_bytes {
+            *seen = (*seen).saturating_add(bytes.len());
+            if *seen > SUBSCRIPTION_PROBE_RESPONSE_LIMIT_BYTES {
+                self.subscription_probe_over_budget = true;
+            }
+        }
         if self.log.first_byte_ms.is_none() && !bytes.is_empty() {
             self.log.first_byte_ms = Some(self.start.elapsed().as_millis() as u64);
         }
@@ -344,6 +358,9 @@ impl Capture {
         self.end_body();
         self.log.duration_ms = self.start.elapsed().as_millis() as u64;
         self.log.upstream_duration_ms = self.upstream_start.elapsed().as_millis() as u64;
+        if self.subscription_probe_over_budget {
+            self.log.error = "Subscription speed test response exceeded the 64 KiB local output limit".into();
+        }
         let ok = (200..300).contains(&self.log.status_code);
         if self.log.error.is_empty() {
             if !ok {
@@ -709,6 +726,45 @@ mod tests {
             .unwrap()
             .contains("private response text"));
         assert!(store.request_logs("9999").unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn oversized_manual_probe_persists_failure_for_both_sample_and_request_log() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(ConfigStore::load(directory.path().join("oversized-probe.db")).unwrap());
+        let config = store.read();
+        let model = config.models.first().expect("default test model");
+        let provider = config.providers.iter().find(|item| item.id == model.provider_id).expect("default test provider");
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("user-agent", "AutoJev/ModelSpeedTest".parse().unwrap());
+        let capture = Capture::new(
+            "chat/completions",
+            &json!({"model":"autojev/model/test", "stream":true}),
+            &headers,
+        );
+        {
+            let mut capture = capture.lock().unwrap();
+            capture.measure(model, provider, 32);
+            capture.upstream(Protocol::Chat, true);
+            capture.log.status_code = 200;
+        }
+        let oversized_content = "x".repeat(70 * 1024);
+        let content_event = json!({"choices":[{"index":0,"delta":{"content":oversized_content},"finish_reason":null}]});
+        let terminal_event = json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]});
+        let wire = format!("data: {content_event}\n\ndata: {terminal_event}\n\ndata: [DONE]\n\n");
+        let source = futures_util::stream::iter(vec![Ok::<Bytes, std::convert::Infallible>(Bytes::from(wire))]);
+        let body = Body::from_stream(observe(source, capture.clone()));
+        let reply = response(Response::new(body), capture, store.clone());
+        axum::body::to_bytes(reply.into_body(), 128 * 1024).await.unwrap();
+
+        let logs = store.request_logs("").unwrap();
+        let log = logs.first().expect("persisted request log");
+        assert_eq!(log.status, "error");
+        assert!(log.error.contains("64 KiB"), "unexpected error: {}", log.error);
+        let config = store.read();
+        let sample = config.performance_samples[&model.id].last().expect("persisted speed sample");
+        assert!(sample.probe);
+        assert!(!sample.success, "an over-budget response must not be recorded as a success");
     }
 }
 

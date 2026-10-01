@@ -4111,7 +4111,7 @@ done
         }).unwrap();
         assert_eq!(
             crate::test_subscription_target(store.clone(), "codex-fixture", "codex-fixture-model").await.unwrap(),
-            "Test request succeeded."
+            crate::SUBSCRIPTION_TEST_SUCCESS_MESSAGE
         );
 
         for _ in 0..3 {

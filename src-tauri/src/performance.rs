@@ -2,7 +2,7 @@
 use crate::{
     config::{AppConfig, ConfigStore, Model, Provider, ProviderKind},
     protocol::Protocol,
-    traffic::{Capture, RequestLog},
+    traffic::{Capture, RequestLog, SUBSCRIPTION_PROBE_RESPONSE_LIMIT_BYTES},
 };
 use anyhow::{ensure, Result};
 use futures_util::StreamExt;
@@ -20,7 +20,6 @@ use std::{
 pub const FRESH_MS: i64 = 30 * 60 * 1000;
 const MANUAL_PROBES_PER_MODEL: usize = 3;
 const PROBE_MAX_OUTPUT_TOKENS: u64 = 24;
-const SUBSCRIPTION_PROBE_MAX_RESPONSE_BYTES: usize = 64 * 1024;
 const PROBE_PROMPT: &str = "Return the numbers 1 through 8 separated by spaces. No other text.";
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -517,7 +516,7 @@ async fn probe_subscription_gateway(
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
-        ensure!(bytes.len() + chunk.len() <= SUBSCRIPTION_PROBE_MAX_RESPONSE_BYTES, "Subscription speed test response exceeded the 64 KiB output limit");
+        ensure!(bytes.len() + chunk.len() <= SUBSCRIPTION_PROBE_RESPONSE_LIMIT_BYTES, "Subscription speed test response exceeded the 64 KiB output limit");
         bytes.extend_from_slice(&chunk);
     }
     if !status.is_success() {
@@ -985,7 +984,7 @@ mod tests {
             assert_eq!(subscription["stream"], true);
         }
         assert_eq!(MANUAL_PROBES_PER_MODEL, 3);
-        assert_eq!(SUBSCRIPTION_PROBE_MAX_RESPONSE_BYTES, 64 * 1024);
+        assert_eq!(SUBSCRIPTION_PROBE_RESPONSE_LIMIT_BYTES, 64 * 1024);
     }
 
     #[tokio::test]
