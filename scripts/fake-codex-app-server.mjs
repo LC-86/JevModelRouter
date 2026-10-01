@@ -150,12 +150,11 @@ const quotaResponse = scenario => {
 };
 
 const complete = (loginId, scenario, index) => {
-  const ok = scenario !== 'failed';
-  const account = ok ? { type: 'chatgpt', email: scenario === 'late' ? identities.late : identities.success, planType: 'fictional-plus' } : undefined;
+  const success = scenario !== 'failed';
+  const account = success ? { type: 'chatgpt', email: scenario === 'late' ? identities.late : identities.success, planType: 'fictional-plus' } : undefined;
   if (account) state.account = account;
-  const params = { loginId, ok };
-  if (account) params.account = account;
-  if (!ok) params.error = `login failed: refresh_token=${fictionalTokens[1]}&access_token=${fictionalTokens[0]}`;
+  const params = { loginId, success };
+  if (!success) params.error = `login failed: refresh_token=${fictionalTokens[1]}&access_token=${fictionalTokens[0]}`;
   send({ jsonrpc: '2.0', method: 'account/login/completed', params });
   // 只有真正的成功登录才在专用 CODEX_HOME 留一个虚构凭据文件：这是「引用隔离 + 受控存储 +
   // 退出清理」的可观察证据。替身自己绝不删除它——清理必须由应用在注销时完成。
@@ -169,11 +168,14 @@ const complete = (loginId, scenario, index) => {
       log({ event: 'lifecycle', method: null, action: 'credential-file-error', error: String((error && error.message) || error) });
     }
   }
-  log({ event: 'notification', method: 'account/login/completed', loginId, ok, scenario, attempt: index, error: params.error });
+  log({ event: 'notification', method: 'account/login/completed', loginId, success, scenario, attempt: index, error: params.error });
 };
 const handlers = {
   initialize: () => ({ result: { version: '0.0.0-fictional', codexHome } }),
-  'account/login/start': () => {
+  'account/login/start': params => {
+    if (params.type !== 'chatgpt') {
+      return { error: { code: -32602, message: 'Invalid request: missing field type' } };
+    }
     const index = state.attempt++;
     const scenario = scenarioFor(index);
     const loginId = `fictional-login-${index + 1}`;
@@ -185,7 +187,7 @@ const handlers = {
       const timer = setTimeout(() => { state.timers.delete(loginId); complete(loginId, scenario, index); }, delay);
       state.timers.set(loginId, timer);
     }
-    return { result: { loginId, authorizationUrl: `https://fictional.invalid/authorize?login=${loginId}`, userCode: `FICT-${index + 1}` } };
+    return { result: { type: 'chatgpt', loginId, authUrl: `https://fictional.invalid/authorize?login=${loginId}` } };
   },
   'account/login/cancel': params => {
     const loginId = String(params.loginId || '');
