@@ -2425,6 +2425,7 @@ mod refresh_tests {
         resume_status: tokio::sync::Notify,
         generation_events: Mutex<std::collections::VecDeque<Vec<GenerationEvent>>>,
         generation_calls: Mutex<Vec<String>>,
+        generation_hooks: Mutex<std::collections::VecDeque<Box<dyn FnOnce() + Send>>>,
     }
 
     /// 替身写回的固定读取时间：失败后必须原样保留，不能被刷新成「现在」。
@@ -2482,6 +2483,7 @@ mod refresh_tests {
                 resume_status: tokio::sync::Notify::new(),
                 generation_events: Mutex::new(std::collections::VecDeque::new()),
                 generation_calls: Mutex::new(Vec::new()),
+                generation_hooks: Mutex::new(std::collections::VecDeque::new()),
             })
         }
     }
@@ -2555,6 +2557,7 @@ mod refresh_tests {
         fn generate<'a>(&'a self, request: GenerationRequest<'a>) -> BoxFuture<'a, Result<GenerationStream<'a>>> {
             let admission = (request.pre_dispatch_check)().map_err(anyhow::Error::msg);
             self.generation_calls.lock().unwrap().push(request.model_id.to_owned());
+            if let Some(hook) = self.generation_hooks.lock().unwrap().pop_front() { hook(); }
             let events = self.generation_events.lock().unwrap().pop_front().unwrap_or_else(|| vec![
                 GenerationEvent::Started { generation: request.generation },
                 GenerationEvent::Chunk("fixture".into()),
@@ -2687,6 +2690,30 @@ mod refresh_tests {
             });
         }).unwrap();
         store.write_secret("provider:openrouter", "fixture-api-key").unwrap();
+    }
+
+    async fn mixed_route_api_server() -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, axum::Router::new().route("/v1/chat/completions", axum::routing::post(
+                move |axum::Json(body): axum::Json<serde_json::Value>| {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        let (content_type, data) = if body["stream"].as_bool().unwrap_or(false) {
+                            ("text/event-stream", "data: [DONE]\n\n".to_owned())
+                        } else {
+                            ("application/json", serde_json::json!({"model":body["model"],"choices":[]}).to_string())
+                        };
+                        axum::http::Response::builder().header(axum::http::header::CONTENT_TYPE, content_type)
+                            .body(axum::body::Body::from(data)).unwrap()
+                    }
+                },
+            ))).await.unwrap();
+        });
+        (format!("http://{address}"), calls, server)
     }
 
     fn target(config: &AppConfig) -> (Model, Provider) {
@@ -2853,6 +2880,102 @@ mod refresh_tests {
         assert!(String::from_utf8_lossy(&body).contains("stream partial"));
         assert_eq!(api_calls.load(Ordering::SeqCst), 4, "stream output must never be joined to another model");
         assert_eq!(adapter.generation_calls.lock().unwrap().len(), 11);
+        api.abort();
+    }
+
+    #[tokio::test]
+    async fn late_account_rejection_is_discarded_after_the_connection_generation_changes() {
+        let adapter = StubAdapter::new();
+        adapter.generation_events.lock().unwrap().push_back(vec![GenerationEvent::RejectedBeforeStart {
+            status: 429, scope: GenerationFailureScope::Account, retry_after_seconds: Some(60),
+            message: "old account rate limit".into(),
+        }]);
+        let (store, _directory) = fixture_store(adapter.clone());
+        let (api_url, api_calls, api) = mixed_route_api_server().await;
+        configure_mixed_route(&store, &api_url);
+        let store_for_switch = store.clone();
+        adapter.generation_hooks.lock().unwrap().push_back(Box::new(move || {
+            store_for_switch.update(|config| {
+                let connection = config.subscriptions.get_mut("codex").unwrap();
+                connection.generation += 1;
+                let generation = connection.generation;
+                let identity = "replacement@example.invalid".to_owned();
+                connection.identity = Some(identity.clone());
+                let evidence = connection.evidence.as_mut().unwrap();
+                evidence.generation = generation;
+                evidence.account = Some(identity.clone());
+                for entry in &mut config.subscription_catalogs.get_mut("codex").unwrap().entries {
+                    entry.confirmed_generation = Some(generation);
+                    entry.account = Some(identity.clone());
+                }
+            }).unwrap();
+        }));
+        let context = crate::proxy::ForwardTestContext::new(store).unwrap();
+        let body = serde_json::json!({"model":"autojev/mixed","messages":[{"role":"user","content":"hello"}]});
+
+        let response = context.forward(axum::http::HeaderMap::new(), body.clone(), "chat/completions").await;
+        assert_eq!(response.status(), axum::http::StatusCode::CONFLICT, "an old-generation rejection must not authorize a handoff");
+        assert_eq!(api_calls.load(Ordering::SeqCst), 0, "a late old-account rejection must not fall through to the API account");
+
+        let response = context.forward(axum::http::HeaderMap::new(), body, "chat/completions").await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap()["model"], "fixture-model");
+        assert_eq!(adapter.generation_calls.lock().unwrap().as_slice(), ["fixture-model", "fixture-model"]);
+        assert_eq!(api_calls.load(Ordering::SeqCst), 0, "the replacement account generation remains eligible");
+        assert!(!context.health_statuses().iter().any(|status| status.model_id.starts_with("subscription-account:")), "the stale rejection must not mutate either account generation's circuit");
+        api.abort();
+    }
+
+    #[tokio::test]
+    async fn unknown_scope_rate_limit_pauses_all_models_for_the_account_across_requests() {
+        let adapter = StubAdapter::new();
+        adapter.generation_events.lock().unwrap().push_back(vec![GenerationEvent::RejectedBeforeStart {
+            status: 429, scope: GenerationFailureScope::Unknown, retry_after_seconds: Some(60),
+            message: "fixture rate limit with unknown scope".into(),
+        }]);
+        let (store, _directory) = fixture_store(adapter.clone());
+        let (api_url, api_calls, api) = mixed_route_api_server().await;
+        configure_mixed_route(&store, &api_url);
+        let context = crate::proxy::ForwardTestContext::new(store).unwrap();
+        let body = serde_json::json!({"model":"autojev/mixed","messages":[{"role":"user","content":"hello"}]});
+
+        let response = context.forward(axum::http::HeaderMap::new(), body.clone(), "chat/completions").await;
+        assert_eq!(response.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(api_calls.load(Ordering::SeqCst), 0, "unknown scope cannot hand off within the current request");
+
+        let response = context.forward(axum::http::HeaderMap::new(), body, "chat/completions").await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap()["model"], "fixture-api-fallback");
+        assert_eq!(adapter.generation_calls.lock().unwrap().as_slice(), ["fixture-model"], "a sibling subscription model must not evade an unknown-scope 429");
+        assert_eq!(api_calls.load(Ordering::SeqCst), 1);
+        assert!(context.health_statuses().iter().any(|status| status.model_id == "subscription-account:codex:1" && status.state == "cooldown"));
+        api.abort();
+    }
+
+    #[tokio::test]
+    async fn model_scoped_retry_after_is_applied_to_the_model_circuit() {
+        let adapter = StubAdapter::new();
+        adapter.generation_events.lock().unwrap().push_back(vec![GenerationEvent::RejectedBeforeStart {
+            status: 429, scope: GenerationFailureScope::Model, retry_after_seconds: Some(60),
+            message: "fixture model rate limit".into(),
+        }]);
+        let (store, _directory) = fixture_store(adapter.clone());
+        let (api_url, api_calls, api) = mixed_route_api_server().await;
+        configure_mixed_route(&store, &api_url);
+        let context = crate::proxy::ForwardTestContext::new(store).unwrap();
+        let body = serde_json::json!({"model":"autojev/mixed","messages":[{"role":"user","content":"hello"}]});
+
+        let response = context.forward(axum::http::HeaderMap::new(), body, "chat/completions").await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap()["model"], "fixture-model-2");
+        let primary = context.health_statuses().into_iter().find(|status| status.model_id == "codex-model").unwrap();
+        assert_eq!(primary.state, "cooldown");
+        assert!((50..=60).contains(&primary.retry_after_seconds), "model cooldown should honor Retry-After=60, got {}s", primary.retry_after_seconds);
+        assert!(!context.health_statuses().iter().any(|status| status.model_id.starts_with("subscription-account:")), "model scope must not pause the whole account");
+        assert_eq!(api_calls.load(Ordering::SeqCst), 0);
         api.abort();
     }
 

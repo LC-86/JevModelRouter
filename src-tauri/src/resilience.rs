@@ -106,8 +106,20 @@ impl Health {
     }
     /// Only one request is allowed to probe a recovered circuit at a time.
     pub fn acquire(&self, id: &str) -> Option<Lease> {
+        self.acquire_inner(id, true)
+    }
+    /// Acquire an existing circuit without creating an entry for an account that has never failed.
+    /// This lets a recovered account circuit admit a single probe while healthy subscriptions stay
+    /// absent from health status until they actually need account-scoped tracking.
+    pub fn acquire_if_present(&self, id: &str) -> Option<Lease> {
+        self.acquire_inner(id, false)
+    }
+    fn acquire_inner(&self, id: &str, create: bool) -> Option<Lease> {
         let mut guard = self.0.lock().unwrap();
-        let c = guard.entry(id.into()).or_default();
+        if create {
+            guard.entry(id.into()).or_default();
+        }
+        let c = guard.get_mut(id)?;
         if c.probing || c.until.is_some_and(|t| t > Instant::now()) {
             return None;
         }
@@ -236,6 +248,22 @@ mod tests {
         drop(probe);
         h.acquire("m").unwrap().complete(200, None, &s);
         assert!(h.available("m"));
+    }
+    #[test]
+    fn an_existing_account_circuit_allows_one_recovery_probe_and_clears_on_success() {
+        let h = Health::default();
+        let settings = Settings::default();
+        assert!(h.acquire_if_present("subscription-account:codex:1").is_none());
+        h.acquire("subscription-account:codex:1").unwrap().complete(429, Some(60), &settings);
+        assert!(h.acquire_if_present("subscription-account:codex:1").is_none());
+        h.0.lock().unwrap().get_mut("subscription-account:codex:1").unwrap().until = Some(Instant::now());
+
+        let probe = h.acquire_if_present("subscription-account:codex:1").unwrap();
+        assert!(h.acquire_if_present("subscription-account:codex:1").is_none(), "only one request may probe a recovered account circuit");
+        probe.complete(200, None, &settings);
+
+        assert!(h.available("subscription-account:codex:1"));
+        assert_eq!(h.statuses().into_iter().find(|status| status.model_id == "subscription-account:codex:1").unwrap().state, "healthy");
     }
     #[test]
     fn threshold_and_request_errors() {
