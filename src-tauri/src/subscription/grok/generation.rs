@@ -73,6 +73,7 @@ struct TextTurn {
     tool_choice: ToolChoice,
     allow_parallel: bool,
     tool_calls: Vec<ParsedToolCall>,
+    tool_call_batch_sizes: Vec<usize>,
     tool_results: Vec<ParsedToolResult>,
     assistant_text: Vec<String>,
 }
@@ -209,6 +210,7 @@ fn parse_plain_text_turn(protocol: Protocol, body: &Value, model_id: &str) -> Re
         tool_choice: ToolChoice::Auto,
         allow_parallel: true,
         tool_calls: Vec::new(),
+        tool_call_batch_sizes: Vec::new(),
         tool_results: Vec::new(),
         assistant_text: Vec::new(),
     })
@@ -276,6 +278,7 @@ fn parse_client_tool_turn(protocol: Protocol, body: &Value, model_id: &str) -> R
     let mut text = Vec::new();
     let mut assistant_text = Vec::new();
     let mut tool_calls = Vec::new();
+    let mut tool_call_batch_sizes = Vec::new();
     let mut tool_results = Vec::new();
 
     match protocol {
@@ -287,6 +290,7 @@ fn parse_client_tool_turn(protocol: Protocol, body: &Value, model_id: &str) -> R
                     Some("user") => text.extend(text_value(message.get("content").context("A user message requires content")?)?),
                     Some("assistant") => {
                         assistant_text.extend(optional_text_value(message.get("content"), "assistant content")?);
+                        let batch_start = tool_calls.len();
                         for call in message.get("tool_calls").and_then(Value::as_array).into_iter().flatten() {
                             reject_fields(call, &["id", "type", "function"], "Chat tool call")?;
                             ensure!(call.get("type").and_then(Value::as_str) == Some("function"), "Only function tool calls are supported");
@@ -296,6 +300,10 @@ fn parse_client_tool_turn(protocol: Protocol, body: &Value, model_id: &str) -> R
                             let raw = function.get("arguments").and_then(Value::as_str).context("Function arguments must be a JSON string")?;
                             let arguments: Value = serde_json::from_str(raw).context("Function arguments must contain valid JSON")?;
                             tool_calls.push(parse_call(call.get("id"), name, arguments)?);
+                        }
+                        let batch_size = tool_calls.len() - batch_start;
+                        if batch_size > 0 {
+                            tool_call_batch_sizes.push(batch_size);
                         }
                     }
                     Some("tool") => {
@@ -310,6 +318,7 @@ fn parse_client_tool_turn(protocol: Protocol, body: &Value, model_id: &str) -> R
         }
         Protocol::Responses => {
             let input = body.get("input").context("Responses requires input")?;
+            let mut response_call_batch_size = 0;
             match input {
                 Value::String(value) => text.push(value.clone()),
                 Value::Array(items) => for item in items {
@@ -332,8 +341,13 @@ fn parse_client_tool_turn(protocol: Protocol, body: &Value, model_id: &str) -> R
                             let raw = item.get("arguments").and_then(Value::as_str).context("Responses function arguments must be a JSON string")?;
                             let arguments: Value = serde_json::from_str(raw).context("Responses function arguments must contain valid JSON")?;
                             tool_calls.push(parse_call(item.get("call_id"), name, arguments)?);
+                            response_call_batch_size += 1;
                         }
                         "function_call_output" => {
+                            if response_call_batch_size > 0 {
+                                tool_call_batch_sizes.push(response_call_batch_size);
+                                response_call_batch_size = 0;
+                            }
                             reject_fields(item, &["type", "id", "call_id", "output"], "Responses function result")?;
                             let id = required_string(item.get("call_id"), "Responses call_id")?;
                             let output = parse_tool_output(item.get("output").context("A function result requires output")?)?;
@@ -343,6 +357,9 @@ fn parse_client_tool_turn(protocol: Protocol, body: &Value, model_id: &str) -> R
                     }
                 },
                 _ => bail!("Responses requires string input or an input array"),
+            }
+            if response_call_batch_size > 0 {
+                tool_call_batch_sizes.push(response_call_batch_size);
             }
         }
         Protocol::Messages => {
@@ -377,6 +394,7 @@ fn parse_client_tool_turn(protocol: Protocol, body: &Value, model_id: &str) -> R
                     }
                     "assistant" => {
                         let content = message.get("content").context("An assistant message requires content")?;
+                        let batch_start = tool_calls.len();
                         if let Some(value) = content.as_str() {
                             assistant_text.push(value.to_owned());
                         } else {
@@ -384,7 +402,7 @@ fn parse_client_tool_turn(protocol: Protocol, body: &Value, model_id: &str) -> R
                                 match block.get("type").and_then(Value::as_str) {
                                     Some("text") => {
                                         reject_fields(block, &["type", "text"], "Messages assistant text block")?;
-                                        assistant_text.push(required_string(block.get("text"), "Messages assistant text")?);
+                                        assistant_text.push(required_text(block.get("text"), "Messages assistant text")?);
                                     }
                                     Some("tool_use") => {
                                         reject_fields(block, &["type", "id", "name", "input"], "Messages tool use")?;
@@ -397,6 +415,10 @@ fn parse_client_tool_turn(protocol: Protocol, body: &Value, model_id: &str) -> R
                                 }
                             }
                         }
+                        let batch_size = tool_calls.len() - batch_start;
+                        if batch_size > 0 {
+                            tool_call_batch_sizes.push(batch_size);
+                        }
                     }
                     _ => bail!("Grok ACP supports user and assistant Messages history only"),
                 }
@@ -405,14 +427,14 @@ fn parse_client_tool_turn(protocol: Protocol, body: &Value, model_id: &str) -> R
     }
 
     ensure!(tool_calls.len() <= 64 && tool_results.len() <= 64, "A Grok tool exchange supports at most 64 calls");
-    validate_client_calls(&tool_calls, &tools, tool_choice, allow_parallel)?;
+    validate_client_calls(&tool_calls, &tool_call_batch_sizes, &tools, tool_choice, allow_parallel)?;
     let bytes = text.iter().chain(assistant_text.iter()).fold(0usize, |sum, part| sum.saturating_add(part.len()));
     ensure!(bytes <= MAX_INPUT_BYTES, "Grok input exceeded the 64 KiB text limit");
     let result_bytes = tool_results.iter().fold(0usize, |sum, result| sum.saturating_add(result.output.len()));
     ensure!(result_bytes <= 32 * 1024, "Grok tool results exceeded the 32 KiB request limit");
     ensure!(text.iter().any(|part| !part.trim().is_empty()) || !tool_calls.is_empty() || !tool_results.is_empty(),
         "Grok ACP requires non-empty user text or a client tool result");
-    Ok(TextTurn { text, max_tokens, tools, tool_choice, allow_parallel, tool_calls, tool_results, assistant_text })
+    Ok(TextTurn { text, max_tokens, tools, tool_choice, allow_parallel, tool_calls, tool_call_batch_sizes, tool_results, assistant_text })
 }
 
 fn reject_fields(value: &Value, allowed: &[&str], label: &str) -> Result<()> {
@@ -426,6 +448,12 @@ fn reject_fields(value: &Value, allowed: &[&str], label: &str) -> Result<()> {
 fn required_string(value: Option<&Value>, label: &str) -> Result<String> {
     let value = value.and_then(Value::as_str).context(format!("{label} must be a string"))?;
     ensure!(!value.trim().is_empty() && value.len() <= 256, "{label} must be a bounded non-empty string");
+    Ok(value.to_owned())
+}
+
+fn required_text(value: Option<&Value>, label: &str) -> Result<String> {
+    let value = value.and_then(Value::as_str).context(format!("{label} must be a string"))?;
+    ensure!(!value.trim().is_empty(), "{label} must be non-empty");
     Ok(value.to_owned())
 }
 
@@ -445,7 +473,7 @@ fn responses_assistant_text(value: &Value) -> Result<Vec<String>> {
         if let Some(annotations) = block.get("annotations") {
             ensure!(annotations.as_array().is_some_and(Vec::is_empty), "Responses text annotations are unsupported");
         }
-        result.push(required_string(block.get("text"), "Responses output_text")?);
+        result.push(required_text(block.get("text"), "Responses output_text")?);
     }
     Ok(result)
 }
@@ -477,13 +505,19 @@ fn parse_call(id: Option<&Value>, name: String, arguments: Value) -> Result<Pars
 
 fn validate_client_calls(
     calls: &[ParsedToolCall],
+    batch_sizes: &[usize],
     tools: &[FunctionTool],
     choice: ToolChoice,
     allow_parallel: bool,
 ) -> Result<()> {
     ensure!(calls.is_empty() || choice == ToolChoice::Auto, "Tool calls are incompatible with tool_choice=none");
     ensure!(calls.is_empty() || !tools.is_empty(), "The request contains tool-call history without client function schemas");
-    ensure!(allow_parallel || calls.len() <= 1, "The request contains multiple calls while parallel tool calls are disabled");
+    ensure!(
+        batch_sizes.iter().all(|size| *size > 0) && batch_sizes.iter().sum::<usize>() == calls.len(),
+        "Grok tool-call history has invalid batch boundaries"
+    );
+    ensure!(allow_parallel || batch_sizes.iter().all(|size| *size <= 1),
+        "The request contains a parallel call batch while parallel tool calls are disabled");
     for call in calls {
         let tool = tools.iter().find(|tool| tool.name == call.name)
             .with_context(|| format!("Tool call names undeclared client function `{}`", call.name))?;
@@ -865,7 +899,7 @@ fn acp_prompt(turn: &TextTurn) -> Result<Vec<Value>> {
         blocks.push(json!({"type":"text","text":format!("Prior assistant response:\n{text}")}));
     }
     for call in &turn.tool_calls {
-        blocks.push(json!({"type":"text","text":format!("Prior client tool call {}: {}", call.name, call.arguments)}));
+        blocks.push(json!({"type":"text","text":format!("Prior client tool call {} ({}): {}", call.id, call.name, call.arguments)}));
     }
     for result in &turn.tool_results {
         let state = if result.is_error { "failed" } else { "completed" };
@@ -1524,6 +1558,7 @@ fn parse_acp_client_tool_call(
 ) -> Result<AcpClientToolCall> {
     ensure!(choice == ToolChoice::Auto && !tools.is_empty(), "Client tools are disabled for this request");
     ensure!(allow_parallel || seen_ids.is_empty(), "Parallel client tools are disabled for this request");
+    ensure_no_acp_tool_output(update)?;
     let status = update.get("status").and_then(Value::as_str).unwrap_or("pending");
     ensure!(status == "pending", "ACP tool calls must be pending before handoff");
     let id = required_string(update.get("toolCallId"), "ACP toolCallId")?;
@@ -1536,6 +1571,14 @@ fn parse_acp_client_tool_call(
     validate_schema_value(&arguments, &tool.parameters, 0)?;
     ensure!(arguments.to_string().len() <= 32 * 1024, "ACP client tool arguments exceed the 32 KiB limit");
     Ok(AcpClientToolCall { id, name, arguments })
+}
+
+#[cfg(test)]
+fn ensure_no_acp_tool_output(update: &Value) -> Result<()> {
+    ensure!(update.get("rawOutput").is_none_or(Value::is_null), "ACP reported helper-side tool output");
+    ensure!(update.get("content").is_none_or(|value| value.is_null() || value.as_array().is_some_and(Vec::is_empty)),
+        "ACP reported helper-side tool output");
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1555,9 +1598,7 @@ fn validate_acp_client_tool_update(
         "ACP changed a pending tool call's function name");
     ensure!(update.get("rawInput").is_none_or(|value| value.is_null() || value == &original.arguments),
         "ACP changed a pending tool call's arguments");
-    ensure!(update.get("rawOutput").is_none_or(Value::is_null), "ACP reported helper-side tool output");
-    ensure!(update.get("content").is_none_or(|value| value.is_null() || value.as_array().is_some_and(Vec::is_empty)),
-        "ACP reported helper-side tool output");
+    ensure_no_acp_tool_output(update)?;
     Ok(())
 }
 
@@ -2163,6 +2204,117 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn original_257_byte_assistant_history_roundtrips_for_all_protocols() {
+        let text = "a".repeat(257);
+        let id = "call_ajv1_grok_7_fixture";
+        let bodies = [
+            (
+                Protocol::Chat,
+                json!({
+                    "model":"grok-test",
+                    "tools":client_tool_schema(Protocol::Chat),
+                    "messages":[
+                        {"role":"user","content":"find x"},
+                        {"role":"assistant","content":text,"tool_calls":[{"id":id,"type":"function","function":{"name":"lookup","arguments":"{\"query\":\"x\"}"}}]},
+                        {"role":"tool","tool_call_id":id,"content":"found"}
+                    ]
+                }),
+            ),
+            (
+                Protocol::Responses,
+                json!({
+                    "model":"grok-test",
+                    "tools":client_tool_schema(Protocol::Responses),
+                    "input":[
+                        {"type":"message","role":"user","content":"find x"},
+                        {"type":"message","id":"msg_fixture","status":"completed","role":"assistant","content":[{"type":"output_text","text":text,"annotations":[]}]},
+                        {"type":"function_call","id":"fc_fixture","call_id":id,"name":"lookup","arguments":"{\"query\":\"x\"}","status":"completed"},
+                        {"type":"function_call_output","call_id":id,"output":"found"}
+                    ]
+                }),
+            ),
+            (
+                Protocol::Messages,
+                json!({
+                    "model":"grok-test","max_tokens":64,
+                    "tools":client_tool_schema(Protocol::Messages),
+                    "messages":[
+                        {"role":"user","content":"find x"},
+                        {"role":"assistant","content":[{"type":"text","text":text},{"type":"tool_use","id":id,"name":"lookup","input":{"query":"x"}}]},
+                        {"role":"user","content":[{"type":"tool_result","tool_use_id":id,"content":"found"}]}
+                    ]
+                }),
+            ),
+        ];
+        for (protocol, body) in bodies {
+            let result = validate_generation_request(protocol, &body, "grok-test", 7);
+            assert!(result.is_ok(), "257-byte assistant history must roundtrip for {protocol:?}: {result:?}");
+        }
+    }
+
+    #[test]
+    fn parallel_tool_policy_is_checked_per_call_batch_not_across_history() {
+        let first = "call_ajv1_grok_7_first";
+        let second = "call_ajv1_grok_7_second";
+        let call = |id: &str, query: &str| json!({
+            "role":"assistant","content":null,
+            "tool_calls":[{"id":id,"type":"function","function":{"name":"lookup","arguments":json!({"query":query}).to_string()}}]
+        });
+        let result = |id: &str| json!({"role":"tool","tool_call_id":id,"content":"found"});
+        let base = json!({
+            "model":"grok-test","parallel_tool_calls":false,
+            "tools":client_tool_schema(Protocol::Chat),
+            "messages":[{"role":"user","content":"find x"},call(first,"x"),result(first),call(second,"y"),result(second)]
+        });
+        let parsed = validate_generation_request(Protocol::Chat, &base, "grok-test", 7);
+        assert!(parsed.is_ok(), "single calls in successive turns are not parallel: {parsed:?}");
+
+        let parallel = json!({
+            "model":"grok-test","parallel_tool_calls":false,
+            "tools":client_tool_schema(Protocol::Chat),
+            "messages":[
+                {"role":"user","content":"find x and y"},
+                {"role":"assistant","content":null,"tool_calls":[
+                    {"id":first,"type":"function","function":{"name":"lookup","arguments":"{\"query\":\"x\"}"}},
+                    {"id":second,"type":"function","function":{"name":"lookup","arguments":"{\"query\":\"y\"}"}}
+                ]},
+                result(first),result(second)
+            ]
+        });
+        assert!(validate_generation_request(Protocol::Chat, &parallel, "grok-test", 7).is_err(),
+            "multiple calls in one batch must remain disabled");
+    }
+
+    #[test]
+    fn acp_followup_prompt_preserves_call_id_name_arguments_and_result_association() {
+        let id_x = "call_ajv1_grok_7_x";
+        let id_y = "call_ajv1_grok_7_y";
+        let history = |swapped: bool| {
+            let (call_x_id, call_y_id) = if swapped { (id_y, id_x) } else { (id_x, id_y) };
+            json!({
+                "model":"grok-test","tools":client_tool_schema(Protocol::Chat),
+                "messages":[
+                    {"role":"user","content":"Compare x and y"},
+                    {"role":"assistant","content":"checking","tool_calls":[
+                        {"id":call_x_id,"type":"function","function":{"name":"lookup","arguments":"{\"query\":\"x\"}"}},
+                        {"id":call_y_id,"type":"function","function":{"name":"lookup","arguments":"{\"query\":\"y\"}"}}
+                    ]},
+                    {"role":"tool","tool_call_id":id_x,"content":"value=10"},
+                    {"role":"tool","tool_call_id":id_y,"content":"value=20"}
+                ]
+            })
+        };
+        let first = acp_prompt(&parse_text_turn(Protocol::Chat, &history(false), "grok-test").unwrap()).unwrap();
+        let swapped = acp_prompt(&parse_text_turn(Protocol::Chat, &history(true), "grok-test").unwrap()).unwrap();
+        assert_ne!(first, swapped, "opposite call-to-result associations must yield different ACP context");
+        let prompt = first.iter().filter_map(|block| block.get("text").and_then(Value::as_str)).collect::<Vec<_>>().join("\n");
+        assert!(prompt.contains(&format!("Prior client tool call {id_x} (lookup): {{\"query\":\"x\"}}")));
+        assert!(prompt.contains(&format!("Prior client tool call {id_y} (lookup): {{\"query\":\"y\"}}")));
+        assert!(prompt.contains(&format!("Client tool result (completed) for {id_x}:\nvalue=10")));
+        assert!(prompt.contains(&format!("Client tool result (completed) for {id_y}:\nvalue=20")));
+    }
+
+    #[test]
     fn acp_builtin_or_already_running_tools_cannot_be_forwarded_to_the_api_client() {
         let request = json!({"tools":client_tool_schema(Protocol::Chat)});
         let tools = parse_function_tools(Protocol::Chat, &request).unwrap();
@@ -2171,6 +2323,12 @@ for line in sys.stdin:
         let already_running = json!({"toolCallId":"client-lookup-1","name":"lookup","status":"in_progress","rawInput":{"query":"x"}});
         assert!(parse_acp_client_tool_call(&helper_tool, &tools, ToolChoice::Auto, true, &no_ids).is_err());
         assert!(parse_acp_client_tool_call(&already_running, &tools, ToolChoice::Auto, true, &no_ids).is_err());
+        let helper_raw_output = json!({"toolCallId":"client-lookup-1","name":"lookup","status":"pending","rawInput":{"query":"x"},"rawOutput":"already executed"});
+        let helper_content = json!({"toolCallId":"client-lookup-1","name":"lookup","status":"pending","rawInput":{"query":"x"},"content":[{"type":"content","content":{"type":"text","text":"already executed"}}]});
+        assert!(parse_acp_client_tool_call(&helper_raw_output, &tools, ToolChoice::Auto, true, &no_ids).is_err(),
+            "an initial tool_call with rawOutput must not be handed to the API client");
+        assert!(parse_acp_client_tool_call(&helper_content, &tools, ToolChoice::Auto, true, &no_ids).is_err(),
+            "an initial tool_call with content output must not be handed to the API client");
 
         let pending = AcpClientToolCall { id:"client-lookup-1".into(), name:"lookup".into(), arguments:json!({"query":"x"}) };
         let unchanged = json!({"toolCallId":"client-lookup-1","status":"pending","rawInput":{"query":"x"}});
@@ -2179,6 +2337,63 @@ for line in sys.stdin:
         assert!(validate_acp_client_tool_update(&unchanged, std::slice::from_ref(&pending), true).is_ok());
         assert!(validate_acp_client_tool_update(&mutated, std::slice::from_ref(&pending), true).is_err());
         assert!(validate_acp_client_tool_update(&helper_output, std::slice::from_ref(&pending), true).is_err());
+    }
+
+    #[tokio::test]
+    async fn acp_tool_calls_with_initial_helper_output_never_become_client_handoffs() {
+        for output_marker in [
+            json!({"rawOutput":"already executed"}),
+            json!({"content":[{"type":"content","content":{"type":"text","text":"already executed"}}]}),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let output_literal = serde_json::to_string(&output_marker).unwrap();
+            let script = r##"#!/usr/bin/env python3
+import json, sys
+session = "initial-output-session"
+prompt_id = None
+for line in sys.stdin:
+    req = json.loads(line); method = req.get("method"); ident = req.get("id")
+    if method == "initialize": result = {"protocolVersion":1,"authMethods":[{"id":"cached_token"}]}
+    elif method == "authenticate": result = {}
+    elif method == "session/new": result = {"sessionId":session}
+    elif method == "session/prompt":
+        prompt_id = ident
+        update = {"sessionUpdate":"tool_call","toolCallId":"client-lookup-1","name":"lookup","status":"pending","rawInput":{"query":"x"}}
+        update.update(OUTPUT_MARKER)
+        sys.stdout.write(json.dumps({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":session,"update":update}}) + "\n")
+        sys.stdout.flush()
+        continue
+    elif method == "session/cancel":
+        sys.stdout.write(json.dumps({"jsonrpc":"2.0","id":prompt_id,"result":{"stopReason":"cancelled"}}) + "\n")
+        sys.stdout.flush()
+        break
+    else: result = {}
+    sys.stdout.write(json.dumps({"jsonrpc":"2.0","id":ident,"result":result}) + "\n"); sys.stdout.flush()
+"##.replace("OUTPUT_MARKER", &output_literal);
+            let helper = install_fake_acp(temp.path(), &script);
+            let adapter = GrokSubscriptionAdapter::with_test_helper(temp.path().to_path_buf(), helper);
+            let mut events = adapter.generate(GenerationRequest {
+                provider_id: "grok-initial-helper-output",
+                generation: 7,
+                model_id: "grok-test",
+                protocol: Protocol::Chat,
+                body: client_tool_initial_request(Protocol::Chat, "grok-test", false),
+                pre_dispatch_check: Arc::new(|| Ok(())),
+            }).await.unwrap();
+            let mut saw_tool_calls = false;
+            let mut saw_failure = false;
+            while let Some(event) = events.next().await {
+                match event {
+                    GenerationEvent::ToolCalls { .. } => saw_tool_calls = true,
+                    GenerationEvent::Failed { .. } => saw_failure = true,
+                    _ => {}
+                }
+            }
+            assert!(saw_failure, "helper output must fail closed before handoff: {output_marker}");
+            assert!(!saw_tool_calls, "a helper-executed operation must never reach the client: {output_marker}");
+            assert!(adapter.pending_tool_turns.lock().unwrap().is_empty(),
+                "a helper-executed operation must not be registered as pending: {output_marker}");
+        }
     }
 
     #[tokio::test]
