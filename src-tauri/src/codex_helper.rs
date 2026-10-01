@@ -234,10 +234,11 @@ fn is_semver(version: &str) -> bool {
     if build_parts.next().is_some() || build.is_some_and(|part| !valid_semver_identifiers(part, false)) {
         return false;
     }
-    let (core, prerelease) = prerelease_and_core.split_once('-').unwrap_or((prerelease_and_core, ""));
-    if !prerelease.is_empty() && !valid_semver_identifiers(prerelease, true) {
-        return false;
-    }
+    let core = match prerelease_and_core.split_once('-') {
+        Some((core, prerelease)) if valid_semver_identifiers(prerelease, true) => core,
+        Some(_) => return false,
+        None => prerelease_and_core,
+    };
     let components = core.split('.').collect::<Vec<_>>();
     components.len() == 3 && components.iter().all(|component| valid_semver_number(component))
 }
@@ -2825,6 +2826,8 @@ mod tests {
             "codex_cli_rs/00.159.0 (Test OS)",
             "other_helper/0.159.0 (Test OS)",
             "codex_cli_rs/0.159.0.1 (Test OS)",
+            "codex_cli_rs/0.159.0- (Test OS)",
+            "codex_cli_rs/0.159.0-+build (Test OS)",
         ] {
             let (identity, version) = helper_self_report(&json!({"userAgent": malformed}));
             assert_eq!(identity.as_deref(), Some(malformed));

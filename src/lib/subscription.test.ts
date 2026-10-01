@@ -142,7 +142,7 @@ describe('subscription login and logout lifecycle', () => {
     expect(connected).toContain('generation=12');
     expect(connected).toContain('identity=fixture@example.invalid');
     expect(connected).toContain('helper_user_agent_unverified=codex_cli_rs/0.159.0 (Test OS; x86_64) rust');
-    expect(connected).toContain('helper=0.4.0');
+    expect(connected).toContain('helper=0.159.0');
     expect(connected).toContain('auth_home=/home/fixture/.autojev/helpers/codex/codex');
     expect(connected).not.toContain('local=');
   });
