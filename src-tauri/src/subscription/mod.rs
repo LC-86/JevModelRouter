@@ -706,6 +706,15 @@ pub struct GenerationRequest<'a> {
 /// 生成事件：辅助进程产出的上游输出。协议转换、捕获与错误仍由调用方负责。
 #[derive(Clone, Debug, PartialEq)]
 pub enum GenerationEvent {
+    /// The adapter can prove that no generation was accepted or started. Only this explicit
+    /// event may authorize an in-request route handoff; an absent `Started` event proves nothing.
+    #[allow(dead_code)]
+    RejectedBeforeStart {
+        status: u16,
+        scope: GenerationFailureScope,
+        retry_after_seconds: Option<u64>,
+        message: String,
+    },
     Started { generation: u64 },
     Chunk(String),
     /// Client-owned function calls. This is terminal for the current HTTP response; callers run
@@ -720,6 +729,15 @@ pub enum GenerationEvent {
     Failed { message: String },
     /// The helper reported an interrupted turn (including client disconnect cancellation).
     Cancelled,
+}
+
+/// The narrowest scope supported by the adapter's rejection evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum GenerationFailureScope {
+    Model,
+    Account,
+    Unknown,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2405,6 +2423,9 @@ mod refresh_tests {
         pause_status: AtomicBool,
         status_started: tokio::sync::Notify,
         resume_status: tokio::sync::Notify,
+        generation_events: Mutex<std::collections::VecDeque<Vec<GenerationEvent>>>,
+        generation_calls: Mutex<Vec<String>>,
+        generation_hooks: Mutex<std::collections::VecDeque<Box<dyn FnOnce() + Send>>>,
     }
 
     /// 替身写回的固定读取时间：失败后必须原样保留，不能被刷新成「现在」。
@@ -2460,6 +2481,9 @@ mod refresh_tests {
                 pause_status: AtomicBool::new(false),
                 status_started: tokio::sync::Notify::new(),
                 resume_status: tokio::sync::Notify::new(),
+                generation_events: Mutex::new(std::collections::VecDeque::new()),
+                generation_calls: Mutex::new(Vec::new()),
+                generation_hooks: Mutex::new(std::collections::VecDeque::new()),
             })
         }
     }
@@ -2531,12 +2555,16 @@ mod refresh_tests {
         }
 
         fn generate<'a>(&'a self, request: GenerationRequest<'a>) -> BoxFuture<'a, Result<GenerationStream<'a>>> {
+            let admission = (request.pre_dispatch_check)().map_err(anyhow::Error::msg);
+            self.generation_calls.lock().unwrap().push(request.model_id.to_owned());
+            if let Some(hook) = self.generation_hooks.lock().unwrap().pop_front() { hook(); }
+            let events = self.generation_events.lock().unwrap().pop_front().unwrap_or_else(|| vec![
+                GenerationEvent::Started { generation: request.generation },
+                GenerationEvent::Chunk("fixture".into()),
+                GenerationEvent::Finished { status: 200 },
+            ]);
             Box::pin(async move {
-                let events = vec![
-                    GenerationEvent::Started { generation: request.generation },
-                    GenerationEvent::Chunk("fixture".into()),
-                    GenerationEvent::Finished { status: 200 },
-                ];
+                admission?;
                 let stream: GenerationStream<'a> = Box::pin(futures_util::stream::iter(events));
                 Ok(stream)
             })
@@ -2610,6 +2638,101 @@ mod refresh_tests {
         (store, directory)
     }
 
+    fn configure_mixed_route(store: &ConfigStore, api_url: &str) {
+        store.update(|config| {
+            config.providers.iter_mut().find(|provider| provider.id == "openrouter").unwrap().base_url = api_url.into();
+            let mut primary = config.models.iter().find(|model| model.provider_id == "codex").unwrap().clone();
+            primary.api_type = "chat_completions".into();
+            let mut secondary = primary.clone();
+            secondary.id = "codex-model-2".into();
+            secondary.model_id = "fixture-model-2".into();
+            let mut api = config.models.iter().find(|model| model.provider_id == "openrouter").unwrap().clone();
+            api.id = "api-fallback".into();
+            api.model_id = "fixture-api-fallback".into();
+            config.models = vec![primary, secondary, api];
+            config.routes = vec![crate::config::RouteRule {
+                id: "mixed".into(), name: "Mixed".into(), strategy: "round_robin".into(),
+                model_ids: vec!["codex-model".into(), "codex-model-2".into(), "api-fallback".into()],
+                model_settings: std::collections::HashMap::from([
+                    ("codex-model".into(), crate::config::RouteModelSettings { priority: 20, weight: 1 }),
+                    ("codex-model-2".into(), crate::config::RouteModelSettings { priority: 10, weight: 1 }),
+                    ("api-fallback".into(), crate::config::RouteModelSettings { priority: 0, weight: 1 }),
+                ]),
+                all_models: false, automatic_policy: None, enabled: true,
+            }];
+            let account = "fixture@example.invalid".to_owned();
+            let capabilities = ["fixture-model", "fixture-model-2"].into_iter().map(|model_id| Capability {
+                model_id: model_id.into(), protocol: "chat_completions".into(), status: CapabilityStatus::Verified,
+            }).collect();
+            config.subscriptions.get_mut("codex").unwrap().state = ConnectionState::Connected;
+            config.subscriptions.get_mut("codex").unwrap().identity = Some(account.clone());
+            config.subscriptions.get_mut("codex").unwrap().evidence = Some(Evidence {
+                generation: 1, account: Some(account.clone()), helper_version: Some("fixture".into()),
+                account_path: Some("/tmp/fixture-account".into()), models: Vec::new(), capabilities,
+                quota: QuotaEvidence {
+                    state: EvidenceState::Available, source: Some("fixture".into()),
+                    observed_at: Some("2026-10-01T00:00:00Z".into()), view: QuotaView::RateLimitsByLimitId,
+                    buckets: vec![QuotaBucket {
+                        limit_id: "fixture-limit".into(), permission: QuotaPermission::Allowed,
+                        windows: vec![QuotaWindow { label: "primary".into(), used_percent: Some(10.0), ..Default::default() }],
+                        credits: Some(QuotaCredits { permission: QuotaPermission::Denied, ..Default::default() }),
+                        ..Default::default()
+                    }], ..Default::default()
+                }, catalog: Default::default(),
+            });
+            config.subscription_catalogs.insert("codex".into(), crate::subscription_catalog::ProviderCatalog {
+                entries: [("fixture-model", "codex-model"), ("fixture-model-2", "codex-model-2")].into_iter()
+                    .map(|(model_id, internal_id)| crate::subscription_catalog::CatalogEntry {
+                        model_id: model_id.into(), name: None, internal_id: internal_id.into(),
+                        availability: crate::subscription_catalog::Availability::Available,
+                        first_seen: None, last_confirmed: None, confirmed_generation: Some(1), account: Some(account.clone()),
+                    }).collect(),
+            });
+        }).unwrap();
+        store.write_secret("provider:openrouter", "fixture-api-key").unwrap();
+    }
+
+    fn switch_codex_test_identity(store: &ConfigStore, identity: &str) {
+        store.update(|config| {
+            let connection = config.subscriptions.get_mut("codex").unwrap();
+            connection.generation += 1;
+            let generation = connection.generation;
+            let identity = identity.to_owned();
+            connection.identity = Some(identity.clone());
+            let evidence = connection.evidence.as_mut().unwrap();
+            evidence.generation = generation;
+            evidence.account = Some(identity.clone());
+            for entry in &mut config.subscription_catalogs.get_mut("codex").unwrap().entries {
+                entry.confirmed_generation = Some(generation);
+                entry.account = Some(identity.clone());
+            }
+        }).unwrap();
+    }
+
+    async fn mixed_route_api_server() -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, axum::Router::new().route("/v1/chat/completions", axum::routing::post(
+                move |axum::Json(body): axum::Json<serde_json::Value>| {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        let (content_type, data) = if body["stream"].as_bool().unwrap_or(false) {
+                            ("text/event-stream", "data: [DONE]\n\n".to_owned())
+                        } else {
+                            ("application/json", serde_json::json!({"model":body["model"],"choices":[]}).to_string())
+                        };
+                        axum::http::Response::builder().header(axum::http::header::CONTENT_TYPE, content_type)
+                            .body(axum::body::Body::from(data)).unwrap()
+                    }
+                },
+            ))).await.unwrap();
+        });
+        (format!("http://{address}"), calls, server)
+    }
+
     fn target(config: &AppConfig) -> (Model, Provider) {
         let model = config.models.iter().find(|model| model.provider_id == "codex").unwrap().clone();
         let provider = config.providers.iter().find(|provider| provider.id == "codex").unwrap().clone();
@@ -2619,6 +2742,548 @@ mod refresh_tests {
     /// 配置里当前落盘的连接。
     fn stored(store: &ConfigStore) -> Connection {
         store.read().subscriptions.get("codex").cloned().unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn mixed_route_retries_only_a_confirmed_pre_start_rejection() {
+        let adapter = StubAdapter::new();
+        adapter.generation_events.lock().unwrap().extend([
+            vec![GenerationEvent::RejectedBeforeStart {
+                status: 429, scope: GenerationFailureScope::Account, retry_after_seconds: Some(60),
+                message: "fixture account rate limit".into(),
+            }],
+            vec![GenerationEvent::RejectedBeforeStart {
+                status: 503, scope: GenerationFailureScope::Account, retry_after_seconds: None,
+                message: "fixture account outage".into(),
+            }],
+            vec![GenerationEvent::RejectedBeforeStart {
+                status: 429, scope: GenerationFailureScope::Model, retry_after_seconds: Some(60),
+                message: "fixture model rate limit".into(),
+            }],
+            vec![GenerationEvent::Started { generation: 1 }, GenerationEvent::Chunk("secondary".into()),
+                GenerationEvent::Finished { status: 200 }],
+            vec![GenerationEvent::Started { generation: 1 }, GenerationEvent::Chunk("partial".into()),
+                GenerationEvent::Failed { message: "fixture failed after output".into() }],
+            vec![GenerationEvent::Started { generation: 1 }, GenerationEvent::ToolCalls { calls: vec![
+                crate::codex_helper::ClientToolCall { id: "call-1".into(), name: "lookup".into(), arguments: "{}".into() },
+            ] }],
+            vec![GenerationEvent::Failed { message: "fixture start state is unknown".into() }],
+            vec![GenerationEvent::RejectedBeforeStart {
+                status: 429, scope: GenerationFailureScope::Unknown, retry_after_seconds: Some(60),
+                message: "fixture rejection scope is unknown".into(),
+            }],
+            vec![GenerationEvent::RejectedBeforeStart {
+                status: 503, scope: GenerationFailureScope::Model, retry_after_seconds: None,
+                message: "fixture fixed-target rejection".into(),
+            }],
+            vec![GenerationEvent::RejectedBeforeStart {
+                status: 429, scope: GenerationFailureScope::Account, retry_after_seconds: Some(60),
+                message: "fixture streaming account rate limit".into(),
+            }],
+            vec![GenerationEvent::Started { generation: 1 }, GenerationEvent::Chunk("stream partial".into()),
+                GenerationEvent::Failed { message: "fixture stream failed after output".into() }],
+        ]);
+        let (store, _directory) = fixture_store(adapter.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let api_calls = Arc::new(AtomicUsize::new(0));
+        let observed = api_calls.clone();
+        let api = tokio::spawn(async move {
+            axum::serve(listener, axum::Router::new().route("/v1/chat/completions", axum::routing::post(
+                move |axum::Json(body): axum::Json<serde_json::Value>| {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        let (content_type, data) = if body["stream"].as_bool().unwrap_or(false) {
+                            ("text/event-stream", "data: [DONE]\n\n".to_owned())
+                        } else {
+                            ("application/json", serde_json::json!({"model":body["model"],"choices":[]}).to_string())
+                        };
+                        axum::http::Response::builder().header(axum::http::header::CONTENT_TYPE, content_type)
+                            .body(axum::body::Body::from(data)).unwrap()
+                    }
+                },
+            ))).await.unwrap();
+        });
+        configure_mixed_route(&store, &format!("http://{address}"));
+
+        let sticky_context = crate::proxy::ForwardTestContext::new(store.clone()).unwrap();
+        let mut sticky_headers = axum::http::HeaderMap::new();
+        sticky_headers.insert("x-autojev-session-id", axum::http::HeaderValue::from_static("mixed-sticky"));
+        let response = sticky_context.forward(sticky_headers.clone(),
+            serde_json::json!({"model":"autojev/mixed","messages":[{"role":"user","content":"hello"}]}),
+            "chat/completions").await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap()["model"], "fixture-api-fallback");
+        assert_eq!(adapter.generation_calls.lock().unwrap().as_slice(), ["fixture-model"]);
+        assert_eq!(api_calls.load(Ordering::SeqCst), 1, "account-scoped failure must skip every model for that account");
+
+        let response = sticky_context.forward(sticky_headers,
+            serde_json::json!({"model":"autojev/mixed","messages":[{"role":"user","content":"hello again"}]}),
+            "chat/completions").await;
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        assert_eq!(status, axum::http::StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap()["model"], "fixture-api-fallback");
+        assert_eq!(adapter.generation_calls.lock().unwrap().as_slice(), ["fixture-model"]);
+        assert_eq!(api_calls.load(Ordering::SeqCst), 2, "the sticky session must not restore an account that is cooling down");
+
+        let response = crate::proxy::forward_test_request(store.clone(),
+            serde_json::json!({"model":"autojev/mixed","messages":[{"role":"user","content":"hello"}]}),
+            "chat/completions").await;
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        assert_eq!(status, axum::http::StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap()["model"], "fixture-api-fallback");
+        assert_eq!(adapter.generation_calls.lock().unwrap().as_slice(), ["fixture-model", "fixture-model"]);
+        assert_eq!(api_calls.load(Ordering::SeqCst), 3, "account-scoped outages must skip sibling subscription models even below the circuit threshold");
+
+        let response = crate::proxy::forward_test_request(store.clone(),
+            serde_json::json!({"model":"autojev/mixed","messages":[{"role":"user","content":"hello"}]}),
+            "chat/completions").await;
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        assert_eq!(status, axum::http::StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap()["model"], "fixture-model-2");
+        assert_eq!(adapter.generation_calls.lock().unwrap().as_slice(), ["fixture-model", "fixture-model", "fixture-model", "fixture-model-2"]);
+        assert_eq!(api_calls.load(Ordering::SeqCst), 3, "model-scoped failure may continue to a different eligible model");
+
+        let response = crate::proxy::forward_test_request(store.clone(),
+            serde_json::json!({"model":"autojev/mixed","messages":[{"role":"user","content":"hello"}]}),
+            "chat/completions").await;
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_GATEWAY);
+        assert_eq!(api_calls.load(Ordering::SeqCst), 3, "partial output must not be followed by another model");
+
+        let response = crate::proxy::forward_test_request(store.clone(),
+            serde_json::json!({"model":"autojev/mixed","messages":[{"role":"user","content":"lookup"}],"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object","properties":{"key":{"type":"string"}}}}}]}),
+            "chat/completions").await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap().pointer("/choices/0/message/tool_calls/0/function/name"), Some(&serde_json::json!("lookup")));
+        assert_eq!(api_calls.load(Ordering::SeqCst), 3, "a tool handoff must not be replayed through a second model");
+
+        let response = crate::proxy::forward_test_request(store.clone(),
+            serde_json::json!({"model":"autojev/mixed","messages":[{"role":"user","content":"hello"}]}),
+            "chat/completions").await;
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_GATEWAY);
+        assert_eq!(api_calls.load(Ordering::SeqCst), 3, "a failure without explicit pre-start evidence is not retryable");
+
+        let response = crate::proxy::forward_test_request(store.clone(),
+            serde_json::json!({"model":"autojev/mixed","messages":[{"role":"user","content":"hello"}]}),
+            "chat/completions").await;
+        assert_eq!(response.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(api_calls.load(Ordering::SeqCst), 3, "unknown failure scope must not retry into another candidate");
+
+        let response = crate::proxy::forward_test_request(store.clone(),
+            serde_json::json!({"model":"autojev/model/codex-model","messages":[{"role":"user","content":"hello"}]}),
+            "chat/completions").await;
+        assert_eq!(response.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(api_calls.load(Ordering::SeqCst), 3, "a fixed subscription model must retain its target");
+
+        let response = crate::proxy::forward_test_request(store.clone(),
+            serde_json::json!({"model":"autojev/mixed","stream":true,"messages":[{"role":"user","content":"hello"}]}),
+            "chat/completions").await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert_eq!(response.headers()[axum::http::header::CONTENT_TYPE], "text/event-stream");
+        let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("[DONE]"));
+        assert_eq!(api_calls.load(Ordering::SeqCst), 4, "streaming may hand off only from an explicit pre-start rejection");
+
+        let response = crate::proxy::forward_test_request(store,
+            serde_json::json!({"model":"autojev/mixed","stream":true,"messages":[{"role":"user","content":"hello"}]}),
+            "chat/completions").await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("stream partial"));
+        assert_eq!(api_calls.load(Ordering::SeqCst), 4, "stream output must never be joined to another model");
+        assert_eq!(adapter.generation_calls.lock().unwrap().len(), 11);
+        api.abort();
+    }
+
+    #[tokio::test]
+    async fn late_account_rejection_is_discarded_after_the_connection_generation_changes() {
+        let adapter = StubAdapter::new();
+        adapter.generation_events.lock().unwrap().push_back(vec![GenerationEvent::RejectedBeforeStart {
+            status: 429, scope: GenerationFailureScope::Account, retry_after_seconds: Some(60),
+            message: "old account rate limit".into(),
+        }]);
+        let (store, _directory) = fixture_store(adapter.clone());
+        let (api_url, api_calls, api) = mixed_route_api_server().await;
+        configure_mixed_route(&store, &api_url);
+        let store_for_switch = store.clone();
+        adapter.generation_hooks.lock().unwrap().push_back(Box::new(move || {
+            store_for_switch.update(|config| {
+                let connection = config.subscriptions.get_mut("codex").unwrap();
+                connection.generation += 1;
+                let generation = connection.generation;
+                let identity = "replacement@example.invalid".to_owned();
+                connection.identity = Some(identity.clone());
+                let evidence = connection.evidence.as_mut().unwrap();
+                evidence.generation = generation;
+                evidence.account = Some(identity.clone());
+                for entry in &mut config.subscription_catalogs.get_mut("codex").unwrap().entries {
+                    entry.confirmed_generation = Some(generation);
+                    entry.account = Some(identity.clone());
+                }
+            }).unwrap();
+        }));
+        let context = crate::proxy::ForwardTestContext::new(store).unwrap();
+        let body = serde_json::json!({"model":"autojev/mixed","messages":[{"role":"user","content":"hello"}]});
+
+        let response = context.forward(axum::http::HeaderMap::new(), body.clone(), "chat/completions").await;
+        assert_eq!(response.status(), axum::http::StatusCode::CONFLICT, "an old-generation rejection must not authorize a handoff");
+        assert_eq!(api_calls.load(Ordering::SeqCst), 0, "a late old-account rejection must not fall through to the API account");
+
+        let response = context.forward(axum::http::HeaderMap::new(), body, "chat/completions").await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap()["model"], "fixture-model");
+        assert_eq!(adapter.generation_calls.lock().unwrap().as_slice(), ["fixture-model", "fixture-model"]);
+        assert_eq!(api_calls.load(Ordering::SeqCst), 0, "the replacement account generation remains eligible");
+        assert!(!context.health_statuses().iter().any(|status| status.model_id.starts_with("subscription-account:")), "the stale rejection must not mutate either account generation's circuit");
+        api.abort();
+    }
+
+    #[tokio::test]
+    async fn unknown_scope_rate_limit_pauses_all_models_for_the_account_across_requests() {
+        let adapter = StubAdapter::new();
+        adapter.generation_events.lock().unwrap().push_back(vec![GenerationEvent::RejectedBeforeStart {
+            status: 429, scope: GenerationFailureScope::Unknown, retry_after_seconds: Some(60),
+            message: "fixture rate limit with unknown scope".into(),
+        }]);
+        let (store, _directory) = fixture_store(adapter.clone());
+        let (api_url, api_calls, api) = mixed_route_api_server().await;
+        configure_mixed_route(&store, &api_url);
+        let context = crate::proxy::ForwardTestContext::new(store).unwrap();
+        let body = serde_json::json!({"model":"autojev/mixed","messages":[{"role":"user","content":"hello"}]});
+
+        let response = context.forward(axum::http::HeaderMap::new(), body.clone(), "chat/completions").await;
+        assert_eq!(response.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(api_calls.load(Ordering::SeqCst), 0, "unknown scope cannot hand off within the current request");
+
+        let response = context.forward(axum::http::HeaderMap::new(), body, "chat/completions").await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap()["model"], "fixture-api-fallback");
+        assert_eq!(adapter.generation_calls.lock().unwrap().as_slice(), ["fixture-model"], "a sibling subscription model must not evade an unknown-scope 429");
+        assert_eq!(api_calls.load(Ordering::SeqCst), 1);
+        assert!(context.health_statuses().iter().any(|status| status.model_id == "subscription-account:codex:1" && status.state == "cooldown"));
+        api.abort();
+    }
+
+    #[tokio::test]
+    async fn model_scoped_retry_after_is_applied_to_the_model_circuit() {
+        let adapter = StubAdapter::new();
+        adapter.generation_events.lock().unwrap().push_back(vec![GenerationEvent::RejectedBeforeStart {
+            status: 429, scope: GenerationFailureScope::Model, retry_after_seconds: Some(60),
+            message: "fixture model rate limit".into(),
+        }]);
+        let (store, _directory) = fixture_store(adapter.clone());
+        let (api_url, api_calls, api) = mixed_route_api_server().await;
+        configure_mixed_route(&store, &api_url);
+        let context = crate::proxy::ForwardTestContext::new(store).unwrap();
+        let body = serde_json::json!({"model":"autojev/mixed","messages":[{"role":"user","content":"hello"}]});
+
+        let response = context.forward(axum::http::HeaderMap::new(), body, "chat/completions").await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap()["model"], "fixture-model-2");
+        let primary = context.health_statuses().into_iter().find(|status| status.model_id == "subscription-model:codex:1:codex-model").unwrap();
+        assert_eq!(primary.state, "cooldown");
+        assert!((50..=60).contains(&primary.retry_after_seconds), "model cooldown should honor Retry-After=60, got {}s", primary.retry_after_seconds);
+        assert!(!context.health_statuses().iter().any(|status| status.model_id.starts_with("subscription-account:")), "model scope must not pause the whole account");
+        assert_eq!(api_calls.load(Ordering::SeqCst), 0);
+        api.abort();
+    }
+
+    #[tokio::test]
+    async fn an_account_switch_does_not_reuse_the_previous_generation_model_circuit() {
+        let adapter = StubAdapter::new();
+        adapter.generation_events.lock().unwrap().push_back(vec![GenerationEvent::RejectedBeforeStart {
+            status: 429, scope: GenerationFailureScope::Account, retry_after_seconds: Some(60),
+            message: "account A rate limit".into(),
+        }]);
+        let (store, _directory) = fixture_store(adapter.clone());
+        let (api_url, api_calls, api) = mixed_route_api_server().await;
+        configure_mixed_route(&store, &api_url);
+        store.update(|config| {
+            config.routes[0].model_ids.retain(|id| id != "codex-model-2");
+            config.routes[0].model_settings.remove("codex-model-2");
+        }).unwrap();
+        let context = crate::proxy::ForwardTestContext::new(store.clone()).unwrap();
+        let body = serde_json::json!({"model":"autojev/mixed","messages":[{"role":"user","content":"hello"}]});
+
+        let response = context.forward(axum::http::HeaderMap::new(), body.clone(), "chat/completions").await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let first = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&first).unwrap()["model"], "fixture-api-fallback");
+        assert_eq!(api_calls.load(Ordering::SeqCst), 1);
+
+        switch_codex_test_identity(&store, "replacement@example.invalid");
+        let response = context.forward(axum::http::HeaderMap::new(), body, "chat/completions").await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let second = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&second).unwrap()["model"], "fixture-model");
+        assert_eq!(adapter.generation_calls.lock().unwrap().as_slice(), ["fixture-model", "fixture-model"]);
+        assert_eq!(api_calls.load(Ordering::SeqCst), 1, "account B must not inherit account A's model circuit");
+        api.abort();
+    }
+
+    #[tokio::test]
+    async fn unknown_scope_service_unavailable_pauses_sibling_models_and_sticky_sessions() {
+        let adapter = StubAdapter::new();
+        adapter.generation_events.lock().unwrap().push_back(vec![GenerationEvent::RejectedBeforeStart {
+            status: 503, scope: GenerationFailureScope::Unknown, retry_after_seconds: Some(60),
+            message: "temporary failure with unknown scope".into(),
+        }]);
+        let (store, _directory) = fixture_store(adapter.clone());
+        let (api_url, api_calls, api) = mixed_route_api_server().await;
+        configure_mixed_route(&store, &api_url);
+        let context = crate::proxy::ForwardTestContext::new(store).unwrap();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-autojev-session-id", axum::http::HeaderValue::from_static("unknown-503-sticky"));
+        let body = serde_json::json!({"model":"autojev/mixed","messages":[{"role":"user","content":"hello"}]});
+
+        let response = context.forward(headers.clone(), body.clone(), "chat/completions").await;
+        assert_eq!(response.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(api_calls.load(Ordering::SeqCst), 0, "unknown scope still cannot hand off within this request");
+
+        let response = context.forward(headers, body, "chat/completions").await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let second = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&second).unwrap()["model"], "fixture-api-fallback");
+        assert_eq!(adapter.generation_calls.lock().unwrap().as_slice(), ["fixture-model"], "a sticky subscription candidate must not bypass the account-generation pause");
+        assert_eq!(api_calls.load(Ordering::SeqCst), 1);
+        assert!(context.health_statuses().iter().any(|status| status.model_id == "subscription-account:codex:1" && status.state == "cooldown"));
+        api.abort();
+    }
+
+    #[tokio::test]
+    async fn sse_recovery_probe_tracks_terminal_success_failure_and_cancellation() {
+        for (events, consume_body, expected_status) in [
+            (vec![GenerationEvent::Failed { message: "fixture stream failure".into() }], true, 502),
+            (vec![GenerationEvent::Cancelled], true, 502),
+            (vec![GenerationEvent::Started { generation: 1 }, GenerationEvent::Chunk("partial".into())], false, 502),
+            (vec![GenerationEvent::Started { generation: 1 }, GenerationEvent::Chunk("complete".into()), GenerationEvent::Finished { status: 200 }], true, 200),
+        ] {
+            let adapter = StubAdapter::new();
+            adapter.generation_events.lock().unwrap().extend([
+                vec![GenerationEvent::RejectedBeforeStart {
+                    status: 429, scope: GenerationFailureScope::Account, retry_after_seconds: Some(60),
+                    message: "seed account cooldown".into(),
+                }],
+                events,
+            ]);
+            let (store, _directory) = fixture_store(adapter.clone());
+            let (api_url, api_calls, api) = mixed_route_api_server().await;
+            configure_mixed_route(&store, &api_url);
+            let context = crate::proxy::ForwardTestContext::new(store).unwrap();
+            let body = serde_json::json!({"model":"autojev/mixed","messages":[{"role":"user","content":"hello"}]});
+
+            let response = context.forward(axum::http::HeaderMap::new(), body.clone(), "chat/completions").await;
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            let _ = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+            let statuses = context.health_statuses();
+            let account_key = statuses.iter().find(|status| status.model_id.starts_with("subscription-account:")).unwrap().model_id.clone();
+            let model_key = statuses.iter().find(|status| status.model_id == "codex-model" || status.model_id.ends_with(":codex-model")).unwrap().model_id.clone();
+            context.expire_health_for_test(&account_key);
+            context.expire_health_for_test(&model_key);
+
+            let mut streaming = body;
+            streaming["stream"] = serde_json::json!(true);
+            let response = context.forward(axum::http::HeaderMap::new(), streaming, "chat/completions").await;
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            if consume_body {
+                let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+                if expected_status == 502 {
+                    assert!(String::from_utf8_lossy(&body).contains("generation_"), "terminal error event must be emitted");
+                } else {
+                    assert!(String::from_utf8_lossy(&body).contains("[DONE]"), "successful stream must emit its terminal frame");
+                }
+            } else {
+                drop(response.into_body());
+            }
+            let account = context.health_statuses().into_iter().find(|status| status.model_id == account_key).unwrap();
+            assert_eq!(account.state, if expected_status == 200 { "healthy" } else { "cooldown" }, "SSE account probe must follow its actual terminal state");
+            assert_eq!(account.last_status, expected_status, "SSE account probe must complete from the actual terminal state");
+            assert_eq!(api_calls.load(Ordering::SeqCst), 1, "only the seed failure may use the API fallback");
+            api.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn mixed_route_recovery_probe_accepts_a_delivered_success_terminal_before_client_drop() {
+        let protocols = [
+            (
+                "chat/completions",
+                serde_json::json!({"model":"autojev/mixed","messages":[{"role":"user","content":"hello"}]}),
+                "[DONE]",
+            ),
+            (
+                "responses",
+                serde_json::json!({"model":"autojev/mixed","input":"hello"}),
+                "response.completed",
+            ),
+            (
+                "messages",
+                serde_json::json!({"model":"autojev/mixed","messages":[{"role":"user","content":"hello"}]}),
+                "message_stop",
+            ),
+        ];
+
+        for (endpoint, request_body, terminal) in protocols {
+            for drop_after_terminal in [true, false] {
+                let adapter = StubAdapter::new();
+                adapter.generation_events.lock().unwrap().extend([
+                    vec![GenerationEvent::RejectedBeforeStart {
+                        status: 429,
+                        scope: GenerationFailureScope::Account,
+                        retry_after_seconds: Some(60),
+                        message: "seed account cooldown".into(),
+                    }],
+                    if drop_after_terminal {
+                        vec![
+                            GenerationEvent::Started { generation: 1 },
+                            GenerationEvent::Chunk("generated text".into()),
+                            GenerationEvent::Finished { status: 200 },
+                        ]
+                    } else {
+                        vec![
+                            GenerationEvent::Started { generation: 1 },
+                            GenerationEvent::Chunk("partial output".into()),
+                        ]
+                    },
+                ]);
+
+                let (store, _directory) = fixture_store(adapter.clone());
+                let (api_url, api_calls, api) = mixed_route_api_server().await;
+                configure_mixed_route(&store, &api_url);
+                store.update(|config| {
+                    let capabilities = ["fixture-model", "fixture-model-2"]
+                        .into_iter()
+                        .flat_map(|model_id| {
+                            ["chat_completions", "responses", "messages"]
+                                .into_iter()
+                                .map(move |protocol| Capability {
+                                    model_id: model_id.into(),
+                                    protocol: protocol.into(),
+                                    status: CapabilityStatus::Verified,
+                                })
+                        })
+                        .collect();
+                    config
+                        .subscriptions
+                        .get_mut("codex")
+                        .unwrap()
+                        .evidence
+                        .as_mut()
+                        .unwrap()
+                        .capabilities = capabilities;
+                }).unwrap();
+                let context = crate::proxy::ForwardTestContext::new(store).unwrap();
+
+                let seed_body = serde_json::json!({
+                    "model":"autojev/mixed",
+                    "messages":[{"role":"user","content":"seed"}]
+                });
+                let response = context
+                    .forward(axum::http::HeaderMap::new(), seed_body, "chat/completions")
+                    .await;
+                assert_eq!(response.status(), axum::http::StatusCode::OK, "seed request for {endpoint}");
+                let _ = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+                assert_eq!(
+                    api_calls.load(Ordering::SeqCst),
+                    1,
+                    "the confirmed account rejection should seed API fallback for {endpoint}"
+                );
+
+                let statuses = context.health_statuses();
+                let account_key = statuses
+                    .iter()
+                    .find(|status| status.model_id.starts_with("subscription-account:"))
+                    .unwrap()
+                    .model_id
+                    .clone();
+                let model_key = statuses
+                    .iter()
+                    .find(|status| status.model_id == "codex-model" || status.model_id.ends_with(":codex-model"))
+                    .unwrap()
+                    .model_id
+                    .clone();
+                context.expire_health_for_test(&account_key);
+                context.expire_health_for_test(&model_key);
+
+                let mut streaming_body = request_body.clone();
+                streaming_body["stream"] = serde_json::json!(true);
+                let response = context
+                    .forward(axum::http::HeaderMap::new(), streaming_body, endpoint)
+                    .await;
+                let status = response.status();
+                if status != axum::http::StatusCode::OK {
+                    let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+                    panic!("recovery probe for {endpoint}: {status}: {}", String::from_utf8_lossy(&body));
+                }
+                let mut stream = response.into_body().into_data_stream();
+                let mut observed = Vec::new();
+                if drop_after_terminal {
+                    while let Some(chunk) = stream.next().await {
+                        observed.extend_from_slice(&chunk.unwrap());
+                        if String::from_utf8_lossy(&observed).contains(terminal) {
+                            break;
+                        }
+                    }
+                    assert!(
+                        String::from_utf8_lossy(&observed).contains(terminal),
+                        "{endpoint} success terminal must be delivered before the client disconnects"
+                    );
+                } else {
+                    let first = stream.next().await.expect("preterminal event").unwrap();
+                    observed.extend_from_slice(&first);
+                    assert!(
+                        !String::from_utf8_lossy(&observed).contains(terminal),
+                        "the counterexample must disconnect before {endpoint} reaches a terminal frame"
+                    );
+                }
+                drop(stream);
+
+                let account = context
+                    .health_statuses()
+                    .into_iter()
+                    .find(|status| status.model_id == account_key)
+                    .unwrap();
+                let expected_status = if drop_after_terminal { 200 } else { 502 };
+                assert_eq!(
+                    account.state,
+                    if drop_after_terminal { "healthy" } else { "cooldown" },
+                    "account probe for {endpoint} must use terminal completion state"
+                );
+                assert_eq!(account.last_status, expected_status, "account probe status for {endpoint}");
+                assert_eq!(
+                    api_calls.load(Ordering::SeqCst),
+                    1,
+                    "only the seed rejection may use API fallback for {endpoint}"
+                );
+                if drop_after_terminal {
+                    let mut follow_up = request_body.clone();
+                    follow_up["stream"] = serde_json::json!(true);
+                    let response = context
+                        .forward(axum::http::HeaderMap::new(), follow_up, endpoint)
+                        .await;
+                    assert_eq!(response.status(), axum::http::StatusCode::OK, "follow-up request for {endpoint}");
+                    let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+                    assert!(
+                        String::from_utf8_lossy(&body).contains(terminal),
+                        "the recovered account should continue serving {endpoint}"
+                    );
+                    assert_eq!(
+                        api_calls.load(Ordering::SeqCst),
+                        1,
+                        "a confirmed successful terminal must keep the next {endpoint} request on subscription"
+                    );
+                }
+                api.abort();
+            }
+        }
     }
 
     #[tokio::test]

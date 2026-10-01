@@ -106,8 +106,31 @@ impl Health {
     }
     /// Only one request is allowed to probe a recovered circuit at a time.
     pub fn acquire(&self, id: &str) -> Option<Lease> {
+        self.acquire_inner(id, true)
+    }
+    /// Acquire a single probe for a circuit whose cooldown has expired.
+    /// Healthy subscriptions do not create account-scoped health entries.
+    pub fn acquire_recovery_probe(&self, id: &str) -> Option<Lease> {
         let mut guard = self.0.lock().unwrap();
-        let c = guard.entry(id.into()).or_default();
+        let c = guard.get_mut(id)?;
+        if c.probing || c.until.is_none_or(|until| until > Instant::now()) {
+            return None;
+        }
+        c.probing = true;
+        Some(Lease {
+            health: self.clone(),
+            id: id.into(),
+            probe: true,
+            generation: c.generation,
+            finished: false,
+        })
+    }
+    fn acquire_inner(&self, id: &str, create: bool) -> Option<Lease> {
+        let mut guard = self.0.lock().unwrap();
+        if create {
+            guard.entry(id.into()).or_default();
+        }
+        let c = guard.get_mut(id)?;
         if c.probing || c.until.is_some_and(|t| t > Instant::now()) {
             return None;
         }
@@ -158,6 +181,12 @@ impl Health {
             *circuit = Circuit { generation: circuit.generation.wrapping_add(1), ..Default::default() };
         }
     }
+    #[cfg(test)]
+    pub(crate) fn expire_for_test(&self, id: &str) {
+        if let Some(circuit) = self.0.lock().unwrap().get_mut(id) {
+            circuit.until = Some(Instant::now());
+        }
+    }
 }
 pub struct Lease {
     health: Health,
@@ -167,7 +196,14 @@ pub struct Lease {
     finished: bool,
 }
 impl Lease {
-    pub fn complete(mut self, status: u16, retry_after: Option<u64>, settings: &Settings) {
+    pub fn complete(self, status: u16, retry_after: Option<u64>, settings: &Settings) {
+        self.complete_inner(status, retry_after, settings, false);
+    }
+    /// Conservatively cool a circuit after a retryable failure whose scope is unknown.
+    pub fn complete_conservatively(self, status: u16, retry_after: Option<u64>, settings: &Settings) {
+        self.complete_inner(status, retry_after, settings, true);
+    }
+    fn complete_inner(mut self, status: u16, retry_after: Option<u64>, settings: &Settings, force_cooldown: bool) {
         let mut guard = self.health.0.lock().unwrap();
         let c = guard.entry(self.id.clone()).or_default();
         if self.generation != c.generation {
@@ -178,7 +214,7 @@ impl Lease {
         c.last_status = status;
         if retryable(status) {
             c.failures = c.failures.saturating_add(1);
-            if matches!(status, 401 | 402 | 403 | 429) || self.probe || c.failures >= settings.failure_threshold {
+            if force_cooldown || matches!(status, 401 | 402 | 403 | 429) || self.probe || c.failures >= settings.failure_threshold {
                 c.generation = c.generation.wrapping_add(1);
                 c.until = Some(
                     Instant::now()
@@ -236,6 +272,22 @@ mod tests {
         drop(probe);
         h.acquire("m").unwrap().complete(200, None, &s);
         assert!(h.available("m"));
+    }
+    #[test]
+    fn an_existing_account_circuit_allows_one_recovery_probe_and_clears_on_success() {
+        let h = Health::default();
+        let settings = Settings::default();
+        assert!(h.acquire_recovery_probe("subscription-account:codex:1").is_none());
+        h.acquire("subscription-account:codex:1").unwrap().complete(429, Some(60), &settings);
+        assert!(h.acquire_recovery_probe("subscription-account:codex:1").is_none());
+        h.0.lock().unwrap().get_mut("subscription-account:codex:1").unwrap().until = Some(Instant::now());
+
+        let probe = h.acquire_recovery_probe("subscription-account:codex:1").unwrap();
+        assert!(h.acquire_recovery_probe("subscription-account:codex:1").is_none(), "only one request may probe a recovered account circuit");
+        probe.complete(200, None, &settings);
+
+        assert!(h.available("subscription-account:codex:1"));
+        assert_eq!(h.statuses().into_iter().find(|status| status.model_id == "subscription-account:codex:1").unwrap().state, "healthy");
     }
     #[test]
     fn threshold_and_request_errors() {
