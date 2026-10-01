@@ -305,6 +305,12 @@ export async function refreshSubscription(providerId: string): Promise<Dashboard
   return invoke('refresh_subscription', { providerId });
 }
 
+/** Arm or disarm real Codex generation for the current connection only; ordinary admission remains mandatory. */
+export async function setCodexRealGenerationEnabled(providerId: string, enabled: boolean, maxCalls: number): Promise<DashboardSnapshot> {
+  if (!isTauri()) throw new Error('Open the desktop app to manage real Codex generation.');
+  return invoke('set_codex_real_generation_enabled', { providerId, enabled, maxCalls: enabled ? maxCalls : null });
+}
+
 /** 开始订阅登录：立即返回 pending，完成结果由前端轮询 get_snapshot 观察。 */
 export async function beginSubscriptionLogin(providerId: string): Promise<DashboardSnapshot> {
   if (!isTauri()) throw new Error('Open the desktop app to sign in to a subscription.');

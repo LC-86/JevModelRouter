@@ -2945,6 +2945,16 @@ done
                 );
         }).unwrap();
         store.write_secret("provider:openrouter", "fixture-api-key").unwrap();
+        // Gateway integration fixtures represent a user-confirmed finite fake run. Production
+        // configuration stays default-off; tests that need to reach later admission gates opt in here.
+        store.update(|config| {
+            crate::subscription::set_codex_real_generation_enabled(
+                config,
+                "codex-fixture",
+                true,
+                Some(crate::subscription::CODEX_REAL_GENERATION_MAX_CALLS),
+            ).unwrap();
+        }).unwrap();
         store
     }
 
@@ -3978,7 +3988,7 @@ done
             .unwrap()
             .unwrap();
         assert_eq!(response.status(), axum::http::StatusCode::BAD_GATEWAY,
-            "an adapter startup denial must terminate this request");
+            "logout must invalidate a queued request before it starts a helper turn");
         let result = tokio::time::timeout(std::time::Duration::from_secs(3), logout)
             .await
             .unwrap()

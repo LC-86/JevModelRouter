@@ -881,6 +881,17 @@ main.debug-main { height: 100dvh; min-height: 0; overflow: hidden; }
 
 /* 已发现目录：发现身份、可用性、资格与用户选择分行呈现。 */
 .provider-catalog { margin-top: 16px; padding: 14px 16px; border: 1px solid var(--line); background: var(--inset); }
+.provider-subscription-generation { margin-top: 16px; padding: 14px 16px; border: 1px solid var(--line); background: var(--inset); display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 8px 16px; }
+.provider-subscription-generation > div { display: grid; gap: 4px; }
+.provider-subscription-generation > div strong { font-size: 13px; }
+.provider-subscription-generation > div p, .provider-subscription-generation-note { margin: 0; color: var(--muted); font-size: 11px; line-height: 1.5; }
+.provider-subscription-generation > div small { color: var(--faint); font-size: 10px; }
+.provider-subscription-generation-limit { display: grid; grid-template-columns: auto 72px; align-items: center; gap: 8px; color: var(--muted); font-size: 11px; }
+.provider-subscription-generation-limit input { width: 72px; min-width: 0; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); color: var(--text); font: inherit; }
+.provider-subscription-generation-toggle { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+.provider-subscription-generation-toggle input { accent-color: var(--green); }
+.provider-subscription-generation-budget { grid-column: 2; color: var(--faint); font-size: 10px; line-height: 1.5; }
+.provider-subscription-generation-note { grid-column: 1 / -1; }
 .provider-catalog > header { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
 .provider-catalog > header strong { font-size: 13px; }
 .provider-catalog > header span { color: var(--muted); font-size: 11px; }

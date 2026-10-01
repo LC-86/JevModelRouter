@@ -183,6 +183,11 @@ export interface SubscriptionView {
   label: string;
   generation: number;
   state: SubscriptionConnectionState;
+  /** Leo's explicit, volatile real-generation opt-in for this Codex connection generation. */
+  real_generation_enabled?: boolean;
+  /** Finite per-confirmation AutoJev request ceiling and remaining attempts. */
+  generation_call_limit?: number | null;
+  generation_calls_remaining?: number | null;
   identity?: string | null;
   helper_version?: string | null;
   account_path?: string | null;

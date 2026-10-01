@@ -88,6 +88,7 @@ import {
   resetGatewayHealth,
   importProviders,
   refreshSubscription,
+  setCodexRealGenerationEnabled,
   restoreAgent,
   saveModel,
   saveProvider,
@@ -548,6 +549,8 @@ function ProvidersPage({ snapshot, onAdd, onEdit, onDelete, onTest, onImport, on
   const [refreshing, setRefreshing] = useState<Record<string, boolean>>({});
   const [subscriptionBusy, setSubscriptionBusy] = useState<Record<string, SubscriptionAction | undefined>>({});
   const [subscriptionErrors, setSubscriptionErrors] = useState<Record<string, string>>({});
+  const [generationBusy, setGenerationBusy] = useState<Record<string, boolean>>({});
+  const [generationCallLimits, setGenerationCallLimits] = useState<Record<string, number>>({});
   const [catalogBusy, setCatalogBusy] = useState<Record<string, boolean>>({});
   // 目录行的选择/停用直接写回模型配置：复用 save_model，写回后以返回的快照为准刷新。
   const toggleCatalogEntry = async (provider: Provider, entry: SubscriptionCatalogEntry, patch: { selected?: boolean; enabled?: boolean }) => {
@@ -572,6 +575,26 @@ function ProvidersPage({ snapshot, onAdd, onEdit, onDelete, onTest, onImport, on
     setToggling((previous) => ({ ...previous, [provider.id]: true }));
     try { await onToggle(provider); }
     finally { setToggling((previous) => ({ ...previous, [provider.id]: false })); }
+  };
+  const toggleCodexGeneration = async (provider: Provider, enabled: boolean) => {
+    if (generationBusy[provider.id]) return;
+    const currentView = subscriptionView(snapshot, provider.id);
+    const generationKey = `${provider.id}:${currentView?.generation ?? 0}`;
+    const maxCalls = generationCallLimits[generationKey] ?? currentView?.generation_call_limit ?? 1;
+    if (enabled && (!Number.isInteger(maxCalls) || maxCalls < 1 || maxCalls > 15)) {
+      onNotify(t('The request limit must be between 1 and 15.'), true);
+      return;
+    }
+    if (enabled && !window.confirm(t('Before enabling real Codex generation, complete the HAND_RUN checklist and confirm the exact model and protocol, fictional input, client-owned tools, total request count, output boundary, possible fees, and allowed steps. This confirmation is limited to {count} AutoJev requests. Failed, cancelled, and client-tool follow-up requests count. The counter is not an upstream billing guarantee. This switch sends no request and does not bypass any admission check; the current 64 KiB collector is not a hard output cap. Continue?', { count: maxCalls }))) return;
+    setGenerationBusy((previous) => ({ ...previous, [provider.id]: true }));
+    try {
+      onSnapshot(await setCodexRealGenerationEnabled(provider.id, enabled, maxCalls));
+      onNotify(t(enabled ? 'Real Codex generation armed for this connection.' : 'Real Codex generation disarmed.'));
+    } catch (error) {
+      onNotify(error instanceof Error ? error.message : String(error), true);
+    } finally {
+      setGenerationBusy((previous) => { const next = { ...previous }; delete next[provider.id]; return next; });
+    }
   };
   const refresh = async (provider: Provider) => {
     if (refreshing[provider.id]) return;
@@ -663,6 +686,50 @@ function ProvidersPage({ snapshot, onAdd, onEdit, onDelete, onTest, onImport, on
             ); })}
           </tbody>
         </table>
+        {snapshot.providers.filter((provider) => provider.kind === 'codex_subscription').map((provider) => {
+          const view = subscriptionView(snapshot, provider.id);
+          const enabled = view?.real_generation_enabled === true;
+          const canArm = provider.enabled && view?.state === 'connected' && Boolean(view.identity?.trim());
+          const generationKey = `${provider.id}:${view?.generation ?? 0}`;
+          const maxCalls = generationCallLimits[generationKey] ?? view?.generation_call_limit ?? 1;
+          return <section className="provider-subscription-generation" key={`codex-generation-${provider.id}`} data-testid={`codex-generation-control-${provider.id}`} aria-label={t('Real Codex generation')}>
+            <div>
+              <strong>{t('Real Codex generation')}</strong>
+              <p data-testid={`codex-generation-state-${provider.id}`}>{t(enabled ? 'Armed for this account; admission still required.' : 'Off. Real Codex requests are denied by default.')}</p>
+              <small>{t('Connection generation {generation} · helper {helper}', { generation: view?.generation ?? 0, helper: view?.helper_version || t('Unknown') })}</small>
+            </div>
+            <label className="provider-subscription-generation-limit">{t('Maximum requests for this confirmation')}
+              <input
+                type="number"
+                min={1}
+                max={15}
+                step={1}
+                inputMode="numeric"
+                data-testid={`codex-generation-call-limit-${provider.id}`}
+                aria-label={t('Maximum requests for this confirmation')}
+                disabled={!canArm || view?.generation_call_limit != null || generationBusy[provider.id] === true}
+                value={maxCalls}
+                onChange={(event) => { const value = Number(event.currentTarget.value); setGenerationCallLimits((previous) => ({ ...previous, [generationKey]: value })); }}
+              />
+            </label>
+            <label className="provider-subscription-generation-toggle">
+              <input
+                type="checkbox"
+                data-testid={`codex-real-generation-${provider.id}`}
+                checked={enabled}
+                disabled={!canArm || generationBusy[provider.id] === true || (!enabled && view?.generation_calls_remaining === 0)}
+                onChange={(event) => void toggleCodexGeneration(provider, event.currentTarget.checked)}
+              />
+              <span>{t('Enable real Codex generation for this connection')}</span>
+            </label>
+            <small className="provider-subscription-generation-budget" data-testid={`codex-generation-budget-${provider.id}`}>
+              {view?.generation_call_limit != null
+                ? t('{remaining} of {limit} confirmed AutoJev requests remain.', { remaining: view?.generation_calls_remaining ?? 0, limit: view?.generation_call_limit ?? maxCalls })
+                : t('Each confirmation is limited to 1–15 AutoJev requests; failures, cancellations, and tool-result follow-ups count.')}
+            </small>
+            <p className="provider-subscription-generation-note">{t('This volatile control does not verify identity, models, protocols, quota, or credits. Every existing admission check remains mandatory. The per-connection request count survives disarm/re-arm and resets after restart, sign-out, or account switch.')}</p>
+          </section>;
+        })}
         {snapshot.providers.length === 0 && <EmptyState icon={<Server />} title={t('No providers yet')} body={t('Add a provider or import from CC Switch or Termany.')} />}
         {providers.filter((provider) => isSubscriptionProvider(provider)).map((provider) => {
           const entries = subscriptionCatalog(subscriptionView(snapshot, provider.id));

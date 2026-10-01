@@ -479,6 +479,32 @@
     const multiDomModels = catalogModelTokens(multi.dom.catalog);
     check(multiDomModels.length === 2 && multiDomModels.every(entry => entry.endsWith(':false')), `The DOM catalog must list both models as ineligible: ${multi.dom.catalog}`);
     check(tokenOf(multi.dom.catalog, 'catalog_state') === 'available' && tokenOf(multi.dom.catalog, 'observed_at') === multi.view.catalog.observed_at, `The DOM catalog state and time must match: ${multi.dom.catalog}`);
+    const generationToggle = await wait(() => document.querySelector(`[data-testid="codex-real-generation-${providerId}"]`), 'Codex real-generation toggle');
+    const generationState = await subscriptionView();
+    check(generationToggle.checked === false && generationState.real_generation_enabled === false, `Real Codex generation must start off for a connected stand-in account: ${JSON.stringify({ checked: generationToggle.checked, enabled: generationState.real_generation_enabled })}`);
+    const generationLimitInput = await wait(() => document.querySelector(`[data-testid="codex-generation-call-limit-${providerId}"]`), 'Codex request limit input');
+    setValue(generationLimitInput, '3');
+    let confirmationText = '';
+    const nativeConfirm = window.confirm;
+    window.confirm = message => { confirmationText = String(message); return true; };
+    generationToggle.click();
+    window.confirm = nativeConfirm;
+    const armedGeneration = await wait(async () => { const view = await subscriptionView(); return view?.real_generation_enabled === true ? view : null; }, 'explicit real-generation opt-in');
+    check(confirmationText.includes('HAND_RUN') && /output boundary|输出边界/i.test(confirmationText), `Enabling must show the pre-run confirmation: ${confirmationText}`);
+    check(generationToggle.checked === true, 'The UI toggle must reflect the volatile opt-in after confirmation');
+    check(armedGeneration.generation_call_limit === 3 && armedGeneration.generation_calls_remaining === 3, `The confirmed request budget must be visible in the snapshot: ${JSON.stringify(armedGeneration)}`);
+    generationToggle.click();
+    const disarmedGeneration = await wait(async () => { const view = await subscriptionView(); return view?.real_generation_enabled === false ? view : null; }, 'explicit real-generation disarm');
+    check(disarmedGeneration.generation_call_limit === 3 && disarmedGeneration.generation_calls_remaining === 3, 'Disarming must preserve the selected count and unused budget');
+    let rearmConfirmation = '';
+    window.confirm = message => { rearmConfirmation = String(message); return true; };
+    (await wait(() => document.querySelector(`[data-testid="codex-real-generation-${providerId}"]`))).click();
+    window.confirm = nativeConfirm;
+    const rearmedGeneration = await wait(async () => { const view = await subscriptionView(); return view?.real_generation_enabled === true ? view : null; }, 'bounded opt-in re-arm');
+    check(rearmConfirmation.includes('3') && rearmedGeneration.generation_call_limit === 3 && rearmedGeneration.generation_calls_remaining === 3,
+      `Re-arming must use the displayed request count: ${JSON.stringify({ rearmConfirmation, rearmedGeneration })}`);
+    record('generationOptIn', { defaultOff: generationState.real_generation_enabled, armed: armedGeneration.real_generation_enabled, generation: armedGeneration.generation, confirmationText });
+    passed('the real-generation control is default-off, finite, and re-arms only after confirmation without resetting its budget');
     record('multi', { quota: multiQuota, catalog: multi.view.catalog, models: multi.view.models, domQuota: multi.dom.quota.slice(0, 800), domCatalog: multi.dom.catalog.slice(0, 400) });
     passed('multi-bucket quota maps usedPercent/windowDurationMins/resetsAt into the DOM and the snapshot, legacy single is not used');
     passed('discovered catalog models stay eligible=false in the DOM and the snapshot');
@@ -491,8 +517,11 @@
       return !value.job.running && value.job.completed === 3 && value.job.error ? value : null;
     }, 'denied speed test with a catalog');
     check(/eligible/i.test(deniedWithCatalog.job.error || ''), `Generation must be denied as ineligible even with an available quota read: ${JSON.stringify(deniedWithCatalog.job)}`);
+    const stillArmed = await subscriptionView();
+    check(stillArmed.real_generation_enabled === true, 'Arming must not hide the fixture model eligibility denial');
+    check(stillArmed.generation_calls_remaining === 3, 'A request denied before dispatch must not consume the confirmation budget');
     record('deniedWithCatalog', { error: deniedWithCatalog.job.error });
-    passed('generation stays denied with a discovered catalog and an available quota read');
+    passed('generation stays denied after opt-in because the discovered fixture model is still ineligible');
     // 2) 旧版单桶（仅 rateLimits，根层许可）+ 旧目录形状 `models`：整体替换为本次权威结果。
     const single = await refreshUntil('legacy single-bucket quota and models-array catalog', (view, dom) =>
       view?.quota?.view === 'rate_limits' && dom.quota.includes('bucket=fictional-single')
@@ -655,6 +684,8 @@
     await click(`[data-testid="sub-logout-${providerId}"]`);
     const after = await wait(async () => { const item = await subscriptionView(); return item?.logout && !item.identity ? item : null; }, 'logout outcome');
     check(after.generation > connectedGeneration, `Sign-out must advance the generation: ${connectedGeneration} -> ${after.generation}`);
+    check(after.real_generation_enabled === false, 'Sign-out must clear the generation-scoped real-generation opt-in');
+    check(after.generation_call_limit == null && after.generation_calls_remaining == null, 'Sign-out must clear the generation-scoped request budget');
     check((after.models || []).length === 0, `Sign-out must clear the discovered catalog: ${JSON.stringify(after.models)}`);
     check(after.catalog?.state === 'unknown' && !after.catalog?.source && !after.catalog?.observed_at, `Sign-out must clear the catalog evidence: ${JSON.stringify(after.catalog)}`);
     check((after.quota?.buckets || []).length === 0 && after.quota?.state === 'unknown' && after.quota?.history !== true && !after.quota?.observed_at, `Sign-out must clear the quota evidence: ${JSON.stringify(after.quota)}`);
@@ -776,6 +807,12 @@
       return item?.login?.stage === 'completed' ? item : null;
     }, 'catalog sign-in');
     check(signedIn.identity === 'standin-success@example.invalid', `The controlled directory needs a verified stand-in account: ${signedIn.identity}`);
+    await invoke('set_codex_real_generation_enabled', { providerId, enabled: true, maxCalls: 15 });
+    const armed = await view();
+    check(armed.real_generation_enabled === true && armed.generation_call_limit === 15 && armed.generation_calls_remaining === 15,
+      `The isolated qualification matrix needs an explicit bounded opt-in: ${JSON.stringify(armed)}`);
+    record('generationOptIn', { enabled: armed.real_generation_enabled, limit: armed.generation_call_limit, remaining: armed.generation_calls_remaining, generation: armed.generation });
+    passed('the isolated model-qualification matrix arms a finite budget without authorizing its ineligible protocol/model cases');
     await click('.sidebar [aria-busy]');
     const gateway = await wait(async () => { const current = await snapshot(); return current.proxy.running ? current.proxy : null; }, 'local gateway');
     check(gateway.port !== 9526 && gateway.port !== 9527 && gateway.port !== 0, `The gateway must use an independent port: ${gateway.port}`);
@@ -962,6 +999,15 @@
       return item?.login?.stage === 'completed' && item.identity ? item : null;
     }, 'catalog re-sign-in');
     check(reconnected.identity === signedIn.identity, `The switched sign-in must verify the stand-in account: ${reconnected.identity}`);
+    await invoke('set_codex_real_generation_enabled', { providerId, enabled: true, maxCalls: 15 });
+    const rearmedAfterSwitch = await view();
+    check(rearmedAfterSwitch.generation === reconnected.generation
+      && rearmedAfterSwitch.real_generation_enabled === true
+      && rearmedAfterSwitch.generation_call_limit === 15
+      && rearmedAfterSwitch.generation_calls_remaining === 15,
+    `A new account generation needs its own explicit bounded fixture grant: ${JSON.stringify(rearmedAfterSwitch)}`);
+    record('generationOptInAfterSwitch', { generation: rearmedAfterSwitch.generation, limit: rearmedAfterSwitch.generation_call_limit, remaining: rearmedAfterSwitch.generation_calls_remaining });
+    passed('the switched fixture account receives a fresh finite consent window; the previous window stays invalidated');
     await invoke('refresh_subscription', { providerId });
     const reverified = await entry();
     check(reverified.availability === 'available' && reverified.eligibility === 'eligible', `A re-verified catalogue must be available again: ${JSON.stringify(reverified)}`);

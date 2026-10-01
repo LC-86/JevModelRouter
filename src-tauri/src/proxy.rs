@@ -716,25 +716,69 @@ fn codex_admission_check(
     identity: Option<String>,
     protocol: Protocol,
 ) -> Arc<dyn Fn() -> Result<(), String> + Send + Sync> {
+    let reserved = Arc::new(std::sync::atomic::AtomicBool::new(false));
     Arc::new(move || {
-        let config = store.read();
-        let provider = config.providers.iter().find(|provider| provider.id == provider_id)
-            .ok_or_else(|| "The subscription provider was removed before dispatch".to_owned())?;
-        if provider.kind != expected_kind {
-            return Err("The subscription provider type changed before dispatch".into());
+        let validate = |config: &crate::config::AppConfig,
+                        call_already_reserved: bool|
+         -> Result<(), String> {
+            let provider = config
+                .providers
+                .iter()
+                .find(|provider| provider.id == provider_id)
+                .ok_or_else(|| {
+                    "The subscription provider was removed before dispatch".to_owned()
+                })?;
+            if provider.kind != expected_kind {
+                return Err("The subscription provider type changed before dispatch".into());
+            }
+            let model = config
+                .models
+                .iter()
+                .find(|model| model.id == model_binding_id)
+                .ok_or_else(|| {
+                    "The subscription model binding was removed before dispatch".to_owned()
+                })?;
+            if model.provider_id != provider_id || model.model_id != model_id {
+                return Err("The subscription model binding changed before dispatch".into());
+            }
+            let connection = config
+                .subscriptions
+                .get(&provider_id)
+                .ok_or_else(|| "The subscription connection changed before dispatch".to_owned())?;
+            if connection.generation != generation || connection.identity != identity {
+                return Err("The subscription account changed before dispatch".into());
+            }
+            let admission =
+                if expected_kind == ProviderKind::CodexSubscription && call_already_reserved {
+                    crate::subscription::admit_model_with_reserved_call(
+                        config, model, provider, protocol,
+                    )
+                } else {
+                    crate::subscription::admit_model(config, model, provider, protocol)
+                };
+            admission.map_err(|denial| denial.summary())
+        };
+
+        if expected_kind != ProviderKind::CodexSubscription {
+            return validate(&store.read(), false);
         }
-        let model = config.models.iter().find(|model| model.id == model_binding_id)
-            .ok_or_else(|| "The subscription model binding was removed before dispatch".to_owned())?;
-        if model.provider_id != provider_id || model.model_id != model_id {
-            return Err("The subscription model binding changed before dispatch".into());
+        if reserved.load(std::sync::atomic::Ordering::SeqCst) {
+            return validate(&store.read(), true);
         }
-        let connection = config.subscriptions.get(&provider_id)
-            .ok_or_else(|| "The subscription connection changed before dispatch".to_owned())?;
-        if connection.generation != generation || connection.identity != identity {
-            return Err("The subscription account changed before dispatch".into());
-        }
-        crate::subscription::admit_model(&config, model, provider, protocol)
-            .map_err(|denial| denial.summary())
+
+        // The helper invokes this callback more than once for one incoming API request.
+        // Reserve once, atomically with all ordinary admission checks; failed and cancelled
+        // requests still consume the confirmed attempt count.
+        let result = store
+            .update(|config| {
+                validate(config, false)?;
+                crate::subscription::reserve_codex_real_generation_call(config, &provider_id)
+                    .map_err(|denial| denial.summary())
+            })
+            .map_err(|error| error.to_string())?;
+        result?;
+        reserved.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
     })
 }
 
