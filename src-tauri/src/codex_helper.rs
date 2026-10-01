@@ -243,6 +243,9 @@ pub struct CodexAppServer {
     pending: Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<std::result::Result<Value, String>>>>>,
     messages: tokio::sync::mpsc::UnboundedReceiver<HelperMessage>,
     deferred_messages: VecDeque<HelperMessage>,
+    /// 全新辅助进程最多可安全关联一次缺少 loginId 的完成通知：它只能属于首次登录请求。
+    /// 后续无 ID 通知无法区分旧尝试迟到或重复，因此必须按不明事件处理。
+    unattributed_login_completion_available: bool,
 }
 
 enum HelperMessage {
@@ -836,6 +839,7 @@ impl CodexAppServer {
             pending,
             messages,
             deferred_messages: VecDeque::new(),
+            unattributed_login_completion_available: true,
         };
         // 官方 app-server 握手：`initialize` 带客户端自述，收到响应后再发一条无 id 的 `initialized` 通知。
         let client_info = json!({
@@ -1030,6 +1034,7 @@ const POLL_SLICE: std::time::Duration = std::time::Duration::from_millis(120);
 struct ActiveLogin {
     login_id: String,
     generation: u64,
+    allow_unattributed_completion: bool,
 }
 
 #[derive(Clone, Default)]
@@ -1409,14 +1414,42 @@ impl CodexAdapter {
     }
 
     /// 结束一次登录尝试：只清理仍属于它的挂起记录，然后用 `account/read` 核实身份。
-    async fn complete_login(&self, provider_id: &str, params: Value) -> Result<Option<LoginResult>> {
-        if let Some(login_id) = params.get("loginId").and_then(Value::as_str) {
+    async fn complete_login(
+        &self,
+        provider_id: &str,
+        expected_login_id: &str,
+        params: Value,
+    ) -> Result<Option<LoginResult>> {
+        let notification_login_id = match params.get("loginId") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(value.as_str().unwrap_or_default()),
+        };
+        let active = {
             let mut logins = self.logins.lock().unwrap();
-            if logins.get(provider_id).is_some_and(|active| active.login_id == login_id) {
-                logins.remove(provider_id);
+            let Some(active) = logins
+                .get(provider_id)
+                .cloned()
+                .filter(|active| active.login_id == expected_login_id)
+            else {
+                return Ok(None);
+            };
+            if notification_login_id.is_some_and(|login_id| login_id != expected_login_id) {
+                return Ok(None);
             }
+            logins.remove(provider_id);
+            active
+        };
+        if notification_login_id.is_none() && !active.allow_unattributed_completion {
+            return Ok(Some(LoginResult::Failed(
+                "The Codex helper completion omitted its login id and could not be safely correlated".to_owned(),
+            )));
         }
-        if !params.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+        let Some(success) = params.get("success").and_then(Value::as_bool) else {
+            return Ok(Some(LoginResult::Failed(
+                "The Codex helper returned an invalid sign-in completion response".to_owned(),
+            )));
+        };
+        if !success {
             let error = params
                 .get("error")
                 .and_then(Value::as_str)
@@ -1428,31 +1461,39 @@ impl CodexAdapter {
         let mut servers = self.servers.lock().await;
         let Some(server) = servers.get_mut(provider_id) else {
             return Ok(Some(LoginResult::Failed(
-                "The Codex helper exited before the account could be verified".to_owned())));
+                "The Codex helper exited before the account could be verified".to_owned(),
+            )));
         };
         let verified = server.call("account/read", json!({})).await;
-        let identity = verified.as_ref().ok().and_then(account_email);
+        let identity = verified
+            .as_ref()
+            .ok()
+            .filter(|result| result["account"]["type"].as_str() == Some("chatgpt"))
+            .and_then(|result| {
+                let (state, identity, _) = account_status(result);
+                (state == ConnectionState::Connected)
+                    .then_some(identity)
+                    .flatten()
+            });
         let Some(identity) = identity else {
             return Ok(Some(LoginResult::Failed(
-                "The Codex helper did not confirm a signed-in account".to_owned())));
-        };
-        let reported = params.get("account").and_then(|account| account.get("email")).and_then(Value::as_str);
-        if reported.is_some_and(|reported| reported != identity) {
-            return Ok(Some(LoginResult::Failed(
-                "The Codex helper returned an identity that does not match the signed-in account".to_owned(),
+                "The Codex helper did not confirm a signed-in account".to_owned(),
             )));
-        }
+        };
         Ok(Some(LoginResult::Completed { identity }))
     }
 }
 
-/// 只处理 `account/login/completed`：返回它绑定的 loginId 与 params。
-fn login_completion(value: &Value) -> Option<(String, Value)> {
+/// 只处理 `account/login/completed`：官方协议允许 loginId 缺失或为 null。
+fn login_completion(value: &Value) -> Option<(Option<String>, Value)> {
     if value.get("method").and_then(Value::as_str) != Some("account/login/completed") {
         return None;
     }
     let params = value.get("params")?.clone();
-    let login_id = params.get("loginId").and_then(Value::as_str)?.to_owned();
+    let login_id = match params.get("loginId") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(value.as_str()?.to_owned()),
+    };
     Some((login_id, params))
 }
 
@@ -1531,23 +1572,50 @@ impl SubscriptionAdapter for CodexAdapter {
         })
     }
 
-    fn start_login<'a>(&'a self, provider_id: &'a str, generation: u64) -> futures_util::future::BoxFuture<'a, Result<LoginStart>> {
+    fn start_login<'a>(
+        &'a self,
+        provider_id: &'a str,
+        generation: u64,
+    ) -> futures_util::future::BoxFuture<'a, Result<LoginStart>> {
         Box::pin(async move {
             let mut servers = self.server_for(provider_id).await?;
-            let server = servers.get_mut(provider_id).expect("the helper was just started");
-            let result = server.call("account/login/start", json!({"mode": "browser"})).await?;
+            let server = servers
+                .get_mut(provider_id)
+                .expect("the helper was just started");
+            let allow_unattributed_completion = server.unattributed_login_completion_available;
+            // 先消耗首次无 ID 通知关联窗口。RPC 超时或取消后，迟到通知不得绑定后续尝试。
+            server.unattributed_login_completion_available = false;
+            let result = server
+                .call("account/login/start", json!({"type": "chatgpt"}))
+                .await?;
+            anyhow::ensure!(
+                result.get("type").and_then(Value::as_str) == Some("chatgpt"),
+                "The Codex helper did not return a browser sign-in response"
+            );
             let login_id = result
                 .get("loginId")
                 .and_then(Value::as_str)
+                .filter(|login_id| !login_id.is_empty())
                 .context("The Codex helper did not return a login id")?
+                .to_owned();
+            let authorization_url = result
+                .get("authUrl")
+                .and_then(Value::as_str)
+                .filter(|url| !url.is_empty())
+                .context("The Codex helper did not return an authorization URL")?
                 .to_owned();
             self.logins.lock().unwrap().insert(
                 provider_id.to_owned(),
-                ActiveLogin { login_id: login_id.clone(), generation });
+                ActiveLogin {
+                    login_id: login_id.clone(),
+                    generation,
+                    allow_unattributed_completion,
+                },
+            );
             Ok(LoginStart {
                 login_id,
-                authorization_url: result.get("authorizationUrl").and_then(Value::as_str).map(str::to_owned),
-                user_code: result.get("userCode").and_then(Value::as_str).map(str::to_owned),
+                authorization_url: Some(authorization_url),
+                user_code: None,
             })
         })
     }
@@ -1573,7 +1641,7 @@ impl SubscriptionAdapter for CodexAdapter {
                     return Ok(None);
                 }
                 if let Some(params) = take_deferred(&self.deferred, provider_id, &tracked.login_id) {
-                    return self.complete_login(provider_id, params).await;
+                    return self.complete_login(provider_id, &tracked.login_id, params).await;
                 }
                 let next = {
                     let mut servers = self.servers.lock().await;
@@ -1595,12 +1663,14 @@ impl SubscriptionAdapter for CodexAdapter {
                 let Some((login_id, params)) = login_completion(&value) else {
                     continue;
                 };
-                if login_id != tracked.login_id {
-                    // 属于另一次尝试：放回队列交给它自己的等待者，绝不吞掉。
-                    defer(&self.deferred, provider_id, &login_id, params);
-                    continue;
+                if let Some(login_id) = login_id {
+                    if login_id != tracked.login_id {
+                        // 属于另一次尝试：放回队列交给它自己的等待者，绝不吞掉。
+                        defer(&self.deferred, provider_id, &login_id, params);
+                        continue;
+                    }
                 }
-                return self.complete_login(provider_id, params).await;
+                return self.complete_login(provider_id, &tracked.login_id, params).await;
             }
         })
     }
@@ -2701,6 +2771,7 @@ while IFS= read -r line; do
       case "$scenario" in
         signed-out) result='{"account":null,"requiresOpenaiAuth":true}' ;;
         incomplete) result='{"account":{"type":"chatgpt","email":null,"planType":"pro"},"requiresOpenaiAuth":true}' ;;
+        api-key-email) result='{"account":{"type":"apiKey","email":"fixture@example.invalid"},"requiresOpenaiAuth":true}' ;;
         *) result='{"account":{"type":"chatgpt","email":"fixture@example.invalid","planType":"pro"},"requiresOpenaiAuth":true}' ;;
       esac
       printf '{"jsonrpc":"2.0","id":%s,"result":%s}\n' "$id" "$result" ;;
@@ -2726,7 +2797,23 @@ while IFS= read -r line; do
         fail) printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32000,"message":"fixture quota read failed"}}\n' "$id" ;;
         *) printf '{"jsonrpc":"2.0","id":%s,"result":{"ordinaryUsageAllowed":true,"accountId":"fixture-account","rateLimits":{"limitId":"legacy-single","primary":{"usedPercent":1,"windowDurationMins":60,"resetsAt":1800000000}},"rateLimitsByLimitId":{"limit-b":{"limitId":"limit-b","limitName":"B","planType":"pro","primary":{"usedPercent":10,"windowDurationMins":300,"resetsAt":1800000100},"secondary":{"usedPercent":20,"windowDurationMins":10080,"resetsAt":1800600000},"credits":{"hasCredits":true,"unlimited":false,"balance":"12.5 credits"}},"limit-a":{"limitId":"limit-a","ordinaryUsageAllowed":false,"primary":{"usedPercent":25,"windowDurationMins":300,"resetsAt":1800000000}}}}}\n' "$id" ;;
       esac ;;
-    *'"method":"account/login/start"'*) n=0; if [ -f "$1.counter" ]; then n=$(cat "$1.counter"); fi; n=$((n+1)); printf '%s' "$n" > "$1.counter"; printf '{"jsonrpc":"2.0","id":%s,"result":{"loginId":"fixture-login-%s","authorizationUrl":"https://example.invalid/auth"}}\n' "$id" "$n"; ( sleep 0.2; printf '{"jsonrpc":"2.0","method":"account/login/completed","params":{"loginId":"fixture-login-%s","ok":true,"account":{"email":"fixture@example.invalid","planType":"pro"}}}\n' "$n" ) & ;;
+    *'"method":"account/login/start"'*)
+      case "$line" in
+        *'"params":{"type":"chatgpt"}'*)
+          n=0; if [ -f "$1.counter" ]; then n=$(cat "$1.counter"); fi; n=$((n+1)); printf '%s' "$n" > "$1.counter"
+          scenario=$(next_scenario "$queue.login")
+          case "$scenario" in
+            wrong-response-type) printf '{"jsonrpc":"2.0","id":%s,"result":{"type":"apiKey","loginId":"fixture-login-%s","authUrl":"https://example.invalid/auth"}}\n' "$id" "$n" ;;
+            *) printf '{"jsonrpc":"2.0","id":%s,"result":{"type":"chatgpt","loginId":"fixture-login-%s","authUrl":"https://example.invalid/auth"}}\n' "$id" "$n" ;;
+          esac
+          case "$scenario" in
+            missing-id) ( sleep 0.2; printf '{"jsonrpc":"2.0","method":"account/login/completed","params":{"success":true,"error":null,"onboardingEntrypoint":null}}\n' ) & ;;
+            failed-sensitive) ( sleep 0.2; printf '{"jsonrpc":"2.0","method":"account/login/completed","params":{"loginId":"fixture-login-%s","success":false,"error":"authorization_code=SUPERSECRET1234567890 refresh_token=abcdef0123456789abcdef0123456789","onboardingEntrypoint":null}}\n' "$n" ) & ;;
+            *) ( sleep 0.2; printf '{"jsonrpc":"2.0","method":"account/login/completed","params":{"loginId":"fixture-login-%s","success":true,"error":null,"onboardingEntrypoint":null}}\n' "$n" ) & ;;
+          esac
+          ;;
+        *) printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32602,"message":"Invalid request: missing field type"}}\n' "$id" ;;
+      esac ;;
     *'"method":"account/login/cancel"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"cancelled":true}}\n' "$id" ;;
     *'"method":"account/logout"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"local":"cleared","remote":"revoked"}}\n' "$id" ;;
     *'"method":"thread/start"'*)
@@ -3182,12 +3269,15 @@ done
         let mut server = CodexAppServer::start_in(home.path(), "codex-fixture", fixture_launch(home.path(), &log)).await.unwrap();
         let read = server.call("account/read", json!({})).await.unwrap();
         assert_eq!(read["account"]["email"], "fixture@example.invalid");
-        let start = server.call("account/login/start", json!({"mode": "browser"})).await.unwrap();
+        let start = server.call("account/login/start", json!({"type": "chatgpt"})).await.unwrap();
+        assert_eq!(start["type"], "chatgpt");
         assert_eq!(start["loginId"], "fixture-login-1");
+        assert_eq!(start["authUrl"], "https://example.invalid/auth");
         let completed = server.next_notification().await.expect("a completion notification");
         assert_eq!(completed["method"], "account/login/completed");
         assert_eq!(completed["params"]["loginId"], "fixture-login-1");
-        assert_eq!(completed["params"]["ok"], true);
+        assert_eq!(completed["params"]["success"], true);
+        assert!(completed["params"].get("account").is_none(), "the official completion notification carries no account identity");
         let error = server.call("fixture/unknown", json!({})).await.unwrap_err().to_string();
         assert!(!error.contains("SUPERSECRET"), "{error}");
         assert!(!error.contains("abcdef0123456789"), "{error}");
@@ -3214,7 +3304,8 @@ done
     async fn adapter_login_verify_logout_and_generates_text() {
         let home = tempfile::tempdir().unwrap();
         let log = home.path().join("env.log");
-        let adapter = CodexAdapter::with_launch(home.path().to_path_buf(), fixture_launch(home.path(), &log));
+        let adapter =
+            CodexAdapter::with_launch(home.path().to_path_buf(), fixture_launch(home.path(), &log));
         assert!(adapter.available());
         assert!(adapter.helper_status().available);
         let start = adapter.start_login("codex-fixture", 1).await.unwrap();
@@ -3224,7 +3315,12 @@ done
         assert_eq!(status.version.as_deref(), Some("fixture-helper-1.0"));
         assert!(status.auth_home.as_deref().unwrap_or_default().contains("codex-fixture"));
         let result = adapter.login_result("codex-fixture", 1).await.unwrap();
-        assert_eq!(result, Some(LoginResult::Completed { identity: "fixture@example.invalid".into() }));
+        assert_eq!(
+            result,
+            Some(LoginResult::Completed {
+                identity: "fixture@example.invalid".into()
+            })
+        );
         let read = adapter.status("codex-fixture", 1).await.unwrap();
         assert_eq!(read.state, ConnectionState::Connected);
         assert_eq!(read.identity.as_deref(), Some("fixture@example.invalid"));
@@ -3263,7 +3359,8 @@ done
         let home = tempfile::tempdir().unwrap();
         let log = home.path().join("tools.log");
         std::fs::write(format!("{}.generation", log.to_string_lossy()), "dynamic-tools").unwrap();
-        let adapter = CodexAdapter::with_launch(home.path().to_path_buf(), fixture_launch(home.path(), &log));
+        let adapter =
+            CodexAdapter::with_launch(home.path().to_path_buf(), fixture_launch(home.path(), &log));
         let tools = json!([{"type":"function","function":{"name":"lookup","description":"Lookup a value","parameters":{"type":"object","properties":{"key":{"type":"string"}},"required":["key"]}}}]);
         let initial_body = json!({"model":"fixture-model","messages":[{"role":"user","content":"lookup"}],"tools":tools});
         let mut initial = adapter
@@ -4682,12 +4779,132 @@ done
         assert_eq!(current, Some(LoginResult::Completed { identity: "fixture@example.invalid".into() }));
     }
 
+    #[tokio::test]
+    async fn first_completion_without_login_id_is_safely_bound_to_its_only_attempt() {
+        let home = tempfile::tempdir().unwrap();
+        let log = home.path().join("env.log");
+        let mut scenario = log.as_os_str().to_os_string();
+        scenario.push(".login");
+        std::fs::write(PathBuf::from(scenario), "missing-id\n").unwrap();
+        let adapter = CodexAdapter::with_launch(home.path().to_path_buf(), fixture_launch(home.path(), &log));
+        adapter.start_login("codex-fixture", 1).await.unwrap();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            adapter.login_result("codex-fixture", 1),
+        )
+        .await
+        .expect("the official optional loginId must be handled without a long timeout")
+        .unwrap();
+        assert_eq!(result, Some(LoginResult::Completed { identity: "fixture@example.invalid".into() }));
+    }
+
+    #[tokio::test]
+    async fn login_start_rejects_a_response_for_another_account_type() {
+        let home = tempfile::tempdir().unwrap();
+        let log = home.path().join("env.log");
+        let mut scenario = log.as_os_str().to_os_string();
+        scenario.push(".login");
+        std::fs::write(PathBuf::from(scenario), "wrong-response-type\n").unwrap();
+        let adapter = CodexAdapter::with_launch(home.path().to_path_buf(), fixture_launch(home.path(), &log));
+
+        let error = adapter.start_login("codex-fixture", 1).await.unwrap_err();
+        assert!(
+            error.to_string().contains("browser sign-in response"),
+            "{error}"
+        );
+        assert_eq!(
+            adapter.login_result("codex-fixture", 1).await.unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_late_idless_completion_cannot_complete_a_replacement_attempt() {
+        let home = tempfile::tempdir().unwrap();
+        let log = home.path().join("env.log");
+        let mut scenario = log.as_os_str().to_os_string();
+        scenario.push(".login");
+        std::fs::write(PathBuf::from(scenario), "missing-id\ndefault\n").unwrap();
+        let adapter =
+            CodexAdapter::with_launch(home.path().to_path_buf(), fixture_launch(home.path(), &log));
+        adapter.start_login("codex-fixture", 1).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        adapter.start_login("codex-fixture", 1).await.unwrap();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            adapter.login_result("codex-fixture", 1),
+        )
+        .await
+        .expect("an ambiguous old completion must be settled promptly")
+        .unwrap();
+        let Some(LoginResult::Failed(message)) = result else {
+            panic!("an idless completion from an earlier attempt must not connect the replacement: {result:?}");
+        };
+        assert!(message.contains("safely correlated"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn official_login_failure_error_is_redacted() {
+        let home = tempfile::tempdir().unwrap();
+        let log = home.path().join("env.log");
+        let mut scenario = log.as_os_str().to_os_string();
+        scenario.push(".login");
+        std::fs::write(PathBuf::from(scenario), "failed-sensitive\n").unwrap();
+        let adapter =
+            CodexAdapter::with_launch(home.path().to_path_buf(), fixture_launch(home.path(), &log));
+        adapter.start_login("codex-fixture", 1).await.unwrap();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            adapter.login_result("codex-fixture", 1),
+        )
+        .await
+        .expect("the failed login notification must settle")
+        .unwrap();
+        let Some(LoginResult::Failed(message)) = result else {
+            panic!("a failed helper notification cannot establish a connection: {result:?}");
+        };
+        assert!(message.contains("[redacted]"), "{message}");
+        assert!(!message.contains("SUPERSECRET"), "{message}");
+        assert!(!message.contains("abcdef0123456789"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn successful_notification_requires_a_chatgpt_account_read() {
+        let home = tempfile::tempdir().unwrap();
+        let log = home.path().join("env.log");
+        let mut scenario = log.as_os_str().to_os_string();
+        scenario.push(".account");
+        std::fs::write(PathBuf::from(scenario), "api-key-email\n").unwrap();
+        let adapter =
+            CodexAdapter::with_launch(home.path().to_path_buf(), fixture_launch(home.path(), &log));
+        adapter.start_login("codex-fixture", 1).await.unwrap();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            adapter.login_result("codex-fixture", 1),
+        )
+        .await
+        .expect("the official successful notification must trigger account/read")
+        .unwrap();
+        assert_eq!(
+            result,
+            Some(LoginResult::Failed(
+                "The Codex helper did not confirm a signed-in account".into()
+            ))
+        );
+    }
+
     #[test]
     fn completion_notifications_are_routed_by_login_id() {
-        let completed = json!({"jsonrpc": "2.0", "method": "account/login/completed", "params": {"loginId": "a", "ok": true}});
+        let completed = json!({"jsonrpc": "2.0", "method": "account/login/completed", "params": {"loginId": "a", "success": true}});
         let (login_id, params) = login_completion(&completed).unwrap();
-        assert_eq!(login_id, "a");
-        assert_eq!(params["ok"], true);
+        assert_eq!(login_id.as_deref(), Some("a"));
+        assert_eq!(params["success"], true);
+        let without_id = json!({"jsonrpc": "2.0", "method": "account/login/completed", "params": {"success": true}});
+        assert_eq!(login_completion(&without_id).unwrap().0, None);
         assert!(login_completion(&json!({"jsonrpc": "2.0", "method": "account/rateLimits/read"})).is_none());
         let deferred = Mutex::new(HashMap::new());
         defer(&deferred, "codex", "b", json!({"loginId": "b"}));

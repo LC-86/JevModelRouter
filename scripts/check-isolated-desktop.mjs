@@ -257,7 +257,7 @@ try {
   assert.match(String(firstObs.completed?.status), /generation=\d+/, `The row must show the generation: ${firstObs.completed?.status}`);
   assert.match(String(firstObs.completed?.status), /helper=(?!Unknown)\S+/, `The row must show the helper version: ${firstObs.completed?.status}`);
   assert.ok(String(firstObs.completed?.home).startsWith(root + '/'), `The helper home must be an isolation path: ${firstObs.completed?.home}`);
-  assert.ok(logs.first.some(entry => entry.event === 'notification' && entry.scenario === 'success' && entry.ok === true), 'The stand-in must complete a successful login');
+  assert.ok(logs.first.some(entry => entry.event === 'notification' && entry.scenario === 'success' && entry.success === true), 'The stand-in must complete a successful login');
   // 第 2 条（换号部分）：换号递增世代、旧身份立刻消失、新登录绑定新世代。
   assert.ok(firstObs.switch && firstObs.switch.to.generation > firstObs.switch.from.generation, `Switching accounts must advance the generation: ${JSON.stringify(firstObs.switch)}`);
   assert.ok(!firstObs.switch.to.identity, `Switching accounts must drop the previous identity: ${JSON.stringify(firstObs.switch)}`);
@@ -267,7 +267,7 @@ try {
   const failedObs = observation(failedRun.report, 'failed');
   assert.equal(failedObs?.stage, 'failed', `A failed login must stay failed in the snapshot: ${JSON.stringify(failedObs)}`);
   assert.ok(failedObs?.error, `A failed login must carry an error: ${JSON.stringify(failedObs)}`);
-  const rawFailure = logs.failed.find(entry => entry.event === 'notification' && entry.ok === false);
+  const rawFailure = logs.failed.find(entry => entry.event === 'notification' && entry.success === false);
   assert.ok(rawFailure, 'The stand-in must emit a failure notification');
   assert.ok(fictionalTokens.every(token => String(rawFailure.error).includes(token)), `The stand-in must inject fictional secrets: ${rawFailure?.error}`);
   const failedEvidence = [failedObs.error, failedObs.status, failedObs.row, failedObs.snapshot].join('\n');
@@ -290,7 +290,7 @@ try {
   assert.ok(!lateObs.lateCompletion?.identity, `A late completion must not revive an identity: ${JSON.stringify(lateObs.lateCompletion)}`);
   assert.ok(lateObs.lateCompletion.generation >= lateObs.lateCompletion.pendingGeneration, `A late completion must not roll the generation back: ${JSON.stringify(lateObs.lateCompletion)}`);
   assert.ok(logs.late.some(entry => entry.event === 'request' && entry.method === 'account/login/cancel'), 'The late run must cancel the pending login');
-  assert.ok(logs.late.some(entry => entry.event === 'notification' && entry.scenario === 'late' && entry.ok === true), 'The stand-in must emit the late completion');
+  assert.ok(logs.late.some(entry => entry.event === 'notification' && entry.scenario === 'late' && entry.success === true), 'The stand-in must emit the late completion');
   // 重启归位：late 运行带着挂起登录退出，failed 运行启动时必须已回到未连接。
   assert.equal(lateObs.exitPending?.login?.stage, 'pending', `The late run must exit with a pending sign-in: ${JSON.stringify(lateObs.exitPending)}`);
   const reconciled = observation(failedRun.report, 'reconciled');
