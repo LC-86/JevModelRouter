@@ -36,7 +36,7 @@ describe('subscription authorization views', () => {
     expect(authErrorLabel({ code: 'already_connected', message: '', recovery: '' }, t)).toBe('该订阅已连接，请先退出登录再重新登录。');
     // 非 Grok 订阅（如 Codex）在本构建未实现：已知 code 走本地化映射，而不是后端英文原文。
     expect(authErrorLabel({ code: 'helper_unsupported', message: 'helper_unsupported: Codex subscription authorization is not implemented in this build; only the Grok CLI helper is managed', recovery: '' }, t)).toBe('本构建只管理 Grok 辅助进程；该订阅服务商的登录、退出与换号尚未实现。');
-    expect(authErrorLabel({ code: 'grok_auth_unverified', message: '', recovery: '' }, t)).toBe('官方 CLI 未提供可核验的机器可读身份接口，Grok 登录已禁用。');
+    expect(authErrorLabel({ code: 'grok_auth_unverified', message: '', recovery: '' }, t)).toBe('AutoJev 尚未核实当前安装 CLI 版本的身份契约，Grok 登录已禁用。');
     // 未知 code 原样显示后端原文，不编造文案。
     expect(authErrorLabel({ code: 'future_failure', message: 'Upstream said no.', recovery: '' }, t)).toBe('Upstream said no.');
     expect(authErrorLabel({ code: 'future_failure', message: '', recovery: '' }, t)).toBe('future_failure');
@@ -125,7 +125,7 @@ describe('subscription authorization dialog', () => {
     }));
     const signIn = html.match(/<button[^>]*subscription-auth-begin[^>]*>/)?.[0] ?? '';
     expect(signIn).toContain('disabled=""');
-    expect(html).toContain(t('Grok sign-in is disabled until AutoJev has a verified machine-readable account identity interface.'));
+    expect(html).toContain(t('Grok sign-in is disabled until AutoJev verifies the identity contract for this installed CLI version.'));
     expect(html).toContain(t('Account identity'));
     expect(html).toContain('未知');
   });

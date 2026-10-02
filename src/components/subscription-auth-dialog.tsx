@@ -104,7 +104,7 @@ export function SubscriptionAuthDialog({ provider, snapshot, onSnapshot, onNotif
           <div><dt>{t('Authorization storage')}</dt><dd><code>{helper?.home ?? t('Unknown')}</code></dd></div>
         </dl>
         <p className="subscription-auth-note">{grokLoginUnsupported
-          ? t('Grok sign-in is disabled until AutoJev has a verified machine-readable account identity interface.')
+          ? t('Grok sign-in is disabled until AutoJev verifies the identity contract for this installed CLI version.')
           : t('The helper is only started for sign-in; availability is probed without network access.')}</p>
       </section>
 

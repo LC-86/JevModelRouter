@@ -8,7 +8,7 @@
 
 - 当前 CLI 1.0.44 的 `login --help` 没有 AutoJev 所需的机器可读 challenge/verified-identity 事件协议。
 - `account` 不是该版本帮助列出的命令。`models --help` 没列出 `--json`。`usage` 要求本地 session ID，并报告 session token/cost，不能作为订阅用量或 Extra Usage 权限。
-- 官方 [CLI reference](https://docs.x.ai/build/cli/reference) 说明 `models` 用于列出可用模型，但没有为本适配器定义账号身份、订阅资格、credits 或机器可读输出 schema。
+- 官方源码 revision [`a549186d9d39311f2d3ee4208db62af8c65aa476`](https://github.com/xai-org/grok-build/tree/a549186d9d39311f2d3ee4208db62af8c65aa476) 定义了候选 ACP 身份与订阅方法，但与本机 CLI 1.0.44 的版本对应关系尚未核实。`x.ai/auth/info` 的 `current_or_expired` 不证明登录有效；`x.ai/auth/check_subscription` 会刷新 JWT，不属于本只读验收可调用的接口。官方 CLI reference 也未给出本机版本对这些方法的兼容承诺。
 - [Headless/ACP 文档](https://docs.x.ai/build/cli/headless-scripting) 中的 `session/prompt` 是生成路径；不能用于身份、目录或额度只读探测。
 
 ## 安全验证入口
@@ -17,4 +17,4 @@
 
 ## 解除阻塞所需证据
 
-需要可引用的版本化接口文档或 xAI 支持确认，覆盖：机器可读登录/身份、模型目录及资格、订阅池/Extra Usage 读数，以及整次调用不得产生超额消费的执行约束。现有帮助和公开文档没有提供这些契约。补齐证据前，身份、目录、订阅额度与 extra-use 限制均为 **Unknown**，不执行真人登录/生成验收。
+官方源码已有候选身份、模型目录和 billing 方法，不应表述为“官方没有接口”。仍需核实这些方法是否存在于本机 CLI 1.0.44、其字段与身份/资格语义、版本稳定性，以及是否有能保证整次调用不产生额外消费的机制。billing 数值或自动充值设置本身不证明消费被禁止；本只读验收不得调用会刷新 JWT 的 `x.ai/auth/check_subscription`。这些核实完成前，身份有效性、目录资格、订阅额度与 extra-use 限制仍为 **Unknown**，不执行真人登录/生成验收。

@@ -13,7 +13,9 @@
 
 本机 `@xai-official/grok` 1.0.44 的只读帮助显示：`account` 不可用；`models --help` 没有 `--json`；`usage` 接受本地 session ID，统计 session token/cost，不是订阅额度或 credits API。没有启动登录、读取账号/session、运行模型目录/额度请求或 ACP。
 
-官方 [CLI reference](https://docs.x.ai/build/cli/reference) 将 `models` 描述为可用模型列表命令，没有定义本适配器所需的机器可读身份、订阅资格或额度 schema。官方 [Usage & limits FAQ](https://docs.x.ai/grok/faq#usage--limits) 指向产品设置里的用量页面，并描述额外购买/自动充值选项；这些资料不提供 AutoJev 可依赖的“整次调用不得产生额外消费”执行保证。[CLI headless/ACP](https://docs.x.ai/build/cli/headless-scripting) 的 `session/prompt` 会生成内容，有潜在额度消耗，不能用于只读探测。
+官方 CLI 文档只把 `models` 描述为可用模型列表；它没有确认本机 1.0.44 对下列候选接口的支持。官方 [xai-org/grok-build 源码](https://github.com/xai-org/grok-build/tree/a549186d9d39311f2d3ee4208db62af8c65aa476) 包含 `x.ai/auth/info`、`x.ai/auth/check_subscription`、`x.ai/models/list`、`x.ai/billing` 与 `x.ai/auto-topup-rule`。这证明该源码版本定义了候选 ACP 方法，不证明本地 CLI 1.0.44（本机源码标识 `5b807183dd79`）实现了同一契约；该官方源码版本对应的最新 changelog 为 1.0.46。
+
+这些候选方法的语义也不足以放开生产准入：`auth/info` 的 `current_or_expired` 状态不证明登录当前有效；`auth/check_subscription` 会刷新 JWT，是有状态网络操作，本只读验收不得调用；`models/list` 不证明模型具备订阅内资格。`billing` 与 `auto-topup-rule` 可读用量、周期、预付余额、按需 cap/已用量与远端自动充值设置，但 `on_demand_enabled` 是远端设置状态，不是阻止消费的执行保证；检查到的 GET 方法也没有提供“整次调用不扣额外 credits”的保证。官方 [Usage & limits FAQ](https://docs.x.ai/grok/faq#usage--limits) 说明订阅周额度用尽后会使用 Extra Usage credits；关闭自动充值不等于已有余额不会被消费。因此，本地版本是否支持这些方法、身份有效性、模型资格和禁止额外消费的保证仍为 **Unknown**。本机 `grok account` 不可用、`models --help` 无 `--json`、`usage` 读取本地 session token/cost 的事实不变。CLI headless/ACP 的 `session/prompt` 会生成内容，不能用于只读探测。
 
 ## 验收
 

@@ -441,7 +441,7 @@ const AUTH_ERROR_LABELS: Record<string, string> = {
   already_connected: 'This subscription is already connected. Sign out before signing in again.',
   helper_isolated: 'Sign-in is disabled in the isolated verification environment.',
   helper_missing: 'The Grok helper was not found on this machine.',
-  grok_auth_unverified: 'Grok sign-in is disabled because the official CLI does not expose a verified machine-readable identity interface.',
+  grok_auth_unverified: 'Grok sign-in is disabled because AutoJev has not verified the identity contract for this installed CLI version.',
   helper_unsupported: 'Only the Grok helper is managed in this build; sign-in, sign-out and account switching are not implemented for this provider.',
   logout_superseded: 'The connection changed while signing out; nothing was cleared. Refresh to review the current state, then retry.',
 };
