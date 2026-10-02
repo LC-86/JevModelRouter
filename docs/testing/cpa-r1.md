@@ -50,6 +50,8 @@ node scripts/check-cpa-desktop.mjs /absolute/owned-target/debug/autojev /absolut
 
 原生脚本首次运行通过既有来源对话框配置四个虚构来源模型，重启后核对稳定 UUID；随后验证 Jev 普通模型 HTTP、并发重载、失败零串用、配置拒绝、暂停、取消、超时及进程回收。每次运行清除上一份终态报告并核对独立 run ID。只有两个进程运行都生成各自 `ok: true` 报告，且接收端记录与自有进程检查通过，才算该层完成。锁屏、超时或缺少报告均判失败/受阻。
 
+每个网关 prompt 同时携带该 run ID；接收和取消回执仅取本轮。`src/lib/cpa-desktop-evidence.test.mjs` 离线执行实际验收 JS，以 IPC/HTTP 系统边界夹具验证：已有旧回执时，本轮未接收、未取消或未超时回收均不能成功；旧轮迟到记录不影响本轮并发计数。执行 `TAURI_DEV_HOST=127.0.0.1 pnpm exec vitest run src/lib/cpa-desktop-evidence.test.mjs`。这是验收证据归属回归，不构成 CPA 或原生网关行为通过。
+
 ## 实际工作流
 
 已读取原仓库 `AGENTS.md` 和 `docs/agents/issue-tracker.md`；隔离分支从 `949b51c7dd8ca560474d59f53dbad0096e20e599` 开始。实际 Matt Pocock 技能位于 `/Users/cuilei/.agents/skills`：`ask-matt/SKILL.md` 路由到 `implement/SKILL.md`，`tdd/SKILL.md` 用于预先约定的原生 IPC/配置和 HTTP 接缝，`code-review/SKILL.md` 用于 Standards/Spec 两轴独立审查，`pr/SKILL.md` 用于 Draft PR。`thread-rename/SKILL.md` 已执行并读回标题。

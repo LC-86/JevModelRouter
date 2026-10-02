@@ -24,7 +24,8 @@
     check(error && error.includes(expected), `${command} must reject ${expected}: ${error || 'accepted'}`);
   };
   try {
-    const { base, binary, reload } = window.__CPA_CHECK__;
+    const { base, binary, reload, run_id } = window.__CPA_CHECK__;
+    const promptFor = name => `${name}@${run_id}`;
     const accounts = ['a1', 'a2', 'b1', 'paid'];
     const targets = accounts.map(account => ({ prefix: `jev-${account}`, source: account.startsWith('a') ? 'source-a' : account === 'b1' ? 'source-b' : 'source-paid', account, plan: `fixture-plan-${account}`, model: 'same-model', aliases: ['same-model'], keys: [`fictional-${account}`], disabled: false }));
     let snapshot = await invoke('get_snapshot');
@@ -83,8 +84,12 @@
       const response = await fetch(`${base}${path}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload || {}), signal });
       check(response.ok, `Fixture control error ${response.status}`); return response.json();
     };
-    const receipts = () => control('/__receipts');
-    const call = (account, prompt = 'fictional', stream = false, signal) => control('/__gateway', { port: snapshot.proxy.port, model: `autojev/model/${report.saved.find(m => m.account === account).model_id}`, prompt, stream }, signal);
+    const receipts = async () => {
+      const history = await control('/__receipts');
+      const current = prompt => typeof prompt === 'string' && prompt.endsWith(`@${run_id}`);
+      return { requests: history.requests.filter(r => current(r.prompt)), cancelled: history.cancelled.filter(current) };
+    };
+    const call = (account, prompt = 'fictional', stream = false, signal) => control('/__gateway', { port: snapshot.proxy.port, model: `autojev/model/${report.saved.find(m => m.account === account).model_id}`, prompt: promptFor(prompt), stream }, signal);
     const restart = async () => {
       await invoke('stop_cpa_validation'); await start();
       // Each fault case starts fresh; its second request still observes the same cooldown.
@@ -104,7 +109,7 @@
     const responses = await Promise.all(Array.from({ length: 18 }, (_, i) => call(accounts[i % 3], `parallel-${i}`)));
     check(responses.every(r => r.status === 200), 'Concurrent requests failed');
     const parallel = (await receipts()).requests.slice(parallelOffset);
-    check(parallel.length === 18 && parallel.every(r => r.account === accounts[Number(r.prompt.split('-')[1]) % 3]), 'Concurrency changed identity');
+    check(parallel.length === 18 && parallel.every(r => r.account === accounts[Number(r.prompt.split('@')[0].split('-')[1]) % 3]), 'Concurrency changed identity');
     report.checks.push('18 concurrent gateway requests retain their source/account/model binding');
 
     // Configuration rejection must leave both the running namespace and receivers unchanged.
@@ -141,7 +146,7 @@
     await invoke('reload_cpa_validation', { profile: { ...profile, targets: profile.targets.map(t => ({ ...t, disabled: t.account === 'paid' })) } });
     check((await reloadWork).every(r => r.status === 200), 'Reload interrupted fixed calls');
     const duringReload = (await receipts()).requests.slice(reloadOffset);
-    check(duringReload.length === 12 && duringReload.every(r => r.account === accounts[Number(r.prompt.split('-')[1]) % 3]), 'Reload mixed bindings');
+    check(duringReload.length === 12 && duringReload.every(r => r.account === accounts[Number(r.prompt.split('@')[0].split('-')[1]) % 3]), 'Reload mixed bindings');
     report.checks.push('disabled/missing account dispatches zero; concurrent hot reload keeps A1/A2/B1 identity');
 
     for (const status of [401, 429, 500, 502, 503, 'drop']) {
@@ -162,13 +167,13 @@
     offset = (await receipts()).requests.length;
     const timeout = await call('a1', 'hang-timeout');
     check(timeout.status === 504, `Timeout must return 504: ${JSON.stringify(timeout)}`); await only(offset, 'a1', 1);
-    await wait(async () => (await receipts()).cancelled.includes('hang-timeout'), 'timed out CPA request reclaimed');
+    await wait(async () => (await receipts()).cancelled.includes(promptFor('hang-timeout')), 'timed out CPA request reclaimed');
     await restart();
     const abort = new AbortController();
     const cancelled = call('a1', 'hang-cancel', true, abort.signal).catch(() => null);
-    await wait(async () => (await receipts()).requests.some(r => r.prompt === 'hang-cancel'), 'stream reached receiver');
+    await wait(async () => (await receipts()).requests.some(r => r.prompt === promptFor('hang-cancel')), 'stream reached receiver');
     abort.abort(); await cancelled;
-    await wait(async () => (await receipts()).cancelled.includes('hang-cancel'), 'cancelled stream reclaimed');
+    await wait(async () => (await receipts()).cancelled.includes(promptFor('hang-cancel')), 'cancelled stream reclaimed');
     report.checks.push('gateway header timeout and client stream cancellation reclaim the owned upstream request');
 
     await invoke('pause_proxy');
