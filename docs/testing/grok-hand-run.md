@@ -24,7 +24,7 @@ pnpm test:grok-readonly-gate
 
 该命令只运行离线 Rust 单测和前端纯函数测试，不调用 `grok`，不启动 ACP，不开浏览器，不读 CLI 设置、session 或凭据，不发送模型请求，也不消费额度。它验证 fail-closed 回归，不证明上游服务、账户权益或费用行为。
 
-`pnpm test:grok-billing-parser` 覆盖候选 ACP billing DTO 的纯 Rust 解析。`pnpm test:grok-readonly-gate` 再构建前端和隔离桌面，并检查 Providers 页显示生产 source/version gate、相关字段为 `Unknown`、生成保持关闭，且不启动 helper、ACP 或模型请求。Fake ACP 消息仅覆盖 JSON-RPC allowlist/framing；它们不能打开生产门。版本证据、候选源与阻断原因见 [Grok ACP 只读路径](grok-acp-readonly.md)。这些本地测试不解锁真实登录或 HAND_RUN 项。
+`pnpm test:grok-billing-parser` 覆盖候选 billing DTO 的纯 Rust 解析。`pnpm test:grok-readonly-gate` 再构建前端和隔离桌面，并检查 Providers 页显示生产 source/version gate、相关字段为 `Unknown`、生成保持关闭，且不启动 helper、ACP 或模型请求。此 change 不实现或模拟未经核实的 ACP wire 方法。版本证据、候选源与阻断原因见 [Grok ACP 只读路径](grok-acp-readonly.md)。这些本地测试不解锁真实登录或 HAND_RUN 项。
 
 结果请填入 [结果模板](grok-hand-run-result-template.md)，将真实登录、读取与生成项记为“阻塞”或“未测”，不要填成通过或用量为 0。
 

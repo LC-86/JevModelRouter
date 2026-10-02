@@ -16,11 +16,11 @@
 | 许可范围 | 当前没有可用的生产许可 | 不派发 Grok 生成 |
 | 真实 OAuth、配置/session、账号凭据 | 未访问 | 未测；本次 Agent 执行禁止 |
 | 真实模型请求 / credits | 未执行 | 未测；模型数和用量费用为 Unknown，不能填 0 |
-| `pnpm test:grok-contract` | Rust 75 passed；Vitest 3 files / 50 passed | 通过；离线 fail-closed 与只读状态契约 |
-| `pnpm test:grok-billing-parser` | 7 passed；495 filtered | 通过；仅解析内存合成 JSON，不连接 ACP 或写入订阅准入状态 |
+| `pnpm test:grok-contract` | Rust 72 passed；Vitest 3 files / 50 passed | 通过；离线 fail-closed 与只读状态契约 |
+| `pnpm test:grok-billing-parser` | 7 passed；492 filtered | 通过；仅解析内存合成 JSON，不连接 ACP 或写入订阅准入状态 |
 | `TAURI_DEV_HOST=127.0.0.1 pnpm test` | 14 files / 91 passed | 通过；离线前端测试 |
 | `pnpm build` / `pnpm release:check` | Vite build 通过；`Release configuration OK: v0.1.2` | 通过；build 保留既有 Tauri API 动静态 chunk 与大 chunk 提示 |
-| 完整 `cargo test --locked --offline --manifest-path src-tauri/Cargo.toml --lib` | 默认沙箱尝试：466 passed / 36 failed，失败均为本地 mock server 绑定 loopback 时 EPERM；允许 loopback 后重跑：502 passed / 0 failed | 通过；重跑仅启用测试所需本地 loopback mock server，没有外部模型或账号请求 |
+| 完整 `cargo test --locked --offline --manifest-path src-tauri/Cargo.toml --lib` | 默认沙箱尝试：463 passed / 36 failed，失败均为本地 mock server 绑定 loopback 时 EPERM；允许 loopback 后重跑：499 passed / 0 failed | 通过；重跑仅启用测试所需本地 loopback mock server，没有外部模型或账号请求 |
 | `pnpm test:grok-readonly-gate` | parser、前端 build、`isolation-check` 桌面 build、原生 Providers 页断言均通过；helper/ACP 与模型请求计数为 0 | 通过；首次默认沙箱运行在本地 loopback `listen` 被 EPERM 阻止，允许该本地测试监听后重跑通过 |
 | 原生 Providers 页断言 | source/version gate 关闭；身份、目录、账单、自动充值和 Extra Usage 为 Unknown；生成关闭；订阅快照不变；无 Grok helper 与模型请求；对比度 13.284:1 / 5.442:1 | 通过；隔离桌面自动断言，不是真实账号/额度或真实 Grok 连接证据 |
 | 原生窗口截图 | 捕获尝试得到全黑窗口；该隔离桌面运行未生成 `isolation-report.json`，故截图已丢弃 | 未通过；无截图保留。无截图捕获的 `pnpm test:grok-readonly-gate` 独立运行通过 |

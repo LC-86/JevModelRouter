@@ -221,8 +221,8 @@ async fn refresh_subscription(state: State<'_, AppState>, provider_id: String) -
 /// Static status for the Grok ACP source/version gate. This command is intentionally read-only
 /// and never launches the CLI, initializes ACP, reads auth state, or refreshes an account.
 #[tauri::command]
-async fn grok_readonly_status() -> subscription::grok::readonly::UiStatus {
-    subscription::grok::readonly::ui_status()
+async fn grok_readonly_status() -> subscription::grok::source_gate::UiStatus {
+    subscription::grok::source_gate::ui_status()
 }
 
 /// Explicit current-connection opt-in; generation remains subject to every existing subscription gate.

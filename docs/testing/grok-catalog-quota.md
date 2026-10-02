@@ -21,7 +21,7 @@
 
 运行 `pnpm test:grok-contract` 只验证本地 fake-helper 合同拒绝、Unknown 展示和前端状态文本。它不运行 Grok CLI，不证明真实身份、目录、额度、Extra Usage 权限或费用上限。安全人工验收入口和当前阻塞项见 [grok-hand-run.md](grok-hand-run.md)；结果记录模板见 [grok-hand-run-result-template.md](grok-hand-run-result-template.md)。
 
-当前生产面板显示 source/version gate；[ACP 只读路径与来源阻断](grok-acp-readonly.md)记录候选方法、版本映射缺口与 fake ACP 验证。Rust 账单 DTO 解析器仅在单元测试中运行，不连接 ACP、读取账号、写入 `QuotaEvidence` 或影响准入。TokenTracker 的独立研究与 MIT 固定来源也记录在该文档中。
+当前生产面板显示 source/version gate；[ACP 只读路径与来源阻断](grok-acp-readonly.md)记录候选方法和版本映射缺口。本次没有实现或模拟 ACP wire 方法。Rust 账单 DTO 解析器仅在单元测试中运行，不连接 ACP、读取账号、写入 `QuotaEvidence` 或影响准入。TokenTracker 的独立研究与 MIT 固定来源也记录在该文档中。
 
 ## 解除阻塞条件
 

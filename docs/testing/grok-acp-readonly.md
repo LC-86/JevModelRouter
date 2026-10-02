@@ -4,8 +4,8 @@
 
 ## What this change implements
 
-- `src-tauri/src/subscription/grok/readonly.rs` contains an ACP JSON-RPC line transport with a compile-time method allowlist for candidate `auth/info`, `models/list`, `billing`, and `auto-topup-rule` reads. It has no process launcher, credential loader, login method, session creation, prompt method, or write method. Fake ACP tests cover request correlation, protocol-version mismatch, and error redaction.
-- Production does not construct that transport. The Tauri `grok_readonly_status` command returns only the closed source gate and Unknown fields; it does not inspect the CLI version, start a process, read auth state, refresh an account, or contact xAI.
+- `src-tauri/src/subscription/grok/source_gate.rs` returns a static closed source/version status. This change implements no ACP transport because the installed helper source and wire names are not verified.
+- The Tauri `grok_readonly_status` command returns only the closed source gate and Unknown fields; it does not inspect the CLI version, start a process, read auth state, refresh an account, or contact xAI.
 - The Providers page replaces the old synthetic billing panel with the production gate status. This is a status view, not a live read or fabricated billing result.
 - The billing DTO parser remains Rust-test-only. It does not populate `QuotaEvidence`, account identity, catalog eligibility, admission, or generation.
 - Real Grok generation remains disabled. No UI control can override the source gate.
@@ -16,7 +16,7 @@ The public npm metadata for the locally observed `@xai-official/grok` 1.0.44 ide
 
 That 1.0.45 source snapshot contains candidate handlers for [`x.ai/billing`](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-shell/src/extensions/billing.rs) and `x.ai/auto-topup-rule`. These handlers require Grok authentication and are not proof that 1.0.44 exposes equivalent ACP methods. The local CLI help observations remain unchanged: no `account` command, no documented `models --json`, and `usage` is session-specific token/cost output.
 
-The [official CLI ACP example](https://docs.x.ai/build/cli/headless-scripting) documents `grok agent stdio` and JSON-RPC framing, then continues through `authenticate`, `session/new`, and `session/prompt`; `session/prompt` generates content and is not used here. The [ACP extension rules](https://agentclientprotocol.com/protocol/v1/extensibility) require custom wire method names to start with `_`. xAI's candidate handlers use `x.ai/...` names internally, but the exact 1.0.44 mapping from those handlers to a public ACP wire request is not documented. The code therefore keeps the candidate transport unconnected to production.
+The [official CLI ACP example](https://docs.x.ai/build/cli/headless-scripting) documents `grok agent stdio` and JSON-RPC framing, then continues through `authenticate`, `session/new`, and `session/prompt`; `session/prompt` generates content and is not used here. The [ACP extension rules](https://agentclientprotocol.com/protocol/v1/extensibility) require custom wire method names to start with `_`. xAI's candidate handlers use `x.ai/...` names internally, but the exact 1.0.44 mapping from those handlers to a public ACP wire request is not documented. No ACP wire method is implemented or tested in this change.
 
 Billing and auto-top-up reads also cannot prove that a complete future generation call is protected from Extra Usage. A usage snapshot, disabled auto top-up, or a successful read is not a consumption guarantee. Missing evidence stays Unknown and generation remains denied.
 
@@ -30,7 +30,7 @@ pnpm test:grok-billing-parser
 pnpm test:grok-readonly-gate
 ```
 
-These checks use in-memory fake ACP messages and the isolated AutoJev app. The UI acceptance asserts the source gate is closed, every account/billing field remains Unknown, generation is off, subscription evidence is unchanged, and no Grok helper or model request was started. None of these checks authenticates a real account or proves the installed CLI contract.
+These checks assert the static source gate and use the isolated AutoJev app. The UI acceptance asserts the gate is closed, every account/billing field remains Unknown, generation is off, subscription evidence is unchanged, and no Grok helper or model request was started. None of these checks authenticates a real account or proves the installed CLI contract.
 
 ## Remaining evidence needed
 
