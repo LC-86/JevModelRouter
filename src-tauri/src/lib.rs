@@ -23,6 +23,8 @@ mod subscription_catalog;
 mod codex_helper;
 mod runtime;
 #[cfg(feature = "isolation-check")]
+mod cpa_validation;
+#[cfg(feature = "isolation-check")]
 mod isolation_check;
 #[cfg(test)]
 mod dispatch_tests;
@@ -42,6 +44,8 @@ use tokio::sync::Mutex;
 
 #[derive(Clone)]
 struct AppState {
+    #[cfg(feature = "isolation-check")]
+    cpa_validation: Arc<Mutex<Option<cpa_validation::Service>>>,
     performance: Arc<performance::Runner>,
     store: Arc<ConfigStore>,
     proxy: Arc<Mutex<Option<ProxyHandle>>>,
@@ -846,12 +850,20 @@ async fn save_policy(
 }
 
 async fn safe_stop(state:&AppState)->Result<(),String> {
+    #[cfg(feature = "isolation-check")]
+    let cpa_stop = match state.cpa_validation.lock().await.take() {
+        Some(service) => service.stop().await.map_err(|e|format!("{e:#}")),
+        None => Ok(()),
+    };
     let mut handle=state.proxy.lock().await;
     agents::restore_gateway(state.store.read().port).map_err(|e|e.to_string())?;
     // 只回收本应用登记的自有辅助进程；不改配置，也不动别家进程。
     let reclaimed=state.store.auth.shutdown();
     if !reclaimed.is_empty(){eprintln!("AutoJev reclaimed subscription helper processes: {reclaimed:?}");}
-    if let Some(proxy)=handle.take(){proxy.stop().await;}Ok(())
+    if let Some(proxy)=handle.take(){proxy.stop().await;}
+    #[cfg(feature = "isolation-check")]
+    cpa_stop?;
+    Ok(())
 }
 #[tauri::command]
 async fn save_gateway_settings(state:State<'_,AppState>,gateway:resilience::Settings)->Result<DashboardSnapshot,String> {
@@ -1420,6 +1432,8 @@ pub fn run() {
             let port = if runtime::isolated() { 0 } else { port };
             if store.read().port != port { store.update(|config| config.port = port)?; }
             let state = AppState {
+                #[cfg(feature = "isolation-check")]
+                cpa_validation: Arc::new(Mutex::new(None)),
                 performance: Arc::new(performance::Runner::default()),
                 store: store.clone(),
                 proxy: Arc::new(Mutex::new(None)),
@@ -1461,6 +1475,11 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(|invoke: tauri::ipc::Invoke<tauri::Wry>| {
+            #[cfg(feature = "isolation-check")]
+            if matches!(invoke.message.command(), "start_cpa_validation" | "reload_cpa_validation" | "stop_cpa_validation") {
+                let handler: fn(tauri::ipc::Invoke<tauri::Wry>) -> bool = tauri::generate_handler![cpa_validation::start_cpa_validation, cpa_validation::reload_cpa_validation, cpa_validation::stop_cpa_validation];
+                return handler(invoke);
+            }
             #[cfg(feature = "isolation-check")]
             if matches!(invoke.message.command(), "isolation_check_report") {
                 let handler: fn(tauri::ipc::Invoke<tauri::Wry>) -> bool = tauri::generate_handler![

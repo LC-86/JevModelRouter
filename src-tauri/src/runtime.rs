@@ -9,6 +9,17 @@ use std::{
 static ISOLATION_ROOT: OnceLock<PathBuf> = OnceLock::new();
 static UPSTREAM: OnceLock<reqwest::Url> = OnceLock::new();
 static GATEWAY_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+#[cfg(feature = "isolation-check")]
+static CPA_VALIDATION_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+
+#[cfg(feature = "isolation-check")]
+pub fn cpa_validation_port(port: u16) { CPA_VALIDATION_PORT.store(port, std::sync::atomic::Ordering::SeqCst); }
+
+#[cfg(feature = "isolation-check")]
+pub fn check_cpa_upstream(url: &reqwest::Url) -> Result<()> {
+    ensure!(UPSTREAM.get().is_some_and(|upstream| url.origin() == upstream.origin()), "CPA upstream must be the explicitly configured loopback fixture");
+    Ok(())
+}
 /// `--autojev-helper <path>` 只在 isolation-check 构建里存在；生产二进制没有这个开关。
 #[cfg(feature = "isolation-check")]
 static HELPER_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
@@ -175,6 +186,8 @@ pub fn gateway_port(port: u16) {
 pub fn check_url(url: &reqwest::Url) -> Result<()> {
     if let Some(upstream) = UPSTREAM.get() {
         let gateway = GATEWAY_PORT.load(std::sync::atomic::Ordering::SeqCst);
+        #[cfg(feature = "isolation-check")]
+        if url.scheme() == "http" && url.host_str() == Some("127.0.0.1") && url.port().is_some_and(|port| port != 0 && port == CPA_VALIDATION_PORT.load(std::sync::atomic::Ordering::SeqCst)) { return Ok(()); }
         ensure!(
             url.origin() == upstream.origin()
                 || (gateway != 0

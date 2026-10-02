@@ -4449,6 +4449,8 @@ done
 
         let app = tauri::test::mock_app();
         app.manage(crate::AppState {
+            #[cfg(feature = "isolation-check")]
+            cpa_validation: Arc::new(tokio::sync::Mutex::new(None)),
             performance: Arc::new(crate::performance::Runner::default()),
             store: store.clone(),
             proxy: Arc::new(tokio::sync::Mutex::new(Some(gateway))),
@@ -5807,6 +5809,8 @@ async fn review_pr40_gateway_loopback_http_three_protocols_tools() {
 
 fn review_pr44_app_state(store: Arc<crate::config::ConfigStore>) -> crate::AppState {
     crate::AppState {
+        #[cfg(feature = "isolation-check")]
+        cpa_validation: Arc::new(tokio::sync::Mutex::new(None)),
         performance: Arc::new(crate::performance::Runner::default()),
         store,
         proxy: Arc::new(tokio::sync::Mutex::new(None)),

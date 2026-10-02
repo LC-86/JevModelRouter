@@ -24,6 +24,7 @@ R1 是选型验证门，不是已完成的服务接入。唯一 prefix 的静态
 
 ## 理由、历史与待验
 
+- [R1 实际 CPA 验证与复现](../testing/cpa-r1.md)：制品追溯、普通 HTTP 实证和原生验收状态。
 - [复用接口、许可和维护边界](../research/local-relay-reuse.md)：固定 CPA/CPAMP 源码与定向能力限制。
 - [独立服务 ADR](../adr/0007-independent-local-relay.md)：复用职责和替换旧 CLI 首选路线的理由。
 - [旧工作处置矩阵](2026-10-02-scope-transition.md)：全部旧 Issue、PR49/50、未交付 WIP 和证据去向。
