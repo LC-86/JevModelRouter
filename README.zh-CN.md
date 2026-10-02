@@ -15,6 +15,8 @@ AutoJev 是基于 Tauri、React 和 Rust 的桌面应用。集中管理服务商
 
 > 项目处于早期开发阶段。安装包以 GitHub Releases 实际发布的平台与版本为准。
 
+> **JevModelRouter 当前开发目标：** Mac 本地模型中转站，明确手选来源和模型供 DSH 调用。规格与依赖票统一从[当前工程入口](docs/plans/manual-model-relay.md)进入。新接入与真人验收仍待完成，本计划不表示真实模型已可用。
+
 ![AutoJev 概览：智能体通过本地网关连接模型，集中查看路由与用量](docs/assets/autojev-overview.png)
 
 ## 功能
