@@ -195,7 +195,7 @@ pub fn script() -> anyhow::Result<Option<String>> {
         .cloned();
     if let Some(mode) = &login_mode {
         anyhow::ensure!(
-            matches!(mode.as_str(), "success" | "late" | "failed" | "grok" | "grok-read" | "catalog" | "model-selection"),
+            matches!(mode.as_str(), "success" | "late" | "failed" | "grok" | "grok-read" | "catalog" | "model-selection" | "grok-billing"),
             "Unknown login check mode: {mode}"
         );
     }
@@ -203,11 +203,21 @@ pub fn script() -> anyhow::Result<Option<String>> {
         .context("Isolation requires a home directory")?
         .to_string_lossy()
         .to_string();
-    let config = serde_json::json!({"base": url.to_string().trim_end_matches('/'), "reload": args.iter().any(|s| s == "--autojev-check-reload"), "loginMode": login_mode, "root": root});
+    let capture_hold_ms = if args.iter().any(|s| s == "--autojev-native-screenshot") { 15_000 } else { 0 };
+    let config = serde_json::json!({"base": url.to_string().trim_end_matches('/'), "reload": args.iter().any(|s| s == "--autojev-check-reload"), "loginMode": login_mode, "root": root, "captureHoldMs": capture_hold_ms});
     Ok(Some(format!(
-        "window.__ISOLATION_CHECK__ = {config};\n{}",
+        "window.__ISOLATION_CHECK__ = {config}; window.dispatchEvent(new Event('autojev-isolation-ready'));\n{}",
         include_str!("isolation-check.js")
     )))
+}
+
+/// Return only a fixed local parser fixture. This command has no production registration.
+#[tauri::command]
+pub fn grok_billing_offline_fixture() -> Result<crate::subscription::grok::billing::OfflineBillingFixture, String> {
+    if !crate::runtime::isolated() {
+        return Err("Offline Grok billing fixtures require the isolation-check environment".into());
+    }
+    Ok(crate::subscription::grok::billing::offline_fixture())
 }
 
 #[tauri::command]

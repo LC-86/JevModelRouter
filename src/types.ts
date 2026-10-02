@@ -141,6 +141,61 @@ export interface SubscriptionQuota {
   missing_fields?: string[];
   history?: boolean;
 }
+
+/** Parser DTO for an offline-only candidate xAI ACP billing payload; never admission evidence. */
+export type BillingDiagnosticFieldState = 'available' | 'missing' | 'null' | 'invalid' | 'out_of_range';
+export interface BillingObserved<T> {
+  state: BillingDiagnosticFieldState;
+  value: T | null;
+  origin: string | null;
+}
+export interface BillingCentDto { val: BillingObserved<number> }
+export interface BillingUsagePeriodDto {
+  periodType: BillingObserved<string>;
+  start: BillingObserved<string>;
+  end: BillingObserved<string>;
+  includedUsed: BillingObserved<BillingCentDto>;
+  onDemandUsed: BillingObserved<BillingCentDto>;
+  totalUsed: BillingObserved<BillingCentDto>;
+}
+export interface GrokBillingConfigDto {
+  creditUsagePercent: BillingObserved<number>;
+  currentPeriod: BillingObserved<BillingUsagePeriodDto>;
+  monthlyLimit: BillingObserved<BillingCentDto>;
+  used: BillingObserved<BillingCentDto>;
+  onDemandCap: BillingObserved<BillingCentDto>;
+  onDemandUsed: BillingObserved<BillingCentDto>;
+  prepaidBalance: BillingObserved<BillingCentDto>;
+  isUnifiedBillingUser: BillingObserved<boolean>;
+  billingPeriodStart: BillingObserved<string>;
+  billingPeriodEnd: BillingObserved<string>;
+  history: BillingObserved<unknown[]>;
+}
+export interface GrokBillingResponseDto {
+  responseState: BillingDiagnosticFieldState;
+  config: BillingObserved<GrokBillingConfigDto>;
+  onDemandEnabled: BillingObserved<boolean>;
+  subscriptionTier: BillingObserved<string>;
+  usagePercent: BillingObserved<number>;
+}
+export interface GrokAutoTopupRuleDto {
+  enabled: BillingObserved<boolean>;
+  minBeforeHittingSl: BillingObserved<BillingCentDto>;
+  topupAmount: BillingObserved<BillingCentDto>;
+  maxAmountPerMonth: BillingObserved<BillingCentDto>;
+}
+export interface GrokBillingOfflineFixture {
+  mode: 'offline_synthetic_fixture';
+  sourceRevision: string;
+  billing: { state: 'sample_returned' | 'sample_failed'; value: GrokBillingResponseDto | null; failureCode: string | null };
+  autoTopup: { state: 'sample_returned' | 'sample_failed'; value: BillingObserved<GrokAutoTopupRuleDto> | null; failureCode: string | null };
+  scope: { providerId: string; connectionInstanceId: string; generation: number };
+  scopeReplay: {
+    currentResponseAccepted: boolean;
+    responseAfterAccountSwitchRejected: boolean;
+    responseAfterConnectionSwitchRejected: boolean;
+  };
+}
 /** 模型目录只读证据；失败时保留上次已核实的目录并标记 stale。 */
 export type SubscriptionCatalogState = 'unknown' | 'available' | 'stale' | 'failed' | 'unsupported';
 export interface SubscriptionCatalogEvidence {

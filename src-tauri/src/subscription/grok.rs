@@ -11,6 +11,8 @@
 // Production generation remains fail-closed until the real CLI contract is verified in #26.
 #[allow(dead_code)]
 mod generation;
+#[cfg(any(feature = "isolation-check", test))]
+pub(crate) mod billing;
 
 use std::{path::PathBuf, time::Duration};
 

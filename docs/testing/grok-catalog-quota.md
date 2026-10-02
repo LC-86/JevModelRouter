@@ -21,6 +21,8 @@
 
 运行 `pnpm test:grok-contract` 只验证本地 fake-helper 合同拒绝、Unknown 展示和前端状态文本。它不运行 Grok CLI，不证明真实身份、目录、额度、Extra Usage 权限或费用上限。安全人工验收入口和当前阻塞项见 [grok-hand-run.md](grok-hand-run.md)；结果记录模板见 [grok-hand-run-result-template.md](grok-hand-run-result-template.md)。
 
+本仓库另有固定版本的 [ACP 账单纯解析器与离线原生界面样例](grok-billing-offline.md)。它只解析本地合成 JSON，不连接 ACP、读取账号、写入 `QuotaEvidence` 或影响准入；不要将界面样例、解析测试或 legacy 比率推断描述成真实 Grok 额度。TokenTracker 的独立研究与 MIT 固定来源也记录在该文档中。
+
 ## 解除阻塞条件
 
 在任何真人 OAuth 或模型调用前，先为固定版本取得可引用的上游接口契约，覆盖机器可读身份、目录及调用资格、订阅额度与额外用量许可，以及能约束整次请求费用的机制。缺少任一关键事实时继续显示 Unknown 并保持生成关闭。不得以 CLI 的 session token/cost、ACP prompt、网站手工读数或一个请求前的额度快照推断该请求不会使用额外额度。

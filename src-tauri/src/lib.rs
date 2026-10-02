@@ -1455,8 +1455,11 @@ pub fn run() {
         })
         .invoke_handler(|invoke: tauri::ipc::Invoke<tauri::Wry>| {
             #[cfg(feature = "isolation-check")]
-            if invoke.message.command() == "isolation_check_report" {
-                let handler: fn(tauri::ipc::Invoke<tauri::Wry>) -> bool = tauri::generate_handler![isolation_check::isolation_check_report];
+            if matches!(invoke.message.command(), "isolation_check_report" | "grok_billing_offline_fixture") {
+                let handler: fn(tauri::ipc::Invoke<tauri::Wry>) -> bool = tauri::generate_handler![
+                    isolation_check::isolation_check_report,
+                    isolation_check::grok_billing_offline_fixture,
+                ];
                 return handler(invoke);
             }
             let handler: fn(tauri::ipc::Invoke<tauri::Wry>) -> bool = tauri::generate_handler![

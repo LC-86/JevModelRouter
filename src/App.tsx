@@ -58,6 +58,7 @@ import {
 import { useAppUpdate } from './components/app-update';
 import { SettingsDialog, type SettingsSection } from './components/settings-dialog';
 import { SubscriptionAuthDialog } from './components/subscription-auth-dialog';
+import { GrokBillingOfflineFixture } from './components/grok-billing-offline-fixture';
 import { usePreferences } from './lib/preferences-context';
 import { SearchSelect } from './components/search-select';
 import { BrandMark } from './components/brand-mark';
@@ -687,6 +688,7 @@ function ProvidersPage({ snapshot, onAdd, onEdit, onDelete, onTest, onImport, on
   return (
     <div className="stack lg">
       <PageIntro title={t("Providers")} body={t("Keys are stored in the local database.")} action={<div className="provider-actions"><ProviderImport onImport={onImport} /><button className="button primary" onClick={onAdd}><Plus size={16} /> {t("Add provider")}</button></div>} />
+      <GrokBillingOfflineFixture t={t} />
       <div className="table-panel provider-table-panel">
         <table className="provider-table">
           <thead><tr><th>{t('Provider')}</th><th>{t('Base URL')}</th><th>{t('Enabled status')}</th><th>{t('Subscription')}</th><th>{t('API key')}</th><th className="provider-actions-heading">{t('Actions')}</th></tr></thead>
