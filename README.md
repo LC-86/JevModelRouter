@@ -15,6 +15,8 @@ AutoJev is a desktop app built with Tauri, React, and Rust. Manage providers, mo
 
 > AutoJev is in early development. Available installers and supported release platforms are listed in GitHub Releases.
 
+> **JevModelRouter development scope:** The current milestone is a Mac local model relay with explicit source/model selection for DSH. Follow the [current specification and dependency tickets](docs/plans/manual-model-relay.md). Source integration and human acceptance remain pending; this plan does not claim live model support.
+
 ![AutoJev overview: agents connected to models through a local gateway, with routing and usage statistics](docs/assets/autojev-overview.png)
 
 ## Features
