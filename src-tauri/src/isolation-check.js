@@ -1116,8 +1116,8 @@
     check(status.realGenerationEnabled === false && status.sourceVersion === null && status.sourceCommit === null,
       `An unverified source must not advertise generation or a source pin: ${JSON.stringify(status)}`);
     const panel = panelNode.textContent || '';
-    check(panel.includes('Source/version verification required') || panel.includes('需要验证来源/版本'), `The panel must identify the closed source gate: ${panel}`);
-    check(panel.includes('No Grok ACP request was sent') || panel.includes('没有发送 Grok ACP 请求'), `The panel must distinguish blocked status from a successful account read: ${panel}`);
+    check(!!panelNode.querySelector('[data-testid="grok-readonly-refresh"]'), 'The panel must offer manual observation');
+    check(panel.includes('Real generation stays off') || panel.includes('真实生成保持关闭'), `The panel must keep observation separate from generation: ${panel}`);
     check((panel.match(/Unknown|未知/g) || []).length >= 5, `All unsupported account fields must be shown as Unknown: ${panel}`);
     check(panel.includes('Off') || panel.includes('关闭'), `Real generation must remain off: ${panel}`);
     const parseColor = (value) => (value.match(/[\d.]+/g) || []).slice(0, 3).map(Number);

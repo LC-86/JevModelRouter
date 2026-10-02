@@ -1,55 +1,42 @@
-# Grok ACP read-only path (Issue #26)
+# Grok manual catalog / usage observation (#26)
 
-**Status (2026-10-02): production ACP reads remain blocked by the source/version gate.** The Providers page now shows that state directly. Account identity, model catalog, billing, auto top-up, Extra Usage permission, and real generation remain Unknown or off.
+Production now has a manual **Refresh models and usage** action on the Providers page. It reads the account already authenticated in the official CLI, then shows only model IDs, current CLI model, subscription tier, usage percentage, and period timestamps. It neither establishes account identity nor changes subscription eligibility, connection evidence, Extra Usage permission, or generation admission. Real generation remains off. This task runs no live account queries or model requests; the parent schedules scoped app validation separately. Keep #26 open for human acceptance.
 
-## What this change implements
+## Observed CLI contract
 
-- `src-tauri/src/subscription/grok/source_gate.rs` returns a static closed source/version status. This change implements no ACP transport because the installed helper source and wire names are not verified.
-- The Tauri `grok_readonly_status` command returns only the closed source gate and Unknown fields; it does not inspect the CLI version, start a process, read auth state, refresh an account, or contact xAI.
-- The Providers page replaces the old synthetic billing panel with the production gate status. This is a status view, not a live read or fabricated billing result.
-- The billing DTO parser remains Rust-test-only. It does not populate `QuotaEvidence`, account identity, catalog eligibility, admission, or generation.
-- Real Grok generation remains disabled. No UI control can override the source gate.
+The parent supplied a successful bounded probe of installed Grok `1.0.44` (`5b807183dd79`). This is an observed compatibility contract, not a complete official schema or proof of source provenance. The earlier claim that this installed version lacks the read methods is superseded by that probe.
 
-## Why the source gate stays closed
+A single owned process runs `grok agent --no-leader stdio` in a temporary working directory. It receives only these sequential JSON-RPC methods, awaiting the matching ID each time:
 
-An exact request to the [npm registry record for `@xai-official/grok@1.0.44`](https://registry.npmjs.org/@xai-official/grok/1.0.44) returned HTTP 200 without a redirect. Its `_id` is `@xai-official/grok@1.0.44`, its `version` is `1.0.44`, its `gitHead` is `5b807183dd7978a460f309132cf0d1183d743526`, and it has no `repository` field. The local installed package manifest omits `gitHead` and `repository`; that does not contradict the registry record. The historical CLI `--version` output `5b807183dd79` matches the registry `gitHead` prefix. A lookup of the full SHA in the public `xai-org/grok-build` repository returned HTTP 422, meaning that lookup did not resolve the SHA there; it does not rule out another source mapping. The local binary's exact bytes still lack a verified mapping to an official source or release. The public source snapshot at [`2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8`](https://github.com/xai-org/grok-build/commit/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8) declares `xai-grok-shell` version 1.0.45 in its [`Cargo.toml`](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-shell/Cargo.toml), so it does not establish the implementation behind installed version 1.0.44.
-
-That 1.0.45 source snapshot contains candidate handlers for [`x.ai/billing`](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-shell/src/extensions/billing.rs) and `x.ai/auto-topup-rule`. These handlers require Grok authentication and are not proof that 1.0.44 exposes equivalent ACP methods. The local CLI help observations remain unchanged: no `account` command, no documented `models --json`, and `usage` is session-specific token/cost output.
-
-The [official CLI ACP example](https://docs.x.ai/build/cli/headless-scripting) documents `grok agent stdio` and JSON-RPC framing, then continues through `authenticate`, `session/new`, and `session/prompt`; `session/prompt` generates content and is not used here. The [ACP extension rules](https://agentclientprotocol.com/protocol/v1/extensibility) require custom wire method names to start with `_`. xAI's candidate handlers use `x.ai/...` names internally, but the exact 1.0.44 mapping from those handlers to a public ACP wire request is not documented. No custom account/billing wire method is implemented or tested in the production path; the bounded standard authentication handshake is described below and was not added to AutoJev.
-
-Billing and auto-top-up reads also cannot prove that a complete future generation call is protected from Extra Usage. A usage snapshot, disabled auto top-up, or a successful read is not a consumption guarantee. Missing evidence stays Unknown and generation remains denied.
-
-## Bounded existing-session authentication check (2026-10-02)
-
-The locally installed CLI reported grok 1.0.44 (5b807183dd79). One bounded ACP v1 check launched the documented grok agent stdio entry with auto-update disabled, /tmp as its working directory, and a temporary leader socket. It sent only initialize, then one standard authenticate request for the cached_token method advertised by initialization. Initialization negotiated protocol v1 and authentication returned success in 1.65 seconds. The response was non-empty; its payload was redacted in memory and not retained or printed, so no account name, email, or other identity was established. The process was terminated after the response (exit 143 from cleanup; no timeout). No session/new, session/prompt, model request, billing, quota, or credit request was sent. A generic stderr diagnostic contained a network-related keyword, but it was not retained and could not be classified; the ACP authentication response itself succeeded.
-
-This verifies that the CLI accepted its existing cached authentication state at that time. It does not establish the account identifier, map the exact 1.0.44 binary to official source, prove billing safety, or change AutoJev's production source gate. The xAI CLI documentation demonstrates ACP authentication followed by session creation and session/prompt; session/prompt is generation-capable and was not called. No custom auth/info method was sent because its 1.0.44 wire contract is not documented.
-
-## Offline verification
-
-Run:
-
-```sh
-pnpm test:grok-contract
-pnpm test:grok-billing-parser
-pnpm test:grok-readonly-gate
+```text
+initialize(protocolVersion: 1, clientCapabilities: {}, clientInfo: readonly-account-query / 1)
+authenticate(methodId: cached_token)
+_x.ai/models/list({})
+_x.ai/billing({})
 ```
 
-These checks assert the static source gate and use the isolated AutoJev app. The UI acceptance asserts the gate is closed, every account/billing field remains Unknown, generation is off, subscription evidence is unchanged, and no Grok helper or model request was started. None of these checks authenticates a real account or proves the installed CLI contract.
+There is no session creation, prompt, retry, OAuth client, recharge operation, or generic method / shell / argument input. Only the official helper reads its cached authentication; the app does not open or export auth files or tokens. Production resolves `$HOME/.local/bin/grok`, then `grok` on PATH, with fixed arguments and a cleared environment allowing HOME/PATH/TMPDIR/LANG. The older arbitrary helper override is not used by this path. Isolated builds require the explicitly pinned fixture helper and isolated HOME.
 
-The isolated native-window capture for this PR is [`../screenshots/grok-readonly-gate.png`](../screenshots/grok-readonly-gate.png). The image includes the Grok status card and the ordinary Providers table; the card shows the source/version gate, Unknown fields, and generation Off. It is UI evidence, not evidence of a Grok account, catalog, quota, or live ACP read. Capture it from an unlocked desktop with:
+The process deadline is 75 seconds. Success, error, timeout, and cancellation close its streams, send termination only to that owned child, wait up to two seconds, then kill/wait if needed (the final wait is bounded to ten seconds; total process budget stays below 90 seconds). The UI cancels on navigation and discards late results. A dropped Rust future uses `kill_on_drop`. No helper stderr or raw account payload is logged, persisted, or returned. JSON-RPC responses have a 256 KiB line and 256-notification bound. Only numeric error codes and stable error categories are shown; potentially private message/data fields are discarded.
 
-```sh
-AUTOJEV_CAPTURE_NATIVE_SCREENSHOT=1 \
-AUTOJEV_GROK_READONLY_SCREENSHOT_PATH=docs/screenshots/grok-readonly-gate.png \
-pnpm test:grok-readonly-gate
-```
+## Display semantics
 
-The command scopes capture to the isolated AutoJev window and asserts zero Grok helper, ACP, and model requests.
+- Models: JSON-RPC result's `result.currentModelId` and `result.availableModels[].modelId`. Discovery does not become a free whitelist or subscription qualification.
+- Usage: `config.creditUsagePercent` must be finite and within 0–100. Remaining percentage is explicitly calculated as `100 - used`. Missing, null, wrong schema and out-of-range values remain distinct Unknown states; valid zero is retained.
+- Plan: response-level snake-case `subscription_tier`.
+- Usage period: `config.currentPeriod.type/start/end`; valid RFC3339 timestamps display in local time. `end` is labelled **Period end / estimated reset**, because the observed response has no independent reset field. Conflicting valid `billingPeriodEnd` makes the estimated reset Unknown and shows a conflict. No currency or money-unit scaling is inferred.
+- Refresh errors clear previous values. Successful observations expire after five minutes and show their last update time. Values are memory-only and disappear on navigation/restart. Auth identity, top-up rule and Extra Usage permission stay Unknown.
 
-![隔离 Providers 页面中的 Grok source/version gate；账号、目录、额度未知，生成关闭](../screenshots/grok-readonly-gate.png)
+The legacy `grok_readonly_status` command remains a static source-provenance/generation-gate snapshot for compatibility. It is not the result or availability of the new manual query. Source provenance is still unverified; production generation remains denied independently.
 
-## Remaining evidence needed
+## Offline validation and handoff
 
-The bounded standard initialization/authentication check above does not validate any custom ACP method. Before further compatibility work, identify and pin the exact helper artifact and use one bounded route: verify an official source/release mapping, select a source-mapped official release, or—if the 1.0.44 source remains unavailable—obtain separate approval for an isolated compatibility probe after its initialization side effects are understood. A probe establishes only observed protocol behavior, not source provenance, account identity, quota permission, or billing safety. Do not use undocumented auth/info, session/prompt, or auth/check_subscription as probes. The one cached-token check does not authorize a new OAuth login, account-profile read, billing read, quota refresh, or model request. Before generation, independently establish model qualification, subscription quota semantics, and a server-side end-to-end Extra Usage restriction.
+Run the CONTRIBUTING gates (`pnpm build`, `pnpm test`, `pnpm release:check`, `cargo test --locked --offline --manifest-path src-tauri/Cargo.toml --lib`). Use `TAURI_DEV_HOST=127.0.0.1` if localhost resolution is unavailable. Existing Rust tests require local loopback listeners; this is separate from external account access.
+
+`node scripts/check-grok-readonly-ui.mjs` starts its own loopback preview server and blocks external browser requests. Its bridge uses only synthetic 25% / ExamplePlan / 2030 fixtures and verifies no automatic read, one manual read, success, sparse/null, 401, cancellation/late result, expiry, and generation Off. Screenshots and a source/file hash report are written under ignored `artifacts/grok-readonly-ui`. Rust fixtures additionally cover invalid schema, network failure, timeout and owned-child cleanup. No real account payload belongs in fixtures or screenshots.
+
+Before app validation, bind the source commit SHA, executable SHA-256 and frontend file hashes in a local artifact manifest. Parent reviewer owns independent review and any scoped actual app validation. A Draft PR is stacked on PR49 at `93e8e61efda2a1beccc14a8f22b0ebd84583ab61` while PR49 is open; after it merges, update normally without rewriting shared history.
+
+Historical source mapping: registry `@xai-official/grok@1.0.44` had `gitHead` `5b807183dd7978a460f309132cf0d1183d743526`; the installed version prefix matches it. Public `xai-org/grok-build` snapshot `2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8` declares 1.0.45 and does not prove the source behind the installed 1.0.44 bytes. That provenance limitation restricts generation; it does not negate the supplied successful read-method observation.
+
+![Synthetic manual Grok observation: ExamplePlan, 25%, 2030 timestamps; no real account](../screenshots/grok-readonly-synthetic.png)
