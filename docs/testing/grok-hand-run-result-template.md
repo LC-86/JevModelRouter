@@ -12,18 +12,18 @@
 | 模型目录机器输出 | `models` 命令存在；`models --help` 未列 `--json`，未核实输出格式与订阅资格语义 | Unknown / 阻塞；未执行目录读取 |
 | 订阅额度 / Extra Usage | `usage` 需要本地 session ID，描述 session token/cost；不是已核实的订阅池/额外消费权限接口 | Unknown / 阻塞；未执行用量读取 |
 | 禁止整次调用超额使用的机制 | 没有适用于 AutoJev 请求的已核实接口/执行保证 | Unknown / 阻塞 |
-| 当前生产 Grok 生成许可 | UI 有进程内存态、默认关闭、最多 15 次的开关；由于 `login_supported=false`，UI 与 IPC 拒绝启用 | 已观察；开关不是上游身份/额度证据，也不能启动当前 fail-closed 的生产适配器 |
-| 许可范围 | 当前连接下所有已核实资格模型和协议；不是 HAND_RUN 中单个模型/协议的运行时绑定 | UI 确认框明确告知账号级范围；实际手测必须严格遵循已记录的单个计划范围 |
+| 当前生产 Grok 生成许可 | source/version gate 固定关闭；Tauri 状态只返回 Unknown 字段；UI 没有可绕过该门的启用控件 | 已观察；真实生成入口仍拒绝，未试图开启 |
+| 许可范围 | 当前没有可用的生产许可 | 不派发 Grok 生成 |
 | 真实 OAuth、配置/session、账号凭据 | 未访问 | 未测；本次 Agent 执行禁止 |
 | 真实模型请求 / credits | 未执行 | 未测；模型数和用量费用为 Unknown，不能填 0 |
-| `pnpm test:grok-contract` | Rust 71 passed；Vitest 2 files / 49 passed | 通过；离线契约回归 |
-| `pnpm test:grok-billing-parser` | 7 passed；491 filtered | 通过；只解析内存合成 JSON，验证 RFC3339 周期、官方字段位置与世代/连接范围旧响应拒绝 |
-| `TAURI_DEV_HOST=127.0.0.1 pnpm test` | 13 files / 90 passed | 通过；离线前端测试 |
-| `pnpm build` / `pnpm release:check` | build 通过；`Release configuration OK: v0.1.2` | 通过；build 保留 Tauri API 动静态 chunk 与大 chunk 提示 |
-| Rust `--lib` 构建与 `isolation-check` 构建 | 普通 Rust 测试构建、`cargo check`、桌面 `cargo build` 均通过 | 通过 |
-| 完整 `cargo test --locked --offline --manifest-path src-tauri/Cargo.toml --lib` | 498 passed / 0 failed | 通过；全部 Rust library 回归 |
-| `pnpm test:grok-billing-offline` | 7 parser tests、前端构建、隔离桌面构建与 4 项原生 UI 断言通过；helper 日志与模型请求账本为空 | 通过；仅固定离线 fixture，不登录、不访问 ACP、不发送模型请求 |
-| 原生窗口截图 | [`docs/screenshots/grok-billing-offline.png`](../screenshots/grok-billing-offline.png) | 仅截取隔离 AutoJev 窗口；界面显著标明 synthetic/offline，非账号/额度证据 |
+| `pnpm test:grok-contract` | Rust 75 passed；Vitest 3 files / 50 passed | 通过；离线 fail-closed 与只读状态契约 |
+| `pnpm test:grok-billing-parser` | 7 passed；495 filtered | 通过；仅解析内存合成 JSON，不连接 ACP 或写入订阅准入状态 |
+| `TAURI_DEV_HOST=127.0.0.1 pnpm test` | 14 files / 91 passed | 通过；离线前端测试 |
+| `pnpm build` / `pnpm release:check` | Vite build 通过；`Release configuration OK: v0.1.2` | 通过；build 保留既有 Tauri API 动静态 chunk 与大 chunk 提示 |
+| 完整 `cargo test --locked --offline --manifest-path src-tauri/Cargo.toml --lib` | 默认沙箱尝试：466 passed / 36 failed，失败均为本地 mock server 绑定 loopback 时 EPERM；允许 loopback 后重跑：502 passed / 0 failed | 通过；重跑仅启用测试所需本地 loopback mock server，没有外部模型或账号请求 |
+| `pnpm test:grok-readonly-gate` | parser、前端 build、`isolation-check` 桌面 build、原生 Providers 页断言均通过；helper/ACP 与模型请求计数为 0 | 通过；首次默认沙箱运行在本地 loopback `listen` 被 EPERM 阻止，允许该本地测试监听后重跑通过 |
+| 原生 Providers 页断言 | source/version gate 关闭；身份、目录、账单、自动充值和 Extra Usage 为 Unknown；生成关闭；订阅快照不变；无 Grok helper 与模型请求；对比度 13.284:1 / 5.442:1 | 通过；隔离桌面自动断言，不是真实账号/额度或真实 Grok 连接证据 |
+| 原生窗口截图 | 捕获尝试得到全黑窗口；该隔离桌面运行未生成 `isolation-report.json`，故截图已丢弃 | 未通过；无截图保留。无截图捕获的 `pnpm test:grok-readonly-gate` 独立运行通过 |
 | 其他真实登录、真实额度/credits 与模型请求 | 未执行 | 未测；按 Issue #26 由 Leo 手测 |
 
 预算语义：每个通过完整准入并开始派发的 API 请求最多启动一个 ACP `session/prompt`，占一个有限 dispatch 槽；失败与取消仍计入 dispatch 槽。客户端工具结果续传作为新 API 请求和新 helper turn 单独计数、占另一槽。人工验收需同时记录 `dispatch` 和 ACP `session/prompt` 实际计数，二者均不得超过事先接受的同一个总上限。
@@ -66,7 +66,7 @@
 | Chat Completions 文本/流式/取消/客户端工具往返 | 未测 | 当前 build 的生产生成入口拒绝；没有发送请求 | 0 | `<留空>` |
 | Responses 文本/流式/取消/客户端工具往返 | 未测 | 当前 build 的生产生成入口拒绝；没有发送请求 | 0 | `<留空>` |
 | Messages 文本/流式/取消/客户端工具往返 | 未测 | 当前 build 的生产生成入口拒绝；没有发送请求 | 0 | `<留空>` |
-| 默认关闭的 Grok 生成许可 | 通过（本地 fake 测试） | 默认 false；有限预算绑定连接世代且不持久化；未知额度/Extra Usage 即使显式 arm 仍拒绝；当前不支持的登录合同使 UI/IPC 均禁用 | 0 | `<留空>` |
+| source/version gate 与默认关闭的 Grok 生成 | 通过（隔离桌面本地测试） | 固定 source pin 未验证；身份、目录、账单、自动充值和 Extra Usage 均为 Unknown；UI/IPC 不提供启用旁路 | 0 | `<留空>` |
 
 ## 停止记录
 

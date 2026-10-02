@@ -218,6 +218,13 @@ async fn refresh_subscription(state: State<'_, AppState>, provider_id: String) -
     Ok(snapshot(&state).await)
 }
 
+/// Static status for the Grok ACP source/version gate. This command is intentionally read-only
+/// and never launches the CLI, initializes ACP, reads auth state, or refreshes an account.
+#[tauri::command]
+async fn grok_readonly_status() -> subscription::grok::readonly::UiStatus {
+    subscription::grok::readonly::ui_status()
+}
+
 /// Explicit current-connection opt-in; generation remains subject to every existing subscription gate.
 #[tauri::command]
 async fn set_codex_real_generation_enabled(
@@ -1455,16 +1462,16 @@ pub fn run() {
         })
         .invoke_handler(|invoke: tauri::ipc::Invoke<tauri::Wry>| {
             #[cfg(feature = "isolation-check")]
-            if matches!(invoke.message.command(), "isolation_check_report" | "grok_billing_offline_fixture") {
+            if matches!(invoke.message.command(), "isolation_check_report") {
                 let handler: fn(tauri::ipc::Invoke<tauri::Wry>) -> bool = tauri::generate_handler![
                     isolation_check::isolation_check_report,
-                    isolation_check::grok_billing_offline_fixture,
                 ];
                 return handler(invoke);
             }
             let handler: fn(tauri::ipc::Invoke<tauri::Wry>) -> bool = tauri::generate_handler![
             get_snapshot,
             refresh_subscription,
+            grok_readonly_status,
             set_codex_real_generation_enabled,
             set_grok_real_generation_enabled,
             begin_subscription_login,

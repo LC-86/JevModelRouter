@@ -132,7 +132,7 @@ const reaped = async pids => {
 // `--autojev-catalog-fixture`，只在该运行生效；两条 loginMode 互不冒充。
 const runDesktop = async ({ label, scenarios, reload = false, loginMode = null, grokScenarios = null, reads = null, catalog = null, catalogFixture = null, accounts = null }) => {
   const captureScreenshot = process.env.AUTOJEV_CAPTURE_NATIVE_SCREENSHOT === '1';
-  assert.ok(!captureScreenshot || (process.env.AUTOJEV_GROK_BILLING_ONLY === '1' && label === 'grok-billing-offline'), 'Native screenshot capture is limited to the focused Grok billing fixture run');
+  assert.ok(!captureScreenshot || (process.env.AUTOJEV_GROK_READONLY_ONLY === '1' && label === 'grok-readonly-gate'), 'Native screenshot capture is limited to the focused Grok read-only gate run');
   const helperLog = join(root, `helper-${label}.jsonl`);
   const grokHelperLog = join(root, `grok-helper-${label}.jsonl`);
   const args = ['--autojev-isolated', root, '--autojev-upstream', base, '--autojev-ui-url', `http://127.0.0.1:${uiPort}`, '--autojev-ui-check', base, '--autojev-helper', helper];
@@ -162,7 +162,7 @@ const runDesktop = async ({ label, scenarios, reload = false, loginMode = null, 
   const captureTask = captureScreenshot
     ? (async () => {
         await sleep(5000);
-        await captureNativeWindow(child.pid, process.env.AUTOJEV_GROK_BILLING_SCREENSHOT_PATH || 'docs/screenshots/grok-billing-offline.png');
+        await captureNativeWindow(child.pid, process.env.AUTOJEV_GROK_READONLY_SCREENSHOT_PATH || 'docs/screenshots/grok-readonly-gate.png');
       })().catch(error => { captureError = error; })
     : Promise.resolve();
   let log = ''; child.stdout.on('data', b => { log += b; }); child.stderr.on('data', b => { log += b; });
@@ -186,13 +186,13 @@ const runDesktop = async ({ label, scenarios, reload = false, loginMode = null, 
 };
 
 try {
-  if (process.env.AUTOJEV_GROK_BILLING_ONLY === '1') {
-    const result = await runDesktop({ label: 'grok-billing-offline', scenarios: 'success', loginMode: 'grok-billing' });
-    assert.deepEqual(await readLog(result.helperLog), [], 'The billing parser fixture must not start the Codex helper');
-    assert.deepEqual(await readLog(result.grokHelperLog), [], 'The billing parser fixture must not start the Grok helper or ACP');
-    assert.equal(requests.length, 0, 'The billing parser fixture must not send any loopback model request');
-    if (process.env.AUTOJEV_CAPTURE_NATIVE_SCREENSHOT === '1') assert.ok(statSync(resolve(process.env.AUTOJEV_GROK_BILLING_SCREENSHOT_PATH || 'docs/screenshots/grok-billing-offline.png')).size > 0);
-    console.log(`Offline Grok billing native UI acceptance passed. Synthetic evidence: ${root}`);
+  if (process.env.AUTOJEV_GROK_READONLY_ONLY === '1') {
+    const result = await runDesktop({ label: 'grok-readonly-gate', scenarios: 'success', loginMode: 'grok-readonly' });
+    assert.deepEqual(await readLog(result.helperLog), [], 'The static status panel must not start the Codex helper');
+    assert.deepEqual(await readLog(result.grokHelperLog), [], 'The static status panel must not start the Grok helper or ACP');
+    assert.equal(requests.length, 0, 'The static status panel must not send any loopback model request');
+    if (process.env.AUTOJEV_CAPTURE_NATIVE_SCREENSHOT === '1') assert.ok(statSync(resolve(process.env.AUTOJEV_GROK_READONLY_SCREENSHOT_PATH || 'docs/screenshots/grok-readonly-gate.png')).size > 0);
+    console.log(`Grok read-only gate native UI acceptance passed. Isolated evidence: ${root}`);
   } else {
   const deadline = Date.now() + 15000;
   while (true) {

@@ -195,7 +195,7 @@ pub fn script() -> anyhow::Result<Option<String>> {
         .cloned();
     if let Some(mode) = &login_mode {
         anyhow::ensure!(
-            matches!(mode.as_str(), "success" | "late" | "failed" | "grok" | "grok-read" | "catalog" | "model-selection" | "grok-billing"),
+            matches!(mode.as_str(), "success" | "late" | "failed" | "grok" | "grok-read" | "catalog" | "model-selection" | "grok-readonly"),
             "Unknown login check mode: {mode}"
         );
     }
@@ -209,15 +209,6 @@ pub fn script() -> anyhow::Result<Option<String>> {
         "window.__ISOLATION_CHECK__ = {config}; window.dispatchEvent(new Event('autojev-isolation-ready'));\n{}",
         include_str!("isolation-check.js")
     )))
-}
-
-/// Return only a fixed local parser fixture. This command has no production registration.
-#[tauri::command]
-pub fn grok_billing_offline_fixture() -> Result<crate::subscription::grok::billing::OfflineBillingFixture, String> {
-    if !crate::runtime::isolated() {
-        return Err("Offline Grok billing fixtures require the isolation-check environment".into());
-    }
-    Ok(crate::subscription::grok::billing::offline_fixture())
 }
 
 #[tauri::command]

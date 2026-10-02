@@ -1,6 +1,6 @@
 # Grok 人工验收入口（Issue #26）
 
-**本提交状态：安全代码验收可执行；真实 Grok HAND_RUN 阻塞。** 当前生产路径没有经过核实的 CLI 机器登录/身份、订阅模型资格、额度和整次调用 Extra Usage 禁止条件接口。界面有一个默认关闭、进程内存态、最多 15 次请求的 Grok 生成许可；但只有经过核实的登录合同才可启用，当前登录支持为 false。许可的范围是当前连接下所有已核实资格模型和协议，不能锁定到 HAND_RUN 中计划的单个模型/协议；因此确认时明确告知此账号级范围。即使将来许可被打开，生产 Grok 适配器仍在此构建中 fail-closed，直到另行实现并审查。此开关不是生成或真实账户操作授权。
+**本提交状态：安全代码验收可执行；真实 Grok HAND_RUN 阻塞。** Providers 页显示 source/version gate 关闭，身份、目录、账单、自动充值与 Extra Usage 都是 `Unknown`；当前界面没有可绕过该 gate 的生成启用控件。该面板不是账号状态读取，也不代表用户账号已失效。真实调用上限与费用预算仍由将来手测负责人事先填写并接受；填写计划本身不授权调用。必须先核实本机 helper 的源码映射、ACP wire contract、模型资格和整次调用费用边界，再重新实现并审查真实读取/生成路径。
 
 ## 本提交可执行的安全验收
 
@@ -9,7 +9,7 @@
 ```sh
 pnpm test:grok-contract
 pnpm test:grok-billing-parser
-pnpm test:grok-billing-offline
+pnpm test:grok-readonly-gate
 ```
 
 通过标准：
@@ -24,7 +24,7 @@ pnpm test:grok-billing-offline
 
 该命令只运行离线 Rust 单测和前端纯函数测试，不调用 `grok`，不启动 ACP，不开浏览器，不读 CLI 设置、session 或凭据，不发送模型请求，也不消费额度。它验证 fail-closed 回归，不证明上游服务、账户权益或费用行为。
 
-`pnpm test:grok-billing-parser` 和 `pnpm test:grok-billing-offline` 还覆盖候选 ACP billing DTO 的本地解析及隔离原生 UI 合成样例。样例不会初始化 ACP，不会发送 billing/auto-top-up RPC，不会读取账号/凭据或更改生产 quota/admission snapshot；详见 [离线解析范围与 TokenTracker 对照](grok-billing-offline.md)。它们也不解锁下方真实登录或 HAND_RUN 项。
+`pnpm test:grok-billing-parser` 覆盖候选 ACP billing DTO 的纯 Rust 解析。`pnpm test:grok-readonly-gate` 再构建前端和隔离桌面，并检查 Providers 页显示生产 source/version gate、相关字段为 `Unknown`、生成保持关闭，且不启动 helper、ACP 或模型请求。Fake ACP 消息仅覆盖 JSON-RPC allowlist/framing；它们不能打开生产门。版本证据、候选源与阻断原因见 [Grok ACP 只读路径](grok-acp-readonly.md)。这些本地测试不解锁真实登录或 HAND_RUN 项。
 
 结果请填入 [结果模板](grok-hand-run-result-template.md)，将真实登录、读取与生成项记为“阻塞”或“未测”，不要填成通过或用量为 0。
 
@@ -37,6 +37,7 @@ pnpm test:grok-billing-offline
 | 订阅额度与整次调用 Extra Usage 限制 | `Unknown` / 未核实 | 不运行任何用量读取或生成 |
 | Grok 生成许可 | 默认关闭；当前登录接口未核实，UI 和 IPC 拒绝启用 | 只观察；不要尝试绕过禁用状态 |
 | Grok 生产生成 | 后端生产入口拒绝，即使许可被 arm 也不进入生产 ACP | 不发送 Chat Completions、Responses 或 Messages 请求 |
+| Grok 只读状态面板 | 显示 source/version gate 关闭；身份、目录、账单、自动充值和 Extra Usage 均为 Unknown | 只观察；不执行 ACP 初始化或读取 |
 
 `grok models` 是公开 CLI 命令；命令存在不等于它有已核实的机器输出格式或账号资格语义。`grok login` / `grok logout` 也存在，但其机器事件与 AutoJev 身份读取合同未被核实。`grok account` 不存在；`models --help` 没有列出 `--json`；`usage` 要求本地 session ID，描述的是 session token/cost，不能代替订阅池或 Extra Usage 权限。ACP `session/prompt` 会生成内容，不是只读账户接口。
 
