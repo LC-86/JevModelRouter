@@ -128,34 +128,71 @@ fn project(models: &Value, billing: &Value) -> Observation {
     }
 }
 
-// One manual read at a time. The ID identifies only this transient query, never an account.
-type Active = Option<(String, watch::Sender<bool>)>;
-static ACTIVE: OnceLock<Mutex<Active>> = OnceLock::new();
-fn active() -> &'static Mutex<Active> {
-    ACTIVE.get_or_init(|| Mutex::new(None))
+// One manual read at a time. Cancellation can arrive before its refresh is registered.
+const CANCEL_RETENTION: Duration = Duration::from_secs(90);
+const MAX_CANCELLED_IDS: usize = 128;
+#[derive(Default)]
+struct ReadState {
+    active: Option<(String, watch::Sender<bool>)>,
+    cancelled: std::collections::VecDeque<(String, std::time::Instant)>,
+    overflow_until: Option<std::time::Instant>,
+}
+impl ReadState {
+    fn prune(&mut self) {
+        self.cancelled
+            .retain(|(_, at)| at.elapsed() < CANCEL_RETENTION);
+    }
+    fn is_cancelled(&mut self, id: &str) -> bool {
+        self.prune();
+        self.overflow_until
+            .is_some_and(|until| std::time::Instant::now() < until)
+            || self.cancelled.iter().any(|(cancelled, _)| cancelled == id)
+    }
+    fn remember_cancel(&mut self, id: &str) {
+        self.prune();
+        self.cancelled.retain(|(cancelled, _)| cancelled != id);
+        if self.cancelled.len() == MAX_CANCELLED_IDS {
+            // Bounded storage must not revive an evicted cancellation. Refuse reads until expiry.
+            self.overflow_until = Some(std::time::Instant::now() + CANCEL_RETENTION);
+            self.cancelled.pop_front();
+        }
+        self.cancelled
+            .push_back((id.into(), std::time::Instant::now()));
+    }
+}
+static ACTIVE: OnceLock<Mutex<ReadState>> = OnceLock::new();
+fn active() -> &'static Mutex<ReadState> {
+    ACTIVE.get_or_init(|| Mutex::new(ReadState::default()))
 }
 struct Registration(String);
 impl Drop for Registration {
     fn drop(&mut self) {
         let mut slot = active().lock().unwrap();
-        if slot.as_ref().is_some_and(|(id, _)| id == &self.0) {
-            *slot = None;
+        if slot.active.as_ref().is_some_and(|(id, _)| id == &self.0) {
+            slot.active = None;
         }
     }
 }
 pub(crate) async fn cancel(request_id: &str) {
+    if request_id.is_empty() || request_id.len() > 80 {
+        return;
+    }
     {
-        if let Some((id, sender)) = active().lock().unwrap().as_ref() {
+        let mut slot = active().lock().unwrap();
+        // The same lock protects cancellation and registration: neither can miss the other.
+        slot.remember_cancel(request_id);
+        if let Some((id, sender)) = slot.active.as_ref() {
             if id == request_id {
                 let _ = sender.send(true);
             }
         }
     }
-    // Acknowledge cancellation after the owned process has completed its cleanup.
+    // An unregistered request retains its cancellation; an owned process must finish cleanup.
     for _ in 0..700 {
         if !active()
             .lock()
             .unwrap()
+            .active
             .as_ref()
             .is_some_and(|(id, _)| id == request_id)
         {
@@ -184,27 +221,52 @@ fn program() -> Result<PathBuf, String> {
         })
         .ok_or_else(|| "helper_missing: install the official Grok CLI".into())
 }
-pub(crate) async fn refresh(request_id: String) -> Result<Observation, String> {
-    if request_id.len() > 80 || request_id.is_empty() {
-        return Err("invalid_request_id".into());
+// Thread-local test resolver keeps the public command path offline without exposing overrides.
+#[cfg(test)]
+thread_local! {
+    static TEST_RESOLVER: std::cell::RefCell<Option<Box<dyn FnOnce() -> Result<(PathBuf, PathBuf), String>>>> = Default::default();
+}
+fn resolve_helper() -> Result<(PathBuf, PathBuf), String> {
+    #[cfg(test)]
+    if let Some(resolver) = TEST_RESOLVER.with(|slot| slot.borrow_mut().take()) {
+        return resolver();
     }
     let program = program()?;
-    let (sender, receiver) = watch::channel(false);
-    {
-        let mut slot = active().lock().unwrap();
-        if slot.is_some() {
-            return Err("read_busy: a Grok observation is already running".into());
-        }
-        *slot = Some((request_id.clone(), sender));
-    }
-    let _registration = Registration(request_id);
     let home = if crate::runtime::isolated() {
         crate::runtime::home_dir()
     } else {
         dirs::home_dir()
     }
     .ok_or("helper_missing: home unavailable")?;
-    run(&program, &home, receiver, DEADLINE).await
+    Ok((program, home))
+}
+pub(crate) async fn refresh(request_id: String) -> Result<Observation, String> {
+    if request_id.len() > 80 || request_id.is_empty() {
+        return Err("invalid_request_id".into());
+    }
+    let entered = std::time::Instant::now();
+    if active().lock().unwrap().is_cancelled(&request_id) {
+        return Err("read_cancelled: Grok observation cancelled".into());
+    }
+    let (program, home) = resolve_helper()?;
+    let (sender, receiver) = watch::channel(false);
+    {
+        let mut slot = active().lock().unwrap();
+        if slot.is_cancelled(&request_id) {
+            return Err("read_cancelled: Grok observation cancelled".into());
+        }
+        if slot.active.is_some() {
+            return Err("read_busy: a Grok observation is already running".into());
+        }
+        slot.active = Some((request_id.clone(), sender));
+    }
+    let _registration = Registration(request_id);
+    // An expired pre-registration read cannot outlive cancellation retention. Reserve cleanup.
+    let budget = CANCEL_RETENTION
+        .checked_sub(entered.elapsed() + Duration::from_secs(12))
+        .filter(|budget| !budget.is_zero())
+        .ok_or("helper_timeout: Grok read deadline exceeded")?;
+    run(&program, &home, receiver, DEADLINE.min(budget)).await
 }
 async fn line(reader: &mut BufReader<tokio::process::ChildStdout>) -> Result<Vec<u8>, String> {
     let mut output = Vec::new();
@@ -315,6 +377,9 @@ async fn run(
     mut cancellation: watch::Receiver<bool>,
     deadline: Duration,
 ) -> Result<Observation, String> {
+    if *cancellation.borrow() {
+        return Err("read_cancelled: Grok observation cancelled".into());
+    }
     let mut command = Command::new(program);
     command
         .args(["agent", "--no-leader", "stdio"])
@@ -402,6 +467,103 @@ mod tests {
         assert_eq!(result.usage_percent.value, Some(0.0));
         assert!(result.period_conflict);
         assert_eq!(result.period_end.state, "conflict");
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn public_refresh_cancelled_during_resolution_never_starts_child_or_rpc() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::{Arc, Barrier};
+        // This is the only public-command fixture; restore its process-global cancellation cache.
+        struct ResetState;
+        impl Drop for ResetState {
+            fn drop(&mut self) {
+                *active().lock().unwrap() = ReadState::default();
+            }
+        }
+        let _reset = ResetState;
+        let directory = tempfile::tempdir().unwrap();
+        let helper = directory.path().join("fake-grok");
+        let home = directory.path().to_path_buf();
+        std::fs::write(
+            &helper,
+            r#"#!/usr/bin/env python3
+import json,os,sys
+open(os.path.join(os.environ['HOME'],'started'),'w').write('synthetic child')
+for line in sys.stdin:
+ r=json.loads(line)
+ with open(os.path.join(os.environ['HOME'],'rpc'),'a') as f: f.write(r['method']+'\n')
+ value={'protocolVersion':1} if r['method']=='initialize' else {}
+ print(json.dumps({'jsonrpc':'2.0','id':r['id'],'result':value}),flush=True)
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let entered = Arc::new(Barrier::new(2));
+        let resume = Arc::new(Barrier::new(2));
+        let id = "offline-public-precancel";
+        let thread = {
+            let entered = entered.clone();
+            let resume = resume.clone();
+            std::thread::spawn(move || {
+                TEST_RESOLVER.with(|slot| {
+                    *slot.borrow_mut() = Some(Box::new(move || {
+                        entered.wait();
+                        resume.wait();
+                        Ok((helper, home))
+                    }))
+                });
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(refresh(id.into()))
+            })
+        };
+        entered.wait();
+        cancel(id).await;
+        assert!(
+            !directory.path().join("started").exists(),
+            "no child at cancellation acknowledgement"
+        );
+        resume.wait();
+        let result = tokio::task::spawn_blocking(move || thread.join().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            result
+                .as_ref()
+                .is_err_and(|error| error.contains("read_cancelled")),
+            "cancelled public refresh resumed: {result:?}; RPCs: {:?}",
+            std::fs::read_to_string(directory.path().join("rpc"))
+        );
+        assert!(
+            !directory.path().join("started").exists(),
+            "cancelled refresh must not spawn"
+        );
+        assert!(
+            !directory.path().join("rpc").exists(),
+            "cancelled refresh must send no RPC"
+        );
+        let before_entry_id = "offline-public-cancel-before-entry";
+        cancel(before_entry_id).await;
+        TEST_RESOLVER.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(|| {
+                panic!("pre-cancelled read must not resolve the CLI")
+            }))
+        });
+        let result = refresh(before_entry_id.into()).await;
+        TEST_RESOLVER.with(|slot| *slot.borrow_mut() = None);
+        assert!(result.is_err_and(|error| error.contains("read_cancelled")));
+        assert!(!directory.path().join("started").exists());
+        assert!(!directory.path().join("rpc").exists());
+        // Saturating the bounded cache cannot make an evicted request readable again.
+        for index in 0..=MAX_CANCELLED_IDS {
+            cancel(&format!("offline-cancel-{index}")).await;
+        }
+        let result = refresh("offline-cancel-0".into()).await;
+        assert!(result.is_err_and(|error| error.contains("read_cancelled")));
+        assert!(!directory.path().join("started").exists());
+        assert!(!directory.path().join("rpc").exists());
     }
     #[cfg(unix)]
     async fn fixture(
