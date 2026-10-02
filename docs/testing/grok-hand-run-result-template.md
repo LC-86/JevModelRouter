@@ -42,9 +42,15 @@
 
 ## 观察字段
 
-| 时间 | 流程 | 连接世代 | 状态/终态/错误码 | 脱敏身份 | helper 版本 | 目录资格 | quota source / observed_at | Extra Usage 整次调用权限 | dispatch / helper turns / 工具轮次 | 预算上限 / 实际费用 | 脱敏证据路径 |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `<UTC>` | `<填写>` | `<填写/Unknown>` | `<填写>` | `<别名/Unknown>` | `<版本/Unknown>` | `<pass/fail/Unknown>` | `<值/Unknown>` | `<prohibited/allowed/Unknown>` | `<实际值/Unknown>` | `<上限；实费/Unknown>` | `<路径>` |
+逐个 dispatch 记录事前计划与本次观察到的实际响应。模型和协议值必须抄录其直接来源（例如响应体 `model` 字段、请求路由、响应 schema 或 `Content-Type`）；身份必须记录已验证身份字段及来源，不能用脱敏账号别名代替。响应或当前连接证据没有提供所需实际值时写 `Unknown`，并停止其余生成步骤。逐字段比较实际值与事前计划；任一不符或 `Unknown` 都不能判通过。
+
+| dispatch # / UTC | 事前计划：model / protocol / 已验证身份 | 实际响应 model：值 / 字段或来源 | 实际身份：值 / 字段或来源（不能用别名代替） | 实际 protocol：值 / 路由或响应来源 | 与计划比较：model / identity / protocol | 响应终态 / HTTP 状态 / 错误码 | 脱敏证据路径 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `<填写>` | `<填写>` | `<值或Unknown；来源>` | `<值或Unknown；来源>` | `<值或Unknown；来源>` | `<match/mismatch/Unknown>` | `<填写>` | `<路径>` |
+
+| 时间 | 流程 | 连接世代 | helper 版本 | 目录资格 | quota source / observed_at | Extra Usage 整次调用权限 | dispatch / helper turns / 工具轮次 | 预算上限 / 实际费用 | 脱敏证据路径 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `<UTC>` | `<填写>` | `<填写/Unknown>` | `<版本/Unknown>` | `<pass/fail/Unknown>` | `<值/Unknown>` | `<prohibited/allowed/Unknown>` | `<实际值/Unknown>` | `<上限；实费/Unknown>` | `<路径>` |
 
 ## 当前版本的结果
 
@@ -61,7 +67,7 @@
 
 ## 停止记录
 
-任一身份、模型资格、额度来源/时间、Extra Usage 限制、helper 路径或隔离 home 为 Unknown 时停止；协议/账号/模型不符、用量或费用超限、意外工具、请求/取消终态不明、或出现未预期 dispatch 时也立即停止。不自动重试、不换账号、不换服务商。
+任一请求失败或报告 `failed` 终态时，无论响应是否建议重试，都立即停止剩余步骤并回报；请求/取消终态不明也立即停止。任一身份、模型资格、额度来源/时间、Extra Usage 限制、helper 路径或隔离 home 为 Unknown 时停止；逐请求实际模型、身份或协议与计划不符或为 `Unknown`、用量或费用超限、意外工具、或出现未预期 dispatch 时也立即停止。不重试、不换账号、不换服务商。
 
 - 停止时间与触发条件：`<填写>`
 - 停止前的 dispatch / 工具计数：`<填写；不能核实写 Unknown>`
