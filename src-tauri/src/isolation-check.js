@@ -1114,6 +1114,15 @@
       `The local billing payload must be parsed without a live RPC: ${JSON.stringify(fixture.billing)}`);
     check(fixture.billing.value?.usagePercent?.origin === 'config.creditUsagePercent',
       `The direct percentage source must be explicit: ${JSON.stringify(fixture.billing.value?.usagePercent)}`);
+    const fixtureConfig = fixture.billing.value?.config?.value;
+    const currentPeriod = fixtureConfig?.currentPeriod?.value;
+    check(currentPeriod?.periodType?.value === 'USAGE_PERIOD_TYPE_MONTHLY' && currentPeriod.start.state === 'available' && currentPeriod.end.state === 'available',
+      `The candidate currentPeriod must contain only its type and validated RFC3339 range: ${JSON.stringify(currentPeriod)}`);
+    check(currentPeriod && !('includedUsed' in currentPeriod) && !('onDemandUsed' in currentPeriod) && !('totalUsed' in currentPeriod),
+      `Usage amounts must not be misplaced under currentPeriod: ${JSON.stringify(currentPeriod)}`);
+    const history = fixtureConfig?.history;
+    check(history?.state === 'available' && history.value?.[0]?.billingCycle?.year === 2026 && history.value?.[0]?.includedUsed?.val === 1250,
+      `Usage cents must remain under the official-shaped billing history entry: ${JSON.stringify(history)}`);
     check(fixture.autoTopup.state === 'sample_failed' && fixture.autoTopup.value === null,
       `A partial synthetic read failure must not erase the billing payload or fabricate a rule: ${JSON.stringify(fixture.autoTopup)}`);
     check(fixture.scopeReplay.currentResponseAccepted && fixture.scopeReplay.responseAfterAccountSwitchRejected && fixture.scopeReplay.responseAfterConnectionSwitchRejected,

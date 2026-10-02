@@ -16,13 +16,13 @@
 | 许可范围 | 当前连接下所有已核实资格模型和协议；不是 HAND_RUN 中单个模型/协议的运行时绑定 | UI 确认框明确告知账号级范围；实际手测必须严格遵循已记录的单个计划范围 |
 | 真实 OAuth、配置/session、账号凭据 | 未访问 | 未测；本次 Agent 执行禁止 |
 | 真实模型请求 / credits | 未执行 | 未测；模型数和用量费用为 Unknown，不能填 0 |
-| `pnpm test:grok-contract`（PR #47 历史记录） | Rust 64 passed；Vitest 2 files / 49 passed | 本次 follow-up 未单独重跑脚本；覆盖由下方完整 Rust 与前端套件更新验证 |
-| `pnpm test:grok-billing-parser` | 6 passed；491 filtered | 通过；只解析内存合成 JSON，并测试世代/连接范围旧响应拒绝 |
+| `pnpm test:grok-contract` | Rust 71 passed；Vitest 2 files / 49 passed | 通过；离线契约回归 |
+| `pnpm test:grok-billing-parser` | 7 passed；491 filtered | 通过；只解析内存合成 JSON，验证 RFC3339 周期、官方字段位置与世代/连接范围旧响应拒绝 |
 | `TAURI_DEV_HOST=127.0.0.1 pnpm test` | 13 files / 90 passed | 通过；离线前端测试 |
 | `pnpm build` / `pnpm release:check` | build 通过；`Release configuration OK: v0.1.2` | 通过；build 保留 Tauri API 动静态 chunk 与大 chunk 提示 |
 | Rust `--lib` 构建与 `isolation-check` 构建 | 普通 Rust 测试构建、`cargo check`、桌面 `cargo build` 均通过 | 通过 |
-| 完整 `cargo test --locked --offline --manifest-path src-tauri/Cargo.toml --lib` | 497 passed / 0 failed | 通过；全部 Rust library 回归 |
-| `pnpm test:grok-billing-offline` | 6 parser tests、前端构建、隔离桌面构建与 4 项原生 UI 断言通过；helper 日志与模型请求账本为空 | 通过；仅固定离线 fixture，不登录、不访问 ACP、不发送模型请求 |
+| 完整 `cargo test --locked --offline --manifest-path src-tauri/Cargo.toml --lib` | 498 passed / 0 failed | 通过；全部 Rust library 回归 |
+| `pnpm test:grok-billing-offline` | 7 parser tests、前端构建、隔离桌面构建与 4 项原生 UI 断言通过；helper 日志与模型请求账本为空 | 通过；仅固定离线 fixture，不登录、不访问 ACP、不发送模型请求 |
 | 原生窗口截图 | [`docs/screenshots/grok-billing-offline.png`](../screenshots/grok-billing-offline.png) | 仅截取隔离 AutoJev 窗口；界面显著标明 synthetic/offline，非账号/额度证据 |
 | 其他真实登录、真实额度/credits 与模型请求 | 未执行 | 未测；按 Issue #26 由 Leo 手测 |
 

@@ -154,9 +154,6 @@ export interface BillingUsagePeriodDto {
   periodType: BillingObserved<string>;
   start: BillingObserved<string>;
   end: BillingObserved<string>;
-  includedUsed: BillingObserved<BillingCentDto>;
-  onDemandUsed: BillingObserved<BillingCentDto>;
-  totalUsed: BillingObserved<BillingCentDto>;
 }
 export interface GrokBillingConfigDto {
   creditUsagePercent: BillingObserved<number>;

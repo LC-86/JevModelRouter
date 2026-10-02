@@ -69,7 +69,6 @@ export function GrokBillingOfflineFixture({ t }: { t: Translate }) {
         <div><dt>{t('Usage percent')}</dt><dd>{observed(billing?.usagePercent, t)}{billing?.usagePercent.origin ? ` · ${billing.usagePercent.origin}` : ''}</dd></div>
         <div><dt>{t('Period type')}</dt><dd>{observed(currentPeriod?.periodType, t)}</dd></div>
         <div><dt>{t('Period start / end')}</dt><dd>{observed(currentPeriod?.start, t)} / {observed(currentPeriod?.end, t)}</dd></div>
-        <div><dt>{t('Included / on-demand / total used')}</dt><dd>{cent(currentPeriod?.includedUsed, t)} / {cent(currentPeriod?.onDemandUsed, t)} / {cent(currentPeriod?.totalUsed, t)}</dd></div>
         <div><dt>{t('Legacy used / monthly limit')}</dt><dd>{cent(config?.used, t)} / {cent(config?.monthlyLimit, t)}</dd></div>
         <div><dt>{t('On-demand cap / used')}</dt><dd>{cent(config?.onDemandCap, t)} / {cent(config?.onDemandUsed, t)}</dd></div>
         <div><dt>{t('Prepaid balance')}</dt><dd>{cent(config?.prepaidBalance, t)}</dd></div>

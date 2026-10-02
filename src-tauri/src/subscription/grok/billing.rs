@@ -3,6 +3,7 @@
 //! This module deliberately has no transport, authentication, persistence, or admission hooks.
 //! The only native UI entry point is compiled into the explicit `isolation-check` build.
 
+use chrono::DateTime;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -56,13 +57,11 @@ pub struct CentDto {
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+/// Mirrors the candidate current-period shape; amount fields belong to `history` records.
 pub struct UsagePeriodDto {
     pub period_type: Observed<String>,
     pub start: Observed<String>,
     pub end: Observed<String>,
-    pub included_used: Observed<CentDto>,
-    pub on_demand_used: Observed<CentDto>,
-    pub total_used: Observed<CentDto>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -202,12 +201,9 @@ pub fn offline_fixture() -> OfflineBillingFixture {
         "config": {
             "creditUsagePercent": 42.5,
             "currentPeriod": {
-                "type": "monthly",
+                "type": "USAGE_PERIOD_TYPE_MONTHLY",
                 "start": "2026-10-01T00:00:00Z",
-                "end": "2026-11-01T00:00:00Z",
-                "includedUsed": {"val": 1250},
-                "onDemandUsed": {"val": 50},
-                "totalUsed": {"val": 1300}
+                "end": "2026-11-01T00:00:00Z"
             },
             "monthlyLimit": {"val": 20000},
             "used": {"val": 7500},
@@ -217,7 +213,12 @@ pub fn offline_fixture() -> OfflineBillingFixture {
             "isUnifiedBillingUser": true,
             "billingPeriodStart": "2026-10-01T00:00:00Z",
             "billingPeriodEnd": "2026-11-01T00:00:00Z",
-            "history": [{"period": "synthetic", "used": {"val": 7000}}]
+            "history": [{
+                "billingCycle": {"year": 2026, "month": 9},
+                "includedUsed": {"val": 1250},
+                "onDemandUsed": {"val": 50},
+                "totalUsed": {"val": 1300}
+            }]
         },
         "on_demand_enabled": false,
         "subscription_tier": "synthetic-tier"
@@ -296,6 +297,14 @@ fn parse_non_empty_string(value: &Value) -> Result<String, FieldState> {
         .ok_or(FieldState::Invalid)
 }
 
+fn parse_rfc3339_timestamp(value: &Value) -> Result<String, FieldState> {
+    let Some(value) = value.as_str() else {
+        return Err(FieldState::Invalid);
+    };
+    DateTime::parse_from_rfc3339(value).map_err(|_| FieldState::Invalid)?;
+    Ok(value.to_owned())
+}
+
 fn parse_percent(value: &Value) -> Result<f64, FieldState> {
     let Some(value) = value.as_f64() else {
         return Err(FieldState::Invalid);
@@ -331,11 +340,8 @@ fn parse_usage_period(value: &Value) -> Result<UsagePeriodDto, FieldState> {
     }
     Ok(UsagePeriodDto {
         period_type: field(value, "type", parse_non_empty_string),
-        start: field(value, "start", parse_non_empty_string),
-        end: field(value, "end", parse_non_empty_string),
-        included_used: field(value, "includedUsed", parse_cent),
-        on_demand_used: field(value, "onDemandUsed", parse_cent),
-        total_used: field(value, "totalUsed", parse_cent),
+        start: field(value, "start", parse_rfc3339_timestamp),
+        end: field(value, "end", parse_rfc3339_timestamp),
     })
 }
 
@@ -356,8 +362,8 @@ fn parse_config(value: &Value) -> Result<BillingConfigDto, FieldState> {
         on_demand_used: field(value, "onDemandUsed", parse_cent),
         prepaid_balance: field(value, "prepaidBalance", parse_cent),
         is_unified_billing_user: field(value, "isUnifiedBillingUser", parse_bool),
-        billing_period_start: field(value, "billingPeriodStart", parse_non_empty_string),
-        billing_period_end: field(value, "billingPeriodEnd", parse_non_empty_string),
+        billing_period_start: field(value, "billingPeriodStart", parse_rfc3339_timestamp),
+        billing_period_end: field(value, "billingPeriodEnd", parse_rfc3339_timestamp),
         history: field(value, "history", |raw| {
             raw.as_array().cloned().ok_or(FieldState::Invalid)
         }),
@@ -431,11 +437,23 @@ mod tests {
         let response = parse_billing_response(&json!({
             "config": {
                 "creditUsagePercent": 0,
-                "currentPeriod": {"type":"monthly", "includedUsed":{"val":0}, "unknownOfficialField":true},
+                "currentPeriod": {
+                    "type":"USAGE_PERIOD_TYPE_MONTHLY",
+                    "start":"2026-10-01T00:00:00Z",
+                    "end":"2026-11-01T00:00:00Z"
+                },
                 "monthlyLimit":{"val":100}, "used":{"val":0}, "onDemandCap":{"val":4},
                 "onDemandUsed":{"val":2}, "prepaidBalance":{"val":8},
-                "isUnifiedBillingUser":false, "billingPeriodStart":"start", "billingPeriodEnd":"end",
-                "history":[{"future":true}]
+                "isUnifiedBillingUser":false,
+                "billingPeriodStart":"2026-10-01T00:00:00Z",
+                "billingPeriodEnd":"2026-11-01T00:00:00Z",
+                "history":[{
+                    "billingCycle":{"year":2026,"month":9},
+                    "includedUsed":{"val":0},
+                    "onDemandUsed":{"val":0},
+                    "totalUsed":{"val":0},
+                    "future":true
+                }]
             },
             "on_demand_enabled":false,
             "subscription_tier":"fixture-plan",
@@ -459,17 +477,26 @@ mod tests {
         );
         let config = response.config.value.unwrap();
         assert_eq!(config.is_unified_billing_user.value, Some(false));
+        let current_period = config.current_period.value.unwrap();
         assert_eq!(
-            config
-                .current_period
-                .value
-                .unwrap()
-                .included_used
-                .value
-                .unwrap()
-                .val
-                .value,
-            Some(0)
+            current_period.period_type.value.as_deref(),
+            Some("USAGE_PERIOD_TYPE_MONTHLY")
+        );
+        assert_eq!(
+            current_period.start.value.as_deref(),
+            Some("2026-10-01T00:00:00Z")
+        );
+        assert_eq!(
+            current_period.end.value.as_deref(),
+            Some("2026-11-01T00:00:00Z")
+        );
+        assert_eq!(
+            config.history.value.as_ref().unwrap()[0]["billingCycle"]["month"],
+            9
+        );
+        assert_eq!(
+            config.history.value.as_ref().unwrap()[0]["includedUsed"]["val"],
+            0
         );
         assert_eq!(config.history.value.unwrap()[0]["future"], true);
     }
@@ -512,6 +539,68 @@ mod tests {
         assert_eq!(response.on_demand_enabled.state, FieldState::Null);
         assert_eq!(response.subscription_tier.state, FieldState::Missing);
         assert_eq!(response.usage_percent.state, FieldState::OutOfRange);
+    }
+
+    #[test]
+    fn period_timestamps_require_valid_rfc3339_and_preserve_missing_null_and_invalid() {
+        let invalid = parse_billing_response(&json!({
+            "config": {
+                "currentPeriod": {
+                    "type": "USAGE_PERIOD_TYPE_MONTHLY",
+                    "start": "not-a-date",
+                    "end": "2026-02-30T00:00:00Z"
+                },
+                "billingPeriodStart": "start",
+                "billingPeriodEnd": "2026-02-30T00:00:00Z"
+            }
+        }));
+        let invalid_config = invalid.config.value.unwrap();
+        let invalid_period = invalid_config.current_period.value.unwrap();
+        assert_eq!(invalid_period.start.state, FieldState::Invalid);
+        assert_eq!(invalid_period.end.state, FieldState::Invalid);
+        assert_eq!(
+            invalid_config.billing_period_start.state,
+            FieldState::Invalid
+        );
+        assert_eq!(invalid_config.billing_period_end.state, FieldState::Invalid);
+
+        let sparse = parse_billing_response(&json!({
+            "config": {
+                "currentPeriod": {"type":"USAGE_PERIOD_TYPE_MONTHLY", "end":null},
+                "billingPeriodStart":null
+            }
+        }));
+        let sparse_config = sparse.config.value.unwrap();
+        let sparse_period = sparse_config.current_period.value.unwrap();
+        assert_eq!(sparse_period.start.state, FieldState::Missing);
+        assert_eq!(sparse_period.end.state, FieldState::Null);
+        assert_eq!(sparse_config.billing_period_start.state, FieldState::Null);
+        assert_eq!(sparse_config.billing_period_end.state, FieldState::Missing);
+
+        let valid = parse_billing_response(&json!({
+            "config": {
+                "currentPeriod": {
+                    "type":"USAGE_PERIOD_TYPE_MONTHLY",
+                    "start":"2024-02-29T10:15:30.125+02:30",
+                    "end":"2024-03-01T00:00:00Z"
+                },
+                "billingPeriodStart":"2024-02-29T00:00:00Z",
+                "billingPeriodEnd":"2024-03-01T00:00:00Z"
+            }
+        }));
+        let valid_config = valid.config.value.unwrap();
+        let valid_period = valid_config.current_period.value.unwrap();
+        assert_eq!(valid_period.start.state, FieldState::Available);
+        assert_eq!(
+            valid_period.start.value.as_deref(),
+            Some("2024-02-29T10:15:30.125+02:30")
+        );
+        assert_eq!(valid_period.end.state, FieldState::Available);
+        assert_eq!(
+            valid_config.billing_period_start.state,
+            FieldState::Available
+        );
+        assert_eq!(valid_config.billing_period_end.state, FieldState::Available);
     }
 
     #[test]
