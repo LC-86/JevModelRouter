@@ -414,9 +414,12 @@ export function denialLabel(denial: SubscriptionDenial | null | undefined, t: Tr
   }[denial.code] ?? denial.code);
 }
 
+function verifiedIdentity(state: SubscriptionConnectionState | undefined, identity: string | null | undefined): string | undefined {
+  return state === 'connected' ? identity?.trim() || undefined : undefined;
+}
+
 export function identityLabel(view: SubscriptionView | undefined, t: Translate): string {
-  const identity = view?.identity?.trim();
-  return identity && identity.length > 0 ? identity : t('Unknown');
+  return verifiedIdentity(view?.state, view?.identity) ?? t('Unknown');
 }
 
 export function subscriptionAuthView(snapshot: DashboardSnapshot, providerId: string): SubscriptionAuthView | undefined {
@@ -438,6 +441,7 @@ const AUTH_ERROR_LABELS: Record<string, string> = {
   already_connected: 'This subscription is already connected. Sign out before signing in again.',
   helper_isolated: 'Sign-in is disabled in the isolated verification environment.',
   helper_missing: 'The Grok helper was not found on this machine.',
+  grok_auth_unverified: 'Grok sign-in is disabled because the official CLI does not expose a verified machine-readable identity interface.',
   helper_unsupported: 'Only the Grok helper is managed in this build; sign-in, sign-out and account switching are not implemented for this provider.',
   logout_superseded: 'The connection changed while signing out; nothing was cleared. Refresh to review the current state, then retry.',
 };
@@ -558,7 +562,7 @@ export function subscriptionStatusText(view: SubscriptionView | undefined, t: Tr
     `state=${state}`,
     `(${connectionStateLabel(state, t)})`,
     `generation=${view?.generation ?? 0}`,
-    `identity=${knownOrUnknown(view?.identity)}`,
+    `identity=${verifiedIdentity(state, view?.identity) ?? 'Unknown'}`,
     `helper_user_agent_unverified=${knownOrUnknown(view?.helper?.user_agent)}`,
     `helper=${helperVersionLabel(view)}`,
     `auth_home=${authHomeLabel(view)}`,

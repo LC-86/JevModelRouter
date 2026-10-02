@@ -186,7 +186,7 @@ export interface SubscriptionView {
   /** Persistent unique identity for this stored connection instance; prevents delete/recreate aliasing. */
   connection_instance_id: string;
   state: SubscriptionConnectionState;
-  /** Leo's explicit, volatile real-generation opt-in for this Codex connection generation. */
+  /** Explicit, volatile real-generation opt-in for this subscription connection generation. */
   real_generation_enabled?: boolean;
   /** Finite per-confirmation AutoJev request ceiling and remaining attempts. */
   generation_call_limit?: number | null;
@@ -216,7 +216,7 @@ export type SubscriptionRemoteRevokeState = 'not_attempted' | 'failed' | 'verifi
 
 export interface SubscriptionAuthChallenge { kind: string; instructions: string; verification_url?: string | null; user_code?: string | null }
 export interface SubscriptionAuthError { code: string; message: string; recovery: string }
-export interface SubscriptionHelperInfo { available: boolean; version?: string | null; program?: string | null; home?: string | null }
+export interface SubscriptionHelperInfo { available: boolean; login_supported: boolean; version?: string | null; program?: string | null; home?: string | null }
 /** 退出证据：本地清除与远端撤销分开记录，二者互不推断。 */
 export interface SubscriptionLogoutEvidence { local: SubscriptionLocalLogoutState; local_detail?: string | null; remote: SubscriptionRemoteRevokeState; remote_detail?: string | null }
 /** 一次登录尝试的界面视图；不含任何凭据、token 或辅助进程输出原文。 */

@@ -545,7 +545,7 @@ async fn forward_attempt(context: ProxyContext, headers: HeaderMap, body: Value,
             return protocol_error_response(StatusCode::UNPROCESSABLE_ENTITY, source, &error.to_string());
         }
         let identity = connection.identity.clone();
-        let pre_dispatch_check = codex_admission_check(
+        let pre_dispatch_check = subscription_admission_check(
             resolved.provider.kind.clone(),
             context.store.clone(),
             resolved.provider.id.clone(),
@@ -706,7 +706,7 @@ async fn forward_attempt(context: ProxyContext, headers: HeaderMap, body: Value,
 
 const MAX_CODEX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 
-fn codex_admission_check(
+fn subscription_admission_check(
     expected_kind: ProviderKind,
     store: Arc<ConfigStore>,
     provider_id: String,
@@ -749,7 +749,7 @@ fn codex_admission_check(
                 return Err("The subscription account changed before dispatch".into());
             }
             let admission =
-                if expected_kind == ProviderKind::CodexSubscription && call_already_reserved {
+                if matches!(&expected_kind, ProviderKind::CodexSubscription | ProviderKind::GrokSubscription) && call_already_reserved {
                     crate::subscription::admit_model_with_reserved_call(
                         config, model, provider, protocol,
                     )
@@ -759,21 +759,25 @@ fn codex_admission_check(
             admission.map_err(|denial| denial.summary())
         };
 
-        if expected_kind != ProviderKind::CodexSubscription {
+        if !matches!(&expected_kind, ProviderKind::CodexSubscription | ProviderKind::GrokSubscription) {
             return validate(&store.read(), false);
         }
         if reserved.load(std::sync::atomic::Ordering::SeqCst) {
             return validate(&store.read(), true);
         }
 
-        // The helper invokes this callback more than once for one incoming API request.
+        // The subscription helper invokes this callback more than once for one incoming API request.
         // Reserve once, atomically with all ordinary admission checks; failed and cancelled
         // requests still consume the confirmed attempt count.
         let result = store
             .update(|config| {
                 validate(config, false)?;
-                crate::subscription::reserve_codex_real_generation_call(config, &provider_id)
-                    .map_err(|denial| denial.summary())
+                let result = match &expected_kind {
+                    ProviderKind::CodexSubscription => crate::subscription::reserve_codex_real_generation_call(config, &provider_id),
+                    ProviderKind::GrokSubscription => crate::subscription::reserve_grok_real_generation_call(config, &provider_id),
+                    _ => unreachable!("only Codex and Grok subscriptions have real-generation controls"),
+                };
+                result.map_err(|denial| denial.summary())
             })
             .map_err(|error| error.to_string())?;
         result?;

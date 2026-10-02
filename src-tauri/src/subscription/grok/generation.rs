@@ -1927,6 +1927,17 @@ for line in sys.stdin:
                         }],
                     },
                 );
+                config.grok_real_generation_grants.insert(
+                    provider.id.clone(),
+                    crate::config::SubscriptionRealGenerationGrant {
+                        connection_instance_id: connection.connection_instance_id.clone(),
+                        generation: connection.generation,
+                        identity: connection.identity.clone().unwrap(),
+                        max_calls: crate::subscription::GROK_REAL_GENERATION_MAX_CALLS,
+                        used_calls: 0,
+                        enabled: true,
+                    },
+                );
             })
             .unwrap();
         store
@@ -2713,6 +2724,11 @@ for line in sys.stdin:
                     assert_eq!(output, Some("grok:hello"), "{protocol:?}: {body}");
                 }
                 calls += 1;
+                assert_eq!(
+                    store.read().grok_real_generation_grants["grok-fixture"].used_calls as usize,
+                    calls,
+                    "each accepted helper turn consumes one finite API dispatch slot"
+                );
             }
         }
 
@@ -2805,6 +2821,11 @@ for line in sys.stdin:
                     }
                 }
                 calls += 1;
+                assert_eq!(
+                    store.read().grok_real_generation_grants["grok-fixture"].used_calls as usize,
+                    calls,
+                    "each accepted helper turn consumes one finite API dispatch slot"
+                );
             }
         }
 

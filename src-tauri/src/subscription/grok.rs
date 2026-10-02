@@ -40,6 +40,7 @@ const CODE_HELPER_ISOLATED: &str = "helper_isolated";
 const CODE_HELPER_MISSING: &str = "helper_missing";
 const CODE_HELPER_TIMEOUT: &str = "helper_timeout";
 const CODE_HELPER_EXITED: &str = "helper_exited";
+const CODE_GROK_INTERFACE_UNVERIFIED: &str = "grok_interface_unverified";
 
 #[cfg(test)]
 #[derive(Clone)]
@@ -182,6 +183,9 @@ pub struct GrokSubscriptionAdapter {
     completed_tool_exchanges: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<(String, u64, String), CompletedClientToolExchange>>>,
     #[cfg(test)]
     test_generation: bool,
+    /// Test-only machine-read fixture protocol; production builds never set this.
+    #[cfg(test)]
+    test_read_protocol: bool,
 }
 
 /// Validate the strict ACP text subset before creating an HTTP response.
@@ -223,6 +227,8 @@ impl GrokSubscriptionAdapter {
             completed_tool_exchanges: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             #[cfg(test)]
             test_generation: false,
+            #[cfg(test)]
+            test_read_protocol: false,
         }
     }
 
@@ -231,7 +237,31 @@ impl GrokSubscriptionAdapter {
     pub(crate) fn with_test_helper(home: PathBuf, program: PathBuf) -> Self {
         let mut adapter = Self::from_parts(home, Some(program), Vec::new(), READ_TIMEOUT);
         adapter.test_generation = true;
+        adapter.test_read_protocol = true;
         adapter
+    }
+
+    /// The JSON-line account/catalog/quota protocol is only a test fixture contract.
+    /// The release app has no verified machine-readable interfaces for these values.
+    fn read_protocol_supported(&self) -> bool {
+        if crate::runtime::isolated() {
+            #[cfg(all(not(test), feature = "isolation-check"))]
+            {
+                return crate::runtime::grok_helper_override().is_some();
+            }
+            #[cfg(any(test, not(feature = "isolation-check")))]
+            {
+                return false;
+            }
+        }
+        #[cfg(test)]
+        {
+            self.test_read_protocol
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
     }
 
     /// 测试专用：缩短读取上限，好让超时路径也能在单测里被覆盖。
@@ -587,6 +617,14 @@ impl SubscriptionAdapter for GrokSubscriptionAdapter {
     /// `identity` 非空 → connected，`null`/缺失 → not_connected（这是事实，不是失败）。
     fn status<'a>(&'a self, provider_id: &'a str, _generation: u64) -> BoxFuture<'a, Result<ConnectionStatus>> {
         Box::pin(async move {
+            if !self.read_protocol_supported() {
+                let (code, reason) = if crate::runtime::isolated() {
+                    (CODE_HELPER_ISOLATED, "Grok account status is unavailable in isolated validation")
+                } else {
+                    (CODE_GROK_INTERFACE_UNVERIFIED, "No verified machine-readable Grok account identity interface is available; identity remains unknown")
+                };
+                bail!("{}", refusal(code, reason));
+            }
             let events = self.run_read(provider_id, ReadCommand::Account).await?;
             let payload = match terminal_of(events, ReadCommand::Account.interface())? {
                 Terminal::Payload(ReadEvent::Account(value)) => value,
@@ -617,6 +655,13 @@ impl SubscriptionAdapter for GrokSubscriptionAdapter {
 
     fn models<'a>(&'a self, provider_id: &'a str, _generation: u64) -> BoxFuture<'a, Result<CatalogRead>> {
         Box::pin(async move {
+            if !self.read_protocol_supported() {
+                return Ok(CatalogRead {
+                    state: EvidenceState::Unknown,
+                    missing_fields: vec!["machine_readable_catalog_interface_unverified".into()],
+                    ..CatalogRead::default()
+                });
+            }
             let events = self.run_read(provider_id, ReadCommand::Models).await?;
             match terminal_of(events, ReadCommand::Models.interface())? {
                 // 固定版本没有该机器接口：如实报 unsupported，不是失败，也绝不返回空目录冒充成功。
@@ -629,6 +674,14 @@ impl SubscriptionAdapter for GrokSubscriptionAdapter {
 
     fn quota<'a>(&'a self, provider_id: &'a str, _generation: u64) -> BoxFuture<'a, Result<QuotaEvidence>> {
         Box::pin(async move {
+            if !self.read_protocol_supported() {
+                return Ok(QuotaEvidence {
+                    state: EvidenceState::Unknown,
+                    view: QuotaView::Unknown,
+                    missing_fields: vec!["machine_readable_subscription_quota_interface_unverified".into()],
+                    ..QuotaEvidence::default()
+                });
+            }
             let events = self.run_read(provider_id, ReadCommand::Usage).await?;
             match terminal_of(events, ReadCommand::Usage.interface())? {
                 Terminal::Unsupported => Ok(QuotaEvidence { state: EvidenceState::Unsupported, ..QuotaEvidence::default() }),
@@ -808,6 +861,32 @@ esac
         let home = provider_home(directory);
         std::fs::create_dir_all(&home).unwrap();
         std::fs::write(home.join(name), value).unwrap();
+    }
+
+    #[tokio::test]
+    async fn production_read_path_keeps_grok_identity_catalog_and_quota_unknown_without_spawning_cli() {
+        let directory = tempfile::tempdir().unwrap();
+        let script = fake_helper(
+            &directory,
+            "printf '%s\\n' \"$*\" >> \"$GROK_HOME/invocations\"\\nprintf '%s\\n' '{\"event\":\"done\"}'",
+        );
+        let adapter = GrokSubscriptionAdapter::from_parts(directory.path().to_path_buf(), Some(script), Vec::new(), READ_TIMEOUT);
+
+        let status = adapter.status("grok", 1).await.unwrap_err().to_string();
+        assert!(status.contains("grok_interface_unverified"), "{status}");
+        let catalog = adapter.models("grok", 1).await.unwrap();
+        assert_eq!(catalog.state, EvidenceState::Unknown);
+        assert!(catalog.models.is_empty());
+        assert!(catalog.source.is_none() && catalog.observed_at.is_none());
+        let quota = adapter.quota("grok", 1).await.unwrap();
+        assert_eq!(quota.state, EvidenceState::Unknown);
+        assert_eq!(quota.view, QuotaView::Unknown);
+        assert!(quota.buckets.is_empty());
+        assert!(quota.source.is_none() && quota.observed_at.is_none());
+
+        let home = provider_home(&directory);
+        assert!(!home.join("invocations").exists(), "unsupported CLI commands must never be spawned");
+        assert!(!home.exists(), "an unsupported read must not create an auth home");
     }
 
     /// `pool.period.end` 不是 RFC3339：`resets_at` 保持 None，原始文本进 invalid_fields（不推算重置时间）。
@@ -1154,18 +1233,21 @@ esac
     }
 
     #[tokio::test]
-    async fn grok_reads_fail_honestly_without_a_helper_or_a_terminal_event() {
-        // 解析不到辅助进程：三条只读方法都必须 `Err`，绝不能「成功但为空」。
+    async fn grok_unverified_reads_stay_unknown_and_test_protocol_failures_are_honest() {
+        // 缺少真实 CLI 或已核实机器接口：身份报明确错误，目录/额度维持 Unknown，不伪造成空结果。
         let directory = tempfile::tempdir().unwrap();
         let missing = GrokSubscriptionAdapter::from_parts(directory.path().to_path_buf(), None, Vec::new(), READ_TIMEOUT);
         assert!(!missing.available());
-        for error in [
-            missing.status("grok", 1).await.unwrap_err().to_string(),
-            missing.models("grok", 1).await.unwrap_err().to_string(),
-            missing.quota("grok", 1).await.unwrap_err().to_string(),
-        ] {
-            assert!(error.contains(CODE_HELPER_MISSING), "{error}");
-        }
+        assert!(missing.status("grok", 1).await.unwrap_err().to_string().contains(CODE_GROK_INTERFACE_UNVERIFIED));
+        let catalog = missing.models("grok", 1).await.unwrap();
+        assert_eq!(catalog.state, EvidenceState::Unknown);
+        assert!(catalog.models.is_empty() && catalog.source.is_none() && catalog.observed_at.is_none());
+        assert_eq!(catalog.missing_fields, vec!["machine_readable_catalog_interface_unverified"]);
+        let quota = missing.quota("grok", 1).await.unwrap();
+        assert_eq!(quota.state, EvidenceState::Unknown);
+        assert_eq!(quota.view, QuotaView::Unknown);
+        assert!(quota.buckets.is_empty() && quota.source.is_none() && quota.observed_at.is_none());
+        assert_eq!(quota.missing_fields, vec!["machine_readable_subscription_quota_interface_unverified"]);
 
         // 提前退出、没有任何输出：如实失败，不伪造成空目录或空额度。
         let empty = fake_adapter(&directory, "exit 0");

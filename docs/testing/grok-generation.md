@@ -1,6 +1,6 @@
 # Grok 订阅生成与客户端工具往返（Issue #20 / #22）
 
-本票实现 Grok CLI/ACP 的受限文本子集，并通过本地 ACP 替身验证适配行为。真实 CLI/OAuth、真实模型调用、额度与生产入口尚未验证；生产生成仍 fail-closed，需由 #26 完成人工核验后另行启用。
+本目录包含 Grok CLI/ACP 的受限文本适配与本地 ACP 替身测试。真实 CLI/OAuth、账号、模型资格、额度和整次调用的额外消费边界没有验证；生产生成仍 fail-closed。即使人工确认某个 CLI 行为，也必须先有可引用的身份、资格、额度与费用上限契约，才能考虑另行打开生产入口。
 
 ## 支持范围
 
@@ -17,7 +17,7 @@
 
 ## 上游边界
 
-Issue #22 的客户端工具闭环由受控 ACP 替身覆盖；它不证明真实 Grok CLI 会按同一方式报告 `pending` 工具调用。真实 CLI/OAuth、真人登录、真实模型调用、额度与 credits 均留给 #26 核验；生产生成继续 fail-closed，替身不能开启生产入口。ACP 的 `tool_call` 状态和取消终态遵循 [Tool Calls](https://agentclientprotocol.com/protocol/v1/tool-calls) 与 [Prompt Turn](https://agentclientprotocol.com/protocol/v1/prompt-turn)。
+Issue #22 的客户端工具闭环由受控 ACP 替身覆盖；它不证明真实 Grok CLI 会按同一方式报告 `pending` 工具调用。ACP 是代理/生成接口；`session/prompt` 会提交生成请求，可能消耗额度，不能用于只读身份、目录或额度探测。生产入口继续 fail-closed，替身不能开启生产入口。ACP 的 `tool_call` 状态和取消终态遵循 [Tool Calls](https://agentclientprotocol.com/protocol/v1/tool-calls) 与 [Prompt Turn](https://agentclientprotocol.com/protocol/v1/prompt-turn)。
 
 ## Agent 验证
 
@@ -30,6 +30,6 @@ Issue #22 的客户端工具闭环由受控 ACP 替身覆盖；它不证明真�
 | `pnpm build` | 通过 TypeScript 与 Vite；保留既有 Tauri API 动态/静态导入及分包大小提示 |
 | `pnpm release:check` | 通过 |
 
-`pnpm test:isolated` 本票未运行：父会话已记录原生桌面 watchdog/报告 `ENOENT`，main 基线结果不确定；不把该路径计为通过，也不扩展修复环境。真实 Grok CLI、OAuth、额度、credits 与模型请求均未执行。
+上述命令结果是本文件既有的历史记录，不构成本次 Issue #26 修复分支的测试结果。当前分支结果见 [人工验收入口](grok-hand-run.md) 和提交记录。真实 Grok CLI、OAuth、额度、credits 与模型请求均未执行。
 
 ACP 的终态及会话配置选项遵循 [Prompt Turn](https://agentclientprotocol.com/protocol/v1/prompt-turn) 与 [Session Config Options](https://agentclientprotocol.com/protocol/v1/session-config-options)；这不代表 Grok CLI 的实际 ACP 行为已由真人核验。

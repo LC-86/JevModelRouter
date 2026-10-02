@@ -28,6 +28,7 @@ pub const CODE_HELPER_MISSING: &str = "helper_missing";
 pub const CODE_HELPER_UNSUPPORTED: &str = "helper_unsupported";
 /// 登录启动期间连接被换号或服务商被删除：新尝试已中止。
 const CODE_LOGIN_SUPERSEDED: &str = "login_superseded";
+const CODE_GROK_AUTH_UNVERIFIED: &str = "grok_auth_unverified";
 /// 退出时更早的世代守卫已经失效（读配置与写配置之间连接被并发登录/换号推进）：
 /// 这次退出既没有写连接状态、也没有回收进程或清理专用 home，界面必须如实告知并允许重试。
 const CODE_LOGOUT_SUPERSEDED: &str = "logout_superseded";
@@ -110,6 +111,9 @@ pub struct LogoutEvidence {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HelperInfo {
     pub available: bool,
+    /// Whether this build currently permits Grok sign-in with a reviewed machine-readable contract.
+    #[serde(default)]
+    pub login_supported: bool,
     #[serde(default)]
     pub version: Option<String>,
     #[serde(default)]
@@ -220,6 +224,9 @@ pub struct GrokCliAuth {
     processes: OwnedProcesses,
     sessions: Mutex<HashMap<String, Session>>,
     logouts: Mutex<HashMap<String, LogoutEvidence>>,
+    /// Test-only switch for the local fake helper protocol; never present in production builds.
+    #[cfg(test)]
+    test_helper: bool,
 }
 
 impl GrokCliAuth {
@@ -240,6 +247,8 @@ impl GrokCliAuth {
             processes: OwnedProcesses::new(),
             sessions: Mutex::new(HashMap::new()),
             logouts: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            test_helper: false,
         }
     }
 
@@ -247,7 +256,20 @@ impl GrokCliAuth {
     /// `pub(crate)` 让 config.rs 的载入清理用例也能用真实实现驱动。
     #[cfg(test)]
     pub(crate) fn with_test_helper(home: PathBuf, program: PathBuf) -> Self {
-        Self::from_parts(home, Some(program), Vec::new())
+        let mut auth = Self::from_parts(home, Some(program), Vec::new());
+        auth.test_helper = true;
+        auth
+    }
+
+    fn login_protocol_supported(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.test_helper
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
     }
 
     fn helper_info(&self, provider_id: &str) -> HelperInfo {
@@ -257,6 +279,7 @@ impl GrokCliAuth {
             available: self.available(),
             // 探测不拉起进程，拿不到版本就必须保持未知。
             version: None,
+            login_supported: self.login_protocol_supported() && !crate::runtime::isolated(),
             program: self.program.as_ref().map(|program| program.display().to_string()),
             home: helper::helper_home(&ProviderKind::GrokSubscription, provider_id, &self.home)
                 .ok()
@@ -370,6 +393,12 @@ impl SubscriptionAuth for GrokCliAuth {
         Box::pin(async move {
             if crate::runtime::isolated() {
                 return Err(refusal(CODE_HELPER_ISOLATED, "Grok authorization is unavailable in isolated validation"));
+            }
+            if !self.login_protocol_supported() {
+                return Err(refusal(
+                    CODE_GROK_AUTH_UNVERIFIED,
+                    "The official Grok CLI does not document the machine-readable challenge and verified-identity contract required by AutoJev.",
+                ));
             }
             let Some(program) = self.program.clone() else {
                 return Err(refusal(CODE_HELPER_MISSING, "No Grok CLI helper was found on PATH"));
@@ -1048,6 +1077,7 @@ mod lifecycle_tests {
             view.generation = generation;
             view.helper = HelperInfo {
                 available: self.available.load(Ordering::SeqCst),
+                login_supported: false,
                 version: None,
                 program: Some("fixture-helper".into()),
                 home: Some(format!("/tmp/fixture-helpers/{provider_id}/home")),
@@ -2075,6 +2105,7 @@ mod lifecycle_tests {
             error: Some(auth_error("helper_error", "failed", "Retry.")),
             helper: HelperInfo {
                 available: false,
+                login_supported: false,
                 version: None,
                 program: Some("grok".into()),
                 home: Some("/tmp/fixture/home".into()),
@@ -2094,6 +2125,7 @@ mod lifecycle_tests {
         assert_eq!(json["challenge"]["user_code"], "ABCD");
         assert_eq!(json["error"]["code"], "helper_error");
         assert_eq!(json["helper"]["available"], false);
+        assert_eq!(json["helper"]["login_supported"], false);
         assert_eq!(json["logout"]["local"], "failed");
         assert_eq!(json["logout"]["remote"], "unsupported");
         assert_eq!(json.as_object().unwrap().len(), 9);
@@ -2108,6 +2140,28 @@ mod lifecycle_tests {
             std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         script
+    }
+
+    #[tokio::test]
+    async fn production_grok_login_rejects_unverified_event_contract_without_spawning_cli() {
+        let directory = tempfile::tempdir().unwrap();
+        let script = fake_helper(
+            &directory,
+            "fake-grok.sh",
+            "printf '%s\\n' \"$*\" >> \"$GROK_HOME/invocations\"\nprintf '%s\\n' '{\"event\":\"challenge\",\"instructions\":\"fixture\"}'\nprintf '%s\\n' '{\"event\":\"identity\",\"identity\":\"fixture@example.invalid\"}'\nprintf '%s\\n' '{\"event\":\"done\"}'",
+        );
+        let auth = GrokCliAuth::from_parts(directory.path().to_path_buf(), Some(script), Vec::new());
+        assert!(auth.available(), "the fixture executable is present");
+        assert!(!auth.view("grok", 1).helper.login_supported, "an installed executable does not verify a login protocol");
+
+        let error = auth.begin("grok", 1).await.unwrap_err();
+        assert!(error.contains("grok_auth_unverified"), "{error}");
+        let view = auth.view("grok", 1);
+        assert_eq!(view.phase, AuthPhase::Idle);
+        assert!(view.identity.is_none() && view.challenge.is_none() && view.attempt.is_none());
+        let home = helper::helper_home(&ProviderKind::GrokSubscription, "grok", directory.path()).unwrap();
+        assert!(!home.join("invocations").exists(), "unsupported login output must never be requested");
+        assert!(!home.exists(), "an unsupported login must not create an auth home");
     }
 
     /// 真实拉起路径：本地假 helper 脚本，不联网、不装 CLI、不碰真实凭据。
@@ -2127,6 +2181,7 @@ mod lifecycle_tests {
         let view = auth.view("grok", 1);
         assert_eq!(view.phase, AuthPhase::Pending);
         assert_eq!(view.attempt, Some(1));
+        assert!(view.helper.login_supported, "test-only fake protocol is explicitly enabled for this fixture");
         assert_eq!(view.helper.program.as_deref(), script.to_str());
         // 探测不拉起进程读版本，因此版本必须保持未知，不得编造。
         assert!(view.helper.version.is_none());
@@ -2605,12 +2660,12 @@ mod lifecycle_tests {
     }
 
     #[tokio::test]
-    async fn grok_cli_auth_refuses_to_start_without_a_helper() {
+    async fn grok_cli_auth_refuses_to_start_without_a_verified_protocol() {
         let directory = tempfile::tempdir().unwrap();
         let auth = GrokCliAuth::from_parts(directory.path().to_path_buf(), None, Vec::new());
         assert!(!auth.available());
         let error = auth.begin("grok", 1).await.unwrap_err();
-        assert!(error.contains(CODE_HELPER_MISSING), "{error}");
+        assert!(error.contains(CODE_GROK_AUTH_UNVERIFIED), "{error}");
         assert_eq!(auth.view("grok", 1).phase, AuthPhase::Idle);
         assert_eq!(auth.view("grok", 1).attempt, None);
     }

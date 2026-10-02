@@ -325,6 +325,26 @@ export async function setCodexRealGenerationEnabled(
   });
 }
 
+/** Arm or disarm real Grok generation for the current connection only; all admission gates remain mandatory. */
+export async function setGrokRealGenerationEnabled(
+  providerId: string,
+  enabled: boolean,
+  maxCalls: number,
+  expectedConnectionInstanceId: string,
+  expectedGeneration: number,
+  expectedIdentity: string,
+): Promise<DashboardSnapshot> {
+  if (!isTauri()) throw new Error('Open the desktop app to manage real Grok generation.');
+  return invoke('set_grok_real_generation_enabled', {
+    providerId,
+    enabled,
+    maxCalls: enabled ? maxCalls : null,
+    expectedConnectionInstanceId,
+    expectedGeneration,
+    expectedIdentity,
+  });
+}
+
 /** 开始订阅登录：立即返回 pending，完成结果由前端轮询 get_snapshot 观察。 */
 export async function beginSubscriptionLogin(providerId: string): Promise<DashboardSnapshot> {
   if (!isTauri()) throw new Error('Open the desktop app to sign in to a subscription.');
