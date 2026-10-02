@@ -8,7 +8,7 @@
 
 - 当前 CLI 1.0.44 的 `login --help` 没有 AutoJev 所需的机器可读 challenge/verified-identity 事件协议。
 - `account` 不是该版本帮助列出的命令。`models --help` 没列出 `--json`。`usage` 要求本地 session ID，并报告 session token/cost，不能作为订阅用量或 Extra Usage 权限。
-- 官方源码 revision [`a549186d9d39311f2d3ee4208db62af8c65aa476`](https://github.com/xai-org/grok-build/tree/a549186d9d39311f2d3ee4208db62af8c65aa476) 定义了候选 ACP 身份与订阅方法，但与本机 CLI 1.0.44 的版本对应关系尚未核实。`x.ai/auth/info` 的 `current_or_expired` 不证明登录有效；`x.ai/auth/check_subscription` 会刷新 JWT，不属于本只读验收可调用的接口。官方 CLI reference 也未给出本机版本对这些方法的兼容承诺。
+- 官方 [公开 commit `72a61251fcffb464bcc687aeb5a998e5a98ec0c9`](https://github.com/xai-org/grok-build/commit/72a61251fcffb464bcc687aeb5a998e5a98ec0c9) 的提交信息标注 `Source-Revision: a549186d9d39311f2d3ee4208db62af8c65aa476`；这是两个不同标识，`a549…` 不是公开 commit SHA。该固定快照的 [`xai-grok-shell/Cargo.toml`](https://github.com/xai-org/grok-build/blob/72a61251fcffb464bcc687aeb5a998e5a98ec0c9/crates/codegen/xai-grok-shell/Cargo.toml) 与 [`CHANGELOG.md`](https://github.com/xai-org/grok-build/blob/72a61251fcffb464bcc687aeb5a998e5a98ec0c9/crates/codegen/xai-grok-shell/CHANGELOG.md) 版本均为 `1.0.16`（2026-09-01），不是本机 CLI 1.0.44；本机版本是否实现同一候选 ACP 契约尚未核实。`x.ai/auth/info` 的 `current_or_expired` 不证明登录有效；`x.ai/auth/check_subscription` 会刷新 JWT，不属于本只读验收可调用的接口。官方 CLI reference 也未给出本机版本对这些方法的兼容承诺。
 - [Headless/ACP 文档](https://docs.x.ai/build/cli/headless-scripting) 中的 `session/prompt` 是生成路径；不能用于身份、目录或额度只读探测。
 
 ## 安全验证入口
