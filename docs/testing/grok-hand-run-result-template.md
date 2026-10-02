@@ -23,7 +23,7 @@
 | 完整 `cargo test --locked --offline --manifest-path src-tauri/Cargo.toml --lib` | 默认沙箱尝试：463 passed / 36 failed，失败均为本地 mock server 绑定 loopback 时 EPERM；允许 loopback 后重跑：499 passed / 0 failed | 通过；重跑仅启用测试所需本地 loopback mock server，没有外部模型或账号请求 |
 | `pnpm test:grok-readonly-gate` | parser、前端 build、`isolation-check` 桌面 build、原生 Providers 页断言均通过；helper/ACP 与模型请求计数为 0 | 通过；首次默认沙箱运行在本地 loopback `listen` 被 EPERM 阻止，允许该本地测试监听后重跑通过 |
 | 原生 Providers 页断言 | source/version gate 关闭；身份、目录、账单、自动充值和 Extra Usage 为 Unknown；生成关闭；订阅快照不变；无 Grok helper 与模型请求；对比度 13.284:1 / 5.442:1 | 通过；隔离桌面自动断言，不是真实账号/额度或真实 Grok 连接证据 |
-| 原生窗口截图 | 捕获尝试得到全黑窗口；该隔离桌面运行未生成 `isolation-report.json`，故截图已丢弃 | 未通过；无截图保留。无截图捕获的 `pnpm test:grok-readonly-gate` 独立运行通过 |
+| 原生窗口截图 | 先前全黑截图已丢弃；本次 [`docs/screenshots/grok-readonly-gate.png`](../screenshots/grok-readonly-gate.png) 已目视确认是隔离 AutoJev Providers 窗口，显示 source/version gate、身份/目录/额度字段 Unknown、真实生成 Off；不含 Grok 账号或凭据 | 通过（原生 UI 证据；不证明真实 Grok 身份、额度、ACP 或模型调用） |
 | 其他真实登录、真实额度/credits 与模型请求 | 未执行 | 未测；按 Issue #26 由 Leo 手测 |
 
 预算语义：每个通过完整准入并开始派发的 API 请求最多启动一个 ACP `session/prompt`，占一个有限 dispatch 槽；失败与取消仍计入 dispatch 槽。客户端工具结果续传作为新 API 请求和新 helper turn 单独计数、占另一槽。人工验收需同时记录 `dispatch` 和 ACP `session/prompt` 实际计数，二者均不得超过事先接受的同一个总上限。

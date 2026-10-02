@@ -38,6 +38,18 @@ pnpm test:grok-readonly-gate
 
 These checks assert the static source gate and use the isolated AutoJev app. The UI acceptance asserts the gate is closed, every account/billing field remains Unknown, generation is off, subscription evidence is unchanged, and no Grok helper or model request was started. None of these checks authenticates a real account or proves the installed CLI contract.
 
+The isolated native-window capture for this PR is [`../screenshots/grok-readonly-gate.png`](../screenshots/grok-readonly-gate.png). The image includes the Grok status card and the ordinary Providers table; the card shows the source/version gate, Unknown fields, and generation Off. It is UI evidence, not evidence of a Grok account, catalog, quota, or live ACP read. Capture it from an unlocked desktop with:
+
+```sh
+AUTOJEV_CAPTURE_NATIVE_SCREENSHOT=1 \
+AUTOJEV_GROK_READONLY_SCREENSHOT_PATH=docs/screenshots/grok-readonly-gate.png \
+pnpm test:grok-readonly-gate
+```
+
+The command scopes capture to the isolated AutoJev window and asserts zero Grok helper, ACP, and model requests.
+
+![隔离 Providers 页面中的 Grok source/version gate；账号、目录、额度未知，生成关闭](../screenshots/grok-readonly-gate.png)
+
 ## Remaining evidence needed
 
 The bounded standard initialization/authentication check above does not validate any custom ACP method. Before further compatibility work, identify and pin the exact helper artifact and use one bounded route: verify an official source/release mapping, select a source-mapped official release, or—if the 1.0.44 source remains unavailable—obtain separate approval for an isolated compatibility probe after its initialization side effects are understood. A probe establishes only observed protocol behavior, not source provenance, account identity, quota permission, or billing safety. Do not use undocumented auth/info, session/prompt, or auth/check_subscription as probes. The one cached-token check does not authorize a new OAuth login, account-profile read, billing read, quota refresh, or model request. Before generation, independently establish model qualification, subscription quota semantics, and a server-side end-to-end Extra Usage restriction.

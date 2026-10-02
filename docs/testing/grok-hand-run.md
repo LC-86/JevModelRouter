@@ -26,6 +26,8 @@ pnpm test:grok-readonly-gate
 
 `pnpm test:grok-billing-parser` 覆盖候选 billing DTO 的纯 Rust 解析。`pnpm test:grok-readonly-gate` 再构建前端和隔离桌面，并检查 Providers 页显示生产 source/version gate、相关字段为 `Unknown`、生成保持关闭，且不启动 helper、ACP 或模型请求。此 change 不实现或模拟未经核实的 ACP wire 方法。版本证据、候选源与阻断原因见 [Grok ACP 只读路径](grok-acp-readonly.md)。这些本地测试不解锁真实登录或 HAND_RUN 项。
 
+本 PR 的隔离 Providers 原生窗口截图为 [`../screenshots/grok-readonly-gate.png`](../screenshots/grok-readonly-gate.png)。画面包含 Grok 状态卡片和普通服务商列表；该卡片佐证 source/version gate、Unknown 字段与生成关闭状态。运行截图检查需要已解锁的桌面会话，且不会启动 Grok helper/ACP 或模型请求。
+
 结果请填入 [结果模板](grok-hand-run-result-template.md)，将真实登录、读取与生成项记为“阻塞”或“未测”，不要填成通过或用量为 0。
 
 ## 当前版本可见行为
