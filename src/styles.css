@@ -370,15 +370,15 @@ input, select, textarea { width: 100%; border: 1px solid var(--line-light); back
 .provider-subscription-catalog-human, .provider-subscription-quota-human, .provider-subscription-quota-history { color: var(--muted); font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
 .provider-subscription-quota-bucket { display: inline-flex; align-items: center; gap: 4px; color: var(--muted); font-size: 11px; line-height: 1.5; }
 .provider-subscription-quota-bucket code { font-size: 11px; }
-.grok-billing-offline-fixture { padding: 16px 18px; border: 1px dashed var(--warning, #c98b28); border-radius: 12px; background: color-mix(in srgb, var(--warning, #c98b28) 7%, var(--panel, #fff)); }
-.grok-billing-offline-fixture header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-.grok-billing-offline-fixture header span, .grok-billing-offline-fixture code { font: 11px var(--mono); overflow-wrap: anywhere; }
-.grok-billing-offline-fixture p { margin: 8px 0; color: var(--muted); font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
-.grok-billing-offline-fixture dl { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px 18px; margin: 12px 0; }
-.grok-billing-offline-fixture dl > div { display: grid; grid-template-columns: minmax(130px, .7fr) minmax(0, 1.3fr); gap: 8px; font-size: 12px; }
-.grok-billing-offline-fixture dt { color: var(--muted); }
-.grok-billing-offline-fixture dd { margin: 0; font-family: var(--mono); overflow-wrap: anywhere; }
-@media (max-width: 760px) { .grok-billing-offline-fixture dl { grid-template-columns: 1fr; } }
+.grok-readonly-status { padding: 16px 18px; border: 1px dashed var(--warning, #c98b28); border-radius: 12px; background: color-mix(in srgb, var(--warning, #c98b28) 7%, var(--surface)); color: var(--text); }
+.grok-readonly-status header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.grok-readonly-status header span, .grok-readonly-status code { font: 11px var(--mono); overflow-wrap: anywhere; }
+.grok-readonly-status p { margin: 8px 0; color: var(--muted); font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+.grok-readonly-status dl { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px 18px; margin: 12px 0 0; }
+.grok-readonly-status dl > div { display: grid; grid-template-columns: minmax(130px, .7fr) minmax(0, 1.3fr); gap: 8px; font-size: 12px; }
+.grok-readonly-status dt { color: var(--muted); }
+.grok-readonly-status dd { margin: 0; font-family: var(--mono); overflow-wrap: anywhere; }
+@media (max-width: 760px) { .grok-readonly-status dl { grid-template-columns: 1fr; } }
 .subscription-provider-note { display: flex; align-items: flex-start; gap: 8px; color: var(--muted); }
 .subscription-provider-note svg { flex-shrink: 0; margin-top: 2px; }
 .subscription-provider-note .provider-test-help { margin: 0; }

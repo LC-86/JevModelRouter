@@ -1,18 +1,14 @@
-//! Grok 只读目录与额度适配器：一次读取 = 一个一次性辅助进程。
-//!
-//! 本模块只做三件事：按 [`crate::subscription::helper`] 的受控 spec 拉起辅助进程、逐行解析
-//! stdout 的 JSON 事件、把事件严格映射成证据。它不下载、不安装、不联网，也不消费任何额度：
-//! 三条只读子命令（`account`/`models`/`usage`）都是本应用的适配约定，未对真实 CLI 验证。
-//!
-//! 隔离验证环境（[`crate::runtime::isolated`]）下绝不拉起任何进程，解析不到辅助进程也如实报错：
-//! 两者都必须返回 `Err`，绝不能返回「成功但为空」的读数。同一服务商的只读读取串行化，
-//! 收尾只回收自己那个 pid，绝不复用登录会话的进程。
+//! Grok subscription boundary. Production account/catalog/quota reads and login remain fail-closed
+//! until the installed CLI source and its ACP wire contract are mapped and reviewed. The older
+//! newline-event adapter below is exercised only by unit-test fakes; it is not a production CLI
+//! contract. The static UI source gate lives in [`source_gate`].
 
 // Production generation remains fail-closed until the real CLI contract is verified in #26.
 #[allow(dead_code)]
 mod generation;
-#[cfg(any(feature = "isolation-check", test))]
+#[cfg(test)]
 pub(crate) mod billing;
+pub(crate) mod source_gate;
 
 use std::{path::PathBuf, time::Duration};
 

@@ -1101,62 +1101,74 @@
     passed('signing out invalidates the catalogue eligibility and clears the dedicated helper home');
   };
 
-  const grokBillingOfflineLifecycle = async () => {
+  const grokReadonlyGateLifecycle = async () => {
     const before = await invoke('get_snapshot');
     const existingGrokViews = (before.subscriptions || []).filter(item => item.provider_id === 'grok-fixture');
-    check(existingGrokViews.length === 0, `The billing sample run must start without a Grok account: ${JSON.stringify(existingGrokViews)}`);
+    check(existingGrokViews.length === 0, `The read-only gate run must start without a Grok account: ${JSON.stringify(existingGrokViews)}`);
     await nav(1);
     const captureHoldMs = Number(window.__ISOLATION_CHECK__.captureHoldMs || 0);
-    const fixtureNode = await wait(() => document.querySelector('[data-testid="grok-billing-offline-fixture"]'), 'offline billing diagnostic panel');
-    const fixture = await invoke('grok_billing_offline_fixture');
-    check(fixture.mode === 'offline_synthetic_fixture', `The command must identify a local fixture: ${JSON.stringify(fixture)}`);
-    check(fixture.billing.state === 'sample_returned' && fixture.billing.value?.usagePercent?.value === 42.5,
-      `The local billing payload must be parsed without a live RPC: ${JSON.stringify(fixture.billing)}`);
-    check(fixture.billing.value?.usagePercent?.origin === 'config.creditUsagePercent',
-      `The direct percentage source must be explicit: ${JSON.stringify(fixture.billing.value?.usagePercent)}`);
-    const fixtureConfig = fixture.billing.value?.config?.value;
-    const currentPeriod = fixtureConfig?.currentPeriod?.value;
-    check(currentPeriod?.periodType?.value === 'USAGE_PERIOD_TYPE_MONTHLY' && currentPeriod.start.state === 'available' && currentPeriod.end.state === 'available',
-      `The candidate currentPeriod must contain only its type and validated RFC3339 range: ${JSON.stringify(currentPeriod)}`);
-    check(currentPeriod && !('includedUsed' in currentPeriod) && !('onDemandUsed' in currentPeriod) && !('totalUsed' in currentPeriod),
-      `Usage amounts must not be misplaced under currentPeriod: ${JSON.stringify(currentPeriod)}`);
-    const history = fixtureConfig?.history;
-    check(history?.state === 'available' && history.value?.[0]?.billingCycle?.year === 2026 && history.value?.[0]?.includedUsed?.val === 1250,
-      `Usage cents must remain under the official-shaped billing history entry: ${JSON.stringify(history)}`);
-    check(fixture.autoTopup.state === 'sample_failed' && fixture.autoTopup.value === null,
-      `A partial synthetic read failure must not erase the billing payload or fabricate a rule: ${JSON.stringify(fixture.autoTopup)}`);
-    check(fixture.scopeReplay.currentResponseAccepted && fixture.scopeReplay.responseAfterAccountSwitchRejected && fixture.scopeReplay.responseAfterConnectionSwitchRejected,
-      `Late results must be discarded after account-generation or connection changes: ${JSON.stringify(fixture.scopeReplay)}`);
-    const panel = fixtureNode.textContent || '';
-    check(panel.includes('Offline Grok billing fixture') || panel.includes('Grok 离线账单样例'), `The visible panel must be clearly marked as synthetic: ${panel}`);
-    check(panel.includes('synthetic-tier') && panel.includes('42.5') && panel.includes('synthetic_partial_read_failure'),
-      `The native panel must render the parsed sample and independent partial failure: ${panel}`);
-    check(panel.includes('old account-generation response rejected') || panel.includes('旧账号世代响应已拒绝'),
-      `The panel must expose the stale-account guard result: ${panel}`);
+    const panelNode = await wait(() => document.querySelector('[data-testid="grok-readonly-status"]'), 'Grok source-verification status panel');
+    const status = await invoke('grok_readonly_status');
+    check(status.state === 'blocked_unverified_source' && status.sourceVerified === false,
+      `The production source gate must remain closed: ${JSON.stringify(status)}`);
+    check(['authInfo', 'modelCatalog', 'billing', 'autoTopupRule', 'extraUsagePermission'].every(key => status[key] === 'unknown'),
+      `Identity, model catalog, billing, auto top-up, and Extra Usage must remain Unknown: ${JSON.stringify(status)}`);
+    check(status.realGenerationEnabled === false && status.sourceVersion === null && status.sourceCommit === null,
+      `An unverified source must not advertise generation or a source pin: ${JSON.stringify(status)}`);
+    const panel = panelNode.textContent || '';
+    check(panel.includes('Source/version verification required') || panel.includes('需要验证来源/版本'), `The panel must identify the closed source gate: ${panel}`);
+    check(panel.includes('No Grok ACP request was sent') || panel.includes('没有发送 Grok ACP 请求'), `The panel must distinguish blocked status from a successful account read: ${panel}`);
+    check((panel.match(/Unknown|未知/g) || []).length >= 5, `All unsupported account fields must be shown as Unknown: ${panel}`);
+    check(panel.includes('Off') || panel.includes('关闭'), `Real generation must remain off: ${panel}`);
+    const parseColor = (value) => (value.match(/[\d.]+/g) || []).slice(0, 3).map(Number);
+    const luminance = (color) => {
+      const channels = parseColor(color);
+      if (channels.length !== 3) return null;
+      const linear = channels.map(channel => {
+        const normalized = channel > 1 ? channel / 255 : channel;
+        return normalized <= 0.04045 ? normalized / 12.92 : ((normalized + 0.055) / 1.055) ** 2.4;
+      });
+      return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2];
+    };
+    const contrast = (foreground, background) => {
+      const fg = luminance(foreground); const bg = luminance(background);
+      return fg === null || bg === null ? null : (Math.max(fg, bg) + 0.05) / (Math.min(fg, bg) + 0.05);
+    };
+    const panelStyle = getComputedStyle(panelNode);
+    const bodyStyle = getComputedStyle(panelNode.querySelector('p'));
+    check(panelStyle.backgroundColor !== 'rgba(0, 0, 0, 0)', 'The Grok status panel must have an explicit contrasting surface');
+    const mainContrast = contrast(panelStyle.color, panelStyle.backgroundColor);
+    const bodyContrast = contrast(bodyStyle.color, panelStyle.backgroundColor);
+    check(mainContrast === null || mainContrast >= 4.5, `Panel text contrast must be at least 4.5:1, got ${mainContrast}`);
+    check(bodyContrast === null || bodyContrast >= 4.5, `Panel explanatory text contrast must be at least 4.5:1, got ${bodyContrast}`);
     const after = await invoke('get_snapshot');
     check(JSON.stringify(after.subscriptions) === JSON.stringify(before.subscriptions),
-      'The offline parser sample must not modify subscription identity, quota, generation, or admission state');
+      'The status read must not modify subscription identity, quota, generation, or admission state');
     const detail = {
-      mode: fixture.mode,
-      sourceRevision: fixture.sourceRevision,
-      usagePercent: fixture.billing.value.usagePercent,
-      autoTopupState: fixture.autoTopup.state,
-      scopeReplay: fixture.scopeReplay,
+      mode: status.state,
+      sourceVerified: status.sourceVerified,
+      authInfo: status.authInfo,
+      modelCatalog: status.modelCatalog,
+      billing: status.billing,
+      autoTopupRule: status.autoTopupRule,
+      extraUsagePermission: status.extraUsagePermission,
+      mainContrast,
+      explanatoryTextContrast: bodyContrast,
       panel: panel.slice(0, 1600),
       subscriptionSnapshotUnchanged: true,
     };
     report.details = detail;
-    passed('offline ACP billing parser fixture renders in the native Providers UI with no connected account');
-    passed('partial auto-top-up fixture failure remains separate and leaves missing values unknown');
-    passed('old billing responses are rejected after an account-generation or connection switch');
-    passed('offline diagnostic leaves production subscription and generation-admission snapshots unchanged');
+    passed('Grok ACP source gate renders in the native Providers UI with no connected account or ACP process');
+    passed('identity, catalog, billing, auto top-up, and Extra Usage remain Unknown while source is unverified');
+    passed('generation remains off and the status call leaves subscription evidence unchanged');
+    passed('read-only status panel text meets 4.5:1 contrast where the webview reports colors');
     if (captureHoldMs > 0) await new Promise(resolve => setTimeout(resolve, captureHoldMs));
   };
 
   try {
     await wait(() => document.querySelector('.app-shell'));
-    if (window.__ISOLATION_CHECK__.loginMode === 'grok-billing') {
-      try { await grokBillingOfflineLifecycle(); report.ok = true; }
+    if (window.__ISOLATION_CHECK__.loginMode === 'grok-readonly') {
+      try { await grokReadonlyGateLifecycle(); report.ok = true; }
       catch (error) { report.error = String(error); report.screen = document.body.innerText.slice(-5000); }
       await invoke('isolation_check_report', { report });
       return;

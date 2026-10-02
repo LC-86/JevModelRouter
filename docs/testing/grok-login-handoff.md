@@ -8,8 +8,12 @@
 
 - 当前 CLI 1.0.44 的 `login --help` 没有 AutoJev 所需的机器可读 challenge/verified-identity 事件协议。
 - `account` 不是该版本帮助列出的命令。`models --help` 没列出 `--json`。`usage` 要求本地 session ID，并报告 session token/cost，不能作为订阅用量或 Extra Usage 权限。
-- 官方 [公开 commit `72a61251fcffb464bcc687aeb5a998e5a98ec0c9`](https://github.com/xai-org/grok-build/commit/72a61251fcffb464bcc687aeb5a998e5a98ec0c9) 的提交信息标注 `Source-Revision: a549186d9d39311f2d3ee4208db62af8c65aa476`；这是两个不同标识，`a549…` 不是公开 commit SHA。该固定快照的 [`xai-grok-shell/Cargo.toml`](https://github.com/xai-org/grok-build/blob/72a61251fcffb464bcc687aeb5a998e5a98ec0c9/crates/codegen/xai-grok-shell/Cargo.toml) 与 [`CHANGELOG.md`](https://github.com/xai-org/grok-build/blob/72a61251fcffb464bcc687aeb5a998e5a98ec0c9/crates/codegen/xai-grok-shell/CHANGELOG.md) 版本均为 `1.0.16`（2026-09-01），不是本机 CLI 1.0.44；本机版本是否实现同一候选 ACP 契约尚未核实。`x.ai/auth/info` 的 `current_or_expired` 不证明登录有效；`x.ai/auth/check_subscription` 会刷新 JWT，不属于本只读验收可调用的接口。官方 CLI reference 也未给出本机版本对这些方法的兼容承诺。
+- npm 注册表[精确的 `@xai-official/grok@1.0.44` 记录](https://registry.npmjs.org/@xai-official/grok/1.0.44)返回 HTTP 200、无重定向，含完整 `gitHead` `5b807183dd7978a460f309132cf0d1183d743526` 且无 `repository` 字段。本地安装清单缺少这两个字段；CLI 历史 build ID `5b807183dd79` 与该 `gitHead` 前缀一致。对完整 SHA 的公开 GitHub 查找返回 HTTP 422，仅说明该次查找未解析，不能证明不存在其他映射；本机二进制到可核验官方源码/发布的映射仍未建立。较旧的固定公开快照 [`72a61251fcffb464bcc687aeb5a998e5a98ec0c9`](https://github.com/xai-org/grok-build/commit/72a61251fcffb464bcc687aeb5a998e5a98ec0c9) 标为 1.0.16，其中候选 `x.ai/auth/info` 状态 `current_or_expired` 不证明当前登录有效；`x.ai/auth/check_subscription` 会刷新 JWT，不属于本只读验收可调用的接口。较新的 1.0.45 快照也不是本机 1.0.44 的源码映射；官方 CLI reference 未承诺本机版本支持上述 ACP 方法。
 - [Headless/ACP 文档](https://docs.x.ai/build/cli/headless-scripting) 中的 `session/prompt` 是生成路径；不能用于身份、目录或额度只读探测。
+
+## 一次现有会话认证检查（2026-10-02）
+
+本机官方 CLI grok 1.0.44 (5b807183dd79) 的 ACP v1 initialize 成功并广告 cached_token；随后一次 authenticate(cached_token) 返回成功，耗时 1.65 秒。响应负载未保留或打印，未核实账户姓名/邮箱，因此只确认现有缓存会话被接受。没有启动交互式 grok login，没有发 session/new、session/prompt 或模型请求，也没有读取账单、额度或 credits。子进程在应答后被清理（退出码 143；不是请求失败），无超时。此项不打开 AutoJev 生产登录功能，也不证明额外用量安全。
 
 ## 安全验证入口
 
@@ -17,4 +21,4 @@
 
 ## 解除阻塞所需证据
 
-官方源码已有候选身份、模型目录和 billing 方法，不应表述为“官方没有接口”。仍需核实这些方法是否存在于本机 CLI 1.0.44、其字段与身份/资格语义、版本稳定性，以及是否有能保证整次调用不产生额外消费的机制。billing 数值或自动充值设置本身不证明消费被禁止；本只读验收不得调用会刷新 JWT 的 `x.ai/auth/check_subscription`。这些核实完成前，身份有效性、目录资格、订阅额度与 extra-use 限制仍为 **Unknown**，不执行真人登录/生成验收。
+官方源码已有候选身份、模型目录和 billing 方法，不应表述为“官方没有接口”。后续验证某个 helper 可在两条有限路线中选择：使用来源映射可验证的官方固定版本，或在确认 initialize 副作用边界并获得单独授权后，以隔离目录做有界兼容性验证。无需无限期寻找 1.0.44 的完整源码；兼容性验证只记录实际协议行为，不能证明发布来源、账号权益或费用约束。真人登录、账号/额度读取和模型调用仍分别保持关闭，直至用户另行授权。billing 数值或自动充值设置本身不证明消费被禁止；本只读验收不得调用会刷新 JWT 的 `x.ai/auth/check_subscription`。身份有效性、目录资格、订阅额度与 Extra Usage 限制未核实时继续显示 **Unknown**，生成保持禁用。

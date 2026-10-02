@@ -7,7 +7,6 @@ use chrono::DateTime;
 use serde::Serialize;
 use serde_json::Value;
 
-pub const SOURCE_REVISION: &str = "xai-org/grok-build@2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8";
 const LEGACY_USAGE_ORIGIN: &str = "legacy.used/monthlyLimit";
 const DIRECT_USAGE_ORIGIN: &str = "config.creditUsagePercent";
 
@@ -101,46 +100,11 @@ pub struct AutoTopupRuleDto {
     pub max_amount_per_month: Observed<CentDto>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SampleRpcState {
-    SampleReturned,
-    SampleFailed,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SampleRpc<T> {
-    pub state: SampleRpcState,
-    pub value: Option<T>,
-    pub failure_code: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BillingScope {
     pub provider_id: String,
     pub connection_instance_id: String,
     pub generation: u64,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ScopeReplay {
-    pub current_response_accepted: bool,
-    pub response_after_account_switch_rejected: bool,
-    pub response_after_connection_switch_rejected: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct OfflineBillingFixture {
-    pub mode: &'static str,
-    pub source_revision: &'static str,
-    pub billing: SampleRpc<BillingResponseDto>,
-    pub auto_topup: SampleRpc<AutoTopupRuleDto>,
-    pub scope: BillingScope,
-    pub scope_replay: ScopeReplay,
 }
 
 /// Reject cached or late values unless provider, connection instance, and generation still match.
@@ -187,84 +151,6 @@ pub fn parse_billing_response(value: &Value) -> BillingResponseDto {
 #[allow(dead_code)]
 pub fn parse_auto_topup_response(value: &Value) -> Observed<AutoTopupRuleDto> {
     field(value, "rule", parse_auto_topup_rule)
-}
-
-/// Fixed local fixture: one synthetic successful billing result and one synthetic partial failure.
-/// No ACP method is called and no value is stored in subscription quota evidence.
-pub fn offline_fixture() -> OfflineBillingFixture {
-    let sample_scope = BillingScope {
-        provider_id: "grok-fixture".into(),
-        connection_instance_id: "offline-synthetic-connection".into(),
-        generation: 1,
-    };
-    let billing_payload = serde_json::json!({
-        "config": {
-            "creditUsagePercent": 42.5,
-            "currentPeriod": {
-                "type": "USAGE_PERIOD_TYPE_MONTHLY",
-                "start": "2026-10-01T00:00:00Z",
-                "end": "2026-11-01T00:00:00Z"
-            },
-            "monthlyLimit": {"val": 20000},
-            "used": {"val": 7500},
-            "onDemandCap": {"val": 4000},
-            "onDemandUsed": {"val": 50},
-            "prepaidBalance": {"val": 900},
-            "isUnifiedBillingUser": true,
-            "billingPeriodStart": "2026-10-01T00:00:00Z",
-            "billingPeriodEnd": "2026-11-01T00:00:00Z",
-            "history": [{
-                "billingCycle": {"year": 2026, "month": 9},
-                "includedUsed": {"val": 1250},
-                "onDemandUsed": {"val": 50},
-                "totalUsed": {"val": 1300}
-            }]
-        },
-        "on_demand_enabled": false,
-        "subscription_tier": "synthetic-tier"
-    });
-
-    let account_switched = BillingScope {
-        generation: 2,
-        ..sample_scope.clone()
-    };
-    let connection_switched = BillingScope {
-        connection_instance_id: "offline-synthetic-connection-2".into(),
-        ..sample_scope.clone()
-    };
-    let scope_replay = ScopeReplay {
-        current_response_accepted: accept_scoped_response(&sample_scope, &sample_scope, ())
-            .is_some(),
-        response_after_account_switch_rejected: accept_scoped_response(
-            &sample_scope,
-            &account_switched,
-            (),
-        )
-        .is_none(),
-        response_after_connection_switch_rejected: accept_scoped_response(
-            &sample_scope,
-            &connection_switched,
-            (),
-        )
-        .is_none(),
-    };
-
-    OfflineBillingFixture {
-        mode: "offline_synthetic_fixture",
-        source_revision: SOURCE_REVISION,
-        billing: SampleRpc {
-            state: SampleRpcState::SampleReturned,
-            value: Some(parse_billing_response(&billing_payload)),
-            failure_code: None,
-        },
-        auto_topup: SampleRpc {
-            state: SampleRpcState::SampleFailed,
-            value: None,
-            failure_code: Some("synthetic_partial_read_failure".into()),
-        },
-        scope: sample_scope,
-        scope_replay,
-    }
 }
 
 fn field<T>(
@@ -670,24 +556,6 @@ mod tests {
         assert_eq!(rule.topup_amount.value.unwrap().val.value, Some(25));
         assert_eq!(rule.min_before_hitting_sl.state, FieldState::Missing);
 
-        let fixture = offline_fixture();
-        assert_eq!(fixture.billing.state, SampleRpcState::SampleReturned);
-        assert_eq!(fixture.auto_topup.state, SampleRpcState::SampleFailed);
-        assert_eq!(
-            fixture.auto_topup.failure_code.as_deref(),
-            Some("synthetic_partial_read_failure")
-        );
-        assert_eq!(fixture.scope_replay.current_response_accepted, true);
-        assert_eq!(
-            fixture.scope_replay.response_after_account_switch_rejected,
-            true
-        );
-        assert_eq!(
-            fixture
-                .scope_replay
-                .response_after_connection_switch_rejected,
-            true
-        );
     }
 
     #[test]
