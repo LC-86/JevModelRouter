@@ -1046,5 +1046,21 @@
   "Official quota reference": "官方额度查看入口",
   "Viewing the official reference is not a bypass for admission.": "官方入口仅供查看，不作为绕过准入的依据。",
   "Removed from the previous catalog: {models}": "已从上一次目录移除：{models}",
-  "Open official reference": "打开官方入口"
+  "Open official reference": "打开官方入口",
+  "Manual observation · generation off": "手动读取 · 生成关闭",
+  "Refresh models and usage": "刷新模型与用量",
+  "Reading…": "读取中…",
+  "Reads the current account already signed in to the official Grok CLI. Model discovery and usage do not prove subscription eligibility or permission for extra fees. Real generation stays off.": "读取官方 Grok CLI 已登录的当前账户。模型目录和用量不能证明订阅资格或额外费用许可；真实生成保持关闭。",
+  "Last updated": "最后更新时间",
+  "Expired; refresh to read current values.": "已过期，请刷新以读取当前值。",
+  "Current CLI model": "CLI 当前模型",
+  "Empty catalog": "目录为空",
+  "used": "已使用",
+  "remaining (calculated)": "剩余（计算值）",
+  "Subscription plan": "订阅套餐",
+  "Usage period": "用量周期",
+  "Period end / estimated reset": "周期结束 / 预计重置",
+  "Billing period end": "账单周期结束",
+  "Usage and billing period ends conflict.": "用量与账单周期结束时间冲突。",
+  "Read cancelled; values are Unknown.": "读取已取消，当前值未知。"
 }

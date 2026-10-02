@@ -1,8 +1,9 @@
 //! Static Grok helper source/version gate.
 //!
 //! This module does not launch the CLI, initialize ACP, read local auth state, or fetch account,
-//! catalog, billing, or auto-top-up data. Those fields stay Unknown until an installed helper can
-//! be mapped to an immutable public source and its read behavior is independently verified.
+//! catalog, billing, or auto-top-up data. Its Unknown fields describe this legacy static snapshot;
+//! the separate manual observation in [`super::readonly`] does not change source provenance or
+//! generation admission.
 
 use serde::Serialize;
 

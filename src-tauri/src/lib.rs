@@ -225,6 +225,17 @@ async fn grok_readonly_status() -> subscription::grok::source_gate::UiStatus {
     subscription::grok::source_gate::ui_status()
 }
 
+/// Manual read only; never updates a subscription connection or generation admission.
+#[tauri::command]
+async fn refresh_grok_readonly(request_id: String) -> Result<subscription::grok::readonly::Observation, String> {
+    subscription::grok::readonly::refresh(request_id).await
+}
+
+#[tauri::command]
+async fn cancel_grok_readonly(request_id: String) {
+    subscription::grok::readonly::cancel(&request_id).await;
+}
+
 /// Explicit current-connection opt-in; generation remains subject to every existing subscription gate.
 #[tauri::command]
 async fn set_codex_real_generation_enabled(
@@ -1472,6 +1483,8 @@ pub fn run() {
             get_snapshot,
             refresh_subscription,
             grok_readonly_status,
+            refresh_grok_readonly,
+            cancel_grok_readonly,
             set_codex_real_generation_enabled,
             set_grok_real_generation_enabled,
             begin_subscription_login,

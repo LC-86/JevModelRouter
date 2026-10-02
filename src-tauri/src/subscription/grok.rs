@@ -1,7 +1,7 @@
-//! Grok subscription boundary. Production account/catalog/quota reads and login remain fail-closed
-//! until the installed CLI source and its ACP wire contract are mapped and reviewed. The older
-//! newline-event adapter below is exercised only by unit-test fakes; it is not a production CLI
-//! contract. The static UI source gate lives in [`source_gate`].
+//! Grok subscription boundary. Manual CLI observations live in [`readonly`] and never enter
+//! subscription evidence or admission. Login and generation remain fail-closed. The older
+//! newline-event adapter below is exercised only by unit-test fakes, not the production CLI.
+//! [`source_gate`] retains the legacy static source-provenance/generation snapshot.
 
 // Production generation remains fail-closed until the real CLI contract is verified in #26.
 #[allow(dead_code)]
@@ -9,6 +9,7 @@ mod generation;
 #[cfg(test)]
 pub(crate) mod billing;
 pub(crate) mod source_gate;
+pub(crate) mod readonly;
 
 use std::{path::PathBuf, time::Duration};
 
