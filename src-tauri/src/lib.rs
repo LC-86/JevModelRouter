@@ -247,6 +247,40 @@ async fn set_codex_real_generation_enabled(
     Ok(snapshot(&state).await)
 }
 
+#[tauri::command]
+async fn set_grok_real_generation_enabled(
+    state: State<'_, AppState>,
+    provider_id: String,
+    enabled: bool,
+    max_calls: Option<u32>,
+    expected_connection_instance_id: String,
+    expected_generation: u64,
+    expected_identity: String,
+) -> Result<DashboardSnapshot, String> {
+    if enabled {
+        let config = state.store.read();
+        let generation = config.subscriptions.get(&provider_id)
+            .map(|connection| connection.generation)
+            .ok_or_else(|| "not_connected: A current Grok connection is required.".to_owned())?;
+        if !state.store.auth.view(&provider_id, generation).helper.login_supported {
+            return Err("grok_auth_unverified: Grok generation cannot be armed until its login and identity contract is verified.".into());
+        }
+    }
+    let outcome = state.store.update(|config| {
+        subscription::set_grok_real_generation_enabled_for_snapshot(
+            config,
+            &provider_id,
+            enabled,
+            max_calls,
+            &expected_connection_instance_id,
+            expected_generation,
+            &expected_identity,
+        )
+    }).map_err(|error| error.to_string())?;
+    outcome.map_err(|denial| format!("{}: {}", denial.code, denial.message))?;
+    Ok(snapshot(&state).await)
+}
+
 /// Disarm on any explicit login/logout/switch action. The control is memory-only and account-bound.
 fn disarm_codex_real_generation(store: &ConfigStore, provider_id: &str) -> Result<(), String> {
     store
@@ -257,11 +291,19 @@ fn disarm_codex_real_generation(store: &ConfigStore, provider_id: &str) -> Resul
         .map_err(|error| error.to_string())
 }
 
+fn disarm_grok_real_generation(store: &ConfigStore, provider_id: &str) -> Result<(), String> {
+    store.update(|config| {
+        subscription::set_grok_real_generation_enabled(config, provider_id, false, None)
+            .expect("disarming a volatile Grok generation grant is always allowed");
+    }).map_err(|error| error.to_string())
+}
+
 /// 开始订阅登录。Grok 由本票内置的 auth 生命周期管理；其它订阅服务商（Codex 等）
 /// 走 Issue #13 的适配器会话。两套实现并存，命令名不变，按 provider kind 分派。
 #[tauri::command]
 async fn begin_subscription_login(state: State<'_, AppState>, provider_id: String) -> Result<DashboardSnapshot, String> {
     disarm_codex_real_generation(&state.store, &provider_id)?;
+    disarm_grok_real_generation(&state.store, &provider_id)?;
     if managed_by_grok_auth(&state.store.read(), &provider_id) {
         subscription::auth::begin(&state.store, &provider_id).await?;
     } else {
@@ -282,6 +324,7 @@ async fn poll_subscription_login(state: State<'_, AppState>, provider_id: String
 /// 取消进行中的登录：Grok 走内置 auth 生命周期，其它订阅走适配器会话。
 #[tauri::command]
 async fn cancel_subscription_login(state: State<'_, AppState>, provider_id: String) -> Result<DashboardSnapshot, String> {
+    disarm_grok_real_generation(&state.store, &provider_id)?;
     if managed_by_grok_auth(&state.store.read(), &provider_id) {
         subscription::auth::cancel(&state.store, &provider_id).await?;
     } else {
@@ -294,6 +337,7 @@ async fn cancel_subscription_login(state: State<'_, AppState>, provider_id: Stri
 #[tauri::command]
 async fn logout_subscription(state: State<'_, AppState>, provider_id: String) -> Result<DashboardSnapshot, String> {
     disarm_codex_real_generation(&state.store, &provider_id)?;
+    disarm_grok_real_generation(&state.store, &provider_id)?;
     if managed_by_grok_auth(&state.store.read(), &provider_id) {
         subscription::auth::logout(&state.store, &provider_id).await?;
     } else {
@@ -306,6 +350,7 @@ async fn logout_subscription(state: State<'_, AppState>, provider_id: String) ->
 #[tauri::command]
 async fn switch_subscription_account(state: State<'_, AppState>, provider_id: String) -> Result<DashboardSnapshot, String> {
     disarm_codex_real_generation(&state.store, &provider_id)?;
+    disarm_grok_real_generation(&state.store, &provider_id)?;
     if managed_by_grok_auth(&state.store.read(), &provider_id) {
         subscription::auth::switch_account(&state.store, &provider_id).await?;
     } else {
@@ -1418,6 +1463,7 @@ pub fn run() {
             get_snapshot,
             refresh_subscription,
             set_codex_real_generation_enabled,
+            set_grok_real_generation_enabled,
             begin_subscription_login,
             poll_subscription_login,
             cancel_subscription_login,

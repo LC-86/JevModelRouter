@@ -89,6 +89,7 @@ import {
   importProviders,
   refreshSubscription,
   setCodexRealGenerationEnabled,
+  setGrokRealGenerationEnabled,
   restoreAgent,
   saveModel,
   saveProvider,
@@ -615,6 +616,34 @@ function ProvidersPage({ snapshot, onAdd, onEdit, onDelete, onTest, onImport, on
       setGenerationBusy((previous) => { const next = { ...previous }; delete next[provider.id]; return next; });
     }
   };
+  const toggleGrokGeneration = async (provider: Provider, enabled: boolean) => {
+    if (generationBusy[provider.id]) return;
+    const currentView = subscriptionView(snapshot, provider.id);
+    const loginSupported = subscriptionAuthView(snapshot, provider.id)?.helper?.login_supported === true;
+    if (enabled && (!loginSupported || !currentView || currentView.state !== 'connected' || !currentView.identity?.trim())) {
+      onNotify(t('A verified Grok login and current connected identity are required before arming generation.'), true);
+      return;
+    }
+    const expectedConnectionInstanceId = currentView?.connection_instance_id ?? '';
+    const expectedGeneration = currentView?.generation ?? 0;
+    const expectedIdentity = currentView?.identity ?? '';
+    const generationKey = `${provider.id}:${currentView?.generation ?? 0}`;
+    const maxCalls = generationCallLimits[generationKey] ?? currentView?.generation_call_limit ?? 1;
+    if (enabled && (!Number.isInteger(maxCalls) || maxCalls < 1 || maxCalls > 15)) {
+      onNotify(t('The request limit must be between 1 and 15.'), true);
+      return;
+    }
+    if (enabled && !window.confirm(t('Before arming real Grok generation, complete HAND_RUN. This is an account-wide opt-in for every eligible model and verified protocol on this connection; it does not lock access to the model and protocol in your plan. Confirm the specific model, protocol, fictional inputs, client-owned tools, dispatch and helper-turn limit, output boundary, possible fees, and allowed steps in HAND_RUN, and use only that plan. The limit is {count} AutoJev requests; failures, cancellations, helper turns, and client-tool follow-ups count. This volatile switch sends no request and cannot bypass identity, model, protocol, quota, or Extra Usage admission. The production Grok adapter remains closed until its interface is verified. Continue?', { count: maxCalls }))) return;
+    setGenerationBusy((previous) => ({ ...previous, [provider.id]: true }));
+    try {
+      onSnapshot(await setGrokRealGenerationEnabled(provider.id, enabled, maxCalls, expectedConnectionInstanceId, expectedGeneration, expectedIdentity));
+      onNotify(t(enabled ? 'Real Grok generation armed for this connection.' : 'Real Grok generation disarmed.'));
+    } catch (error) {
+      onNotify(error instanceof Error ? error.message : String(error), true);
+    } finally {
+      setGenerationBusy((previous) => { const next = { ...previous }; delete next[provider.id]; return next; });
+    }
+  };
   const refresh = async (provider: Provider) => {
     if (refreshing[provider.id]) return;
     setRefreshing((previous) => ({ ...previous, [provider.id]: true }));
@@ -747,6 +776,51 @@ function ProvidersPage({ snapshot, onAdd, onEdit, onDelete, onTest, onImport, on
                 : t('Each confirmation is limited to 1–15 AutoJev requests; failures, cancellations, and tool-result follow-ups count.')}
             </small>
             <p className="provider-subscription-generation-note">{t('This volatile control does not verify identity, models, protocols, quota, or credits. Every existing admission check remains mandatory. The per-connection request count survives disarm/re-arm and resets after restart, sign-out, or account switch.')}</p>
+          </section>;
+        })}
+        {snapshot.providers.filter((provider) => provider.kind === 'grok_subscription').map((provider) => {
+          const view = subscriptionView(snapshot, provider.id);
+          const enabled = view?.real_generation_enabled === true;
+          const loginSupported = subscriptionAuthView(snapshot, provider.id)?.helper?.login_supported === true;
+          const canArm = provider.enabled && loginSupported && view?.state === 'connected' && Boolean(view.identity?.trim());
+          const generationKey = `${provider.id}:${view?.generation ?? 0}`;
+          const maxCalls = generationCallLimits[generationKey] ?? view?.generation_call_limit ?? 1;
+          return <section className="provider-subscription-generation" key={`grok-generation-${provider.id}`} data-testid={`grok-generation-control-${provider.id}`} aria-label={t('Real Grok generation')}>
+            <div>
+              <strong>{t('Real Grok generation')}</strong>
+              <p data-testid={`grok-generation-state-${provider.id}`}>{t(enabled ? 'Armed for this account; admission still required.' : 'Off. Real Grok requests are denied by default.')}</p>
+              <small>{t('Connection generation {generation} · helper {helper}', { generation: view?.generation ?? 0, helper: view?.helper_version || t('Unknown') })} · {t('Helper self-report (unverified)')}: {view?.helper?.user_agent || t('Unknown')}</small>
+            </div>
+            <label className="provider-subscription-generation-limit">{t('Maximum requests for this confirmation')}
+              <input
+                type="number"
+                min={1}
+                max={15}
+                step={1}
+                inputMode="numeric"
+                data-testid={`grok-generation-call-limit-${provider.id}`}
+                aria-label={t('Maximum requests for this confirmation')}
+                disabled={!canArm || view?.generation_call_limit != null || generationBusy[provider.id] === true}
+                value={maxCalls}
+                onChange={(event) => { const value = Number(event.currentTarget.value); setGenerationCallLimits((previous) => ({ ...previous, [generationKey]: value })); }}
+              />
+            </label>
+            <label className="provider-subscription-generation-toggle">
+              <input
+                type="checkbox"
+                data-testid={`grok-real-generation-${provider.id}`}
+                checked={enabled}
+                disabled={!canArm || generationBusy[provider.id] === true || (!enabled && view?.generation_calls_remaining === 0)}
+                onChange={(event) => void toggleGrokGeneration(provider, event.currentTarget.checked)}
+              />
+              <span>{t('Enable real Grok generation for this connection')}</span>
+            </label>
+            <small className="provider-subscription-generation-budget" data-testid={`grok-generation-budget-${provider.id}`}>
+              {view?.generation_call_limit != null
+                ? t('{remaining} of {limit} confirmed AutoJev requests remain.', { remaining: view?.generation_calls_remaining ?? 0, limit: view?.generation_call_limit ?? maxCalls })
+                : t('Each confirmation is limited to 1–15 AutoJev requests; failures, cancellations, helper turns, and client-tool follow-ups count.')}
+            </small>
+            <p className="provider-subscription-generation-note">{t('This volatile control does not verify identity, models, protocols, quota, or Extra Usage. Every existing admission check remains mandatory. The production Grok adapter remains closed until its interface is verified.')}</p>
           </section>;
         })}
         {snapshot.providers.length === 0 && <EmptyState icon={<Server />} title={t('No providers yet')} body={t('Add a provider or import from CC Switch or Termany.')} />}

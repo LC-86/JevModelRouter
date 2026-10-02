@@ -93,7 +93,7 @@ pub enum QuotaView {
     Unknown,
     RateLimitsByLimitId,
     RateLimits,
-    /// 本应用的 Grok 只读额度事件（`usage --json`）；与 Codex 的多桶/旧版单桶语义不可混用。
+    /// Grok 测试替身的额度事件视图；生产 CLI 当前没有已核实的额度机器接口。
     GrokCliUsage,
 }
 
@@ -566,7 +566,7 @@ fn extra_usage_denial(provider: &Provider, permission: QuotaPermission) -> Optio
             "extra_usage_allowed",
             DenialFamily::Quota,
             format!("{name} currently permits use of extra credits, so AutoJev cannot keep this request within the subscription allowance."),
-            "Disable extra-usage permission upstream and refresh read-only evidence, or use an API provider.".into(),
+            "Use an API provider until a reviewed integration can verify that extra credits cannot be used for the whole call.".into(),
         )),
         QuotaPermission::Unknown => Some(Denial::new(
             "extra_usage_permission_unknown",
@@ -597,6 +597,7 @@ fn admission_denial(provider: &Provider, quota: &QuotaEvidence) -> Option<Denial
 /// The real Codex generation control is a volatile, connection-generation-scoped opt-in.
 /// It never creates or changes identity, model, protocol, quota, or extra-usage evidence.
 pub const CODEX_REAL_GENERATION_MAX_CALLS: u32 = 15;
+pub const GROK_REAL_GENERATION_MAX_CALLS: u32 = 15;
 
 pub fn codex_real_generation_enabled(config: &AppConfig, provider: &Provider) -> bool {
     if provider.kind != ProviderKind::CodexSubscription {
@@ -618,6 +619,25 @@ pub fn codex_real_generation_enabled(config: &AppConfig, provider: &Provider) ->
             })
 }
 
+/// Grok uses an independent in-memory opt-in, bound to its current connection identity and generation.
+/// It never supersedes the identity, catalog, protocol, quota, or Extra Usage admission checks.
+pub fn grok_real_generation_enabled(config: &AppConfig, provider: &Provider) -> bool {
+    if provider.kind != ProviderKind::GrokSubscription {
+        return false;
+    }
+    let Some(connection) = config.subscriptions.get(&provider.id) else {
+        return false;
+    };
+    connection.state == ConnectionState::Connected
+        && connection.identity.as_deref().is_some_and(|identity| !identity.trim().is_empty())
+        && config.grok_real_generation_grants.get(&provider.id).is_some_and(|grant| {
+            grant.enabled
+                && grant.generation == connection.generation
+                && grant.connection_instance_id == connection.connection_instance_id
+                && connection.identity.as_deref() == Some(grant.identity.as_str())
+        })
+}
+
 pub fn codex_real_generation_call_counts(
     config: &AppConfig,
     provider: &Provider,
@@ -632,6 +652,23 @@ pub fn codex_real_generation_call_counts(
     config
         .codex_real_generation_grants
         .get(&provider.id)
+        .filter(|grant| {
+            grant.generation == connection.generation
+                && grant.connection_instance_id == connection.connection_instance_id
+                && connection.identity.as_deref() == Some(grant.identity.as_str())
+        })
+        .map(|grant| (grant.max_calls, grant.max_calls.saturating_sub(grant.used_calls)))
+}
+
+pub fn grok_real_generation_call_counts(config: &AppConfig, provider: &Provider) -> Option<(u32, u32)> {
+    let connection = config.subscriptions.get(&provider.id)?;
+    if provider.kind != ProviderKind::GrokSubscription
+        || connection.state != ConnectionState::Connected
+        || connection.identity.as_deref().map(str::trim).unwrap_or("").is_empty()
+    {
+        return None;
+    }
+    config.grok_real_generation_grants.get(&provider.id)
         .filter(|grant| {
             grant.generation == connection.generation
                 && grant.connection_instance_id == connection.connection_instance_id
@@ -751,6 +788,100 @@ pub fn set_codex_real_generation_enabled(
     Ok(())
 }
 
+/// Explicit, finite Grok-generation consent for one verified connection generation.
+/// Enabling this never supplies missing evidence and cannot bypass ordinary admission.
+pub fn set_grok_real_generation_enabled(
+    config: &mut AppConfig,
+    provider_id: &str,
+    enabled: bool,
+    max_calls: Option<u32>,
+) -> Result<(), Denial> {
+    if !enabled {
+        let current = config.subscriptions.get(provider_id).and_then(|connection| {
+            connection.identity.as_deref().map(|identity| {
+                (connection.connection_instance_id.clone(), connection.generation, identity.to_owned())
+            })
+        });
+        let grant_matches = current.as_ref().is_some_and(|(instance_id, generation, identity)| {
+            config.grok_real_generation_grants.get(provider_id).is_some_and(|grant| {
+                grant.connection_instance_id == *instance_id
+                    && grant.generation == *generation
+                    && grant.identity == *identity
+            })
+        });
+        if grant_matches {
+            if let Some(grant) = config.grok_real_generation_grants.get_mut(provider_id) {
+                grant.enabled = false;
+            }
+        } else {
+            config.grok_real_generation_grants.remove(provider_id);
+        }
+        return Ok(());
+    }
+
+    let provider = config.providers.iter().find(|provider| provider.id == provider_id).ok_or_else(|| {
+        Denial::new(
+            "provider_not_found",
+            DenialFamily::Disabled,
+            "The Grok subscription provider is unavailable.".into(),
+            "Open Providers and select the configured Grok subscription.".into(),
+        )
+    })?;
+    if provider.kind != ProviderKind::GrokSubscription {
+        return Err(Denial::new(
+            "not_grok_subscription",
+            DenialFamily::Disabled,
+            "The real-generation control is only available for Grok subscriptions.".into(),
+            "Select the Grok subscription provider in Providers.".into(),
+        ));
+    }
+    let max_calls = max_calls.filter(|value| (1..=GROK_REAL_GENERATION_MAX_CALLS).contains(value))
+        .ok_or_else(|| Denial::new(
+            "grok_generation_call_limit_invalid",
+            DenialFamily::Disabled,
+            format!("The Grok request limit must be between 1 and {GROK_REAL_GENERATION_MAX_CALLS}."),
+            "Complete HAND_RUN with a finite request count before arming real Grok generation.".into(),
+        ))?;
+    let connection = connection_check(config, provider)?;
+    let connection_instance_id = connection.connection_instance_id.clone();
+    let generation = connection.generation;
+    let identity = connection.identity.as_deref().expect("connection_check verified the identity").to_owned();
+    if let Some(grant) = config.grok_real_generation_grants.get_mut(provider_id).filter(|grant| {
+        grant.connection_instance_id == connection_instance_id
+            && grant.generation == generation
+            && grant.identity == identity
+    }) {
+        if max_calls > grant.max_calls || max_calls < grant.used_calls {
+            return Err(Denial::new(
+                "grok_generation_call_limit_invalid",
+                DenialFamily::Disabled,
+                "The request limit for this connection cannot be increased or set below calls already used.".into(),
+                "Keep the original confirmed request limit for this connection generation.".into(),
+            ));
+        }
+        if grant.used_calls >= max_calls {
+            return Err(Denial::new(
+                "grok_generation_call_limit",
+                DenialFamily::Disabled,
+                "The confirmed Grok request limit has been reached.".into(),
+                "Stop this run; the Grok request budget for this connection generation is exhausted.".into(),
+            ));
+        }
+        grant.max_calls = max_calls;
+        grant.enabled = true;
+    } else {
+        config.grok_real_generation_grants.insert(provider_id.to_owned(), crate::config::SubscriptionRealGenerationGrant {
+            connection_instance_id,
+            generation,
+            identity,
+            max_calls,
+            used_calls: 0,
+            enabled: true,
+        });
+    }
+    Ok(())
+}
+
 /// Apply an opt-in only if the connection instance still matches the confirmation snapshot,
 /// in addition to its verified account and numeric generation.
 /// The check and mutation run under one ConfigStore update.
@@ -779,6 +910,33 @@ pub fn set_codex_real_generation_enabled_for_snapshot(
         }
     }
     set_codex_real_generation_enabled(config, provider_id, enabled, max_calls)
+}
+
+pub fn set_grok_real_generation_enabled_for_snapshot(
+    config: &mut AppConfig,
+    provider_id: &str,
+    enabled: bool,
+    max_calls: Option<u32>,
+    expected_connection_instance_id: &str,
+    expected_generation: u64,
+    expected_identity: &str,
+) -> Result<(), Denial> {
+    if enabled {
+        let matches = config.subscriptions.get(provider_id).is_some_and(|connection| {
+            connection.connection_instance_id == expected_connection_instance_id
+                && connection.generation == expected_generation
+                && connection.identity.as_deref() == Some(expected_identity)
+        });
+        if !matches {
+            return Err(Denial::new(
+                "grok_generation_confirmation_stale",
+                DenialFamily::Disabled,
+                "The Grok connection changed after the confirmation was shown.".into(),
+                "Review the current connection and confirm its request limit again.".into(),
+            ));
+        }
+    }
+    set_grok_real_generation_enabled(config, provider_id, enabled, max_calls)
 }
 
 /// Reserve one admitted Codex API generation attempt. Callers perform the complete model,
@@ -824,6 +982,39 @@ pub fn reserve_codex_real_generation_call(
     Ok(())
 }
 
+/// Reserve one admitted Grok generation attempt. The gateway calls this atomically with all
+/// ordinary identity, model, protocol, quota, and Extra Usage checks.
+pub fn reserve_grok_real_generation_call(config: &mut AppConfig, provider_id: &str) -> Result<(), Denial> {
+    let current = config.subscriptions.get(provider_id).map(|connection| {
+        (connection.connection_instance_id.clone(), connection.generation, connection.identity.clone())
+    });
+    let Some(grant) = config.grok_real_generation_grants.get_mut(provider_id) else {
+        return Err(Denial::new(
+            "grok_generation_disabled",
+            DenialFamily::Disabled,
+            "Real Grok generation is disabled for this connection.".into(),
+            "Complete and review the Grok HAND_RUN checklist, then explicitly enable this connection in Providers.".into(),
+        ));
+    };
+    if !grant.enabled
+        || !current.as_ref().is_some_and(|(instance_id, generation, identity)| {
+            grant.connection_instance_id == *instance_id
+                && grant.generation == *generation
+                && identity.as_deref() == Some(grant.identity.as_str())
+        })
+        || grant.used_calls >= grant.max_calls
+    {
+        return Err(Denial::new(
+            "grok_generation_call_limit",
+            DenialFamily::Disabled,
+            "The confirmed Grok request limit has been reached.".into(),
+            "Stop this run. A new finite Grok HAND_RUN confirmation is required before another request.".into(),
+        ));
+    }
+    grant.used_calls += 1;
+    Ok(())
+}
+
 fn evaluate(
     config: &AppConfig,
     provider: &Provider,
@@ -850,6 +1041,16 @@ fn evaluate(
             "Complete and review the Codex HAND_RUN checklist, then explicitly enable this connection in Providers. All identity, model, protocol, quota, and extra-usage checks still apply.".into(),
         ));
     }
+    if provider.kind == ProviderKind::GrokSubscription
+        && !grok_real_generation_enabled(config, provider)
+    {
+        return Err(Denial::new(
+            "grok_generation_disabled",
+            DenialFamily::Disabled,
+            "Real Grok generation is disabled for this connection.".into(),
+            "Complete and review the Grok HAND_RUN checklist, then explicitly enable this connection. All identity, model, protocol, quota, and Extra Usage checks still apply.".into(),
+        ));
+    }
     if provider.kind == ProviderKind::CodexSubscription
         && !reserved_call
         && codex_real_generation_call_counts(config, provider).is_some_and(|(_, remaining)| remaining == 0)
@@ -859,6 +1060,17 @@ fn evaluate(
             DenialFamily::Disabled,
             "The confirmed Codex request limit has been reached.".into(),
             "Stop this run. A new finite HAND_RUN confirmation is required before another request.".into(),
+        ));
+    }
+    if provider.kind == ProviderKind::GrokSubscription
+        && !reserved_call
+        && grok_real_generation_call_counts(config, provider).is_some_and(|(_, remaining)| remaining == 0)
+    {
+        return Err(Denial::new(
+            "grok_generation_call_limit",
+            DenialFamily::Disabled,
+            "The confirmed Grok request limit has been reached.".into(),
+            "Stop this run. A new finite Grok HAND_RUN confirmation is required before another request.".into(),
         ));
     }
     // 资格只看账号目录：同一账号同一世代的读取失败仍算合格（网络失败 ≠ 被移除）。
@@ -1765,6 +1977,9 @@ pub fn sync_provider(config: &mut AppConfig, provider_id: &str, kind: &ProviderK
     if *kind != ProviderKind::CodexSubscription {
         config.codex_real_generation_grants.remove(provider_id);
     }
+    if *kind != ProviderKind::GrokSubscription {
+        config.grok_real_generation_grants.remove(provider_id);
+    }
 }
 
 /// 服务商标识重命名时迁移连接，保留世代与已核实身份；订阅目录随标识一起迁移。
@@ -1789,6 +2004,16 @@ pub fn rename_provider(config: &mut AppConfig, old_id: &str, new_id: &str) {
             config.codex_real_generation_grants.insert(new_id.to_owned(), grant);
         }
     }
+    if let Some(grant) = config.grok_real_generation_grants.remove(old_id) {
+        let can_migrate = config.subscriptions.get(new_id).is_some_and(|connection| {
+            connection.connection_instance_id == grant.connection_instance_id
+                && connection.generation == grant.generation
+                && connection.identity.as_deref() == Some(grant.identity.as_str())
+        });
+        if can_migrate {
+            config.grok_real_generation_grants.insert(new_id.to_owned(), grant);
+        }
+    }
     crate::subscription_catalog::rename_provider(config, old_id, new_id);
 }
 
@@ -1796,6 +2021,7 @@ pub fn rename_provider(config: &mut AppConfig, old_id: &str, new_id: &str) {
 pub fn forget_provider(config: &mut AppConfig, provider_id: &str) {
     config.subscriptions.remove(provider_id);
     config.codex_real_generation_grants.remove(provider_id);
+    config.grok_real_generation_grants.remove(provider_id);
     crate::subscription_catalog::forget_provider(config, provider_id);
 }
 
@@ -2027,9 +2253,9 @@ pub struct SubscriptionView {
     pub generation: u64,
     pub connection_instance_id: String,
     pub state: ConnectionState,
-    /// Whether Leo explicitly enabled real Codex requests for this current connection generation.
+    /// Whether the current subscription connection has an explicit volatile generation opt-in.
     pub real_generation_enabled: bool,
-    /// Per-confirmation request ceiling and remaining AutoJev Codex generation requests.
+    /// Per-confirmation request ceiling and remaining AutoJev subscription generation requests.
     pub generation_call_limit: Option<u32>,
     pub generation_calls_remaining: Option<u32>,
     pub identity: Option<String>,
@@ -2098,9 +2324,14 @@ pub fn views(config: &AppConfig, adapter_available: bool, sessions: &SessionStat
                 generation: connection.generation,
                 connection_instance_id: connection.connection_instance_id.clone(),
                 state: connection.state,
-                real_generation_enabled: codex_real_generation_enabled(config, provider),
-                generation_call_limit: codex_real_generation_call_counts(config, provider).map(|(limit, _)| limit),
-                generation_calls_remaining: codex_real_generation_call_counts(config, provider).map(|(_, remaining)| remaining),
+                real_generation_enabled: codex_real_generation_enabled(config, provider)
+                    || grok_real_generation_enabled(config, provider),
+                generation_call_limit: codex_real_generation_call_counts(config, provider)
+                    .or_else(|| grok_real_generation_call_counts(config, provider))
+                    .map(|(limit, _)| limit),
+                generation_calls_remaining: codex_real_generation_call_counts(config, provider)
+                    .or_else(|| grok_real_generation_call_counts(config, provider))
+                    .map(|(_, remaining)| remaining),
                 identity: connection.identity.clone(),
                 helper_version: evidence.and_then(|evidence| evidence.helper_version.clone()),
                 account_path: evidence.and_then(|evidence| evidence.account_path.clone()),
@@ -2543,6 +2774,101 @@ mod admission_tests {
             "extra_usage_permission_unknown",
             "one bucket without a prohibition makes the whole request unsafe"
         );
+    }
+
+    #[test]
+    fn grok_unknown_quota_or_extra_usage_permission_never_admits_generation() {
+        let (mut config, provider, model) = fixture(ProviderKind::GrokSubscription);
+        connected(&mut config);
+        assert!(provider.enabled, "the provider switch alone is not generation admission");
+        assert!(!grok_real_generation_enabled(&config, &provider), "Grok generation starts default-off");
+        assert_eq!(admit_model(&config, &model, &provider, Protocol::Chat).unwrap_err().code, "grok_generation_disabled");
+        set_grok_real_generation_enabled(&mut config, &provider.id, true, Some(15)).unwrap();
+        assert!(grok_real_generation_enabled(&config, &provider));
+
+        let quota = &mut config.subscriptions.get_mut(FIXTURE_PROVIDER).unwrap().evidence.as_mut().unwrap().quota;
+        *quota = QuotaEvidence {
+            state: EvidenceState::Unknown,
+            missing_fields: vec!["machine_readable_subscription_quota_interface_unverified".into()],
+            ..QuotaEvidence::default()
+        };
+        assert_eq!(
+            admit_model(&config, &model, &provider, Protocol::Chat).unwrap_err().code,
+            "quota_unknown",
+            "an enabled provider cannot turn unknown Grok quota into permission"
+        );
+
+        let quota = &mut config.subscriptions.get_mut(FIXTURE_PROVIDER).unwrap().evidence.as_mut().unwrap().quota;
+        *quota = QuotaEvidence {
+            state: EvidenceState::Available,
+            buckets: vec![QuotaBucket {
+                limit_id: "fixture-pool".into(),
+                permission: QuotaPermission::Allowed,
+                windows: vec![QuotaWindow { label: "included".into(), used_percent: Some(1.0), ..QuotaWindow::default() }],
+                credits: None,
+                ..QuotaBucket::default()
+            }],
+            ..QuotaEvidence::default()
+        };
+        assert_eq!(
+            admit_model(&config, &model, &provider, Protocol::Chat).unwrap_err().code,
+            "extra_usage_permission_unknown",
+            "included usage availability does not prove that the whole call cannot use Extra Usage"
+        );
+    }
+
+    #[test]
+    fn grok_generation_grant_is_connection_scoped_and_has_an_immutable_finite_budget() {
+        let (mut config, provider, model) = fixture(ProviderKind::GrokSubscription);
+        connected(&mut config);
+        assert!(!grok_real_generation_enabled(&config, &provider));
+        set_grok_real_generation_enabled(&mut config, &provider.id, true, Some(2)).unwrap();
+        assert_eq!(grok_real_generation_call_counts(&config, &provider), Some((2, 2)));
+        assert!(admit_model(&config, &model, &provider, Protocol::Chat).is_ok());
+
+        let original_connection = config.subscriptions[FIXTURE_PROVIDER].clone();
+        let mut changed_connection = config.clone();
+        changed_connection
+            .subscriptions
+            .get_mut(FIXTURE_PROVIDER)
+            .unwrap()
+            .generation += 1;
+        assert!(!grok_real_generation_enabled(&changed_connection, &provider));
+        assert_eq!(
+            set_grok_real_generation_enabled_for_snapshot(
+                &mut changed_connection,
+                &provider.id,
+                true,
+                Some(2),
+                &original_connection.connection_instance_id,
+                original_connection.generation,
+                original_connection.identity.as_deref().unwrap(),
+            )
+            .unwrap_err()
+            .code,
+            "grok_generation_confirmation_stale"
+        );
+
+        reserve_grok_real_generation_call(&mut config, &provider.id).unwrap();
+        assert_eq!(grok_real_generation_call_counts(&config, &provider), Some((2, 1)));
+        set_grok_real_generation_enabled(&mut config, &provider.id, false, None).unwrap();
+        assert!(!grok_real_generation_enabled(&config, &provider));
+        assert_eq!(grok_real_generation_call_counts(&config, &provider), Some((2, 1)));
+        set_grok_real_generation_enabled(&mut config, &provider.id, true, Some(2)).unwrap();
+        assert!(grok_real_generation_enabled(&config, &provider));
+        assert_eq!(grok_real_generation_call_counts(&config, &provider), Some((2, 1)));
+        assert_eq!(
+            set_grok_real_generation_enabled(&mut config, &provider.id, true, Some(3)).unwrap_err().code,
+            "grok_generation_call_limit_invalid",
+            "re-arming cannot increase the approved budget"
+        );
+        reserve_grok_real_generation_call(&mut config, &provider.id).unwrap();
+        assert_eq!(grok_real_generation_call_counts(&config, &provider), Some((2, 0)));
+        assert_eq!(admit_model(&config, &model, &provider, Protocol::Chat).unwrap_err().code, "grok_generation_call_limit");
+        assert_eq!(reserve_grok_real_generation_call(&mut config, &provider.id).unwrap_err().code, "grok_generation_call_limit");
+
+        set_grok_real_generation_enabled(&mut config, &provider.id, false, None).unwrap();
+        assert!(!grok_real_generation_enabled(&config, &provider));
     }
 
     #[test]

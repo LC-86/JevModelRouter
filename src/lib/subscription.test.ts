@@ -48,7 +48,8 @@ describe('subscription views', () => {
 
   it('shows unknown identity instead of guessing it', () => {
     expect(identityLabel(view(), t)).toBe('未知');
-    expect(identityLabel(view({ identity: 'fixture@example.invalid' }), t)).toBe('fixture@example.invalid');
+    expect(identityLabel(view({ state: 'connected', identity: 'fixture@example.invalid' }), t)).toBe('fixture@example.invalid');
+    expect(identityLabel(view({ state: 'not_connected', identity: 'old@example.invalid' }), t)).toBe('未知');
     expect(identityLabel(undefined, t)).toBe('未知');
   });
 
@@ -145,6 +146,12 @@ describe('subscription login and logout lifecycle', () => {
     expect(connected).toContain('helper=0.159.0');
     expect(connected).toContain('auth_home=/home/fixture/.autojev/helpers/codex/codex');
     expect(connected).not.toContain('local=');
+
+    const disconnectedWithHistoricalIdentity = subscriptionStatusText(view({
+      state: 'not_connected', identity: 'old@example.invalid',
+    }), t);
+    expect(disconnectedWithHistoricalIdentity).toContain('identity=Unknown');
+    expect(disconnectedWithHistoricalIdentity).not.toContain('old@example.invalid');
   });
 
   it('adds the login stage and the separate logout outcomes to the status text', () => {

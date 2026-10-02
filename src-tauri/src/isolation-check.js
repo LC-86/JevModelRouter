@@ -205,20 +205,30 @@
         return dialog && dialog.textContent.includes(grokProviderId) ? dialog : null;
       };
       await wait(grokDialog, 'grok subscription auth dialog');
-      await click('.subscription-auth-dialog .subscription-auth-begin');
-      const rowError = await wait(() => {
-        const text = grokDialog()?.querySelector('.subscription-auth-error')?.textContent?.trim();
-        return text && /not implemented|unsupported|not supported/i.test(text) ? text : null;
-      }, 'grok sign-in error in dialog');
+      const signIn = grokDialog()?.querySelector('.subscription-auth-begin');
+      check(signIn?.disabled === true, 'Grok sign-in must be disabled without a verified machine-readable login contract');
       const directError = await invoke('begin_subscription_login', { providerId: grokProviderId }).then(() => { throw new Error('Grok sign-in must be rejected'); }, error => String(error));
-      check(/grok/i.test(directError) && /not implemented|unsupported|not supported/i.test(directError), `Grok sign-in must fail with a clear message: ${directError}`);
+      check(/grok_auth_unverified/i.test(directError), `Grok sign-in must fail with the unverified-interface reason: ${directError}`);
       const grokAfter = await wait(async () => (await grokView()) || null, 'grok view after rejection');
       check(grokAfter.state === 'not_connected' && grokAfter.generation === grok.generation, `A rejected Grok sign-in must not change its connection: ${JSON.stringify({ state: grokAfter.state, generation: grokAfter.generation })}`);
       check(grokAfter.login.stage === 'idle' && !grokAfter.identity, `A rejected Grok sign-in must not create a session: ${JSON.stringify(grokAfter.login)}`);
+      const grokGenerationToggle = await wait(() => document.querySelector(`[data-testid="grok-real-generation-${grokProviderId}"]`), 'default-off Grok generation toggle');
+      check(grokGenerationToggle.checked === false && grokGenerationToggle.disabled && grokAfter.real_generation_enabled === false,
+        `Grok generation must remain default-off and unavailable until login is verified: ${JSON.stringify({ checked: grokGenerationToggle.checked, disabled: grokGenerationToggle.disabled, enabled: grokAfter.real_generation_enabled })}`);
+      const armError = await invoke('set_grok_real_generation_enabled', {
+        providerId: grokProviderId,
+        enabled: true,
+        maxCalls: 1,
+        expectedConnectionInstanceId: grokAfter.connection_instance_id,
+        expectedGeneration: grokAfter.generation,
+        expectedIdentity: '',
+      }).then(() => { throw new Error('Grok generation must not arm before login verification'); }, error => String(error));
+      check(/grok_auth_unverified/i.test(armError), `Grok generation IPC must reject while its login contract is unverified: ${armError}`);
       const codexAfter = await subscriptionView();
       check(codexAfter.state === codexBefore.state && codexAfter.generation === codexBefore.generation && (codexAfter.identity ?? null) === (codexBefore.identity ?? null), `The Codex row must not be affected by the Grok action: ${JSON.stringify({ before: { state: codexBefore.state, generation: codexBefore.generation }, after: { state: codexAfter.state, generation: codexAfter.generation } })}`);
-      record('grokRejected', { rowError: rowError.slice(-500), directError, after: { state: grokAfter.state, generation: grokAfter.generation, login: grokAfter.login }, codex: { state: codexAfter.state, generation: codexAfter.generation } });
-      passed('an unsupported Grok sign-in is rejected with a clear error and changes nothing');
+      record('grokRejected', { directError, armError, generationToggle: { checked: grokGenerationToggle.checked, disabled: grokGenerationToggle.disabled }, after: { state: grokAfter.state, generation: grokAfter.generation, login: grokAfter.login }, codex: { state: codexAfter.state, generation: codexAfter.generation } });
+      passed('an unverified Grok sign-in stays disabled and changes nothing');
+      passed('Grok real generation is default-off and cannot be armed before login verification');
       passed('the Codex row is unaffected by the rejected Grok sign-in');
       await click('.subscription-auth-dialog .subscription-auth-footer button.primary');
       await wait(() => !grokDialog(), 'grok subscription auth dialog closed');
@@ -1232,7 +1242,7 @@
       check(grokAfterLogout.auth.logout.local === 'not_attempted' && grokAfterLogout.auth.logout.remote === 'not_attempted', `Rejected Grok sign-out must not claim a clear: ${JSON.stringify(grokAfterLogout.auth.logout)}`);
       check(grokAfterLogout.auth.phase === 'idle', `Rejected Grok sign-out must not start a sign-in: ${grokAfterLogout.auth.phase}`);
       passed('grok subscription authorization rejected by isolation, not by helper detection');
-      // 界面侧：登录入口必须显示诚实失败原因，不得渲染凭据，也不得伪造远端撤销。
+      // 界面侧：未核实的机器登录协议保持禁用，身份为 Unknown，不得渲染凭据或伪造远端撤销。
       // 订阅行按 kind 分派后 Grok 行只渲染本票入口：仍要锁定 Grok 行自己的入口与含 grok-subscription 的对话框。
       await nav(1);
       const grokEntry = await wait(() => {
@@ -1249,17 +1259,18 @@
       const grokGeneration = (await invoke('get_snapshot')).subscriptions.find(v => v.provider_id === grokProviderId).generation;
       const generationText = await wait(() => grokDialog()?.querySelector('.subscription-auth-generation')?.textContent?.trim() || null, 'grok dialog generation');
       check(generationText.includes(String(grokGeneration)), `Dialog generation must match the backend: ${generationText} vs ${grokGeneration}`);
-      await click('.subscription-auth-dialog .subscription-auth-begin');
-      const authError = await wait(() => grokDialog()?.querySelector('.subscription-auth-error')?.textContent?.trim() || null, 'grok dialog sign-in error');
-      check(authError.length > 0, 'The sign-in entry must show why sign-in failed');
+      const signIn = grokDialog()?.querySelector('.subscription-auth-begin');
+      check(signIn?.disabled === true, 'Grok sign-in must be disabled without a verified machine-readable login contract');
       const authDialogText = grokDialog()?.textContent ?? '';
       check(authDialogText.includes(grokProviderId), `The sign-in dialog must belong to the Grok row: ${authDialogText.slice(0, 200)}`);
+      check(authDialogText.includes('Unknown') || authDialogText.includes('未知'), `Unverified Grok identity must remain Unknown: ${authDialogText}`);
+      check(authDialogText.includes('Grok 登录已禁用') || authDialogText.includes('Grok sign-in is disabled'), `The disabled login must explain the missing interface: ${authDialogText}`);
       check(/未尝试远端撤销|Remote revoke not attempted/.test(authDialogText), `Sign-out evidence must keep the remote revoke unattempted: ${authDialogText}`);
       check(!/远端撤销已验证|Remote revoke verified/.test(authDialogText), 'Isolation must not claim a verified remote revoke');
       check(!/sk-[A-Za-z0-9]{4,}|Bearer\s[A-Za-z0-9]|api[_-]?key\s*[:=]/i.test(document.body.innerText), 'The sign-in dialog must not render credentials');
       await click('.subscription-auth-dialog .subscription-auth-footer button.primary');
       await wait(() => !grokDialog(), 'grok subscription auth dialog closed');
-      passed('subscription sign-in UI shows an honest failure without credentials');
+      passed('subscription sign-in UI keeps unverified Grok login disabled without credentials');
       await nav(5);
       for (const option of ['OpenAI Chat Completions', 'OpenAI Responses', 'Anthropic Messages']) {
         await click('.debug-settings .select-control button');

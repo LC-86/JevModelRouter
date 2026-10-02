@@ -1927,6 +1927,17 @@ for line in sys.stdin:
                         }],
                     },
                 );
+                config.grok_real_generation_grants.insert(
+                    provider.id.clone(),
+                    crate::config::SubscriptionRealGenerationGrant {
+                        connection_instance_id: connection.connection_instance_id.clone(),
+                        generation: connection.generation,
+                        identity: connection.identity.clone().unwrap(),
+                        max_calls: crate::subscription::GROK_REAL_GENERATION_MAX_CALLS,
+                        used_calls: 0,
+                        enabled: true,
+                    },
+                );
             })
             .unwrap();
         store
@@ -2642,7 +2653,7 @@ for line in sys.stdin:
         params = req["params"]; prompt = params["prompt"][0]["text"]
         text = "grok:" + prompt
         sys.stdout.write(json.dumps({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":session,"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":text}}}}) + "\n")
-        reason = "max_tokens" if prompt == "max-token" else "end_turn"
+        reason = "max_tokens" if prompt == "max-token" else ("failed" if prompt == "fail-request" else "end_turn")
         sys.stdout.write(json.dumps({"jsonrpc":"2.0","id":ident,"result":{"stopReason":reason}}) + "\n"); sys.stdout.flush(); break
     else: result = {}
     sys.stdout.write(json.dumps({"jsonrpc":"2.0","id":ident,"result":result}) + "\n"); sys.stdout.flush()
@@ -2713,6 +2724,11 @@ for line in sys.stdin:
                     assert_eq!(output, Some("grok:hello"), "{protocol:?}: {body}");
                 }
                 calls += 1;
+                assert_eq!(
+                    store.read().grok_real_generation_grants["grok-fixture"].used_calls as usize,
+                    calls,
+                    "each accepted helper turn consumes one finite API dispatch slot"
+                );
             }
         }
 
@@ -2805,8 +2821,27 @@ for line in sys.stdin:
                     }
                 }
                 calls += 1;
+                assert_eq!(
+                    store.read().grok_real_generation_grants["grok-fixture"].used_calls as usize,
+                    calls,
+                    "each accepted helper turn consumes one finite API dispatch slot"
+                );
             }
         }
+
+        let failed = crate::proxy::forward_test_request(
+            store.clone(),
+            json!({"model":alias,"messages":[{"role":"user","content":"fail-request"}]}),
+            crate::subscription::protocol_key(Protocol::Chat),
+        )
+        .await;
+        assert_eq!(failed.status(), axum::http::StatusCode::BAD_GATEWAY);
+        calls += 1;
+        assert_eq!(
+            store.read().grok_real_generation_grants["grok-fixture"].used_calls as usize,
+            calls,
+            "a failed helper terminal still consumes exactly one admitted dispatch slot"
+        );
 
         let rejected = crate::proxy::forward_test_request(
             store,
@@ -2888,6 +2923,7 @@ for line in sys.stdin:
         let store = admitted_grok_store(temp.path(), adapter.clone());
         let alias = "autojev/model/grok-fixture-binding";
         let generation = store.read().subscriptions.get("grok-fixture").unwrap().generation;
+        let mut expected_dispatches = 0usize;
 
         for protocol in [Protocol::Chat, Protocol::Responses, Protocol::Messages] {
             for streaming in [false, true] {
@@ -2896,6 +2932,12 @@ for line in sys.stdin:
                     crate::subscription::protocol_key(protocol),
                 ).await;
                 assert_eq!(initial.status(), axum::http::StatusCode::OK, "{protocol:?}/{streaming}");
+                expected_dispatches += 1;
+                assert_eq!(
+                    store.read().grok_real_generation_grants["grok-fixture"].used_calls as usize,
+                    expected_dispatches,
+                    "each client-tool handoff consumes one dispatch slot"
+                );
                 let bytes = axum::body::to_bytes(initial.into_body(), 1024 * 1024).await.unwrap();
                 let wire = String::from_utf8(bytes.to_vec()).unwrap();
                 let ids = grok_tool_call_ids(&wire);
@@ -2918,6 +2960,12 @@ for line in sys.stdin:
                         crate::subscription::protocol_key(Protocol::Chat),
                     ).await;
                     let _ = axum::body::to_bytes(unrelated.into_body(), 1024 * 1024).await.unwrap();
+                    expected_dispatches += 1;
+                    assert_eq!(
+                        store.read().grok_real_generation_grants["grok-fixture"].used_calls as usize,
+                        expected_dispatches,
+                        "an unrelated accepted request consumes exactly one dispatch slot"
+                    );
                     let held = adapter.pending_tool_turns.lock().unwrap().keys()
                         .filter(|(provider, current, _)| provider == "grok-fixture" && *current == generation).count();
                     assert_eq!(held, 2, "an unrelated request consumed another request's pending tool batch");
@@ -2929,6 +2977,12 @@ for line in sys.stdin:
                     crate::subscription::protocol_key(protocol),
                 ).await;
                 assert_eq!(followup.status(), axum::http::StatusCode::OK, "{protocol:?}/{streaming}");
+                expected_dispatches += 1;
+                assert_eq!(
+                    store.read().grok_real_generation_grants["grok-fixture"].used_calls as usize,
+                    expected_dispatches,
+                    "a client-tool result continuation is a separately counted dispatch"
+                );
                 let bytes = axum::body::to_bytes(followup.into_body(), 1024 * 1024).await.unwrap();
                 let wire = String::from_utf8(bytes.to_vec()).unwrap();
                 assert!(wire.contains("resolved"), "{protocol:?}/{streaming}: {wire}");
@@ -2949,6 +3003,7 @@ for line in sys.stdin:
                 }
             }
         }
+        assert_eq!(expected_dispatches, 13);
     }
 
     #[tokio::test]
@@ -3020,6 +3075,7 @@ for line in sys.stdin:
         let store = admitted_grok_store(temp.path(), adapter.clone());
         let alias = "autojev/model/grok-fixture-binding";
         let generation = store.read().subscriptions.get("grok-fixture").unwrap().generation;
+        let mut expected_dispatches = 0usize;
 
         for streaming in [false, true] {
             let response = crate::proxy::forward_test_request(
@@ -3027,6 +3083,12 @@ for line in sys.stdin:
                 crate::subscription::protocol_key(Protocol::Chat),
             ).await;
             assert_eq!(response.status(), axum::http::StatusCode::OK);
+            expected_dispatches += 1;
+            assert_eq!(
+                store.read().grok_real_generation_grants["grok-fixture"].used_calls as usize,
+                expected_dispatches,
+                "a request that is cancelled when its response body is abandoned still consumes one dispatch slot"
+            );
             drop(response);
             tokio::time::timeout(Duration::from_secs(3), async {
                 loop {
@@ -3040,6 +3102,11 @@ for line in sys.stdin:
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             }).await.expect("abandoned client tool response must cancel and revoke its handoff");
+            assert_eq!(
+                store.read().grok_real_generation_grants["grok-fixture"].used_calls as usize,
+                expected_dispatches,
+                "cancellation cleanup must not double-charge or refund the admitted dispatch"
+            );
         }
     }
 
@@ -3065,27 +3132,53 @@ for line in sys.stdin:
     sys.stdout.write(json.dumps({"jsonrpc":"2.0","id":ident,"result":result}) + "\n"); sys.stdout.flush()
 "##,
         );
-        let adapter = GrokSubscriptionAdapter::with_test_helper(temp.path().to_path_buf(), helper);
+        let adapter = Arc::new(GrokSubscriptionAdapter::with_test_helper(
+            temp.path().to_path_buf(),
+            helper,
+        ));
+        let store = admitted_grok_store(temp.path(), adapter.clone());
+        let provider_id = "grok-fixture";
+        let generation = store.read().subscriptions[provider_id].generation;
+        let reserved = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pre_dispatch_check = {
+            let store = store.clone();
+            let reserved = reserved.clone();
+            Arc::new(move || {
+                if reserved.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    return Ok(());
+                }
+                let outcome = store
+                    .update(|config| {
+                        crate::subscription::reserve_grok_real_generation_call(
+                            config,
+                            provider_id,
+                        )
+                    })
+                    .map_err(|error| error.to_string())?;
+                outcome.map_err(|denial| format!("{}: {}", denial.code, denial.message))?;
+                Ok(())
+            })
+        };
         let mut events = adapter
             .generate(GenerationRequest {
-                provider_id: "grok-cancel",
-                generation: 9,
+                provider_id,
+                generation,
                 model_id: "grok-test",
                 protocol: Protocol::Responses,
                 body: json!({"model":"grok-test","input":"hello"}),
-                pre_dispatch_check: Arc::new(|| Ok(())),
+                pre_dispatch_check,
             })
             .await
             .unwrap();
         assert_eq!(
             events.next().await,
-            Some(GenerationEvent::Started { generation: 9 })
+            Some(GenerationEvent::Started { generation })
         );
         assert_eq!(
             events.next().await,
             Some(GenerationEvent::Chunk("partial".into()))
         );
-        adapter.cancel_generation("grok-cancel", 9);
+        adapter.cancel_generation(provider_id, generation);
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(2), events.next())
                 .await
@@ -3093,6 +3186,11 @@ for line in sys.stdin:
             Some(GenerationEvent::Cancelled)
         );
         assert!(events.next().await.is_none());
+        assert_eq!(
+            store.read().grok_real_generation_grants[provider_id].used_calls,
+            1,
+            "an explicitly cancelled admitted request consumes one slot and is never charged again"
+        );
     }
 
     #[tokio::test]

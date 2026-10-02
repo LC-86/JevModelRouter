@@ -30,6 +30,7 @@ export function SubscriptionAuthDialog({ provider, snapshot, onSnapshot, onNotif
   const pollEpoch = useRef(0);
   const view = subscriptionAuthView(snapshot, provider.id);
   const helper = view?.helper;
+  const grokLoginUnsupported = provider.kind === 'grok_subscription' && helper?.login_supported !== true;
   const errorText = (cause: unknown) => String(cause instanceof Error ? cause.message : cause);
 
   useEffect(() => {
@@ -102,12 +103,15 @@ export function SubscriptionAuthDialog({ provider, snapshot, onSnapshot, onNotif
           <div><dt>{t('Helper version')}</dt><dd>{helper?.version ?? t('Unknown')}</dd></div>
           <div><dt>{t('Authorization storage')}</dt><dd><code>{helper?.home ?? t('Unknown')}</code></dd></div>
         </dl>
-        <p className="subscription-auth-note">{t('The helper is only started for sign-in; availability is probed without network access.')}</p>
+        <p className="subscription-auth-note">{grokLoginUnsupported
+          ? t('Grok sign-in is disabled until AutoJev verifies the identity contract for this installed CLI version.')
+          : t('The helper is only started for sign-in; availability is probed without network access.')}</p>
       </section>
 
       <section className="subscription-auth-section">
         <h3>{t('Sign-in status')}</h3>
         <p className="subscription-auth-phase" role="status">{authPhaseLabel(view?.phase ?? 'idle', t)}</p>
+        {provider.kind === 'grok_subscription' && view?.phase !== 'succeeded' && <p className="subscription-auth-identity" role="status"><span>{t('Account identity')}</span><code>{t('Unknown')}</code></p>}
         {view?.phase === 'pending' && challenge && <div className="subscription-auth-challenge">
           <p>{challenge.instructions}</p>
           <p className="subscription-auth-challenge-method">{t('Sign-in method')}: <code>{challenge.kind}</code></p>
@@ -126,7 +130,7 @@ export function SubscriptionAuthDialog({ provider, snapshot, onSnapshot, onNotif
         <div className="subscription-auth-actions">
           {view?.phase === 'pending'
             ? <button type="button" className="button ghost" disabled={!cancelAllowed({ phase: view?.phase ?? 'idle', busy, pollInFlight: polling })} title={polling ? t('Waiting for the current poll to finish') : undefined} onClick={() => void run(() => cancelSubscriptionLogin(provider.id))}>{busy ? <LoaderCircle size={16} className="import-spinner" /> : <X size={16} />}{t('Cancel sign-in')}</button>
-            : <button type="button" className="button primary subscription-auth-begin" disabled={busy} onClick={() => void run(() => beginSubscriptionLogin(provider.id))}>{busy ? <LoaderCircle size={16} className="import-spinner" /> : <LogIn size={16} />}{t('Sign in')}</button>}
+            : <button type="button" className="button primary subscription-auth-begin" disabled={busy || grokLoginUnsupported} onClick={() => void run(() => beginSubscriptionLogin(provider.id))}>{busy ? <LoaderCircle size={16} className="import-spinner" /> : <LogIn size={16} />}{t('Sign in')}</button>}
         </div>
       </section>
 

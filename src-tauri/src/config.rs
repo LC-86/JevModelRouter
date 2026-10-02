@@ -12,11 +12,11 @@ fn default_selected() -> bool { true }
 pub const DEFAULT_PORT: u16 = 9527;
 pub const DEV_PORT: u16 = 9526;
 
-/// A single, process-memory consent window for manual Codex generation checks.
+/// A single, process-memory consent window for subscription generation checks.
 /// `used_calls` counts AutoJev requests admitted through the subscription adapter,
 /// including attempts that later fail or are cancelled.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CodexRealGenerationGrant {
+pub struct SubscriptionRealGenerationGrant {
     /// Persistent connection instance this volatile grant belongs to.
     pub connection_instance_id: String,
     pub generation: u64,
@@ -26,6 +26,8 @@ pub struct CodexRealGenerationGrant {
     pub used_calls: u32,
     pub enabled: bool,
 }
+
+pub type CodexRealGenerationGrant = SubscriptionRealGenerationGrant;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Provider {
@@ -192,6 +194,9 @@ pub struct AppConfig {
     /// 用户对当前连接世代的一次有限真实生成许可。仅驻留进程内存，重启、退出或换号后不会沿用。
     #[serde(skip)]
     pub codex_real_generation_grants: std::collections::HashMap<String, CodexRealGenerationGrant>,
+    /// Grok has its own finite volatile grant. It never persists or permits unknown admission evidence.
+    #[serde(skip)]
+    pub grok_real_generation_grants: std::collections::HashMap<String, SubscriptionRealGenerationGrant>,
     pub install_id: String,
     pub port: u16,
     pub providers: Vec<Provider>,
@@ -216,6 +221,7 @@ impl Default for AppConfig {
             subscriptions: Default::default(),
             subscription_catalogs: Default::default(),
             codex_real_generation_grants: Default::default(),
+            grok_real_generation_grants: Default::default(),
             install_id: Uuid::new_v4().to_string(),
             port: DEFAULT_PORT,
             providers: vec![
@@ -601,6 +607,26 @@ mod storage_tests {
         assert!(!serialized.contains("codex_real_generation_grants"));
         let restored: AppConfig = serde_json::from_str(&serialized).unwrap();
         assert!(restored.codex_real_generation_grants.is_empty());
+    }
+
+    #[test]
+    fn grok_real_generation_opt_in_is_not_persisted_across_restart() {
+        let mut config = AppConfig::default();
+        config.grok_real_generation_grants.insert(
+            "grok".into(),
+            SubscriptionRealGenerationGrant {
+                connection_instance_id: "fixture-connection".into(),
+                generation: 7,
+                identity: "fixture@example.invalid".into(),
+                max_calls: 3,
+                used_calls: 1,
+                enabled: true,
+            },
+        );
+        let serialized = serde_json::to_string(&config).unwrap();
+        assert!(!serialized.contains("grok_real_generation_grants"));
+        let restored: AppConfig = serde_json::from_str(&serialized).unwrap();
+        assert!(restored.grok_real_generation_grants.is_empty());
     }
 
     #[test]
