@@ -1101,8 +1101,66 @@
     passed('signing out invalidates the catalogue eligibility and clears the dedicated helper home');
   };
 
+  const grokBillingOfflineLifecycle = async () => {
+    const before = await invoke('get_snapshot');
+    const existingGrokViews = (before.subscriptions || []).filter(item => item.provider_id === 'grok-fixture');
+    check(existingGrokViews.length === 0, `The billing sample run must start without a Grok account: ${JSON.stringify(existingGrokViews)}`);
+    await nav(1);
+    const captureHoldMs = Number(window.__ISOLATION_CHECK__.captureHoldMs || 0);
+    const fixtureNode = await wait(() => document.querySelector('[data-testid="grok-billing-offline-fixture"]'), 'offline billing diagnostic panel');
+    const fixture = await invoke('grok_billing_offline_fixture');
+    check(fixture.mode === 'offline_synthetic_fixture', `The command must identify a local fixture: ${JSON.stringify(fixture)}`);
+    check(fixture.billing.state === 'sample_returned' && fixture.billing.value?.usagePercent?.value === 42.5,
+      `The local billing payload must be parsed without a live RPC: ${JSON.stringify(fixture.billing)}`);
+    check(fixture.billing.value?.usagePercent?.origin === 'config.creditUsagePercent',
+      `The direct percentage source must be explicit: ${JSON.stringify(fixture.billing.value?.usagePercent)}`);
+    const fixtureConfig = fixture.billing.value?.config?.value;
+    const currentPeriod = fixtureConfig?.currentPeriod?.value;
+    check(currentPeriod?.periodType?.value === 'USAGE_PERIOD_TYPE_MONTHLY' && currentPeriod.start.state === 'available' && currentPeriod.end.state === 'available',
+      `The candidate currentPeriod must contain only its type and validated RFC3339 range: ${JSON.stringify(currentPeriod)}`);
+    check(currentPeriod && !('includedUsed' in currentPeriod) && !('onDemandUsed' in currentPeriod) && !('totalUsed' in currentPeriod),
+      `Usage amounts must not be misplaced under currentPeriod: ${JSON.stringify(currentPeriod)}`);
+    const history = fixtureConfig?.history;
+    check(history?.state === 'available' && history.value?.[0]?.billingCycle?.year === 2026 && history.value?.[0]?.includedUsed?.val === 1250,
+      `Usage cents must remain under the official-shaped billing history entry: ${JSON.stringify(history)}`);
+    check(fixture.autoTopup.state === 'sample_failed' && fixture.autoTopup.value === null,
+      `A partial synthetic read failure must not erase the billing payload or fabricate a rule: ${JSON.stringify(fixture.autoTopup)}`);
+    check(fixture.scopeReplay.currentResponseAccepted && fixture.scopeReplay.responseAfterAccountSwitchRejected && fixture.scopeReplay.responseAfterConnectionSwitchRejected,
+      `Late results must be discarded after account-generation or connection changes: ${JSON.stringify(fixture.scopeReplay)}`);
+    const panel = fixtureNode.textContent || '';
+    check(panel.includes('Offline Grok billing fixture') || panel.includes('Grok 离线账单样例'), `The visible panel must be clearly marked as synthetic: ${panel}`);
+    check(panel.includes('synthetic-tier') && panel.includes('42.5') && panel.includes('synthetic_partial_read_failure'),
+      `The native panel must render the parsed sample and independent partial failure: ${panel}`);
+    check(panel.includes('old account-generation response rejected') || panel.includes('旧账号世代响应已拒绝'),
+      `The panel must expose the stale-account guard result: ${panel}`);
+    const after = await invoke('get_snapshot');
+    check(JSON.stringify(after.subscriptions) === JSON.stringify(before.subscriptions),
+      'The offline parser sample must not modify subscription identity, quota, generation, or admission state');
+    const detail = {
+      mode: fixture.mode,
+      sourceRevision: fixture.sourceRevision,
+      usagePercent: fixture.billing.value.usagePercent,
+      autoTopupState: fixture.autoTopup.state,
+      scopeReplay: fixture.scopeReplay,
+      panel: panel.slice(0, 1600),
+      subscriptionSnapshotUnchanged: true,
+    };
+    report.details = detail;
+    passed('offline ACP billing parser fixture renders in the native Providers UI with no connected account');
+    passed('partial auto-top-up fixture failure remains separate and leaves missing values unknown');
+    passed('old billing responses are rejected after an account-generation or connection switch');
+    passed('offline diagnostic leaves production subscription and generation-admission snapshots unchanged');
+    if (captureHoldMs > 0) await new Promise(resolve => setTimeout(resolve, captureHoldMs));
+  };
+
   try {
     await wait(() => document.querySelector('.app-shell'));
+    if (window.__ISOLATION_CHECK__.loginMode === 'grok-billing') {
+      try { await grokBillingOfflineLifecycle(); report.ok = true; }
+      catch (error) { report.error = String(error); report.screen = document.body.innerText.slice(-5000); }
+      await invoke('isolation_check_report', { report });
+      return;
+    }
     if (window.__ISOLATION_CHECK__.loginMode === 'catalog') {
       // 目录/额度只读验收：先成功登录，再按替身队列逐个排练目录与额度场景。
       try { await catalogLifecycle(); report.ok = true; }

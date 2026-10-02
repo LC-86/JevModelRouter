@@ -27,6 +27,8 @@
     "release:mac": "node scripts/release-mac.mjs",
     "test": "vitest run",
     "test:grok-contract": "cargo test --locked --offline --manifest-path src-tauri/Cargo.toml --lib grok && TAURI_DEV_HOST=127.0.0.1 vitest run src/lib/subscription-auth.test.ts src/lib/subscription.test.ts",
+    "test:grok-billing-parser": "cargo test --locked --offline --manifest-path src-tauri/Cargo.toml --lib subscription::grok::billing",
+    "test:grok-billing-offline": "pnpm test:grok-billing-parser && pnpm build && cargo build --locked --offline --manifest-path src-tauri/Cargo.toml --features isolation-check && AUTOJEV_GROK_BILLING_ONLY=1 node scripts/check-isolated-desktop.mjs",
     "test:isolated": "pnpm build && cargo build --locked --manifest-path src-tauri/Cargo.toml --features isolation-check && node scripts/check-isolated-desktop.mjs",
     "test:decision-ui": "node scripts/check-decision-provider-ui.mjs",
     "test:codex-budget-ui": "pnpm build && node scripts/check-codex-budget-ui.mjs && node scripts/check-codex-budget-entries-ui.mjs",

@@ -4,7 +4,7 @@ import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { realpathSync, readdirSync, statSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir, homedir } from 'node:os';
-import { resolve, join } from 'node:path';
+import { resolve, join, relative } from 'node:path';
 import { once } from 'node:events';
 
 // 隔离根目录要与 Rust 侧 canonicalize 后的路径比较（macOS 上 /var 是指向 /private/var 的符号链接）。
@@ -94,6 +94,25 @@ const readLog = async path => {
   catch { return []; }
 };
 const helperPids = async path => [...new Set((await readLog(path)).map(entry => entry.pid).filter(Boolean))];
+const captureNativeWindow = async (pid, targetPath) => {
+  const screenshotRoot = resolve('docs/screenshots');
+  const target = resolve(targetPath);
+  const rel = relative(screenshotRoot, target);
+  assert.ok(rel && rel !== '..' && !rel.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`), 'The native screenshot must stay under docs/screenshots');
+  const swift = `import AppKit\nimport CoreGraphics\nimport Foundation\nlet targetPid = Int(CommandLine.arguments[1]) ?? -1\nlet options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]\nlet windows = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] ?? []\nif let window = windows.first(where: { ($0[kCGWindowOwnerPID as String] as? Int) == targetPid && ($0[kCGWindowLayer as String] as? Int ?? 99) == 0 }), let windowId = window[kCGWindowNumber as String] { print(windowId) } else { fputs("isolated AutoJev window not visible\\n", stderr); exit(3) }`;
+  let windowId = '';
+  const deadline = Date.now() + 8000;
+  while (Date.now() < deadline) {
+    try {
+      windowId = execFileSync('/usr/bin/swift', ['-e', swift, String(pid)], { encoding: 'utf8' }).trim();
+      if (/^\d+$/.test(windowId)) break;
+    } catch { await sleep(500); }
+  }
+  assert.match(windowId, /^\d+$/, 'The isolated app window must be located before capture');
+  execFileSync('/usr/sbin/screencapture', ['-x', '-l', windowId, target]);
+  assert.ok(statSync(target)?.size > 0, `The native screenshot must be written: ${target}`);
+  console.log(`Captured only the isolated AutoJev native window: ${target}`);
+};
 let desktop;
 let sentinel;
 const observation = (report, label) => Object.fromEntries((report.details?.observations || []).map(item => [item.label, item.value]))[label];
@@ -112,6 +131,8 @@ const reaped = async pids => {
 // `catalogFixture`（对象）是 #17 的受控目录替身输入：写进隔离根目录的 JSON 文件并交给
 // `--autojev-catalog-fixture`，只在该运行生效；两条 loginMode 互不冒充。
 const runDesktop = async ({ label, scenarios, reload = false, loginMode = null, grokScenarios = null, reads = null, catalog = null, catalogFixture = null, accounts = null }) => {
+  const captureScreenshot = process.env.AUTOJEV_CAPTURE_NATIVE_SCREENSHOT === '1';
+  assert.ok(!captureScreenshot || (process.env.AUTOJEV_GROK_BILLING_ONLY === '1' && label === 'grok-billing-offline'), 'Native screenshot capture is limited to the focused Grok billing fixture run');
   const helperLog = join(root, `helper-${label}.jsonl`);
   const grokHelperLog = join(root, `grok-helper-${label}.jsonl`);
   const args = ['--autojev-isolated', root, '--autojev-upstream', base, '--autojev-ui-url', `http://127.0.0.1:${uiPort}`, '--autojev-ui-check', base, '--autojev-helper', helper];
@@ -119,6 +140,7 @@ const runDesktop = async ({ label, scenarios, reload = false, loginMode = null, 
   if (grokScenarios) args.push('--autojev-grok-helper', resolve('scripts/fake-grok-read-helper.mjs'));
   if (reload) args.push('--autojev-check-reload');
   if (loginMode) args.push('--autojev-login-check', loginMode);
+  if (captureScreenshot) args.push('--autojev-native-screenshot');
   if (catalogFixture) {
     const fixturePath = join(root, `catalog-${label}.json`);
     await writeFile(fixturePath, JSON.stringify(catalogFixture, null, 2));
@@ -136,12 +158,21 @@ const runDesktop = async ({ label, scenarios, reload = false, loginMode = null, 
   if (accounts) env.AUTOJEV_FAKE_HELPER_ACCOUNTS = accounts;
   const child = spawn(binary, args, { env, stdio: 'pipe' });
   desktop = child;
+  let captureError;
+  const captureTask = captureScreenshot
+    ? (async () => {
+        await sleep(5000);
+        await captureNativeWindow(child.pid, process.env.AUTOJEV_GROK_BILLING_SCREENSHOT_PATH || 'docs/screenshots/grok-billing-offline.png');
+      })().catch(error => { captureError = error; })
+    : Promise.resolve();
   let log = ''; child.stdout.on('data', b => { log += b; }); child.stderr.on('data', b => { log += b; });
   const liveDuringRun = new Set();
   let probing = true;
   const probe = (async () => { while (probing) { for (const pid of await helperPids(helperLog)) if (alive(pid)) liveDuringRun.add(pid); await sleep(120); } })();
   const timer = setTimeout(() => child.kill('SIGTERM'), 120000);
   const [code, signal] = await once(child, 'exit'); clearTimeout(timer);
+  await captureTask;
+  if (captureError) throw captureError;
   probing = false; await probe;
   await writeFile(join(root, `${label}.desktop.log`), log);
   const report = JSON.parse(await readFile(join(root, 'isolation-report.json'), 'utf8'));
@@ -155,6 +186,14 @@ const runDesktop = async ({ label, scenarios, reload = false, loginMode = null, 
 };
 
 try {
+  if (process.env.AUTOJEV_GROK_BILLING_ONLY === '1') {
+    const result = await runDesktop({ label: 'grok-billing-offline', scenarios: 'success', loginMode: 'grok-billing' });
+    assert.deepEqual(await readLog(result.helperLog), [], 'The billing parser fixture must not start the Codex helper');
+    assert.deepEqual(await readLog(result.grokHelperLog), [], 'The billing parser fixture must not start the Grok helper or ACP');
+    assert.equal(requests.length, 0, 'The billing parser fixture must not send any loopback model request');
+    if (process.env.AUTOJEV_CAPTURE_NATIVE_SCREENSHOT === '1') assert.ok(statSync(resolve(process.env.AUTOJEV_GROK_BILLING_SCREENSHOT_PATH || 'docs/screenshots/grok-billing-offline.png')).size > 0);
+    console.log(`Offline Grok billing native UI acceptance passed. Synthetic evidence: ${root}`);
+  } else {
   const deadline = Date.now() + 15000;
   while (true) {
     try { if ((await fetch(`http://127.0.0.1:${uiPort}`)).ok) break; } catch { /* Our Vite is starting. */ }
@@ -516,6 +555,7 @@ try {
   assert.ok(allowedUrls.some(url => url.includes('docs.x.ai')), `The Grok reference host must be allowed: ${JSON.stringify(allowedUrls)}`);
   console.log('Authorization-link ACL asserted statically (auth.openai.com, chatgpt.com, docs.x.ai); the real browser open was NOT executed.');
   console.log(`Native desktop login lifecycle acceptance passed. Fictional evidence: ${root}`);
+  }
 } finally {
   await writeFile(join(root, 'requests.json'), JSON.stringify(requests, null, 2));
   if (sentinel?.exitCode === null) sentinel.kill('SIGTERM');

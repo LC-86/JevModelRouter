@@ -8,6 +8,8 @@
 
 ```sh
 pnpm test:grok-contract
+pnpm test:grok-billing-parser
+pnpm test:grok-billing-offline
 ```
 
 通过标准：
@@ -21,6 +23,8 @@ pnpm test:grok-contract
 - 本地显式注入的 fake helper 可以验证内部事件解析；fake 协议不能改写生产默认值。
 
 该命令只运行离线 Rust 单测和前端纯函数测试，不调用 `grok`，不启动 ACP，不开浏览器，不读 CLI 设置、session 或凭据，不发送模型请求，也不消费额度。它验证 fail-closed 回归，不证明上游服务、账户权益或费用行为。
+
+`pnpm test:grok-billing-parser` 和 `pnpm test:grok-billing-offline` 还覆盖候选 ACP billing DTO 的本地解析及隔离原生 UI 合成样例。样例不会初始化 ACP，不会发送 billing/auto-top-up RPC，不会读取账号/凭据或更改生产 quota/admission snapshot；详见 [离线解析范围与 TokenTracker 对照](grok-billing-offline.md)。它们也不解锁下方真实登录或 HAND_RUN 项。
 
 结果请填入 [结果模板](grok-hand-run-result-template.md)，将真实登录、读取与生成项记为“阻塞”或“未测”，不要填成通过或用量为 0。
 

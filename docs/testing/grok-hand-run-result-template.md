@@ -16,12 +16,15 @@
 | 许可范围 | 当前连接下所有已核实资格模型和协议；不是 HAND_RUN 中单个模型/协议的运行时绑定 | UI 确认框明确告知账号级范围；实际手测必须严格遵循已记录的单个计划范围 |
 | 真实 OAuth、配置/session、账号凭据 | 未访问 | 未测；本次 Agent 执行禁止 |
 | 真实模型请求 / credits | 未执行 | 未测；模型数和用量费用为 Unknown，不能填 0 |
-| `pnpm test:grok-contract`（含默认关闭、有限预算与 Grok 准入回归） | Rust 64 passed；Vitest 2 files / 49 passed | 通过；只使用 fake/纯函数，不证明真实服务行为 |
+| `pnpm test:grok-contract` | Rust 71 passed；Vitest 2 files / 49 passed | 通过；离线契约回归 |
+| `pnpm test:grok-billing-parser` | 7 passed；491 filtered | 通过；只解析内存合成 JSON，验证 RFC3339 周期、官方字段位置与世代/连接范围旧响应拒绝 |
 | `TAURI_DEV_HOST=127.0.0.1 pnpm test` | 13 files / 90 passed | 通过；离线前端测试 |
-| `pnpm build` / `pnpm release:check` | 通过 | 通过；Vite 有 Tauri API 动静态 chunk 与大 chunk 提示 |
-| Rust `--lib` 构建（普通 / `isolation-check`）与 `node --check src-tauri/src/isolation-check.js` | 均通过 | 通过 |
-| 完整 `cargo test --locked --offline --manifest-path src-tauri/Cargo.toml --lib` | 455 passed / 36 failed | 所有失败来自当前沙箱 `Operation not permitted` socket/process；同一 loopback bind 错误已在干净精确基线复现 |
-| `pnpm test:isolated` | 前端构建和 isolation Rust 构建通过；Node 夹具 `listen` 报 `EPERM` | 沙箱限制；在桌面应用启动前失败，未执行 UI 验收或截图 |
+| `pnpm build` / `pnpm release:check` | build 通过；`Release configuration OK: v0.1.2` | 通过；build 保留 Tauri API 动静态 chunk 与大 chunk 提示 |
+| Rust `--lib` 构建与 `isolation-check` 构建 | 普通 Rust 测试构建、`cargo check`、桌面 `cargo build` 均通过 | 通过 |
+| 完整 `cargo test --locked --offline --manifest-path src-tauri/Cargo.toml --lib` | 498 passed / 0 failed | 通过；全部 Rust library 回归 |
+| `pnpm test:grok-billing-offline` | 7 parser tests、前端构建、隔离桌面构建与 4 项原生 UI 断言通过；helper 日志与模型请求账本为空 | 通过；仅固定离线 fixture，不登录、不访问 ACP、不发送模型请求 |
+| 原生窗口截图 | [`docs/screenshots/grok-billing-offline.png`](../screenshots/grok-billing-offline.png) | 仅截取隔离 AutoJev 窗口；界面显著标明 synthetic/offline，非账号/额度证据 |
+| 其他真实登录、真实额度/credits 与模型请求 | 未执行 | 未测；按 Issue #26 由 Leo 手测 |
 
 预算语义：每个通过完整准入并开始派发的 API 请求最多启动一个 ACP `session/prompt`，占一个有限 dispatch 槽；失败与取消仍计入 dispatch 槽。客户端工具结果续传作为新 API 请求和新 helper turn 单独计数、占另一槽。人工验收需同时记录 `dispatch` 和 ACP `session/prompt` 实际计数，二者均不得超过事先接受的同一个总上限。
 
