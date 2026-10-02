@@ -11,6 +11,10 @@
 - npm 注册表[精确的 `@xai-official/grok@1.0.44` 记录](https://registry.npmjs.org/@xai-official/grok/1.0.44)返回 HTTP 200、无重定向，含完整 `gitHead` `5b807183dd7978a460f309132cf0d1183d743526` 且无 `repository` 字段。本地安装清单缺少这两个字段；CLI 历史 build ID `5b807183dd79` 与该 `gitHead` 前缀一致。对完整 SHA 的公开 GitHub 查找返回 HTTP 422，仅说明该次查找未解析，不能证明不存在其他映射；本机二进制到可核验官方源码/发布的映射仍未建立。较旧的固定公开快照 [`72a61251fcffb464bcc687aeb5a998e5a98ec0c9`](https://github.com/xai-org/grok-build/commit/72a61251fcffb464bcc687aeb5a998e5a98ec0c9) 标为 1.0.16，其中候选 `x.ai/auth/info` 状态 `current_or_expired` 不证明当前登录有效；`x.ai/auth/check_subscription` 会刷新 JWT，不属于本只读验收可调用的接口。较新的 1.0.45 快照也不是本机 1.0.44 的源码映射；官方 CLI reference 未承诺本机版本支持上述 ACP 方法。
 - [Headless/ACP 文档](https://docs.x.ai/build/cli/headless-scripting) 中的 `session/prompt` 是生成路径；不能用于身份、目录或额度只读探测。
 
+## 一次现有会话认证检查（2026-10-02）
+
+本机官方 CLI grok 1.0.44 (5b807183dd79) 的 ACP v1 initialize 成功并广告 cached_token；随后一次 authenticate(cached_token) 返回成功，耗时 1.65 秒。响应负载未保留或打印，未核实账户姓名/邮箱，因此只确认现有缓存会话被接受。没有启动交互式 grok login，没有发 session/new、session/prompt 或模型请求，也没有读取账单、额度或 credits。子进程在应答后被清理（退出码 143；不是请求失败），无超时。此项不打开 AutoJev 生产登录功能，也不证明额外用量安全。
+
 ## 安全验证入口
 
 从仓库根目录运行 `pnpm test:grok-contract`。它只运行 Rust 本地 fake-helper 单测和前端纯函数测试，不执行 `grok` CLI、不登录、不访问凭据、不发模型请求或消费额度。结果含义和人工验收状态见 [Grok 人工验收入口](grok-hand-run.md)。

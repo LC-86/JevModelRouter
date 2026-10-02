@@ -11,7 +11,7 @@
 
 ## 接口核对结果
 
-本机 `@xai-official/grok` 1.0.44 的只读帮助显示：`account` 不可用；`models --help` 没有 `--json`；`usage` 接受本地 session ID，统计 session token/cost，不是订阅额度或 credits API。没有启动登录、读取账号/session、运行模型目录/额度请求或 ACP。
+本机 `@xai-official/grok` 1.0.44 的只读帮助显示：`account` 不可用；`models --help` 没有 `--json`；`usage` 接受本地 session ID，统计 session token/cost，不是订阅额度或 credits API。此句记录当时的 CLI 帮助核验；2026-10-02 后续另做了一次有界 ACP v1 initialize + authenticate(cached_token) 现有会话检查，成功但未检查或保留账户身份，未发 session/new 或 session/prompt，详情见 [Grok ACP 只读路径与来源阻断](grok-acp-readonly.md)。
 
 官方 CLI 文档只把 `models` 描述为可用模型列表；它没有确认本机 1.0.44 对候选机器接口的支持。npm 注册表的[精确 1.0.44 记录](https://registry.npmjs.org/@xai-official/grok/1.0.44)返回 HTTP 200 且无重定向，`_id` 与 `version` 均为 `@xai-official/grok@1.0.44` / `1.0.44`，`gitHead` 为 `5b807183dd7978a460f309132cf0d1183d743526`，没有 `repository` 字段。本机安装包清单没有 `gitHead` 或 `repository` 字段；CLI 历史 `--version` 自报 build ID `5b807183dd79` 与注册表 `gitHead` 前缀相同。对该完整 SHA 的公开 GitHub 仓库查找返回 HTTP 422，只能说明这次查找没有解析该 SHA，不能证明不存在其他源码映射；本机二进制的精确字节仍未映射到可核验的官方源码或发布。较新的官方公开快照 [`2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8`](https://github.com/xai-org/grok-build/commit/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8) 的 [`xai-grok-shell/Cargo.toml`](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-shell/Cargo.toml) 声明版本为 1.0.45，而不是本机 1.0.44。该公开快照在 [`billing.rs`](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-shell/src/extensions/billing.rs) 中有 `x.ai/billing` 和 `x.ai/auto-topup-rule` 候选 handler；它不证明 1.0.44 的 ACP wire method 或响应契约。
 
