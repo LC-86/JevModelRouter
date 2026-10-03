@@ -1023,6 +1023,9 @@ fn evaluate(
     protocol: Protocol,
     reserved_call: bool,
 ) -> Result<(), Denial> {
+    if let Some(denial) = crate::cpa_sources::denial(config, provider, model) {
+        return Err(denial);
+    }
     if !is_subscription_provider(provider) {
         return Ok(());
     }

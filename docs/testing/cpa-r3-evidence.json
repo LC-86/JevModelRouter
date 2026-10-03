@@ -1,0 +1,67 @@
+{
+  "first.report": {
+    "checks": [
+      "begin/wait/cancel public desktop loop",
+      "failure/disconnect public desktop loop",
+      "connection/directory/selection/listening gateway rejection; no same-name API fallback",
+      "stale directory retained; switch disables old target; explicit rebind"
+    ],
+    "layer": "native-desktop-fictional-cpa",
+    "ok": true,
+    "receipts": {
+      "accountQueries": 0,
+      "deleted": [
+        "fictional-fictional-a.json"
+      ],
+      "downloads": 0,
+      "models": 0,
+      "sessions": [
+        "fictional-1",
+        "fictional-2"
+      ]
+    },
+    "run_id": "af937f04-587e-4f7c-b990-9050f5424383",
+    "saved": {
+      "generation": 8,
+      "model_id": "a2937f1f-8633-48e9-b645-2231a2dbf982",
+      "provider_id": "cpa-768876fe-f135-4f5d-8389-867024ab770c"
+    }
+  },
+  "reload.report": {
+    "checks": [
+      "isolated DB restart re-read; no automatic authorization"
+    ],
+    "layer": "native-desktop-fictional-cpa",
+    "ok": true,
+    "receipts": {
+      "accountQueries": 0,
+      "deleted": [
+        "fictional-fictional-a.json"
+      ],
+      "downloads": 0,
+      "models": 0,
+      "sessions": [
+        "fictional-1",
+        "fictional-2"
+      ]
+    },
+    "run_id": "a31dff76-a73b-4f61-a667-7c9776aca1da",
+    "saved": {
+      "generation": 8,
+      "model_id": "a2937f1f-8633-48e9-b645-2231a2dbf982",
+      "provider_id": "cpa-768876fe-f135-4f5d-8389-867024ab770c"
+    }
+  },
+  "receiver-records": {
+    "models": 0,
+    "downloads": 0,
+    "accountQueries": 0,
+    "sessions": [
+      "fictional-1",
+      "fictional-2"
+    ],
+    "deleted": [
+      "fictional-fictional-a.json"
+    ]
+  }
+}

@@ -20,6 +20,7 @@ mod router;
 mod dispatch;
 mod subscription;
 mod subscription_catalog;
+mod cpa_sources;
 mod codex_helper;
 mod runtime;
 #[cfg(feature = "isolation-check")]
@@ -63,6 +64,7 @@ struct ProxyStatus {
 
 #[derive(Serialize)]
 struct DashboardSnapshot {
+    cpa_subscriptions: Vec<cpa_sources::View>,
     recovery_notice: Option<String>,
     gateway: resilience::Settings,
     health: Vec<resilience::Status>,
@@ -119,6 +121,7 @@ async fn snapshot(state: &AppState) -> DashboardSnapshot {
     };
     let subscription_auth = subscription::auth::views(&config, &*state.store.auth);
     DashboardSnapshot {
+        cpa_subscriptions: state.store.cpa.views(&config),
         recovery_notice: lifecycle::notice(config.port),
         gateway: config.gateway.clone(),
         health: state.proxy.lock().await.as_ref().map_or_else(Vec::new, |p|p.health.statuses()),
@@ -218,6 +221,9 @@ async fn get_snapshot(state: State<'_, AppState>) -> Result<DashboardSnapshot, S
 /// 挂起登录期间不改写连接，避免把 pending 伪装成已连接或让旧身份复活。
 #[tauri::command]
 async fn refresh_subscription(state: State<'_, AppState>, provider_id: String) -> Result<DashboardSnapshot, String> {
+    if state.store.read().cpa_subscriptions.contains_key(&provider_id) {
+        return cpa_sources::cpa_subscription_action(state,provider_id,"refresh".into()).await;
+    }
     subscription::refresh(&state.store, &provider_id).await?;
     Ok(snapshot(&state).await)
 }
@@ -313,6 +319,9 @@ fn disarm_grok_real_generation(store: &ConfigStore, provider_id: &str) -> Result
 /// 走 Issue #13 的适配器会话。两套实现并存，命令名不变，按 provider kind 分派。
 #[tauri::command]
 async fn begin_subscription_login(state: State<'_, AppState>, provider_id: String) -> Result<DashboardSnapshot, String> {
+    if state.store.read().cpa_subscriptions.contains_key(&provider_id) {
+        return cpa_sources::cpa_subscription_action(state,provider_id,"begin".into()).await;
+    }
     disarm_codex_real_generation(&state.store, &provider_id)?;
     disarm_grok_real_generation(&state.store, &provider_id)?;
     if managed_by_grok_auth(&state.store.read(), &provider_id) {
@@ -328,6 +337,9 @@ async fn begin_subscription_login(state: State<'_, AppState>, provider_id: Strin
 /// Codex 的挂起登录由 `get_snapshot` 的内存态直接观察（Issue #13）。
 #[tauri::command]
 async fn poll_subscription_login(state: State<'_, AppState>, provider_id: String) -> Result<DashboardSnapshot, String> {
+    if state.store.read().cpa_subscriptions.contains_key(&provider_id) {
+        return cpa_sources::cpa_subscription_action(state,provider_id,"poll".into()).await;
+    }
     subscription::auth::poll(&state.store, &provider_id).await?;
     Ok(snapshot(&state).await)
 }
@@ -335,6 +347,9 @@ async fn poll_subscription_login(state: State<'_, AppState>, provider_id: String
 /// 取消进行中的登录：Grok 走内置 auth 生命周期，其它订阅走适配器会话。
 #[tauri::command]
 async fn cancel_subscription_login(state: State<'_, AppState>, provider_id: String) -> Result<DashboardSnapshot, String> {
+    if state.store.read().cpa_subscriptions.contains_key(&provider_id) {
+        return cpa_sources::cpa_subscription_action(state,provider_id,"cancel".into()).await;
+    }
     disarm_grok_real_generation(&state.store, &provider_id)?;
     if managed_by_grok_auth(&state.store.read(), &provider_id) {
         subscription::auth::cancel(&state.store, &provider_id).await?;
@@ -347,6 +362,9 @@ async fn cancel_subscription_login(state: State<'_, AppState>, provider_id: Stri
 /// 退出订阅账号：Grok 走内置 auth 生命周期（本地清除与自有进程回收），其它订阅走适配器退出。
 #[tauri::command]
 async fn logout_subscription(state: State<'_, AppState>, provider_id: String) -> Result<DashboardSnapshot, String> {
+    if state.store.read().cpa_subscriptions.contains_key(&provider_id) {
+        return cpa_sources::cpa_subscription_action(state,provider_id,"disconnect".into()).await;
+    }
     disarm_codex_real_generation(&state.store, &provider_id)?;
     disarm_grok_real_generation(&state.store, &provider_id)?;
     if managed_by_grok_auth(&state.store.read(), &provider_id) {
@@ -360,6 +378,9 @@ async fn logout_subscription(state: State<'_, AppState>, provider_id: String) ->
 /// 更换订阅账号：Grok 走内置 auth 生命周期；其它订阅走适配器换号并挂起等待者。
 #[tauri::command]
 async fn switch_subscription_account(state: State<'_, AppState>, provider_id: String) -> Result<DashboardSnapshot, String> {
+    if state.store.read().cpa_subscriptions.contains_key(&provider_id) {
+        return cpa_sources::cpa_subscription_action(state,provider_id,"switch".into()).await;
+    }
     disarm_codex_real_generation(&state.store, &provider_id)?;
     disarm_grok_real_generation(&state.store, &provider_id)?;
     if managed_by_grok_auth(&state.store.read(), &provider_id) {
@@ -410,6 +431,9 @@ async fn save_provider(
     original_id: Option<String>,
     creating: Option<bool>,
 ) -> Result<DashboardSnapshot, String> {
+    if state.store.read().cpa_subscriptions.contains_key(original_id.as_deref().unwrap_or(&provider.id)) {
+        return Err("Manage this CPA connection with its dedicated controls".into());
+    }
     provider.id = provider.id.trim().to_owned();
     validate_provider(&provider).map_err(|error| error.to_string())?;
     if subscription::is_subscription_provider(&provider) && api_key.as_deref().is_some_and(|key| !key.trim().is_empty()) {
@@ -703,6 +727,9 @@ async fn delete_provider(
     state: State<'_, AppState>,
     id: String,
 ) -> Result<DashboardSnapshot, String> {
+    if state.store.read().cpa_subscriptions.contains_key(&id) {
+        state.store.cpa.disconnect(&state.store,&id,false).await.map_err(|e|e.to_string())?;
+    }
     // 删除前释放两套订阅资源：#13 的适配器/内存会话（Codex 等）与本票的 Grok 授权生命周期。
     // 任一失败都中止删除，provider 与连接都保留；非该 kind 的调用按各自实现是空操作。
     subscription::dispose(&state.store, &id, &state.sessions).await?;
@@ -850,6 +877,7 @@ async fn save_policy(
 }
 
 async fn safe_stop(state:&AppState)->Result<(),String> {
+    state.store.cpa.shutdown(&state.store).await.map_err(|e|e.to_string())?;
     #[cfg(feature = "isolation-check")]
     let cpa_stop = match state.cpa_validation.lock().await.take() {
         Some(service) => service.stop().await.map_err(|e|format!("{e:#}")),
@@ -1418,6 +1446,13 @@ pub fn run() {
             // isolation-check 构建里，验收脚本可以额外指定受控目录文件（`--autojev-catalog-fixture`）：
             // 那个替身只替换上游目录与额度读取，登录、世代、准入与派发仍是同一套生产代码。
             let mut store = ConfigStore::load(root.join(database))?;
+            #[cfg(feature="isolation-check")]
+            if std::env::args().any(|arg|arg=="--autojev-cpa-auth-check") && !std::env::args().any(|arg|arg=="--autojev-cpa-auth-reload") {
+                if !runtime::isolated() { return Err(anyhow!("CPA auth fixture requires isolation").into()); }
+                let args:Vec<_>=std::env::args().collect();
+                let i=args.iter().position(|s|s=="--autojev-upstream").context("Missing CPA auth fixture")?;
+                store.cpa=Arc::new(cpa_sources::Manager::owned_fixture(args[i+1].clone())?);
+            }
             store.subscription = Arc::new(subscription::SubscriptionAdapters::new(vec![
                 subscription_adapter()?,
                 Arc::new(subscription::grok::GrokSubscriptionAdapter::new()),
@@ -1489,6 +1524,9 @@ pub fn run() {
             }
             let handler: fn(tauri::ipc::Invoke<tauri::Wry>) -> bool = tauri::generate_handler![
             get_snapshot,
+            cpa_sources::create_cpa_subscription,
+            cpa_sources::cpa_subscription_action,
+            cpa_sources::select_cpa_model,
             refresh_subscription,
             grok_readonly_status,
             set_codex_real_generation_enabled,

@@ -1,0 +1,707 @@
+//! CPA owns credentials/OAuth/refresh. Jev stores references and identity generations.
+//! R3 has no real generation grant; registration and discovery cannot create one.
+use crate::{
+    config::{AppConfig, ConfigStore, Model, Provider, ProviderKind},
+    subscription::{Connection as Identity, ConnectionState, Denial, DenialFamily, EvidenceState},
+};
+use anyhow::{ensure, Result};
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
+
+mod client;
+#[cfg(test)]
+mod tests;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Stage {
+    #[default]
+    Idle,
+    Starting,
+    Waiting,
+    Connected,
+    Failed,
+    Cancelled,
+    Disconnected,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Discovered {
+    pub model_id: String,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Connection {
+    pub identity: Identity,
+    pub provider: String,
+    pub stage: Stage,
+    pub plan: Option<String>,
+    pub credential_ref: Option<String>,
+    pub catalog: Vec<Discovered>,
+    pub catalog_state: EvidenceState,
+    pub observed_at: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Binding {
+    pub provider_id: String,
+    pub connection_instance_id: String,
+    pub generation: u64,
+    pub account: Option<String>,
+    pub plan: Option<String>,
+    pub model_id: String,
+}
+impl Binding {
+    fn matches(&self, id: &str, c: &Connection, model: &str) -> bool {
+        self.provider_id == id
+            && self.connection_instance_id == c.identity.connection_instance_id
+            && self.generation == c.identity.generation
+            && self.account == c.identity.identity
+            && self.plan == c.plan
+            && self.model_id == model
+    }
+}
+
+#[derive(Clone, Serialize)]
+pub struct ModelView {
+    pub id: String,
+    pub model_id: String,
+    pub name: String,
+    pub selected: bool,
+    pub bound: bool,
+}
+#[derive(Clone, Serialize)]
+pub struct View {
+    pub provider_id: String,
+    pub provider: String,
+    pub stage: Stage,
+    pub connection_instance_id: String,
+    pub generation: u64,
+    pub account: Option<String>,
+    pub plan: Option<String>,
+    pub catalog_state: EvidenceState,
+    pub observed_at: Option<String>,
+    pub models: Vec<ModelView>,
+    pub error: Option<String>,
+    pub authorization_url: Option<String>,
+    pub service_available: bool,
+    pub qualification: &'static str,
+    pub quota: &'static str,
+    pub capability: &'static str,
+}
+
+#[derive(Clone)]
+struct Attempt {
+    stamp: Binding,
+    state: String,
+    url: String,
+}
+#[derive(Default)]
+pub struct Manager {
+    // One dedicated service profile per connection. Never scan/adopt a shared CPA.
+    clients: Mutex<HashMap<String, Arc<client::Client>>>,
+    attempts: Mutex<HashMap<String, Attempt>>,
+    fixture: Option<Arc<client::Client>>,
+}
+
+impl Manager {
+    #[cfg(any(test, feature = "isolation-check"))]
+    pub fn owned_fixture(base: String) -> Result<Self> {
+        Ok(Self {
+            fixture: Some(Arc::new(client::Client::owned_fixture(base)?)),
+            ..Default::default()
+        })
+    }
+    fn client(&self, id: &str) -> Result<Arc<client::Client>> {
+        self.clients
+            .lock()
+            .unwrap()
+            .get(id)
+            .cloned()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "CPA service is not provisioned; real authorization is pending R6/R7"
+                )
+            })
+    }
+    pub fn create(&self, store: &ConfigStore, provider: &str, name: &str) -> Result<String> {
+        ensure!(
+            provider == "codex",
+            "This R3 integration currently supports the Codex management contract only"
+        );
+        ensure!(
+            !name.trim().is_empty() && name.len() <= 100,
+            "Enter a connection name"
+        );
+        let id = format!("cpa-{}", uuid::Uuid::new_v4());
+        let mut clients = self.clients.lock().unwrap();
+        store.update(|config| {
+            config.providers.push(Provider {
+                id: id.clone(),
+                name: name.trim().into(),
+                kind: ProviderKind::CodexSubscription,
+                base_url: String::new(),
+                enabled: true,
+                preset: String::new(),
+                api_type: String::new(),
+                test_model: String::new(),
+                has_api_key: false,
+            });
+            config.cpa_subscriptions.insert(
+                id.clone(),
+                Connection {
+                    identity: Identity::default(),
+                    provider: provider.into(),
+                    stage: Stage::Idle,
+                    plan: None,
+                    credential_ref: None,
+                    catalog: vec![],
+                    catalog_state: EvidenceState::Unknown,
+                    observed_at: None,
+                    error: None,
+                },
+            );
+        })?;
+        if clients.is_empty() {
+            if let Some(client) = &self.fixture {
+                clients.insert(id.clone(), client.clone());
+            }
+        }
+        Ok(id)
+    }
+
+    pub fn views(&self, config: &AppConfig) -> Vec<View> {
+        let attempts = self.attempts.lock().unwrap();
+        let clients = self.clients.lock().unwrap();
+        let mut views: Vec<_> = config
+            .cpa_subscriptions
+            .iter()
+            .map(|(id, c)| View {
+                provider_id: id.clone(),
+                provider: c.provider.clone(),
+                stage: c.stage,
+                connection_instance_id: c.identity.connection_instance_id.clone(),
+                generation: c.identity.generation,
+                account: c.identity.identity.clone(),
+                plan: c.plan.clone(),
+                catalog_state: c.catalog_state,
+                observed_at: c.observed_at.clone(),
+                error: c.error.clone(),
+                service_available: clients.contains_key(id),
+                authorization_url: attempts
+                    .get(id)
+                    .filter(|a| a.stamp.matches(id, c, "") && c.stage == Stage::Waiting)
+                    .map(|a| a.url.clone()),
+                qualification: "unknown",
+                quota: "unknown",
+                capability: "unverified",
+                models: config
+                    .models
+                    .iter()
+                    .filter(|m| m.provider_id == *id)
+                    .map(|m| ModelView {
+                        id: m.id.clone(),
+                        model_id: m.model_id.clone(),
+                        name: m.name.clone(),
+                        selected: m.selected,
+                        bound: config
+                            .cpa_model_bindings
+                            .get(&m.id)
+                            .is_some_and(|b| b.matches(id, c, &m.model_id)),
+                    })
+                    .collect(),
+            })
+            .collect();
+        views.sort_by(|a, b| a.provider_id.cmp(&b.provider_id));
+        views
+    }
+
+    pub async fn begin(&self, store: &ConfigStore, id: &str) -> Result<()> {
+        let client = self.client(id)?;
+        ensure!(
+            !self.attempts.lock().unwrap().contains_key(id),
+            "Disconnect the previous owned authorization attempt first"
+        );
+        let stamp = store.update(|config| -> Result<Binding> {
+            let c = config
+                .cpa_subscriptions
+                .get_mut(id)
+                .ok_or_else(|| anyhow::anyhow!("Unknown CPA connection"))?;
+            ensure!(
+                !matches!(c.stage, Stage::Starting | Stage::Waiting | Stage::Connected),
+                "Disconnect or cancel this connection first"
+            );
+            ensure!(
+                c.credential_ref.is_none(),
+                "Retry credential cleanup before reconnecting"
+            );
+            advance(c, Stage::Starting)?;
+            Ok(stamp(id, c, ""))
+        })??;
+        let result = async {
+            ensure!(
+                client.credentials().await?.is_empty(),
+                "Dedicated CPA profile contains an unclaimed credential; do not adopt or delete it"
+            );
+            client
+                .begin(&store.read().cpa_subscriptions[id].provider)
+                .await
+        }
+        .await;
+        let (state, url) = match result {
+            Ok(v) => v,
+            Err(e) => {
+                fail(store, id, &stamp, &e.to_string())?;
+                return Err(e);
+            }
+        };
+        let committed = {
+            let mut attempts = self.attempts.lock().unwrap();
+            let committed = store.update(|config| -> Result<()> {
+                let c = current(config, id, &stamp)?;
+                ensure!(c.stage == Stage::Starting, "Authorization was superseded");
+                c.stage = Stage::Waiting;
+                c.identity.state = ConnectionState::AuthorizationPending;
+                Ok(())
+            })?;
+            if committed.is_ok() {
+                attempts.insert(
+                    id.into(),
+                    Attempt {
+                        stamp: stamp.clone(),
+                        state: state.clone(),
+                        url,
+                    },
+                );
+            }
+            committed
+        };
+        if committed.is_err() {
+            client.cancel(&state).await?;
+        }
+        committed
+    }
+
+    pub async fn poll(&self, store: &ConfigStore, id: &str) -> Result<()> {
+        let client = self.client(id)?;
+        let attempt = self
+            .attempts
+            .lock()
+            .unwrap()
+            .get(id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("No owned authorization session"))?;
+        let result = async {
+            if client.status(&attempt.state).await? == "wait" { return Ok(None); }
+            let mut files=client.credentials().await?;
+            ensure!(files.len()==1 && files[0].provider==store.read().cpa_subscriptions[id].provider && !files[0].disabled, "Dedicated CPA profile must contain exactly one active credential of the expected provider");
+            Ok(Some(files.remove(0)))
+        }.await;
+        let credential = match result {
+            Ok(None) => return Ok(()),
+            Ok(Some(c)) => c,
+            Err(e) => {
+                fail(store, id, &attempt.stamp, &e.to_string())?;
+                return Err(e);
+            }
+        };
+        let mut attempts = self.attempts.lock().unwrap();
+        store.update(|config| -> Result<()> {
+            let c = current(config, id, &attempt.stamp)?;
+            ensure!(c.stage == Stage::Waiting, "Authorization was superseded");
+            c.identity.state = ConnectionState::Connected;
+            c.identity.identity = known(credential.id_token.chatgpt_account_id);
+            c.plan = known(credential.id_token.plan_type);
+            c.credential_ref = Some(credential.name);
+            c.stage = Stage::Connected;
+            c.error = None;
+            Ok(())
+        })??;
+        if attempts.get(id).is_some_and(|a| a.stamp == attempt.stamp) {
+            attempts.remove(id);
+        }
+        Ok(())
+    }
+
+    pub async fn disconnect(&self, store: &ConfigStore, id: &str, cancel: bool) -> Result<()> {
+        // Commit the denial before any network wait. Older poll/refresh completions fail their stamp.
+        let (attempt, credential, cleanup_stamp) = {
+            let attempts = self.attempts.lock().unwrap();
+            let (credential, cleanup_stamp) =
+                store.update(|config| -> Result<(Option<String>, Binding)> {
+                    let c = config
+                        .cpa_subscriptions
+                        .get_mut(id)
+                        .ok_or_else(|| anyhow::anyhow!("Unknown CPA connection"))?;
+                    if cancel {
+                        ensure!(
+                            matches!(c.stage, Stage::Starting | Stage::Waiting),
+                            "No pending authorization to cancel"
+                        );
+                    }
+                    let credential = c.credential_ref.clone();
+                    advance(
+                        c,
+                        if cancel {
+                            Stage::Cancelled
+                        } else {
+                            Stage::Disconnected
+                        },
+                    )?;
+                    Ok((credential, stamp(id, c, "")))
+                })??;
+            (attempts.get(id).cloned(), credential, cleanup_stamp)
+        };
+        let result = async {
+            if let Some(a) = &attempt {
+                self.client(id)?.cancel(&a.state).await?;
+            }
+            if let Some(name) = &credential {
+                self.client(id)?.delete(name).await?;
+            }
+            Ok(())
+        }
+        .await;
+        if result.is_err() {
+            // Keep the owned cleanup reference for an explicit retry; never restore connection state.
+            store.update(|config| { if let Ok(c)=current(config,id,&cleanup_stamp) { c.error=Some("Local connection disabled; CPA cleanup failed. Retry disconnect before reconnecting.".into()); } })?;
+        } else {
+            let mut attempts = self.attempts.lock().unwrap();
+            store.update(|config| {
+                if let Ok(c) = current(config, id, &cleanup_stamp) {
+                    c.credential_ref = None;
+                }
+            })?;
+            if attempts
+                .get(id)
+                .is_some_and(|a| attempt.as_ref().is_some_and(|old| old.stamp == a.stamp))
+            {
+                attempts.remove(id);
+            }
+        }
+        result
+    }
+
+    pub async fn refresh(&self, store: &ConfigStore, id: &str) -> Result<()> {
+        let client = self.client(id)?;
+        let config = store.read();
+        let c = config
+            .cpa_subscriptions
+            .get(id)
+            .ok_or_else(|| anyhow::anyhow!("Unknown CPA connection"))?;
+        ensure!(
+            c.stage == Stage::Connected,
+            "Connect before reading the directory"
+        );
+        let b = stamp(id, c, "");
+        let name = c
+            .credential_ref
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Credential reference is unknown"))?;
+        let sequence = store
+            .begin_subscription_refresh(id)
+            .map_err(anyhow::Error::msg)?;
+        let metadata = client.credentials().await;
+        // Identity commits before discovery: a directory failure cannot preserve a changed account.
+        let b=store.update_subscription_refresh(id,sequence,|config| {
+            let c=current(config,id,&b).map_err(|e|e.to_string())?;
+            let files=match &metadata {
+                Ok(files)=>files,
+                Err(error)=> {mark_read_failed(c);return Err(error.to_string());}
+            };
+            let file=if files.len()==1 {files.iter().find(|f|f.name==name&&f.provider==c.provider&&!f.disabled)} else {None};
+            let Some(file)=file else {
+                advance(c,Stage::Disconnected).map_err(|e|e.to_string())?;
+                c.error=Some("Owned CPA credential disappeared, was disabled, or became ambiguous; connection disabled".into());
+                return Err(c.error.clone().unwrap());
+            };
+            let account=known(file.id_token.chatgpt_account_id.clone());
+            let plan=known(file.id_token.plan_type.clone());
+            if account!=c.identity.identity||plan!=c.plan {
+                advance(c,Stage::Connected).map_err(|e|e.to_string())?;
+                c.identity.state=ConnectionState::Connected;c.identity.identity=account;c.plan=plan;
+            }
+            Ok(stamp(id,c,""))
+        }).map_err(anyhow::Error::msg)?;
+        let result = client.models(&name).await;
+        store
+            .update_subscription_refresh(
+                id,
+                sequence,
+                |config| -> std::result::Result<(), String> {
+                    let c = current(config, id, &b).map_err(|e| e.to_string())?;
+                    match &result {
+                        Ok(models) => {
+                            c.catalog = models.clone();
+                            c.catalog_state = EvidenceState::Available;
+                            c.observed_at = Some(chrono::Utc::now().to_rfc3339());
+                            c.error = None;
+                        }
+                        Err(_) => mark_read_failed(c),
+                    }
+                    if let Ok(models) = &result {
+                        for discovered in models {
+                            if !config
+                                .models
+                                .iter()
+                                .any(|m| m.provider_id == id && m.model_id == discovered.model_id)
+                            {
+                                let mut model = AppConfig::default().models.remove(0);
+                                model.id = uuid::Uuid::new_v4().to_string();
+                                model.provider_id = id.into();
+                                model.model_id = discovered.model_id.clone();
+                                model.name = discovered.name.clone();
+                                model.selected = false;
+                                model.enabled = true;
+                                model.supports_tools = false;
+                                model.supports_vision = false;
+                                model.supports_reasoning = false;
+                                model.input_price_known = Some(false);
+                                model.output_price_known = Some(false);
+                                model.cache_price_known = Some(false);
+                                config.models.push(model);
+                            }
+                        }
+                    }
+                    Ok(())
+                },
+            )
+            .map_err(anyhow::Error::msg)?;
+        result.map(|_| ())
+    }
+
+    /// Selecting is the user's explicit binding/rebinding action. Discovery never changes it.
+    pub fn select(
+        &self,
+        store: &ConfigStore,
+        id: &str,
+        model_id: &str,
+        selected: bool,
+    ) -> Result<()> {
+        store.update(|config| -> Result<()> {
+            let c = config
+                .cpa_subscriptions
+                .get(id)
+                .ok_or_else(|| anyhow::anyhow!("Unknown CPA connection"))?;
+            let model = config
+                .models
+                .iter_mut()
+                .find(|m| m.id == model_id && m.provider_id == id)
+                .ok_or_else(|| anyhow::anyhow!("Unknown source model"))?;
+            if selected {
+                ensure!(
+                    c.stage == Stage::Connected
+                        && c.identity.identity.is_some()
+                        && c.plan.is_some()
+                        && c.catalog_state == EvidenceState::Available
+                        && c.catalog.iter().any(|m| m.model_id == model.model_id),
+                    "Current account, plan and directory are required before binding this model"
+                );
+                config
+                    .cpa_model_bindings
+                    .insert(model.id.clone(), stamp(id, c, &model.model_id));
+            }
+            model.selected = selected;
+            Ok(())
+        })??;
+        Ok(())
+    }
+
+    pub async fn shutdown(&self, store: &ConfigStore) -> Result<()> {
+        let ids: Vec<_> = store
+            .read()
+            .cpa_subscriptions
+            .iter()
+            .filter(|(id, c)| {
+                matches!(c.stage, Stage::Starting | Stage::Waiting)
+                    || self.attempts.lock().unwrap().contains_key(*id)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        let mut failures = Vec::new();
+        for id in ids {
+            if let Err(error) = self.disconnect(store, &id, false).await {
+                failures.push(error.to_string());
+            }
+        }
+        ensure!(
+            failures.is_empty(),
+            "CPA owned-session cleanup failed: {}",
+            failures.join("; ")
+        );
+        Ok(())
+    }
+}
+
+fn mark_read_failed(c: &mut Connection) {
+    c.catalog_state = if c.catalog.is_empty() {
+        EvidenceState::Failed
+    } else {
+        EvidenceState::Stale
+    };
+    c.error = Some("CPA directory read failed; historical configuration retained".into());
+}
+
+pub fn denial(config: &AppConfig, provider: &Provider, model: Option<&Model>) -> Option<Denial> {
+    let c = config.cpa_subscriptions.get(&provider.id)?;
+    let (code, family, message) = if !provider.enabled || model.is_some_and(|m| !m.enabled) {
+        (
+            "provider_disabled",
+            DenialFamily::Disabled,
+            "CPA target is disabled",
+        )
+    } else if c.stage != Stage::Connected {
+        (
+            "cpa_not_connected",
+            DenialFamily::NotConnected,
+            "CPA subscription connection is not connected",
+        )
+    } else if model.is_none_or(|m| {
+        !config
+            .cpa_model_bindings
+            .get(&m.id)
+            .is_some_and(|b| b.matches(&provider.id, c, &m.model_id))
+    }) {
+        (
+            "cpa_target_identity_changed",
+            DenialFamily::NotEligible,
+            "This fixed target is not bound to the current account, plan and connection generation",
+        )
+    } else {
+        ("cpa_qualification_unknown",DenialFamily::Quota,"CPA login and directory do not prove model eligibility, protocol capability or whole-call subscription-only consumption")
+    };
+    Some(Denial {
+        code: code.into(),
+        family,
+        message: message.into(),
+        recovery:
+            "Review this source in R7. This target never falls back to another account or API."
+                .into(),
+    })
+}
+
+pub fn reconcile_loaded(config: &mut AppConfig) -> Result<bool> {
+    let mut changed = false;
+    for c in config.cpa_subscriptions.values_mut() {
+        if matches!(c.stage, Stage::Starting | Stage::Waiting) {
+            advance(c, Stage::Disconnected)?;
+            c.error = Some(
+                "Pending authorization ended with the previous process; reconnect explicitly"
+                    .into(),
+            );
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+
+fn known(value: Option<String>) -> Option<String> {
+    value
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty() && s.len() <= 200)
+}
+fn stamp(id: &str, c: &Connection, model: &str) -> Binding {
+    Binding {
+        provider_id: id.into(),
+        connection_instance_id: c.identity.connection_instance_id.clone(),
+        generation: c.identity.generation,
+        account: c.identity.identity.clone(),
+        plan: c.plan.clone(),
+        model_id: model.into(),
+    }
+}
+fn advance(c: &mut Connection, stage: Stage) -> Result<()> {
+    c.identity.generation = c
+        .identity
+        .generation
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("Connection generation exhausted"))?;
+    c.identity.state = ConnectionState::NotConnected;
+    c.identity.identity = None;
+    c.identity.evidence = None;
+    c.plan = None;
+    c.stage = stage;
+    c.error = None;
+    c.catalog_state = if c.catalog.is_empty() {
+        EvidenceState::Unknown
+    } else {
+        EvidenceState::Stale
+    };
+    Ok(())
+}
+fn current<'a>(config: &'a mut AppConfig, id: &str, b: &Binding) -> Result<&'a mut Connection> {
+    let c = config
+        .cpa_subscriptions
+        .get_mut(id)
+        .ok_or_else(|| anyhow::anyhow!("Connection removed"))?;
+    ensure!(
+        b.matches(id, c, ""),
+        "Connection identity changed; late result discarded"
+    );
+    Ok(c)
+}
+fn fail(store: &ConfigStore, id: &str, b: &Binding, error: &str) -> Result<()> {
+    store.update(|config| -> Result<()> {
+        let c = current(config, id, b)?;
+        c.stage = Stage::Failed;
+        c.identity.state = ConnectionState::NotConnected;
+        c.error = Some(error.into());
+        Ok(())
+    })??;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn create_cpa_subscription(
+    state: tauri::State<'_, crate::AppState>,
+    provider: String,
+    name: String,
+) -> std::result::Result<crate::DashboardSnapshot, String> {
+    state
+        .store
+        .cpa
+        .create(&state.store, &provider, &name)
+        .map_err(|e| e.to_string())?;
+    Ok(crate::snapshot(&state).await)
+}
+#[tauri::command]
+pub async fn cpa_subscription_action(
+    state: tauri::State<'_, crate::AppState>,
+    provider_id: String,
+    action: String,
+) -> std::result::Result<crate::DashboardSnapshot, String> {
+    let manager = &state.store.cpa;
+    let result = match action.as_str() {
+        "begin" => manager.begin(&state.store, &provider_id).await,
+        "poll" => manager.poll(&state.store, &provider_id).await,
+        "refresh" => manager.refresh(&state.store, &provider_id).await,
+        "cancel" => manager.disconnect(&state.store, &provider_id, true).await,
+        "disconnect" => manager.disconnect(&state.store, &provider_id, false).await,
+        "switch" => match manager.disconnect(&state.store, &provider_id, false).await {
+            Ok(()) => manager.begin(&state.store, &provider_id).await,
+            Err(e) => Err(e),
+        },
+        _ => Err(anyhow::anyhow!("Unknown CPA connection action")),
+    };
+    result.map_err(|e| e.to_string())?;
+    Ok(crate::snapshot(&state).await)
+}
+#[tauri::command]
+pub async fn select_cpa_model(
+    state: tauri::State<'_, crate::AppState>,
+    provider_id: String,
+    model_id: String,
+    selected: bool,
+) -> std::result::Result<crate::DashboardSnapshot, String> {
+    state
+        .store
+        .cpa
+        .select(&state.store, &provider_id, &model_id, selected)
+        .map_err(|e| e.to_string())?;
+    Ok(crate::snapshot(&state).await)
+}
