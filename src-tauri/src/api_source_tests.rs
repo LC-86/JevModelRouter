@@ -10,6 +10,36 @@ use axum::{
 use serde_json::json;
 use std::sync::{Arc, Mutex};
 
+fn review_choice_stream(field: &str, key: &str) -> String {
+    let mut choices = Vec::new();
+    if field == "tools" {
+        choices.push(json!([
+            {"index":1,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"echo","arguments":""}}]},"finish_reason":null},
+            {"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_0","type":"function","function":{"name":"echo","arguments":""}}]},"finish_reason":null}
+        ]));
+        let arguments = [format!("{{\"note\":\"{key}\"}}"), r#"{"note":"other value"}"#.into()];
+        let split = arguments[0].find("coding").unwrap();
+        for (index, piece) in [(0, &arguments[0][..split]), (1, &arguments[1][..10]), (0, &arguments[0][split..]), (1, &arguments[1][10..])] {
+            choices.push(json!([{"index":index,"delta":{"tool_calls":[{"index":0,"function":{"arguments":piece}}]},"finish_reason":null}]));
+        }
+    } else {
+        let split = key.find("coding").unwrap();
+        for (index, piece) in [(0, format!("你好 {}", &key[..split])), (1, "other choice".into()), (0, format!("{} 完成", &key[split..])), (1, " retained".into())] {
+            let mut delta = json!({});
+            delta[field] = piece.into();
+            choices.push(json!([{"index":index,"delta":delta,"finish_reason":null}]));
+        }
+    }
+    let reason = if field == "tools" { "tool_calls" } else { "stop" };
+    choices.push(json!([{"index":1,"delta":{},"finish_reason":reason},{"index":0,"delta":{},"finish_reason":reason}]));
+    let mut text = String::new();
+    for choices in choices {
+        text.push_str(&format!("data: {}\n\n", json!({"id":"review-choices","object":"chat.completion.chunk","created":0,"model":"same-model","choices":choices})));
+    }
+    text.push_str("data: [DONE]\n\n");
+    text
+}
+
 async fn source_fixture() -> (
     tempfile::TempDir,
     Arc<ConfigStore>,
@@ -25,7 +55,18 @@ async fn source_fixture() -> (
             let records = records.clone();
             async move {
                 let path = uri.0.path().to_string();
-                records.lock().unwrap().push(json!({"path":path,"authorization":headers.get("authorization").and_then(|v|v.to_str().ok()),"model":body["model"]}));
+                records.lock().unwrap().push(json!({"path":path,"authorization":headers.get("authorization").and_then(|v|v.to_str().ok()),"model":body["model"],"n":body["n"]}));
+                if let Some(field) = body.pointer("/messages/0/content").and_then(|v| v.as_str()).and_then(|v| v.strip_prefix("review-choice-")) {
+                    let key = headers["authorization"].to_str().unwrap().trim_start_matches("Bearer ");
+                    let text = review_choice_stream(field, key);
+                    let chunks: std::collections::VecDeque<_> = text.as_bytes().chunks(71).map(axum::body::Bytes::copy_from_slice).collect();
+                    let stream = futures_util::stream::unfold(chunks, |mut chunks| async move { let chunk = chunks.pop_front()?; tokio::task::yield_now().await; Some((Ok::<_, std::io::Error>(chunk), chunks)) });
+                    return axum::response::Response::builder().header("content-type", "text/event-stream").body(axum::body::Body::from_stream(stream)).unwrap();
+                }
+                if let Some(style) = body.pointer("/messages/0/content").and_then(|v| v.as_str()).and_then(|v| v.strip_prefix("review-multiline-")) {
+                    let text = ": keepalive\nevent: provider.extension\nid: extension-1\nretry: 1000\ndata: line one\ndata:\ndata: 第二行\ndata:\nprovider-extension: retained\n\ndata:\n\ndata: [DONE]\n\n";
+                    return ([("content-type", "text/event-stream")], if style == "crlf" { text.replace('\n', "\r\n") } else { text.into() }).into_response();
+                }
                 if body.pointer("/messages/0/content").and_then(|v| v.as_str()) == Some("split-secret") {
                     let key = headers["authorization"].to_str().unwrap().trim_start_matches("Bearer ");
                     let text = format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"你好 {key} {key}\"}},\"finish_reason\":null}}]}}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n");
@@ -357,6 +398,87 @@ async fn api_sources_all_refused_targets_dispatch_zero_to_every_other_source() {
     }
     gateway.stop().await;
     upstream.abort();
+}
+
+#[tokio::test]
+async fn api_source_chat_choices_keep_separate_text_reasoning_and_tools() {
+    let (_root, store, received, upstream) = source_fixture().await;
+    let gateway = crate::proxy::start(store).await.unwrap();
+    let mut failures = Vec::new();
+    for field in ["content", "refusal", "reasoning_content", "reasoning", "tools"] {
+        let reply = reqwest::Client::new().post(format!("http://127.0.0.1:{}/v1/chat/completions", gateway.port))
+            .json(&json!({"model":"autojev/model/uuid-coding","n":2,"stream":true,"messages":[{"role":"user","content":format!("review-choice-{field}")}]})).send().await.unwrap();
+        assert_eq!(reply.status(), 200);
+        let bytes = match reply.bytes().await {
+            Ok(bytes) => bytes,
+            Err(error) => { failures.push(format!("{field}: stream terminated: {error}")); continue; }
+        };
+        let events = crate::protocol::SseParser::default().push(&bytes).unwrap();
+        assert_eq!(events.last().unwrap().1, "[DONE]");
+        let mut output = [String::new(), String::new()];
+        let mut calls = [String::new(), String::new()];
+        let mut finished = [false; 2];
+        for (_, data) in events.into_iter().filter(|(_, data)| data != "[DONE]") {
+            let value: serde_json::Value = serde_json::from_str(&data).unwrap();
+            for choice in value["choices"].as_array().unwrap() {
+                let index = choice["index"].as_u64().unwrap() as usize;
+                if let Some(piece) = choice["delta"][field].as_str() { output[index].push_str(piece); }
+                if let Some(tools) = choice["delta"]["tool_calls"].as_array() {
+                    for call in tools {
+                        assert_eq!(call["index"], 0);
+                        if let Some(id) = call["id"].as_str() { calls[index] = id.into(); }
+                        output[index].push_str(call["function"]["arguments"].as_str().unwrap());
+                    }
+                }
+                finished[index] |= choice["finish_reason"].is_string();
+            }
+        }
+        assert_eq!(finished, [true, true]);
+        let expected = if field == "tools" {
+            assert_eq!(calls, ["call_0", "call_1"]);
+            for (index, text) in output.iter().enumerate() {
+                match serde_json::from_str::<serde_json::Value>(text) {
+                    Ok(value) => {
+                        let expected = if index == 0 { "[REDACTED]" } else { "other value" };
+                        if value["note"] != expected { failures.push(format!("{field}/{index}: {value}")); }
+                    }
+                    Err(error) => failures.push(format!("{field}/{index}: invalid arguments: {error}")),
+                }
+            }
+            continue;
+        } else { ["你好 [REDACTED] 完成", "other choice retained"] };
+        if output != expected { failures.push(format!("{field}: {output:?}")); }
+    }
+    let records = received.lock().unwrap().clone();
+    assert_eq!(records.len(), 5);
+    assert!(records.iter().all(|r| r["path"] == "/coding/v4/chat/completions" && r["n"] == 2));
+    gateway.stop().await;
+    upstream.abort();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[tokio::test]
+async fn api_source_multiline_sse_keeps_every_data_line_and_event_metadata() {
+    let (_root, store, received, upstream) = source_fixture().await;
+    let gateway = crate::proxy::start(store).await.unwrap();
+    let mut failures = Vec::new();
+    for style in ["lf", "crlf"] {
+        let reply = reqwest::Client::new().post(format!("http://127.0.0.1:{}/v1/chat/completions", gateway.port))
+            .json(&json!({"model":"autojev/model/uuid-coding","stream":true,"messages":[{"role":"user","content":format!("review-multiline-{style}")}]})).send().await.unwrap();
+        assert_eq!(reply.status(), 200);
+        let bytes = reply.bytes().await.unwrap();
+        let events = crate::protocol::SseParser::default().push(&bytes).unwrap();
+        let expected = vec![("provider.extension".into(), "line one\n\n第二行\n".into()), (String::new(), String::new()), (String::new(), "[DONE]".into())];
+        if events != expected { failures.push(format!("{style}: {events:?}")); }
+        let text = std::str::from_utf8(&bytes).unwrap();
+        for metadata in [": keepalive", "id: extension-1", "retry: 1000", "provider-extension: retained"] {
+            assert!(text.contains(metadata), "{style}: missing {metadata}");
+        }
+    }
+    assert_eq!(received.lock().unwrap().len(), 2);
+    gateway.stop().await;
+    upstream.abort();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 #[tokio::test]

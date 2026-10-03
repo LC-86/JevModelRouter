@@ -99,8 +99,13 @@ impl Frame {
                 if wrote_data {
                     continue;
                 }
-                output.push_str("data: ");
-                output.push_str(&safe);
+                for (i, part) in safe.split('\n').enumerate() {
+                    if i > 0 {
+                        output.push('\n');
+                    }
+                    output.push_str("data: ");
+                    output.push_str(part);
+                }
                 wrote_data = true;
             } else {
                 output.push_str(&line.replace(key, "[REDACTED]"));
@@ -154,18 +159,22 @@ fn delta_fields(value: &serde_json::Value) -> Vec<(String, String)> {
     let mut fields = Vec::new();
     if let Some(choices) = value["choices"].as_array() {
         for (i, choice) in choices.iter().enumerate() {
+            let choice_index = choice["index"].as_u64().unwrap_or(i as u64);
             for name in ["content", "refusal", "reasoning_content", "reasoning"] {
                 let channel = if name.starts_with("reasoning") {
                     "reasoning"
                 } else {
                     "text"
                 };
-                fields.push((channel.into(), format!("/choices/{i}/delta/{name}")));
+                fields.push((
+                    format!("{channel}:{choice_index}"),
+                    format!("/choices/{i}/delta/{name}"),
+                ));
             }
             if let Some(calls) = choice["delta"]["tool_calls"].as_array() {
                 for (j, call) in calls.iter().enumerate() {
                     fields.push((
-                        format!("tool:{}", call["index"].as_u64().unwrap_or(0)),
+                        format!("tool:{choice_index}:{}", call["index"].as_u64().unwrap_or(0)),
                         format!("/choices/{i}/delta/tool_calls/{j}/function/arguments"),
                     ));
                 }

@@ -19,6 +19,8 @@
 
 默认价格字段的 `*_price_known` 保持 false，界面显示未知；数值占位不构成零费用证据。Key、用户声明的账号/套餐标签以及模型条目都不证明套餐资格。
 
+Chat 同协议沿用既有 `n>1` 透传，文本、拒绝、推理及工具参数按上游 choice index 隔离；跨协议转换仍明确拒绝多 choice，不扩大转换能力。非 JSON SSE 扩展事件保留全部逻辑 data 行（包括空行）、事件元数据与终态。
+
 ## 共享数据与调用边界
 
 `AppConfig.api_sources` / `DashboardSnapshot.api_sources` 是按 Provider ID 索引的非秘密元数据：连接实例 UUID、世代、分类、显式协议基址、上游协议、后端生成的 `api-generation:<connection_instance_uuid>` 凭据引用，以及账号/套餐的 unknown 或 user_declared 状态。Provider/Model 既有字段和模型 UUID 保持兼容；没有迁移进订阅连接。
@@ -50,6 +52,8 @@ Rust 听网关验收覆盖三类来源同名模型、决策/生成凭据隔离�
 额外旧 `check-isolated-desktop.mjs` 停在 Grok 登录错误码断言：脚本期望 `grok_auth_unverified`，isolation 构建返回 `helper_isolated`。同一脚本在指定 main `5dd59847cc3afb998a6b747fa5153dfef6394d1a` 同样失败；该既有 Grok 验收问题未计为通过，也未扩大本票去修改。
 
 PR62 的两项自动代码审查反馈也补出公开行为红灯：round_robin/jev 在429/500/503后依次请求三来源；原生 save_model 接受不匹配协议。修复在解析到显式来源后关闭本次请求重试，并在模型保存前校验协议。六个路由失败组合现在各只请求一个目标；原生新增/编辑拒绝保持配置、零生成，继承和匹配协议仍可使用。未分类旧 API 的既有重试规则保持。
+
+随后两项流式反馈均通过真实回环网关复现：交错 choice 的四种文本/推理字段重组出虚构 Key，同索引工具片段导致流中断；LF/CRLF 非 JSON 多 data 行事件只剩第一行。最小修复为通道键加入上游 choice index，并为每个逻辑行重新输出 data 前缀。五种同协议双 choice 请求保留各自内容、工具 ID/合法参数及终态；两种换行事件完整保留中文、空 data 行和元数据。未新增协议或认证能力。
 
 复现时只使用本次自有构建目录和脚本创建的临时运行空间：
 
