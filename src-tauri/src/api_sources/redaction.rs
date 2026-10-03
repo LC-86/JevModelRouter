@@ -154,12 +154,16 @@ struct Channel {
     spans: Vec<Span>,
 }
 
-/// Match the append-only fields consumed by the existing protocol bridge and Debug.
+/// Match existing bridge/Debug fields and same-protocol legacy function arguments.
 fn delta_fields(value: &serde_json::Value) -> Vec<(String, String)> {
     let mut fields = Vec::new();
     if let Some(choices) = value["choices"].as_array() {
         for (i, choice) in choices.iter().enumerate() {
             let choice_index = choice["index"].as_u64().unwrap_or(i as u64);
+            fields.push((
+                format!("tool:legacy:{choice_index}"),
+                format!("/choices/{i}/delta/function_call/arguments"),
+            ));
             for name in ["content", "refusal", "reasoning_content", "reasoning"] {
                 let channel = if name.starts_with("reasoning") {
                     "reasoning"

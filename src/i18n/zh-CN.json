@@ -1059,6 +1059,7 @@
   "Create a new connection to change the endpoint, account, plan, protocol or credential. Existing targets keep their identity.": "更改入口、账号、套餐、协议或凭据请新建连接；已有目标保持原身份。",
   "Source protocol base URL": "来源协议入口",
   "Generation API key": "生成用途 API Key",
+  "Enter a generation API key before saving this source.": "保存此来源前，请输入生成用途 API Key。",
   "Add the entered model to my pool when saving": "保存时将填写的模型加入常用池",
   "Save this source connection and model before testing. Saving sends no request.": "先保存来源连接和模型，再测试；保存不会发送请求。",
   "Plan eligibility and fees unknown": "套餐资格及费用未知"

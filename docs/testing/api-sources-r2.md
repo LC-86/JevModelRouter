@@ -27,6 +27,8 @@ Chat 同协议沿用既有 `n>1` 透传，文本、拒绝、推理及工具参�
 
 每个新来源连接只绑定一种生成用途。保存后，来源 ID、分类、账号/套餐标签、endpoint、协议和凭据不允许原地替换；更换这些信息或补缺凭据时创建新连接及新模型 UUID。名称、测试模型、选择和停用仍可编辑。模型 UUID 不能原地改绑另一来源或裸模型；模型协议必须继承或匹配来源协议，不匹配的新增和编辑在保存前拒绝。
 
+新建显式来源必须提供非空生成 Key；缺失或全空白 Key 在保存提供商、来源、凭据引用和模型前拒绝。表单显示“保存此来源前，请输入生成用途 API Key”；修正后可继续使用同一个未保存 ID。已有连接不提供新 Key 的正常编辑保留原凭据；旧未分类 API 的可选 Key 保存语义保持。
+
 账号/套餐标签的 160 长度限制与既有 HTML `maxLength` 使用相同的 UTF-16 单位：[浏览器规则](https://developer.mozilla.org/en-US/docs/Web/HTML/Reference/Attributes/maxlength)。中文计一个单位，常用 emoji 计两个；原生保存允许 60/160 个中文与 80 个 emoji，拒绝 161 个中文及 81 个 emoji，失败不持久化、不生成请求。
 
 删除来源会删除其生成凭据，但保留 retired 标记和非秘密 model_bindings；删除模型也保留原 UUID 与裸模型的关系。退休来源 ID 不得重用，重新连接使用新 ID。旧 UUID 和 `<provider>/<model>` 别名不能指向新账号；在途请求持有的连接专属凭据引用不会读到另一个账号或决策用途的 Key。
@@ -39,12 +41,13 @@ Chat 同协议沿用既有 `n>1` 透传，文本、拒绝、推理及工具参�
 
 ## 既有流式事件的有限对照
 
-对照范围仅为 `protocol/stream.rs` 的 Bridge 产生/消费事件与 DebugProgress 已识别字段，沿用现有 Frame 递归处理、增量通道和终态，不新增协议解析或转换能力。
+覆盖口径包括 `protocol/stream.rs` 的 Bridge 产生/消费事件、DebugProgress 已识别字段，以及同协议透传中的 legacy Chat function_call。此前仅核对转换器/Debug 字段未涵盖 legacy 透传；下表现明确两者。沿用现有 Frame 递归处理、增量通道和终态，不新增协议解析或转换能力。
 
 | 现有事件/字段 | 处理边界 |
 | --- | --- |
 | Chat choices 的 content/refusal、reasoning_content/reasoning | choice index 独立文本/推理通道 |
 | Chat tool_calls.function.arguments | choice + tool index；既有内层 JSON 完整性处理 |
+| 同协议 Chat legacy function_call.arguments | JSON 完整响应沿用内层 JSON 递归；SSE 按 choice index 使用独立参数通道，保留函数名和 function_call 终态 |
 | Messages content_block_start 的 text/thinking 与对应 text_delta/thinking_delta | block index；初始文本和后续 delta 共用该块通道 |
 | Messages input_json_delta.partial_json | block index；既有 JSON 参数通道 |
 | Responses output_text.delta/refusal.delta | output_index + content_index |
@@ -58,9 +61,11 @@ Chat 同协议沿用既有 `n>1` 透传，文本、拒绝、推理及工具参�
 
 同协议 Responses custom-tool input 由既有透传支持；跨协议上游 custom-tool 的既有限制保持。公开回环新增 custom input 的两输出项交错回归，并以八个合法流场景验证 Messages 文本/思考起始块、Responses 文本/拒绝的输出项与内容段、已识别推理文本/摘要段的索引边界。不同输出中的普通前缀不会互相拼接而误改内容；已有三协议文本/参数矩阵继续覆盖其余已支持追加字段。
 
+同协议 Chat 的 legacy functions 请求及 JSON/SSE 响应另有公开双 choice 回归：参数、函数名与终态保留，交错参数按各 choice 脱敏。未扩展 legacy 跨协议转换；未验证私有/未知增量字段的逻辑重组，其他完整元数据沿用逐帧处理。这是上述字段和场景的有限证据，不声称任意透传场景都已验证。
+
 ## 已执行的验收
 
-原生桌面两次独立进程均返回当前 run_id 的成功终态报告：第一次通过实际表单添加四来源，第二次从同一自有临时 DB 重开。两次连接实例、模型 UUID 和 endpoint 完全一致；修复后的 62 次请求均核对来源路径、裸模型及虚构凭据匹配，无决策密钥，退休连接和模型标识关系也跨进程保留。
+原生桌面两次独立进程均返回当前 run_id 的成功终态报告：第一次通过实际表单添加四来源，第二次从同一自有临时 DB 重开。两次连接实例、模型 UUID 和 endpoint 完全一致；修复后的 64 次请求均核对来源路径、裸模型及虚构凭据匹配，无决策密钥，退休连接和模型标识关系也跨进程保留。12 个新建缺失/空白 Key 保存场景在持久化前拒绝、零生成；表单修正后的两次固定请求各只命中所选来源。现存来源凭据失效/丢失的运行时拒绝矩阵由 Rust 听网关验收覆盖，原生新建不再制造缺凭据连接。
 
 Rust 听网关验收覆盖三类来源同名模型、决策/生成凭据隔离、身份篡改拒绝、缺凭据/停用/移除/协议不支持的零请求矩阵、200 错误体与 401/429/500 脱敏、跨 HTTP 分块 SSE/标头/日志脱敏、JSON 转义的三协议文本/SSE、在途用途凭据改写、慢 JSON 的空闲超时，以及旧格式 DB 的隔离副本 UUID 与有效引用。另启用真实后台调度 65 秒，三类新来源的生成与测速请求均为零。完整精确提交的检查及独立两轴审查结果以 PR Evidence 为准。
 
@@ -79,6 +84,8 @@ PR62 的两项自动代码审查反馈也补出公开行为红灯：round_robin/
 随后两项流式反馈均通过真实回环网关复现：交错 choice 的四种文本/推理字段重组出虚构 Key，同索引工具片段导致流中断；LF/CRLF 非 JSON 多 data 行事件只剩第一行。最小修复为通道键加入上游 choice index，并为每个逻辑行重新输出 data 前缀。五种同协议双 choice 请求保留各自内容、工具 ID/合法参数及终态；两种换行事件完整保留中文、空 data 行和元数据。未新增协议或认证能力。
 
 最新两项反馈补出 custom-tool 原始 input delta 与 done 不一致、原生保存拒绝 60 个中文标签。按既有事件清单对照还复现独立输出前缀误拼、思考块初始字段遗漏；修复限于现有通道的字段/索引映射及标签 UTF-16 计数。custom input、八个索引场景与两次原生进程中的账号/套餐中文、emoji 边界通过。
+
+随后 legacy 同协议 SSE 参数重组虚构 Key、新建显式来源无 Key 仍持久化两条红灯均复现。修复只增加 legacy choice 参数通道与创建前 Key 准入；客户端给表单明确错误，已有连接/旧 API 兼容行为由原生验证。未新增凭据补挂流程或协议转换能力。
 
 复现时只使用本次自有构建目录和脚本创建的临时运行空间：
 

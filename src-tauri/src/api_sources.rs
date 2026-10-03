@@ -90,6 +90,7 @@ pub fn validate_edit(
                 && provider.kind != crate::config::ProviderKind::Ollama,
             "Explicit API sources require a generation key, not subscription authorization"
         );
+        ensure!(has_new_key, "source_credential_missing: Enter a generation API key before saving this source.");
         validate_endpoint(&provider.base_url)?;
         crate::protocol::Protocol::parse(&provider.api_type)?;
         ensure!(

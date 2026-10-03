@@ -135,6 +135,7 @@ export async function getSnapshot(): Promise<DashboardSnapshot> {
 }
 
 export async function saveProvider(provider: Provider, apiKey?: string, addTestModel = false, originalId?: string, creating = false, source?: ApiSourceDraft): Promise<DashboardSnapshot> {
+  if (source && creating && !apiKey?.trim()) throw new Error('Enter a generation API key before saving this source.');
   if (!isTauri()) {
     const oldId = originalId ?? provider.id;
     if ((creating || oldId !== provider.id) && MOCK.providers.some(p => p.id === provider.id)) throw new Error('Provider ID already exists');

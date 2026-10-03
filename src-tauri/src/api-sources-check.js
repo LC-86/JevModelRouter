@@ -151,13 +151,44 @@
     check(await recordsCount() === before, 'Invalid/ambiguous targets dispatch zero requests');
     report.checks.push('identity edits rejected; 401/429/503/404 stay on the fixed source; deselection preserves UUID; disabled/invalid/unsupported/ambiguous targets dispatch zero through gateway, test, Debug and manual probe');
     const missingId = `r2-missing-${run_id}`;
-    let next = await invoke('save_provider', { provider: { ...provider, id: missingId, name: 'missing fictional credential' }, creating: true, source: { kind: 'official_api' }, addTestModel: true });
-    const missing = next.models.find(m => m.provider_id === missingId);
     before = await recordsCount();
-    check((await gateway(`autojev/model/${missing.id}`)).body.includes('source_credential_missing'), 'Missing generation key must not use the decision key');
-    await rejected('test_provider', { id: missingId }, 'source_credential_missing');
-    check(await recordsCount() === before, 'Missing generation credential must dispatch zero');
-    await invoke('delete_provider', { id: missingId });
+    for (const kind of ['official_api', 'third_party_api', 'coding_plan']) {
+      const id = `${missingId}-${kind}`;
+      for (const apiKey of [undefined, ' \t\n ']) {
+        await rejected('save_provider', { provider: { ...provider, id }, apiKey, creating: true, source: { kind }, addTestModel: true }, 'source_credential_missing');
+        const saved = await invoke('get_snapshot');
+        check(!saved.providers.some(p => p.id === id) && !saved.api_sources[id] && !saved.models.some(m => m.provider_id === id), 'Missing-key refusal must not persist provider, source, credential reference or model');
+      }
+    }
+    let next = await invoke('save_provider', { provider: { ...provider, name: 'edited source keeps its credential' }, originalId: provider.id });
+    check(next.providers.find(p => p.id === provider.id).has_api_key && next.api_sources[provider.id].credential_reference === snapshot.api_sources[provider.id].credential_reference, 'Existing source edits with no new key preserve the saved credential reference');
+    const legacyEmptyId = `${missingId}-legacy`;
+    next = await invoke('save_provider', { provider: { ...provider, id: legacyEmptyId }, creating: true, addTestModel: false });
+    check(!next.api_sources[legacyEmptyId] && !next.providers.find(p => p.id === legacyEmptyId).has_api_key, 'Legacy unclassified source creation keeps its optional-key behavior');
+    await invoke('delete_provider', { id: legacyEmptyId });
+    check(await recordsCount() === before, 'Missing-key refusals and compatible edits must dispatch zero');
+    report.checks.push('new official/third-party/coding sources reject absent/blank generation key before persistence with zero generation; existing edits retain stored credential; legacy unclassified optional-key creation remains compatible');
+    await click('.provider-actions .button.primary');
+    await click('.provider-dialog .search-select-trigger');
+    (await wait(() => [...document.querySelectorAll('.provider-dialog [role="option"]')].find(e => /OpenAI Compatible|OpenAI 兼容/.test(e.textContent)), 'compatible provider')).click();
+    await set('[data-testid="api-source-kind"]', 'official_api');
+    const formId = `${missingId}-official_api`;
+    await set('.provider-dialog input[pattern="[a-zA-Z0-9_-]+"]', formId);
+    await set('.provider-dialog input[type="url"]', `${base}/coding/v4`);
+    await set('#provider-test-model', 'same-model');
+    await click('.provider-dialog-actions button[type="submit"]');
+    await wait(() => /Enter a generation API key before saving this source|保存此来源前.*生成用途/.test(document.querySelector('.provider-test-result.error')?.textContent || ''), 'clear missing-generation-key form error');
+    check(!(await invoke('get_snapshot')).providers.some(p => p.id === formId), 'Form error must not persist or reserve the source ID');
+    check(await recordsCount() === before, 'Form error must dispatch zero generation');
+    await set('.provider-dialog input[type="password"]', 'fictional-r2-coding');
+    await click('.provider-dialog-actions button[type="submit"]');
+    await wait(() => !document.querySelector('.provider-dialog'), 'corrected source saved');
+    next = await invoke('get_snapshot');
+    const corrected = next.models.find(m => m.provider_id === formId);
+    check(corrected && next.providers.find(p => p.id === formId).has_api_key, 'The same refused ID can be saved with a fictional generation key');
+    check((await gateway(`autojev/model/${corrected.id}`)).status === 200 && await recordsCount() === before + 1, 'Corrected source reaches exactly its fixed endpoint');
+    await invoke('delete_provider', { id: formId });
+    report.checks.push('native form shows an explicit generation-key error without persistence or requests; correcting the same ID saves and dispatches exactly once to its fixed source');
     // Explicit manual probes and Debug go through the same normal gateway target.
     await invoke('start_model_speed_tests', { ids: [coding.model_uuid] });
     await wait(async () => !(await invoke('get_model_performance')).job.running, 'manual probe complete');
@@ -207,7 +238,7 @@
     const catalog = await control('/__gateway', { port: snapshot.proxy.port, endpoint: '/v1/models' });
     const logs = await invoke('get_request_logs', { since: '2000-01-01T00:00:00Z' });
     for (const source of sources) check(!JSON.stringify([logs, catalog]).includes(`fictional-r2-${source.id}`), 'Directory and logs must not expose a generation key');
-    report.checks.push('missing credential denied; manual probe and Debug hit saved source; Debug logical delta and nested tool JSON/SSE echoes are redacted; three compatible downstream text/stream protocols preserve fixed source and terminal; directory/logs contain no generation secrets');
+    report.checks.push('missing credential refused before creation; manual probe and Debug hit saved source; Debug logical delta and nested tool JSON/SSE echoes are redacted; three compatible downstream text/stream protocols preserve fixed source and terminal; directory/logs contain no generation secrets');
     check(await recordsCount() > 0, 'This run must have real receiver evidence');
     report.ok = true;
   } catch (error) { report.error = `${error?.message || error}\n${error?.stack || ''}`; }
