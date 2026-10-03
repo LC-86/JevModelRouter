@@ -387,8 +387,9 @@ async fn api_sources_same_model_hits_only_the_explicit_endpoint_and_generation_k
         .unwrap();
     let gateway = crate::proxy::start(store).await.unwrap();
     for id in ["official", "third", "coding"] {
+        // The pre-R4 provider/model reference remains usable through the same fixed UUID and admission path.
         let reply = reqwest::Client::new().post(format!("http://127.0.0.1:{}/v1/chat/completions", gateway.port))
-            .json(&json!({"model":format!("autojev/model/uuid-{id}"),"messages":[{"role":"user","content":"fictional request"}]})).send().await.unwrap();
+            .json(&json!({"model":format!("{id}/same-model"),"messages":[{"role":"user","content":"fictional request"}]})).send().await.unwrap();
         assert_eq!(reply.status(), 200, "{id}: {}", reply.text().await.unwrap());
     }
     let records = received.lock().unwrap().clone();
@@ -561,8 +562,9 @@ async fn api_sources_all_refused_targets_dispatch_zero_to_every_other_source() {
                     .delete_secret(&format!("api-generation:instance-{id}"))
                     .unwrap();
             }
+            // A legacy valid alias still resolves to its old fixed source target and cannot bypass denial.
             let reply = reqwest::Client::new().post(format!("http://127.0.0.1:{}/v1/chat/completions", gateway.port))
-                .json(&json!({"model":format!("autojev/model/uuid-{id}"),"messages":[{"role":"user","content":"fixture"}]})).send().await.unwrap();
+                .json(&json!({"model":format!("{id}/same-model"),"messages":[{"role":"user","content":"fixture"}]})).send().await.unwrap();
             assert!(!reply.status().is_success(), "{id}/{condition}");
             let body = reply.text().await.unwrap();
             assert!(

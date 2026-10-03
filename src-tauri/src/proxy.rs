@@ -1958,8 +1958,20 @@ mod tests {
         store.update(|config| { config.port = 0; config.models.truncate(1); }).unwrap();
         let public_id = {
             let config = store.read();
-            format!("{}/{}", config.models[0].provider_id, config.models[0].model_id)
+            format!("autojev/model/{}", config.models[0].id)
         };
+        let mut same_name_cpa_model = store.read().models[0].clone();
+        same_name_cpa_model.id = "cpa-stable-uuid".into();
+        same_name_cpa_model.provider_id = "cpa-fictional".into();
+        store.update(|config| {
+            config.providers.push(Provider {
+                preset: String::new(), api_type: String::new(), test_model: String::new(),
+                id: "cpa-fictional".into(), name: "同名 Codex 连接".into(),
+                kind: ProviderKind::CodexSubscription, base_url: String::new(), enabled: true, has_api_key: false,
+            });
+            same_name_cpa_model.name = config.models[0].name.clone();
+            config.models.push(same_name_cpa_model);
+        }).unwrap();
         store
             .update(|config| {
                 config.agent_catalogs.insert(
@@ -1972,6 +1984,11 @@ mod tests {
             .unwrap();
         let gateway = start(store.clone()).await.unwrap();
         let client = Client::new();
+        let missing_credential: Value = client
+            .get(format!("http://127.0.0.1:{}/v1/models", gateway.port))
+            .send().await.unwrap().json().await.unwrap();
+        assert!(missing_credential["data"].as_array().unwrap().is_empty(), "{}", missing_credential);
+        store.write_secret("provider:openrouter", "fictional-only-key").unwrap();
         let catalog: Value = client
             .get(format!("http://127.0.0.1:{}/v1/models", gateway.port))
             .send().await.unwrap().json().await.unwrap();
@@ -1979,6 +1996,7 @@ mod tests {
             .as_array().unwrap().iter()
             .map(|entry| entry["id"].as_str().unwrap().to_owned()).collect();
         assert!(ids.iter().any(|id| id == &public_id), "{ids:?}");
+        assert_eq!(ids.len(), 1, "unverified same-name CPA targets must not enter the callable directory: {ids:?}");
         // Agent 保存目录按保存内容原样返回：它是注入清单，不因本地目录状态改写。
         let agent: Value = client
             .get(format!("http://127.0.0.1:{}/v1/models", gateway.port))
@@ -2058,6 +2076,7 @@ mod tests {
         let store = Arc::new(ConfigStore::load(directory.path().join("autojev.db")).unwrap());
         let reserved=TcpListener::bind("127.0.0.1:0").await.unwrap();let port=reserved.local_addr().unwrap().port();drop(reserved);
         store.update(|config| config.port = port).unwrap();
+        store.write_secret("provider:openrouter", "fictional-only-key").unwrap();
         let handle = start(store.clone()).await.unwrap();
         tokio::time::sleep(Duration::from_millis(40)).await;
         let response: Value = reqwest::get(format!("http://127.0.0.1:{port}/health"))
@@ -2069,8 +2088,9 @@ mod tests {
         assert_eq!(response["status"], "ok");
         let catalog:Value=reqwest::get(format!("http://127.0.0.1:{port}/v1/models")).await.unwrap().json().await.unwrap();
         assert_eq!(catalog["object"],"list");
-        // Public IDs are <provider>/<model> for models and autojev/<route> for routes; each must resolve back.
+        // Fixed model call IDs use the stable local UUID; routes retain their route ID.
         let config=store.read();let ids=catalog["data"].as_array().unwrap();assert!(!ids.is_empty());
+        assert_eq!(ids[0]["id"],format!("autojev/model/{}",config.models[0].id));
         assert!(ids.iter().all(|v|crate::router::normalize_requested_model(&config,v["id"].as_str()).unwrap().is_some_and(|m|m.starts_with("autojev/"))));
         handle.stop().await;
         assert!(TcpListener::bind(("127.0.0.1",port)).await.is_ok());
@@ -2152,8 +2172,8 @@ mod route_forward_tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-autojev-agent", HeaderValue::from_static("hermes"));
         headers.insert("x-autojev-session-id", HeaderValue::from_static("same-session"));
-        let provider = store.read().models[0].provider_id.clone();
-        for (public, upstream) in [(format!("{provider}/first"), "first"), (format!("{provider}/second"), "second"), ("not-selected".into(), "")] {
+        let models=store.read().models;
+        for (public, upstream) in [(format!("autojev/model/{}",models[0].id), "first"), (format!("autojev/model/{}",models[1].id), "second"), ("not-selected".into(), "")] {
             let body = json!({"model":public,"messages":[{"role":"user","content":"hello"}]});
             let response = forward(context.clone(), headers.clone(), body, "/v1/chat/completions", "chat/completions").await;
             if upstream.is_empty() {assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);}
@@ -2398,17 +2418,17 @@ async fn model_catalog(State(context):State<ProxyContext>,headers:HeaderMap)->Re
     }
     // 公共目录：只列已选、已启用、服务商启用且当前账号资格合格的模型；
     // 路由只有在至少有一个这样的候选时才出现。取消选择与资格不可用都不在这里展示。
-    let bindings=config.models.iter().filter(|m|crate::subscription::catalog_listed(&config,m)).map(|m|format!("model/{}",m.id))
-        .chain(config.routes.iter().filter(|r|r.enabled&&route_catalog_listed(&config,r)).map(|r|r.id.clone())).collect::<Vec<_>>();
+    let bindings=config.models.iter().filter(|m|crate::subscription::callable_catalog_listed(&context.store,&config,m)).map(|m|format!("model/{}",m.id))
+        .chain(config.routes.iter().filter(|r|r.enabled&&route_catalog_listed(&context.store,&config,r)).map(|r|r.id.clone())).collect::<Vec<_>>();
     let data=bindings.iter().filter_map(|b|crate::agent_catalog::build(&config,std::slice::from_ref(b)).ok()).flatten()
         .map(|e|json!({"id":e.id,"name":e.name,"object":"model","created":0,"owned_by":"autojev"})).collect::<Vec<_>>();
     Json(json!({"object":"list","data":data})).into_response()
 }
 
 /// 路由进入公共目录的条件：至少有一个已选、启用、服务商启用且资格合格的候选。
-fn route_catalog_listed(config:&crate::config::AppConfig, rule:&crate::config::RouteRule) -> bool {
+fn route_catalog_listed(store:&ConfigStore, config:&crate::config::AppConfig, rule:&crate::config::RouteRule) -> bool {
     config.models.iter().any(|model| crate::router::rule_includes_model(config, rule, model)
-        && crate::subscription::catalog_listed(config, model))
+        && crate::subscription::callable_catalog_listed(store, config, model))
 }
 
 #[cfg(test)]

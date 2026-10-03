@@ -70,10 +70,10 @@ import {
   CATALOG_REFERENCE_URL, QUOTA_REFERENCE_URL, agentCatalogPendingSync, agentSelectableModels, availabilityLabel,
   capabilityLabel, catalogLabel, catalogModelRow, catalogRemovedLabel, connectionStateLabel, connectionStateTone,
   creditsAxisText, denialLabel, eligibilityLabel, identityLabel, isSubscriptionKind, isSubscriptionProvider,
-  localLogoutLabel, loginStageLabel, loginStageTone, modelCapability, modelListMembers, protocolKey,
+  localLogoutLabel, loginStageLabel, loginStageTone, modelCapability, modelListMembers, modelSelected, protocolKey,
   quotaHistoryLabel, quotaLabel, quotaPermissionLabel, quotaViewLabel, remoteRevocationLabel, speedTestCandidates,
   subscriptionActions, subscriptionAuthView, subscriptionCatalog, subscriptionCatalogText, subscriptionQuotaText,
-  subscriptionReason, subscriptionStatusText, subscriptionView, unselectedModels,
+  subscriptionReason, subscriptionStatusText, subscriptionView,
 } from './lib/subscription';
 import { connectableRoutes } from './lib/route-candidates';
 import {
@@ -92,6 +92,7 @@ import {
   resetGatewayHealth,
   importProviders,
   refreshSubscription,
+  selectCpaModel,
   setCodexRealGenerationEnabled,
   setGrokRealGenerationEnabled,
   restoreAgent,
@@ -269,7 +270,7 @@ export default function App() {
           {navigation.map((item) => {
             const Icon = item.icon;
             return (
-              <button key={item.id} className={cx('nav-item', page === item.id && 'active')} onClick={() => setPage(item.id)}>
+              <button key={item.id} data-nav-page={item.id} className={cx('nav-item', page === item.id && 'active')} onClick={() => setPage(item.id)}>
                 <Icon size={17} />
                 <span>{item.label}</span>
                 
@@ -916,9 +917,8 @@ function ModelsPage({ snapshot, onAdd, onEdit, onDelete, onChange, onNotify, onR
     speedTests.dismissError();
     setDismissedSpeedJob(true);
   }, [speedError, onNotify, t, speedTests.dismissError]);
-  // 模型列表只由「已选择」决定；测速候选另外要求未停用且服务商启用。
-  const pool = modelListMembers(snapshot.models);
-  const excluded = unselectedModels(snapshot.models);
+  // 手选池保留所有已建档行；选择、停用、资格与协议能力分别呈现。
+  const pool = snapshot.models;
   const testable = speedTestCandidates(snapshot.models, snapshot.providers);
   const selectedCount = testable.filter(model => speedTests.selected.includes(model.id)).length;
   const [tests, setTests] = useState<Record<string, ProviderTestStatus>>({});
@@ -929,10 +929,16 @@ function ModelsPage({ snapshot, onAdd, onEdit, onDelete, onChange, onNotify, onR
     catch (error) { onNotify(t(String(error)), true); }
     finally { setToggling(previous => ({ ...previous, [model.id]: false })); }
   };
-  const reselect = async (model: Model) => {
+  const selectInPool = async (model: Model, selected: boolean) => {
     setToggling(previous => ({ ...previous, [model.id]: true }));
-    try { onChange(await saveModel({ ...model, selected: true })); onNotify(t('Model added to the model list')); }
-    catch (error) { onNotify(t(String(error)), true); }
+    try {
+      if (snapshot.cpa_subscriptions?.some(connection => connection.provider_id === model.provider_id)) {
+        onChange(await selectCpaModel(model.provider_id, model.id, selected));
+      } else {
+        onChange(await saveModel({ ...model, selected }));
+      }
+      onNotify(t(selected ? 'Model added to the model list' : 'Model removed from the model list'));
+    } catch (error) { onNotify(t(String(error instanceof Error ? error.message : error)), true); }
     finally { setToggling(previous => ({ ...previous, [model.id]: false })); }
   };
   const test = async (model: Model) => {
@@ -952,32 +958,40 @@ function ModelsPage({ snapshot, onAdd, onEdit, onDelete, onChange, onNotify, onR
   };
   return (
     <div className="stack lg">
-      <PageIntro title={t("Models")} body={t("Add only models you actually want agents to use. Tier and capability metadata drive the local router.")} action={<div className="model-speed-actions"><SpeedTestToolbar tests={speedTests} models={testable}/><button className="button primary" onClick={onAdd}><Plus size={16} />  {t("Add model")}</button></div>} />
+      <PageIntro title={t("Models")} body={t("Review every discovered source target here. Selection adds it to the pool; disabling blocks calls. Qualification and protocol capability remain separate evidence.")} action={<div className="model-speed-actions"><SpeedTestToolbar tests={speedTests} models={testable}/><button className="button primary" onClick={onAdd}><Plus size={16} />  {t("Add model")}</button></div>} />
       <div className="table-panel provider-table-panel">
         <table className="provider-table models-table">
-        <thead><tr><th className="model-speed-check"><label className="model-selection"><input autoComplete="off" autoCapitalize="none" ref={element => { if (element) element.indeterminate = selectedCount > 0 && selectedCount < testable.length; }} type="checkbox" aria-label={t("Select all enabled models")} disabled={!testable.length} checked={testable.length > 0 && selectedCount === testable.length} onChange={e => speedTests.select(e.target.checked ? testable.map(m => m.id) : [])}/></label></th><th>{t("MODEL")}</th><th>{t("Enabled status")}</th><th title={t('Time until the first content arrives. Lower is faster.') + ' ' + t('Output tokens per second after the first content. Higher is faster.')}>{t('First response / Output speed')}</th><th>{t("INPUT / OUTPUT")}</th><th>{t("Model information")}</th><th className="provider-actions-heading">{t("Actions")}</th></tr></thead>
+        <thead><tr><th className="model-speed-check"><label className="model-selection"><input autoComplete="off" autoCapitalize="none" ref={element => { if (element) element.indeterminate = selectedCount > 0 && selectedCount < testable.length; }} type="checkbox" aria-label={t("Select all enabled models")} disabled={!testable.length} checked={testable.length > 0 && selectedCount === testable.length} onChange={e => speedTests.select(e.target.checked ? testable.map(m => m.id) : [])}/></label></th><th>{t("MODEL")}</th><th>{t("Model pool")}</th><th>{t("Enabled status")}</th><th title={t('Time until the first content arrives. Lower is faster.') + ' ' + t('Output tokens per second after the first content. Higher is faster.')}>{t('First response / Output speed')}</th><th>{t("INPUT / OUTPUT")}</th><th>{t("Model information")}</th><th className="provider-actions-heading">{t("Actions")}</th></tr></thead>
         <tbody>
         {pool.map((model) => {
           const provider = snapshot.providers.find(p => p.id === model.provider_id);
+          const cpa = snapshot.cpa_subscriptions?.find(connection => connection.provider_id === model.provider_id);
+          const cpaModel = cpa?.models.find(candidate => candidate.id === model.id);
+          const apiSource = snapshot.api_sources?.[model.provider_id];
           const modelHealth = health.find(h => h.model_id === model.id && h.state !== 'healthy');
           const subscription = isSubscriptionProvider(provider) ? subscriptionView(snapshot, model.provider_id) : undefined;
-          const capability = subscription ? modelCapability(subscription, model.model_id, protocolKey(model.api_type || provider?.api_type || 'chat_completions')) : undefined;
+          const capability = cpa ? (cpa.capability as 'unverified'|'verified'|'unsupported') : subscription ? modelCapability(subscription, model.model_id, protocolKey(model.api_type || provider?.api_type || 'chat_completions')) : 'unverified';
+          const catalogEntry = subscription?.catalog_entries?.find(entry => entry.internal_id === model.id);
+          const protocol = protocolKey(model.api_type || provider?.api_type || 'chat_completions');
+          const catalogState = cpa ? (cpa.catalog_state === 'stale' ? 'Stale (last confirmed read kept)' : cpa.catalog_state === 'available' ? 'Catalog available' : 'Catalog unknown') : subscription?.catalog?.state ? catalogLabel(subscription.catalog.state, t) : 'Catalog unknown';
+          const qualification = catalogEntry ? eligibilityLabel(catalogEntry.eligibility, t) : cpa ? (cpa.qualification === 'unknown' ? 'Unknown' : cpa.qualification) : subscription ? 'Unknown' : 'Not applicable (API credential target)';
+          const account = cpa ? `${cpa.account ?? t('Unknown')} (CPA)` : subscription ? identityLabel(subscription, t) : apiSource?.account_label ? `${apiSource.account_label} (${apiSource.account_state === 'user_declared' ? 'user declared' : 'unknown'})` : t('Unknown');
+          const plan = cpa ? `${cpa.plan ?? t('Unknown')} (CPA)` : subscription ? (subscription.quota.buckets?.find(bucket => bucket.plan_type)?.plan_type ?? t('Unknown')) : apiSource?.plan_label ? `${apiSource.plan_label} (${apiSource.plan_state === 'user_declared' ? 'user declared' : 'unknown'})` : t('Unknown');
+          const sourceKind = apiSource ? (apiSource.kind === 'official_api' ? 'Official API' : apiSource.kind === 'third_party_api' ? 'Third-party API' : 'Coding Plan (Key)') : cpa ? 'CPA subscription' : provider?.kind === 'codex_subscription' || provider?.kind === 'grok_subscription' ? 'Subscription' : provider?.kind === 'ollama' ? 'Local API' : 'Legacy API';
+          const protocolName = protocol === 'responses' ? 'Responses' : protocol === 'messages' ? 'Messages' : 'Chat Completions';
           return (
-          <tr key={model.id} className={speedTests.selected.includes(model.id) ? 'is-selected' : undefined}>
+          <tr key={model.id} className={speedTests.selected.includes(model.id) ? 'is-selected' : undefined} data-testid={`model-pool-row-${model.id}`} data-model-id={model.id} data-model-bound={cpaModel?.bound ?? true}>
             <td className="model-speed-check"><label className="model-selection"><input autoComplete="off" autoCapitalize="none" type="checkbox" aria-label={t("Select model for speed test") + ": " + model.provider_id + "/" + model.model_id} disabled={!testable.some(m => m.id === model.id)} checked={speedTests.selected.includes(model.id)} onChange={() => speedTests.toggle(model.id)}/></label></td>
-            <td><div className="provider-table-name"><span className="provider-table-icon"><ProviderLogo id={provider ? providerPreset(provider) : 'custom-openai'}/></span><div><strong>{model.name || model.model_id}</strong><small>{provider ? providerIdentifier(provider) : model.provider_id}/{model.model_id}</small></div></div></td>
+            <td><div className="provider-table-name"><span className="provider-table-icon"><ProviderLogo id={provider ? providerPreset(provider) : 'custom-openai'}/></span><div><strong>{model.name || model.model_id}</strong><small>{sourceKind} · {provider?.name ?? model.provider_id}</small><small>来源/连接 ID：{provider ? providerIdentifier(provider) : model.provider_id} · {apiSource ? `实例 ${apiSource.connection_instance_id} / 世代 ${apiSource.generation}` : cpa ? `实例 ${cpa.connection_instance_id} / 世代 ${cpa.generation}` : '连接身份未知'}</small><small>账号：{account} · 套餐：{plan}</small><small>上游模型 ID：{model.model_id}</small><small>稳定调用 ID：<code>autojev/model/{model.id}</code></small></div></div></td>
+            <td><div className="provider-enabled-cell"><button type="button" role="switch" data-testid={`model-pool-select-${model.id}`} aria-checked={modelSelected(model)} aria-label={t('Select model {model}', { model: model.name || model.model_id })} disabled={toggling[model.id] || (!!cpaModel && !cpaModel.bound && !modelSelected(model))} className={cx('switch', modelSelected(model) && 'on')} onClick={() => void selectInPool(model, !modelSelected(model))}><span/></button><span>{t(modelSelected(model) ? 'SELECTED' : 'NOT SELECTED')}</span></div></td>
             <td><div className="provider-enabled-cell"><button type="button" role="switch" aria-checked={model.enabled} aria-label={t('Enable {provider}', { provider: model.name })} disabled={toggling[model.id]} className={cx('switch', model.enabled && 'on')} onClick={() => void toggle(model)}><span/></button><span>{t(model.enabled ? 'ENABLED' : 'DISABLED')}</span></div>{modelHealth && <div className="model-health-status" title={modelHealth.last_status ? `HTTP ${modelHealth.last_status}` : t('Connection failed')}><span>{t(modelHealth.state === 'cooldown' ? 'Cooling down' : modelHealth.state === 'probing' ? 'Checking recovery' : 'Awaiting recovery')}{modelHealth.retry_after_seconds > 0 ? ` · ${modelHealth.retry_after_seconds}s` : ''}</span><button type="button" className="icon-action" title={t('Clear cooldown')} aria-label={t('Clear cooldown') + ': ' + (model.name || model.model_id)} disabled={clearingCooldown[model.id]} onClick={() => void clearCooldown(model.id)}><RefreshCw size={13} className={clearingCooldown[model.id] ? 'import-spinner' : ''}/></button></div>}</td>
             <td><SpeedCell result={speedTests.view?.models[model.id]} running={speedTests.view?.job.running === true && speedTests.view.job.current_models.includes(model.id)}/></td>
             <td><code className="provider-table-url">{(model.input_price_known ?? model.input_cost_per_million > 0) ? `$${model.input_cost_per_million}` : t('Unknown')} / {(model.output_price_known ?? model.output_cost_per_million > 0) ? `$${model.output_cost_per_million}` : t('Unknown')}</code></td>
-            <td><div className="model-info-cell"><span className={model.supports_vision ? 'model-image-supported' : 'model-image-unsupported'} role="img" aria-label={t(model.supports_vision ? 'Supports image input' : 'Image input not marked as supported')} title={t(model.supports_vision ? 'Supports image input' : 'Image input not marked as supported')}>{model.supports_vision ? <ImageIcon size={16} aria-hidden="true"/> : <ImageOff size={16} aria-hidden="true"/>}</span><span title={t('Context length (tokens)') + ': ' + (model.context_window > 0 ? model.context_window.toLocaleString() : t('Unknown'))}>{model.context_window > 0 ? new Intl.NumberFormat('en', { notation: 'compact', maximumFractionDigits: 2 }).format(model.context_window) : '—'}</span>{capability && <span className={cx('model-capability-badge', capability)} title={t('Generation stays denied for subscription models until every condition is verified.')}>{capabilityLabel(capability, t)}</span>}</div></td>
-            <td><div className="row-actions"><button className="icon-action" disabled={!provider || tests[model.id] === 'testing'} title={t('Test')} aria-label={t('Test')} onClick={() => void test(model)}>{tests[model.id] === 'testing' ? <LoaderCircle size={15} className="import-spinner"/> : <Play size={15}/>}</button><button className="icon-action" data-testid={`model-configure-${model.id}`} title={t("Configure")} aria-label={t("Configure")} onClick={() => onEdit(model)}><Settings2 size={15} /></button><button className="icon-action danger" title={t("Delete")} aria-label={t("Delete")} onClick={() => onDelete(model.id)}><Trash2 size={15} /></button></div></td>
+            <td><div className="model-info-cell"><span className={model.supports_vision ? 'model-image-supported' : 'model-image-unsupported'} role="img" aria-label={t(model.supports_vision ? 'Supports image input' : 'Image input not marked as supported')} title={t(model.supports_vision ? 'Supports image input' : 'Image input not marked as supported')}>{model.supports_vision ? <ImageIcon size={16} aria-hidden="true"/> : <ImageOff size={16} aria-hidden="true"/>}</span><span title={t('Context length (tokens)') + ': ' + (model.context_window > 0 ? model.context_window.toLocaleString() : t('Unknown'))}>{model.context_window > 0 ? new Intl.NumberFormat('en', { notation: 'compact', maximumFractionDigits: 2 }).format(model.context_window) : '—'}</span><div className="model-pool-evidence"><span data-evidence="catalog">目录：{catalogState}</span><span data-evidence="qualification">资格：{qualification}</span><span data-evidence="protocol">协议能力：{capabilityLabel(capability, t)} · 配置 {protocolName}{!subscription && !cpa ? '（未独立验证）' : ''}</span></div></div></td>
+            <td><div className="row-actions">{cpaModel && !cpaModel.bound && <button type="button" className="button ghost small" data-testid={`model-pool-rebind-${model.id}`} disabled={toggling[model.id]||cpa?.stage!=='connected'||cpa.catalog_state!=='available'} onClick={() => void selectInPool(model, true)}>重新绑定当前账号并加入模型池</button>}<button className="icon-action" disabled={!provider || tests[model.id] === 'testing'} title={t('Test')} aria-label={t('Test')} onClick={() => void test(model)}>{tests[model.id] === 'testing' ? <LoaderCircle size={15} className="import-spinner"/> : <Play size={15}/>}</button><button className="icon-action" data-testid={`model-configure-${model.id}`} title={t("Configure")} aria-label={t("Configure")} onClick={() => onEdit(model)}><Settings2 size={15} /></button><button className="icon-action danger" title={t("Delete")} aria-label={t("Delete")} onClick={() => onDelete(model.id)}><Trash2 size={15} /></button></div></td>
           </tr>
         ); })}
         </tbody></table>
-        {excluded.length > 0 && <div className="model-excluded-notice" role="status" data-testid="unselected-models-notice">
-          <div><strong>{t('{count} models are not selected', { count: excluded.length })}</strong><p>{t('Not selected models stay out of the model list, counts, speed tests and agent catalogs. Direct calls by the original model ID still work.')}</p></div>
-          <div className="model-excluded-list">{excluded.map((model) => <button key={model.id} type="button" className="button ghost small" disabled={toggling[model.id]} onClick={() => void reselect(model)}>{t('Add to model list')}: {model.name || model.model_id}</button>)}</div>
-        </div>}
         {pool.length === 0 && <EmptyState icon={<Cpu />} title={t("No models in the pool")} body={t("Add at least one model before starting the proxy.")} />}
       </div>
     </div>

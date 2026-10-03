@@ -1,6 +1,6 @@
 export type CpaStage = 'idle'|'starting'|'waiting'|'connected'|'failed'|'cancelled'|'disconnected';
 export interface CpaView {
-  provider_id:string; provider:string; connection_instance_id:string; generation:number;
+  provider_id:string; provider:string; connection_name:string; connection_instance_id:string; generation:number;
   stage:CpaStage; account:string|null; plan:string|null;
   catalog_state:string; observed_at:string|null; error:string|null;
   authorization_url:string|null; service_available:boolean;

@@ -97,6 +97,7 @@ pub struct ModelView {
 pub struct View {
     pub provider_id: String,
     pub provider: String,
+    pub connection_name: String,
     pub stage: Stage,
     pub connection_instance_id: String,
     pub generation: u64,
@@ -271,6 +272,12 @@ impl Manager {
             .map(|(id, c)| View {
                 provider_id: id.clone(),
                 provider: c.provider.clone(),
+                connection_name: config
+                    .providers
+                    .iter()
+                    .find(|provider| provider.id == *id)
+                    .map(|provider| provider.name.clone())
+                    .unwrap_or_else(|| c.provider.clone()),
                 stage: c.stage,
                 connection_instance_id: c.identity.connection_instance_id.clone(),
                 generation: c.identity.generation,

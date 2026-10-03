@@ -485,7 +485,7 @@ input, select, textarea { width: 100%; border: 1px solid var(--line-light); back
 
 .models-table .cap-list span { font-size: 10px; font-family: inherit; }
 .models-table .status-dot { flex-shrink: 0; }
-.models-table td:nth-child(4), .models-table td:nth-child(5) { white-space: nowrap; }
+.models-table td:nth-child(5), .models-table td:nth-child(6) { white-space: nowrap; }
 
 .desktop-window, .desktop-window body { background: transparent; overflow: hidden; }
 .desktop-window #root { height: 100vh; overflow: hidden; border-radius: 12px; clip-path: inset(0 round 12px); isolation: isolate; border: 1px solid var(--line); background: var(--bg); }
@@ -608,6 +608,12 @@ main.debug-main { height: 100dvh; min-height: 0; overflow: hidden; }
 .settings-dialog .switch span { border-radius: 0; }
 
 .models-table .model-speed-check { width: 48px; padding: 0 8px 0 12px; text-align: center; }
+.models-table td:nth-child(2) { min-width: 310px; }
+.models-table .provider-table-name > div { min-width: 0; }
+.models-table .provider-table-name small { overflow-wrap: anywhere; }
+.model-pool-evidence { display: grid; gap: 3px; margin-top: 5px; }
+.model-pool-evidence span { color: var(--muted); font: 10px/1.4 var(--font-mono); white-space: normal; }
+.models-table .row-actions .button { max-width: 190px; white-space: normal; }
 
 .model-selection { display: inline-grid; place-items: center; width: 28px; height: 28px; vertical-align: middle; cursor: pointer; }
 .provider-dialog .api-source-add-model { display: flex; align-items: center; width: auto; height: auto; gap: 8px; font-size: 11px; }

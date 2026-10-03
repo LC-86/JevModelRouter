@@ -6,6 +6,22 @@ use axum::{
 use serde_json::json;
 use std::sync::Arc;
 
+#[test]
+fn cpa_view_projects_saved_connection_name_without_changing_fixed_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = ConfigStore::load(temp.path().join("named-view.db")).unwrap();
+    let manager = Manager::default();
+    let id = manager.create(&store, "codex", "团队 Codex").unwrap();
+    let view = manager.views(&store.read()).remove(0);
+    assert_eq!(view.provider_id, id);
+    assert_eq!(view.provider, "codex");
+    assert_eq!(view.connection_name, "团队 Codex");
+    let value = serde_json::to_value(view).unwrap();
+    assert_eq!(value["connection_name"], "团队 Codex");
+    assert_eq!(value["provider_id"], id);
+    assert!(value.get("credential_ref").is_none());
+}
+
 struct AccountFixture {
     base: String,
     requests: Arc<std::sync::Mutex<Vec<(String, String)>>>,
