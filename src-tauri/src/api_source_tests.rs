@@ -49,6 +49,26 @@ async fn source_fixture() -> (
                     }
                     return ([("content-type", "application/json")], format!("{{\"error\":{{\"message\":\"{escaped}\"}}}}")).into_response();
                 }
+                if serde_json::to_string(&body).unwrap().contains("delta-secret") {
+                    let key = headers.get("authorization").or_else(|| headers.get("x-api-key")).unwrap().to_str().unwrap().trim_start_matches("Bearer ");
+                    let (mut text, terminal) = if path.ends_with("/messages") {
+                        ("event: message_start\ndata: {\"message\":{\"usage\":{}}}\n\nevent: content_block_start\ndata: {\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n".to_string(), "event: content_block_stop\ndata: {\"index\":0}\n\nevent: message_delta\ndata: {\"delta\":{\"stop_reason\":\"end_turn\"}}\n\nevent: message_stop\ndata: {}\n\n")
+                    } else if path.ends_with("/responses") {
+                        (String::new(), "event: response.completed\ndata: {\"response\":{\"id\":\"fixture\",\"status\":\"completed\",\"output\":[]}}\n\n")
+                    } else {
+                        (String::new(), "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+                    };
+                    for piece in key.chars().map(|c| c.to_string()) {
+                        let frame = if path.ends_with("/messages") { format!("event: content_block_delta\ndata: {}\n\n", json!({"index":0,"delta":{"type":"text_delta","text":piece}})) }
+                        else if path.ends_with("/responses") { format!("event: response.output_text.delta\ndata: {}\n\n", json!({"output_index":0,"content_index":0,"delta":piece})) }
+                        else { format!("data: {}\n\n", json!({"choices":[{"index":0,"delta":{"content":piece},"finish_reason":null}]})) };
+                        text.push_str(&frame);
+                    }
+                    text.push_str(terminal);
+                    let chunks: std::collections::VecDeque<_> = text.as_bytes().chunks(71).map(axum::body::Bytes::copy_from_slice).collect();
+                    let stream = futures_util::stream::unfold(chunks, |mut chunks| async move { let chunk = chunks.pop_front()?; tokio::task::yield_now().await; Some((Ok::<_, std::io::Error>(chunk), chunks)) });
+                    return axum::response::Response::builder().header("content-type", "text/event-stream").body(axum::body::Body::from_stream(stream)).unwrap();
+                }
                 if serde_json::to_string(&body).unwrap().contains("inflight-secret") { tokio::time::sleep(std::time::Duration::from_millis(150)).await; }
                 if serde_json::to_string(&body).unwrap().contains("slow-json") {
                     let bytes = serde_json::to_vec(&json!({"choices":[{"message":{"role":"assistant","content":"fictional slow response"},"finish_reason":"stop"}]})).unwrap();
@@ -135,7 +155,10 @@ fn api_source_identity_survives_reopen_without_projecting_a_secret() {
         .update(|config| *config = serde_json::from_value::<AppConfig>(value).unwrap())
         .unwrap();
     store
-        .write_secret("api-generation:fixture-connection", "fictional-generation-key")
+        .write_secret(
+            "api-generation:fixture-connection",
+            "fictional-generation-key",
+        )
         .unwrap();
     drop(store);
     let reopened = ConfigStore::load(path).unwrap();
@@ -244,7 +267,7 @@ async fn api_sources_all_refused_targets_dispatch_zero_to_every_other_source() {
                 body.contains(match condition {
                     "missing" => "source_credential_missing",
                     "disabled" => "source_disabled",
-                    "removed" => "Unknown model",
+                    "removed" => "source_model_retired",
                     _ => "source_protocol_unsupported",
                 }),
                 "{id}/{condition}: {body}"
@@ -372,6 +395,160 @@ async fn api_source_legacy_database_copy_preserves_existing_uuid_and_credential_
         original_bytes,
         "Only the isolated copy may be changed"
     );
+    gateway.stop().await;
+    upstream.abort();
+}
+
+#[tokio::test]
+async fn api_source_redaction_preserves_incomplete_prefix_and_sse_block_order() {
+    use futures_util::StreamExt;
+    let frames = [
+        ": keepalive\nprovider-extension: retained\n\n",
+        "event: message_start\ndata: {\"message\":{\"usage\":{}}}\n\n",
+        "event: content_block_start\ndata: {\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\ndata: {\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"你好 fictional-\"}}\n\n",
+        "event: content_block_stop\ndata: {\"index\":0}\n\n",
+        "event: message_delta\ndata: {\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+        "event: message_stop\ndata: {}\n\n",
+    ];
+    let input =
+        futures_util::stream::iter(frames.into_iter().map(|text| {
+            Ok::<_, std::io::Error>(axum::body::Bytes::copy_from_slice(text.as_bytes()))
+        }));
+    let safe = crate::api_sources::redacted_stream(input, Some("fictional-coding".into()), true);
+    futures_util::pin_mut!(safe);
+    let mut bytes = Vec::new();
+    while let Some(chunk) = safe.next().await {
+        bytes.extend_from_slice(&chunk.unwrap());
+    }
+    let text = String::from_utf8(bytes.clone()).unwrap();
+    assert!(text.contains(": keepalive\nprovider-extension: retained"));
+    assert!(
+        text.find("你好 fictional-").unwrap() < text.find("event: content_block_stop").unwrap()
+    );
+    let collected = crate::protocol::collect_debug_stream(
+        &bytes,
+        crate::protocol::Protocol::Messages,
+        "fixture",
+    )
+    .unwrap();
+    assert!(
+        collected.to_string().contains("你好 fictional-"),
+        "An incomplete prefix is legitimate output"
+    );
+}
+
+#[tokio::test]
+async fn api_source_cross_delta_secret_cannot_reappear_in_converted_output_or_logs() {
+    let (_root, store, _received, upstream) = source_fixture().await;
+    let gateway = crate::proxy::start(store.clone()).await.unwrap();
+    for source_protocol in ["chat_completions", "responses", "messages"] {
+        store
+            .update(|config| {
+                config
+                    .providers
+                    .iter_mut()
+                    .find(|p| p.id == "coding")
+                    .unwrap()
+                    .api_type = source_protocol.into();
+                config
+                    .models
+                    .iter_mut()
+                    .find(|m| m.id == "uuid-coding")
+                    .unwrap()
+                    .api_type = String::new();
+                config.api_sources.get_mut("coding").unwrap().api_type = source_protocol.into();
+            })
+            .unwrap();
+        for (endpoint, terminal) in [
+            ("chat/completions", "[DONE]"),
+            ("responses", "response.completed"),
+            ("messages", "message_stop"),
+        ] {
+            let request = if endpoint == "responses" {
+                json!({"model":"autojev/model/uuid-coding","input":"delta-secret","stream":true})
+            } else {
+                json!({"model":"autojev/model/uuid-coding","messages":[{"role":"user","content":"delta-secret"}],"max_tokens":16,"stream":true})
+            };
+            let reply = reqwest::Client::new()
+                .post(format!("http://127.0.0.1:{}/v1/{endpoint}", gateway.port))
+                .json(&request)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(reply.status(), 200);
+            let body = reply.text().await.unwrap();
+            assert!(
+                body.contains(terminal),
+                "{source_protocol}/{endpoint}: {body}"
+            );
+            assert!(
+                !body.contains("fictional-coding"),
+                "{source_protocol}/{endpoint}: {body}"
+            );
+            assert!(
+                body.contains("[REDACTED]"),
+                "{source_protocol}/{endpoint}: {body}"
+            );
+        }
+    }
+    assert!(!serde_json::to_string(&store.request_logs("").unwrap())
+        .unwrap()
+        .contains("fictional-coding"));
+    gateway.stop().await;
+    upstream.abort();
+}
+
+#[tokio::test]
+async fn api_source_retired_alias_and_uuid_cannot_be_captured_as_another_sources_bare_id() {
+    let (_root, store, received, upstream) = source_fixture().await;
+    store
+        .update(|config| {
+            config.api_sources.get_mut("official").unwrap().retired = true;
+            config.providers.retain(|p| p.id != "official");
+            config.models.retain(|m| m.provider_id != "official");
+            config.models[0].model_id = "official/same-model".into();
+            config
+                .api_sources
+                .get_mut("third")
+                .unwrap()
+                .model_bindings
+                .insert("uuid-third".into(), "official/same-model".into());
+        })
+        .unwrap();
+    let gateway = crate::proxy::start(store.clone()).await.unwrap();
+    for reference in ["official/same-model", "uuid-official"] {
+        if reference == "uuid-official" {
+            store
+                .update(|config| {
+                    config.models[0].model_id = reference.into();
+                    config
+                        .api_sources
+                        .get_mut("third")
+                        .unwrap()
+                        .model_bindings
+                        .insert("uuid-third".into(), reference.into());
+                })
+                .unwrap();
+        }
+        let reply = reqwest::Client::new()
+            .post(format!(
+                "http://127.0.0.1:{}/v1/chat/completions",
+                gateway.port
+            ))
+            .json(&json!({"model":reference,"messages":[{"role":"user","content":"fixture"}]}))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            !reply.status().is_success(),
+            "Retired reference dispatched: {reference}"
+        );
+        assert!(
+            received.lock().unwrap().is_empty(),
+            "Retired reference hit another source"
+        );
+    }
     gateway.stop().await;
     upstream.abort();
 }

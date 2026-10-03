@@ -44,6 +44,10 @@ const fixture = createServer(async (req, res) => {
   }
   if (body.stream) {
     res.writeHead(200, { 'content-type': 'text/event-stream' });
+    if (JSON.stringify(body).includes('delta-secret-r2')) {
+      for (const content of ['fictional-r2-', source]) res.write('data: ' + JSON.stringify({ choices: [{ index: 0, delta: { content }, finish_reason: null }] }) + '\n\n');
+      res.end('data: ' + JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }) + '\n\ndata: [DONE]\n\n'); return;
+    }
     res.write('data: ' + JSON.stringify({ id: 'r2', choices: [{ index: 0, delta: { role: 'assistant', content: `OK ${source}` }, finish_reason: null }] }) + '\n\n');
     res.end('data: ' + JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: 2, completion_tokens: 2 } }) + '\n\ndata: [DONE]\n\n');
   } else {

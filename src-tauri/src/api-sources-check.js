@@ -136,6 +136,9 @@
     await wait(async () => !(await invoke('get_model_performance')).job.running, 'manual probe complete');
     const debugOk = await invoke('debug_curl', { id: `r2-ok-${run_id}`, endpoint: 'chat/completions', body: { model: target, messages: [{ role: 'user', content: 'fictional debug' }], stream: false }, headers: {}, onProgress: channel });
     check(debugOk.body.includes('OK coding'), 'Debug must reach the exact saved source');
+    const secretDebug = await invoke('debug_curl', { id: `r2-delta-${run_id}`, endpoint: 'responses', body: { model: target, input: 'delta-secret-r2', stream: true }, headers: {}, onProgress: channel });
+    check(secretDebug.body.includes('response.completed') && secretDebug.body.includes('[REDACTED]'), 'Debug stream must redact across logical deltas and preserve terminal');
+    check(!JSON.stringify(secretDebug).includes('fictional-r2-coding'), 'Converted Debug output and parsed body must not reconstruct a generation key');
     for (const endpoint of ['/v1/chat/completions', '/v1/responses', '/v1/messages']) {
       for (const stream of [false, true]) {
         const request = endpoint === '/v1/responses' ? { model: target, input: 'fictional protocol probe', max_output_tokens: 8, stream }
@@ -161,11 +164,19 @@
     check((await gateway(`autojev/model/${retiredModel.id}`)).status !== 200, 'A deleted fixed target must stay invalid');
     check((await gateway(`${retiredId}/same-model`)).status !== 200, 'A deleted provider alias must stay invalid');
     check(await recordsCount() === before, 'Deleted UUID/connection references must never dispatch to a new source');
-    report.checks.push('deleted UUIDs/provider aliases cannot be rebound; an inflight request keeps its original source/credential');
+    for (const reference of [`${retiredId}/same-model`, retiredModel.id]) {
+      const collision = { ...retiredModel, id: crypto.randomUUID(), provider_id: 'r2-openrouter', model_id: reference };
+      await invoke('save_model', { model: collision });
+      check((await gateway(reference)).status !== 200, 'Another source bare ID must not capture a retired public reference');
+      check((await gateway(`autojev/model/${reference}`)).status !== 200, 'Legacy fixed namespace must not capture a retired public reference');
+      check(await recordsCount() === before, 'Retired namespace collision must dispatch zero to all sources');
+      await invoke('delete_model', { id: collision.id });
+    }
+    report.checks.push('deleted UUIDs/provider aliases cannot be rebound or captured by another source bare ID; an inflight request keeps its original source/credential');
     const catalog = await control('/__gateway', { port: snapshot.proxy.port, endpoint: '/v1/models' });
     const logs = await invoke('get_request_logs', { since: '2000-01-01T00:00:00Z' });
     for (const source of sources) check(!JSON.stringify([logs, catalog]).includes(`fictional-r2-${source.id}`), 'Directory and logs must not expose a generation key');
-    report.checks.push('missing credential denied; manual probe and Debug hit saved source; three compatible downstream text/stream protocols preserve fixed source and terminal; directory/logs contain no generation secrets');
+    report.checks.push('missing credential denied; manual probe and Debug hit saved source; Debug logical delta echoes are redacted; three compatible downstream text/stream protocols preserve fixed source and terminal; directory/logs contain no generation secrets');
     check(await recordsCount() > 0, 'This run must have real receiver evidence');
     report.ok = true;
   } catch (error) { report.error = `${error?.message || error}\n${error?.stack || ''}`; }

@@ -226,6 +226,30 @@ pub fn validate_model_identity(config: &AppConfig, model: &Model) -> Result<()> 
     Ok(())
 }
 
+/// Saved public IDs take precedence over another source's similarly named model.
+pub fn validate_public_reference(config: &AppConfig, requested: &str) -> Result<()> {
+    let reference = requested
+        .strip_prefix("autojev/model/")
+        .or_else(|| requested.strip_prefix("model/"))
+        .unwrap_or(requested);
+    for (provider_id, source) in &config.api_sources {
+        for (id, upstream_id) in &source.model_bindings {
+            if reference == id || reference == format!("{provider_id}/{upstream_id}") {
+                ensure!(
+                    !source.retired
+                        && config.models.iter().any(|model| {
+                            model.provider_id == *provider_id
+                                && model.model_id == *upstream_id
+                                && (reference != id || model.id == *id)
+                        }),
+                    "source_model_retired: This saved source target is no longer available"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Shared admission for the gateway, saved tests and manual probes.
 pub fn admit_generation_target(
     store: &crate::config::ConfigStore,
@@ -280,155 +304,5 @@ pub fn admit_generation_target(
     Ok(key)
 }
 
-/// Redact this request's credential before protocol parsing, logs or downstream output.
-enum RedactionBuffer {
-    Json(Vec<u8>),
-    Sse(crate::protocol::SseParser),
-}
-
-fn redact_value(value: &mut serde_json::Value, key: &str) {
-    match value {
-        serde_json::Value::String(text) => *text = text.replace(key, "[REDACTED]"),
-        serde_json::Value::Array(items) => {
-            for item in items {
-                redact_value(item, key);
-            }
-        }
-        serde_json::Value::Object(fields) => {
-            let previous = std::mem::take(fields);
-            for (name, mut value) in previous {
-                redact_value(&mut value, key);
-                fields.insert(name.replace(key, "[REDACTED]"), value);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn redact_json(bytes: &[u8], key: &str) -> Vec<u8> {
-    if let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(bytes) {
-        redact_value(&mut value, key);
-        serde_json::to_vec(&value).expect("JSON value serializes")
-    } else {
-        String::from_utf8_lossy(bytes)
-            .replace(key, "[REDACTED]")
-            .into_bytes()
-    }
-}
-
-fn redact_sse(frame: &[u8], key: &str) -> std::io::Result<Vec<u8>> {
-    let text = std::str::from_utf8(frame)
-        .map_err(|_| std::io::Error::other("Invalid upstream event stream"))?;
-    let data = text
-        .lines()
-        .filter_map(|line| {
-            line.strip_prefix("data:")
-                .map(|value| value.strip_prefix(' ').unwrap_or(value))
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let safe =
-        String::from_utf8(redact_json(data.as_bytes(), key)).expect("redacted JSON is UTF-8");
-    if safe == data && !text.contains(key) {
-        return Ok(frame.to_vec());
-    }
-    let mut output = String::new();
-    let mut wrote_data = false;
-    for line in text.lines().filter(|line| !line.is_empty()) {
-        if line.starts_with("data:") {
-            if wrote_data {
-                continue;
-            }
-            output.push_str("data: ");
-            output.push_str(&safe);
-            wrote_data = true;
-        } else {
-            output.push_str(&line.replace(key, "[REDACTED]"));
-        }
-        output.push('\n');
-    }
-    output.push('\n');
-    Ok(output.into_bytes())
-}
-
-/// Redact this request's credential before protocol parsing, logs or downstream output.
-/// Decode JSON before redaction so escaped credentials cannot reappear after parsing.
-pub fn redacted_stream<S, E>(
-    input: S,
-    secret: Option<String>,
-    is_sse: bool,
-) -> impl futures_util::Stream<Item = std::result::Result<axum::body::Bytes, std::io::Error>> + Send
-where
-    S: futures_util::Stream<Item = std::result::Result<axum::body::Bytes, E>> + Send + 'static,
-    E: Send + 'static,
-{
-    use futures_util::StreamExt;
-    let key = secret.unwrap_or_default();
-    let buffer = if is_sse {
-        RedactionBuffer::Sse(Default::default())
-    } else {
-        RedactionBuffer::Json(Vec::new())
-    };
-    futures_util::stream::unfold(
-        (Box::pin(input), key, buffer, false),
-        |(mut stream, key, mut buffer, mut ended)| async move {
-            loop {
-                if ended {
-                    return None;
-                }
-                let next = stream.next().await;
-                if key.is_empty() {
-                    return next.map(|chunk| {
-                        (
-                            chunk.map_err(|_| {
-                                std::io::Error::other("Upstream connection interrupted")
-                            }),
-                            (stream, key, buffer, false),
-                        )
-                    });
-                }
-                let output: std::io::Result<Option<Vec<u8>>> = match next {
-                    Some(Err(_)) => Err(std::io::Error::other("Upstream connection interrupted")),
-                    Some(Ok(chunk)) => match &mut buffer {
-                        RedactionBuffer::Json(bytes) => {
-                            if bytes.len() + chunk.len() > 16 * 1024 * 1024 {
-                                Err(std::io::Error::other("Upstream JSON is too large"))
-                            } else {
-                                bytes.extend_from_slice(&chunk);
-                                Ok(Some(Vec::new()))
-                            }
-                        }
-                        RedactionBuffer::Sse(parser) => parser
-                            .push_raw(&chunk)
-                            .map_err(|_| std::io::Error::other("Invalid upstream event stream"))
-                            .and_then(|frames| {
-                                frames
-                                    .into_iter()
-                                    .map(|frame| redact_sse(&frame, &key))
-                                    .collect::<std::io::Result<Vec<_>>>()
-                                    .map(|frames| Some(frames.concat()))
-                            }),
-                    },
-                    None => {
-                        ended = true;
-                        match &buffer {
-                            RedactionBuffer::Json(bytes) => Ok(Some(redact_json(bytes, &key))),
-                            RedactionBuffer::Sse(parser) if parser.clean_eof() => Ok(None),
-                            _ => Err(std::io::Error::other("Incomplete upstream event stream")),
-                        }
-                    }
-                };
-                match output {
-                    Err(error) => return Some((Err(error), (stream, key, buffer, true))),
-                    Ok(Some(bytes)) => {
-                        return Some((
-                            Ok(axum::body::Bytes::from(bytes)),
-                            (stream, key, buffer, ended),
-                        ))
-                    }
-                    _ => {}
-                }
-            }
-        },
-    )
-}
+mod redaction;
+pub use redaction::redacted_stream;
