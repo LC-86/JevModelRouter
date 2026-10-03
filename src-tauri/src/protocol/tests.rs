@@ -430,3 +430,19 @@ fn namespaced_stream_restores_names_on_added_done_and_completed_items() {
         assert!(!items.iter().any(|item|item.to_string().contains(alias)));
     }
 }
+
+#[test]
+fn sse_line_endings_work_across_every_http_split() {
+    let source = "event: message\ndata: 你好\ndata:\n\ndata: [DONE]\n\n";
+    let expected = vec![("message".into(), "你好\n".into()), (String::new(), "[DONE]".into())];
+    let mixed = "event: message\r\ndata: 你好\rdata:\n\rdata: [DONE]\r\n\n";
+    for wire in [source.into(), source.replace('\n', "\r\n"), source.replace('\n', "\r"), mixed.into()] {
+        for split in 0..=wire.len() {
+            let mut parser = SseParser::default();
+            let mut frames = parser.push(&wire.as_bytes()[..split]).unwrap();
+            frames.extend(parser.push(&wire.as_bytes()[split..]).unwrap());
+            assert_eq!(frames, expected, "wire={wire:?}, split={split}");
+            assert!(parser.clean_eof());
+        }
+    }
+}
