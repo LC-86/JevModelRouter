@@ -16,6 +16,7 @@ struct AccountFixture {
     cancelled: Arc<std::sync::atomic::AtomicBool>,
     cleanup_fail: Arc<std::sync::atomic::AtomicBool>,
     auth_delayed: Arc<std::sync::atomic::AtomicBool>,
+    status_failed: Arc<std::sync::atomic::AtomicBool>,
     server: tokio::task::JoinHandle<()>,
 }
 impl AccountFixture {
@@ -23,6 +24,8 @@ impl AccountFixture {
         let account = Arc::new(std::sync::Mutex::new(None));
         let active = account.clone();
         let signed_in = account.clone();
+        let status_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let expired = status_failed.clone();
         let deleted = account.clone();
         let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let cancellation = cancelled.clone();
@@ -42,7 +45,7 @@ impl AccountFixture {
         let auth_release = release.clone();
         let router=Router::new()
             .route("/v8/management/oauth/auth-url",get(move || {let delay=auth_delay.clone();let entered=auth_entered.clone();let release=auth_release.clone();async move {if delay.load(std::sync::atomic::Ordering::SeqCst) {entered.notify_one();release.notified().await;} Json(json!({"state":"fictional-session","url":"https://auth.example.invalid/authorize"}))}}))
-            .route("/v8/management/oauth/status",get(move || {let active=signed_in.clone();async move {*active.lock().unwrap()=Some("account-a");Json(json!({"status":"ok"}))}}))
+            .route("/v8/management/oauth/status",get(move || {let active=signed_in.clone();let expired=expired.clone();async move {if expired.load(std::sync::atomic::Ordering::SeqCst) {return Json(json!({"status":"error","error":"unknown or expired state"}));} *active.lock().unwrap()=Some("account-a");Json(json!({"status":"ok"}))}}))
             .route("/v8/management/credentials",get(move || {let active=active.clone();async move {Json(json!({"files":active.lock().unwrap().map(|account|json!({"name":"owned.json","provider":"codex","id_token":{"chatgpt_account_id":account,"plan_type":"plan-a"}})).into_iter().collect::<Vec<_>>()}))}}).delete(move ||{let deleted=deleted.clone();let failed=cleanup_failed.clone();async move {if failed.load(std::sync::atomic::Ordering::SeqCst) {return (axum::http::StatusCode::BAD_GATEWAY,Json(json!({})));} *deleted.lock().unwrap()=None;(axum::http::StatusCode::OK,Json(json!({"status":"ok"})))}}))
             .route("/v8/management/oauth/session",delete(move ||{let cancelled=cancellation.clone();async move {Json(json!({"status":"ok","cancelled":cancelled.load(std::sync::atomic::Ordering::SeqCst)}))}}))
             .route("/v8/management/credentials/models",get(move || {let failed=failed.clone();let delay=delay.clone();let arrival=arrival.clone();let unblock=unblock.clone();async move {
@@ -66,6 +69,7 @@ impl AccountFixture {
             cancelled,
             cleanup_fail,
             auth_delayed,
+            status_failed,
             server,
         }
     }
@@ -183,6 +187,11 @@ async fn completed_authorization_cancel_can_retry_only_its_owned_cleanup() {
     fixture
         .cleanup_fail
         .store(false, std::sync::atomic::Ordering::SeqCst);
+    // Fixed CPA expires completed sessions after one minute. The cleanup reference
+    // was already proven and persisted; a later retry must not need that session.
+    fixture
+        .status_failed
+        .store(true, std::sync::atomic::Ordering::SeqCst);
     manager.disconnect(&store, &id, false).await.unwrap();
     assert!(fixture.account.lock().unwrap().is_none());
     manager.begin(&store, &id).await.unwrap();

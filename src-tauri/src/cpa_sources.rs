@@ -466,9 +466,10 @@ impl Manager {
             if let Some(a) = &attempt {
                 let client = self.client(id)?;
                 let session = a.state.as_deref().expect("pending start handled above");
-                if !client.cancel(session).await? {
+                if !client.cancel(session).await? && credential.is_none() {
                     // Fixed CPA returns false after completion. This attempt started with an
                     // empty, exclusive profile: claim a proven completion for cleanup only.
+                    // An already persisted cleanup reference outlives CPA's completed-session TTL.
                     let files = client.credentials().await?;
                     if !files.is_empty() {
                         ensure!(
