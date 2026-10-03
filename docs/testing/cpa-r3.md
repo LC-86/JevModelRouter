@@ -88,3 +88,13 @@ R2 原生基线也在此合并结果运行两次，首轮 `97f4d183-cbd8-41d7-9f
 同一取消接缝的 **13/13** 回归覆盖两种响应顺序、取消失败显式重试、Waiting 的可重试与不确定残留、迟到完成/到期；完整 Rust **538/538**、前端 **96/96**、build/release 与原生隔离构建通过。原生公开 poll 在途时点击取消，再释放 Waiting；报告保存 `service_available:true / stage:cancelled / account:null / plan:null / retry_stage:waiting`，随后既有目录/选择/网关拒绝、两次删除 UUID 保留及重启继续通过。原始证据 `pr61-p2-fixes.cancel-waiting` 和当前两轮报告保存这些结果；真实操作仍为 **0**。
 
 原两项在 `6094b395` 完成独立 Standards/Spec 复审。按父线程最新指示，本次 Waiting 功能修复只作必要回归，不新增复审轮次或低影响重构；不把旧 head 的独立审查结论移用到最终新 head。
+
+## 13:51 的两 mutex 循环 P1 核对
+
+[审查意见](https://github.com/LC-86/JevModelRouter/pull/61#discussion_r4173427257) 的基线为 `b480b45a78f5ebcf79986238c092f94adcedb36a`。实际 `CleanupLease` 保存 `&Mutex<HashSet<String>>` 和连接 ID；`cleanup_lease` 插入清理标记使用的临时 guard 在返回前已释放。`disconnect` 跨管理等待持有的是逻辑清理责任，进入 `cleanup_owned` 后取 attempts 锁时没有持 cleaning guard。begin/remove 的嵌套顺序是 attempts → cleaning，没有审查所述 cleaning → attempts 的反向嵌套。父线程独立只读核对确认此 P1 为误报；本轮生产锁逻辑保持原样。
+
+新增公开管理/临时 DB/虚构回环回归以独立于 Tokio 的 std mpsc 接收端和 10 秒墙钟期限验证：取消 HTTP 回执挂起、清理 lease 存活时，begin 已返回前次清理的拒绝；释放回执后清理结束；32 组同时 begin/disconnect、每组清理和末尾待授权 shutdown 完成。测试在未改动的生产代码上直接通过，实测 0.11 秒。失败路径使用 runtime shutdown_background，避免阻塞 worker 导致测试 teardown 无限等待。不伪造失败复现，也不把这里写成修复了生产死锁。
+
+原生首轮 `3cb499be-da70-45fc-8f67-9d3bcfbdc143` / 重启 `7edf3557-7bec-4a5e-aef0-1661475edf56` 均 ok:true。Waiting 取消后保留服务、再次授权进入 waiting，两次删除保留 UUID `8b52355d-8b65-46bc-bc32-fc425e6273a1` 和绑定，重启保持引用；模型/下载/账户查询均 0。本轮测试与文档之外没有生产文件变更，前端96/build/release/native构建属于 b480b45 已通过的相同生产树。
+
+完整 Rust 两次各为 **538 passed / 1 failed**：第一次未改动的旧 CLI 替身测试 `a_superseded_attempt_never_reclaims_the_current_attempt` 报 helper_exited，第二次未改动的 `exclusive_file_lock_prevents_recovery_race` 报 WouldBlock；两项分别定点重跑通过，失败原因未确认。新有界并发回归在两次完整运行都通过。原始证据 `pr61-p1-lock-check` 保留结果，不冒称全量539通过；按父线程指示不扩展旧 CLI/文件锁修复或复审轮次。真实操作仍为 0。

@@ -690,3 +690,108 @@ async fn a_failed_cancel_keeps_a_late_waiting_poll_owned_for_explicit_retry() {
     manager.begin(&store, &id).await.unwrap();
     manager.disconnect(&store, &id, true).await.unwrap();
 }
+
+#[test]
+fn concurrent_begin_disconnect_and_shutdown_finish_within_a_wall_clock_deadline() {
+    // The receiver lives outside Tokio: a blocking mutex cycle cannot stall its deadline.
+    // Always detach runtime shutdown on failure so a blocked worker cannot hang this test.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4).enable_all().build().unwrap();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let fixture = runtime.block_on(AccountFixture::start());
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(ConfigStore::load(temp.path().join("concurrent.db")).unwrap());
+        let manager = Arc::new(Manager::owned_fixture(fixture.base.clone()).unwrap());
+        let id = manager.create(&store, "codex", "Concurrent lifecycle").unwrap();
+        let (sent, completed) = std::sync::mpsc::channel();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        runtime.block_on(manager.begin(&store, &id)).unwrap();
+        fixture.cancel_delayed.store(true, std::sync::atomic::Ordering::SeqCst);
+        {
+            let sent = sent.clone(); let store = store.clone();
+            let manager = manager.clone(); let id = id.clone();
+            runtime.spawn(async move {
+                let _ = sent.send(("held_cleanup", manager.disconnect(&store, &id, false).await));
+            });
+        }
+        runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(2), fixture.cancel_entered.notified()).await.unwrap();
+        });
+        {
+            let sent = sent.clone(); let store = store.clone();
+            let manager = manager.clone(); let id = id.clone();
+            runtime.spawn(async move {
+                let _ = sent.send(("during_cleanup", manager.begin(&store, &id).await));
+            });
+        }
+        let (operation, outcome) = completed.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            .expect("Begin blocked while only the logical cleanup lease was alive");
+        assert_eq!(operation, "during_cleanup");
+        assert!(outcome.unwrap_err().to_string().contains("previous owned authorization/cleanup"));
+        fixture.cancel_release.notify_one();
+        let (operation, outcome) = completed.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            .expect("Acknowledged cleanup did not finish");
+        assert_eq!(operation, "held_cleanup"); outcome.unwrap();
+        fixture.cancel_delayed.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(manager.cleanup_finished(&id));
+        for round in 0..32 {
+            let gate = Arc::new(tokio::sync::Barrier::new(2));
+            {
+                let gate = gate.clone(); let sent = sent.clone();
+                let store = store.clone(); let manager = manager.clone(); let id = id.clone();
+                runtime.spawn(async move {
+                    gate.wait().await;
+                    let outcome = manager.begin(&store, &id).await;
+                    let _ = sent.send(("begin", outcome));
+                });
+            }
+            {
+                let gate = gate.clone(); let sent = sent.clone();
+                let store = store.clone(); let manager = manager.clone(); let id = id.clone();
+                runtime.spawn(async move {
+                    gate.wait().await;
+                    let outcome = manager.disconnect(&store, &id, false).await;
+                    let _ = sent.send(("disconnect", outcome));
+                });
+            }
+            for _ in 0..2 {
+                let (operation, outcome) = completed.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                    .unwrap_or_else(|_| panic!("Concurrent begin/disconnect did not settle by the wall-clock deadline, round {round}"));
+                if operation == "disconnect" { outcome.unwrap(); }
+                // An overlapping begin may be refused or superseded; it must still finish.
+            }
+            {
+                let sent = sent.clone(); let store = store.clone();
+                let manager = manager.clone(); let id = id.clone();
+                runtime.spawn(async move {
+                    let _ = sent.send(("cleanup", manager.disconnect(&store, &id, false).await));
+                });
+            }
+            let (operation, outcome) = completed.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                .expect("Owned cleanup did not settle by the wall-clock deadline");
+            assert_eq!(operation, "cleanup"); outcome.unwrap();
+            assert!(manager.cleanup_finished(&id));
+        }
+        {
+            let sent = sent.clone(); let store = store.clone();
+            let manager = manager.clone(); let id = id.clone();
+            runtime.spawn(async move {
+                let outcome = async {
+                    manager.begin(&store, &id).await?;
+                    manager.shutdown(&store).await
+                }.await;
+                let _ = sent.send(("shutdown", outcome));
+            });
+        }
+        let (operation, outcome) = completed.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            .expect("Pending authorization shutdown did not settle by the wall-clock deadline");
+        assert_eq!(operation, "shutdown"); outcome.unwrap();
+        assert!(manager.cleanup_finished(&id));
+        let view = manager.views(&store.read()).remove(0);
+        assert_eq!(view.stage, Stage::Disconnected);
+        assert!(view.account.is_none() && view.plan.is_none() && view.authorization_url.is_none());
+        assert!(view.service_available);
+    }));
+    runtime.shutdown_background();
+    if let Err(panic) = result { std::panic::resume_unwind(panic); }
+}

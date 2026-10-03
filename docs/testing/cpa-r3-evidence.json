@@ -909,5 +909,162 @@
       },
       "review_scope": "No further review rounds or low-impact refactoring, as directed by the parent."
     }
+  },
+  "pr61-p1-lock-check": {
+    "review_head": "b480b45a78f5ebcf79986238c092f94adcedb36a",
+    "review_id": 5401096010,
+    "discussion_id": 4173427257,
+    "conclusion": "The stated two-mutex cycle is not present; CleanupLease stores a reference and ID, not a mutex guard. Parent independently confirmed this false positive.",
+    "production_changes": false,
+    "locking": {
+      "begin_remove_nested_order": [
+        "attempts",
+        "cleaning"
+      ],
+      "disconnect": "cleanup_lease briefly inserts the owned ID under cleaning; that guard is released before cleanup_owned accesses attempts. CleanupLease drop only removes the ID."
+    },
+    "test": "cpa_sources::tests::concurrent_begin_disconnect_and_shutdown_finish_within_a_wall_clock_deadline",
+    "bounded_regression": {
+      "result": "passed",
+      "duration_seconds": 0.11,
+      "wall_clock_budget_seconds": 10,
+      "concurrent_rounds": 32,
+      "controlled_interleaving": "cancel HTTP acknowledgement held open while begin finishes with an owned-cleanup refusal; release acknowledgement, then cleanup and pending shutdown finish",
+      "watchdog": "std::sync::mpsc receiver outside Tokio; runtime shutdown_background on failure avoids hanging teardown"
+    },
+    "full_run_1": {
+      "passed": 538,
+      "failed": 1,
+      "test": "subscription::auth::lifecycle_tests::a_superseded_attempt_never_reclaims_the_current_attempt",
+      "error": "helper_exited: the helper exited before returning a challenge",
+      "targeted_recheck": "1 passed; 0 failed"
+    },
+    "full_run_2": {
+      "passed": 538,
+      "failed": 1,
+      "test": "lifecycle::tests::exclusive_file_lock_prevents_recovery_race",
+      "error": "WouldBlock",
+      "targeted_recheck": "1 passed; 0 failed"
+    },
+    "failure_scope": "Both failed test/production files are unchanged. Cause unconfirmed; do not claim a clean full run or continue unrelated fixes.",
+    "first.report": {
+      "api_source": {
+        "connection_instance_id": "c6838625-771b-4182-bc02-e5612940d8ab",
+        "generation": 1,
+        "model_id": "4766e83a-5648-4a54-b9c6-3469c9ed78f2",
+        "provider_id": "same-name-paid"
+      },
+      "bound_rediscovery": {
+        "bound": true,
+        "deleted_id": "8b52355d-8b65-46bc-bc32-fc425e6273a1",
+        "restored_id": "8b52355d-8b65-46bc-bc32-fc425e6273a1",
+        "selected": false
+      },
+      "cancel_waiting": {
+        "account": null,
+        "generation": 3,
+        "plan": null,
+        "retry_stage": "waiting",
+        "service_available": true,
+        "stage": "cancelled"
+      },
+      "checks": [
+        "begin/wait/cancel public desktop loop",
+        "cancel with an in-flight Waiting poll preserves the profile and retries authorization",
+        "failure/disconnect public desktop loop",
+        "public delete_model and directory rediscovery preserve an unselected fixed UUID",
+        "public delete_model preserves an existing binding UUID; reselection stays explicit",
+        "public model edits retain the CPA fixed target and unknown capabilities",
+        "connection/directory/selection/listening gateway rejection; no same-name API fallback",
+        "stale directory retained; switch disables old target; explicit rebind",
+        "R2 explicit API and R3 CPA identities coexist and persist independently"
+      ],
+      "layer": "native-desktop-fictional-cpa",
+      "ok": true,
+      "receipts": {
+        "accountQueries": 0,
+        "deleted": [
+          "fictional-fictional-a.json"
+        ],
+        "downloads": 0,
+        "models": 0,
+        "sessions": [
+          "fictional-1",
+          "fictional-2"
+        ],
+        "waitingAfterCancel": {
+          "cancelledSessions": 1,
+          "credentialPresent": false
+        }
+      },
+      "rediscovery": {
+        "deleted_id": "8b52355d-8b65-46bc-bc32-fc425e6273a1",
+        "restored_id": "8b52355d-8b65-46bc-bc32-fc425e6273a1",
+        "selected": false
+      },
+      "run_id": "3cb499be-da70-45fc-8f67-9d3bcfbdc143",
+      "saved": {
+        "generation": 8,
+        "model_id": "8b52355d-8b65-46bc-bc32-fc425e6273a1",
+        "provider_id": "cpa-6849eda2-65f0-45b1-b3ef-bb174b119963"
+      }
+    },
+    "reload.report": {
+      "api_source": {
+        "connection_instance_id": "c6838625-771b-4182-bc02-e5612940d8ab",
+        "generation": 1,
+        "model_id": "4766e83a-5648-4a54-b9c6-3469c9ed78f2",
+        "provider_id": "same-name-paid"
+      },
+      "checks": [
+        "isolated DB restart re-read; no automatic authorization",
+        "R2 explicit API and R3 CPA identities coexist and persist independently"
+      ],
+      "layer": "native-desktop-fictional-cpa",
+      "ok": true,
+      "receipts": {
+        "accountQueries": 0,
+        "deleted": [
+          "fictional-fictional-a.json"
+        ],
+        "downloads": 0,
+        "models": 0,
+        "sessions": [
+          "fictional-1",
+          "fictional-2"
+        ],
+        "waitingAfterCancel": {
+          "cancelledSessions": 1,
+          "credentialPresent": false
+        }
+      },
+      "run_id": "7edf3557-7bec-4a5e-aef0-1661475edf56",
+      "saved": {
+        "generation": 8,
+        "model_id": "8b52355d-8b65-46bc-bc32-fc425e6273a1",
+        "provider_id": "cpa-6849eda2-65f0-45b1-b3ef-bb174b119963"
+      }
+    },
+    "receiver-records": {
+      "models": 0,
+      "downloads": 0,
+      "accountQueries": 0,
+      "sessions": [
+        "fictional-1",
+        "fictional-2"
+      ],
+      "deleted": [
+        "fictional-fictional-a.json"
+      ],
+      "waitingAfterCancel": {
+        "cancelledSessions": 1,
+        "credentialPresent": false
+      }
+    },
+    "real_operations": {
+      "oauth_login": 0,
+      "account_quota_queries": 0,
+      "model_calls": 0
+    }
   }
 }
