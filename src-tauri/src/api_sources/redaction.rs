@@ -4,22 +4,40 @@ enum RedactionBuffer {
     Sse(SseRedactor),
 }
 
-fn redact_value(value: &mut serde_json::Value, key: &str) {
+fn redact_value(value: &mut serde_json::Value, key: &str) -> bool {
     match value {
-        serde_json::Value::String(text) => *text = text.replace(key, "[REDACTED]"),
-        serde_json::Value::Array(items) => {
-            for item in items {
-                redact_value(item, key);
-            }
+        serde_json::Value::String(text) => {
+            let safe = text.replace(key, "[REDACTED]");
+            let changed = safe != *text;
+            *text = safe;
+            changed
         }
+        serde_json::Value::Array(items) => items
+            .iter_mut()
+            .fold(false, |changed, item| redact_value(item, key) || changed),
         serde_json::Value::Object(fields) => {
+            let mut changed = false;
             let previous = std::mem::take(fields);
             for (name, mut value) in previous {
-                redact_value(&mut value, key);
-                fields.insert(name.replace(key, "[REDACTED]"), value);
+                // The existing bridge decodes this protocol field again for tool input.
+                if name == "arguments" {
+                    if let Some(text) = value.as_str() {
+                        if let Ok(mut arguments) = serde_json::from_str(text) {
+                            if redact_value(&mut arguments, key) {
+                                value = arguments.to_string().into();
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+                changed |= redact_value(&mut value, key);
+                let safe = name.replace(key, "[REDACTED]");
+                changed |= safe != name;
+                fields.insert(safe, value);
             }
+            changed
         }
-        _ => {}
+        _ => false,
     }
 }
 
@@ -147,7 +165,7 @@ fn delta_fields(value: &serde_json::Value) -> Vec<(String, String)> {
             if let Some(calls) = choice["delta"]["tool_calls"].as_array() {
                 for (j, call) in calls.iter().enumerate() {
                     fields.push((
-                        format!("tool:{}", call["index"]),
+                        format!("tool:{}", call["index"].as_u64().unwrap_or(0)),
                         format!("/choices/{i}/delta/tool_calls/{j}/function/arguments"),
                     ));
                 }
@@ -173,6 +191,10 @@ fn delta_fields(value: &serde_json::Value) -> Vec<(String, String)> {
         "response.function_call_arguments.delta" => {
             fields.push((format!("tool:{}", value["output_index"]), "/delta".into()))
         }
+        "response.output_item.added" if value["item"]["type"] == "function_call" => fields.push((
+            format!("tool:{}", value["output_index"]),
+            "/item/arguments".into(),
+        )),
         kind if kind.starts_with("response.reasoning") => {
             fields.push(("reasoning".into(), "/delta".into()))
         }
@@ -222,6 +244,24 @@ impl SseRedactor {
             return Err(std::io::Error::other("Upstream event stream is too large"));
         }
         // Keep original frame order: a held text prefix must precede its block stop.
+        for (name, channel) in channels(&self.pending) {
+            if name.starts_with("tool:") {
+                if let Ok(mut arguments) = serde_json::from_str(&channel.text) {
+                    if redact_value(&mut arguments, key) {
+                        let safe = arguments.to_string();
+                        for (i, span) in channel.spans.iter().enumerate() {
+                            *self.pending[span.frame]
+                                .value
+                                .as_mut()
+                                .unwrap()
+                                .pointer_mut(&span.pointer)
+                                .unwrap() =
+                                if i == 0 { safe.clone() } else { String::new() }.into();
+                        }
+                    }
+                }
+            }
+        }
         let mut edits: std::collections::BTreeMap<(usize, String), Vec<(usize, usize, String)>> =
             Default::default();
         for channel in channels(&self.pending).values() {
@@ -262,6 +302,25 @@ impl SseRedactor {
         }
         let terminal = self.pending.iter().any(Frame::terminal);
         let mut ready = self.pending.len();
+        // A partial serialized argument can hide an escaped credential until decoded.
+        for (name, channel) in channels(&self.pending) {
+            if name.starts_with("tool:")
+                && !channel.text.is_empty()
+                && serde_json::from_str::<serde_json::Value>(&channel.text).is_err()
+            {
+                if terminal {
+                    return Err(std::io::Error::other("Invalid upstream tool arguments"));
+                }
+                ready = ready.min(
+                    channel
+                        .spans
+                        .iter()
+                        .find(|span| span.end > span.start)
+                        .unwrap()
+                        .frame,
+                );
+            }
+        }
         if !terminal {
             for channel in channels(&self.pending).values() {
                 let suffix = (1..key.len().min(channel.text.len() + 1))
@@ -292,6 +351,13 @@ impl SseRedactor {
     fn finish(&mut self, key: &str) -> std::io::Result<Vec<u8>> {
         if !self.parser.clean_eof() {
             return Err(std::io::Error::other("Incomplete upstream event stream"));
+        }
+        if channels(&self.pending).iter().any(|(name, channel)| {
+            name.starts_with("tool:")
+                && !channel.text.is_empty()
+                && serde_json::from_str::<serde_json::Value>(&channel.text).is_err()
+        }) {
+            return Err(std::io::Error::other("Incomplete upstream tool arguments"));
         }
         Ok(self.drain(self.pending.len(), key))
     }

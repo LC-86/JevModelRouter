@@ -42,6 +42,17 @@ const fixture = createServer(async (req, res) => {
     res.writeHead(mode, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ error: { message: `fixture rejection ${req.headers.authorization}` } })); return;
   }
+  if (JSON.stringify(body).includes('nested-secret-r2')) {
+    const argumentsJson = '{"note":"\\u0066ictional-r2-' + source + '"}';
+    const call = { id: 'call_fixture', type: 'function', function: { name: 'echo', arguments: argumentsJson } };
+    if (body.stream) {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write('data: ' + JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ ...call, index: 0, function: { name: 'echo', arguments: '' } }] }, finish_reason: null }] }) + '\n\n');
+      for (const piece of argumentsJson) res.write('data: ' + JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: piece } }] }, finish_reason: null }] }) + '\n\n');
+      res.end('data: ' + JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] }) + '\n\ndata: [DONE]\n\n');
+    } else reply({ choices: [{ message: { role: 'assistant', content: null, tool_calls: [call] }, finish_reason: 'tool_calls' }] });
+    return;
+  }
   if (body.stream) {
     res.writeHead(200, { 'content-type': 'text/event-stream' });
     if (JSON.stringify(body).includes('delta-secret-r2')) {

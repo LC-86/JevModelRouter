@@ -69,6 +69,38 @@ async fn source_fixture() -> (
                     let stream = futures_util::stream::unfold(chunks, |mut chunks| async move { let chunk = chunks.pop_front()?; tokio::task::yield_now().await; Some((Ok::<_, std::io::Error>(chunk), chunks)) });
                     return axum::response::Response::builder().header("content-type", "text/event-stream").body(axum::body::Body::from_stream(stream)).unwrap();
                 }
+                if serde_json::to_string(&body).unwrap().contains("nested-secret") {
+                    let arguments = r#"{"note":"\u0066ictional-coding"}"#;
+                    if path.ends_with("/messages") {
+                        if body["stream"] == true {
+                            let mut text = "event: message_start\ndata: {\"message\":{\"usage\":{}}}\n\nevent: content_block_start\ndata: {\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_fixture\",\"name\":\"echo\",\"input\":{}}}\n\n".to_string();
+                            for piece in arguments.chars().map(|c| c.to_string()) { text.push_str(&format!("event: content_block_delta\ndata: {}\n\n", json!({"index":0,"delta":{"type":"input_json_delta","partial_json":piece}}))); }
+                            text.push_str("event: content_block_stop\ndata: {\"index\":0}\n\nevent: message_delta\ndata: {\"delta\":{\"stop_reason\":\"tool_use\"}}\n\nevent: message_stop\ndata: {}\n\n");
+                            return ([("content-type", "text/event-stream")], text).into_response();
+                        }
+                        return Json(json!({"id":"fixture","content":[{"type":"tool_use","id":"call_fixture","name":"echo","input":serde_json::from_str::<serde_json::Value>(arguments).unwrap()}],"stop_reason":"tool_use"})).into_response();
+                    }
+                    if path.ends_with("/responses") {
+                        let item = json!({"type":"function_call","call_id":"call_fixture","name":"echo","arguments":arguments});
+                        let response = json!({"id":"fixture","status":"completed","output":[item]});
+                        if body["stream"] == true {
+                            let mut text = format!("event: response.output_item.added\ndata: {}\n\n", json!({"output_index":0,"item":{"type":"function_call","call_id":"call_fixture","name":"echo","arguments":""}}));
+                            for piece in arguments.chars().map(|c| c.to_string()) { text.push_str(&format!("event: response.function_call_arguments.delta\ndata: {}\n\n", json!({"output_index":0,"delta":piece}))); }
+                            text.push_str(&format!("event: response.completed\ndata: {}\n\n", json!({"response":response})));
+                            return ([("content-type", "text/event-stream")], text).into_response();
+                        }
+                        return Json(response).into_response();
+                    }
+                    if body["stream"] == true {
+                        let mut text = format!("data: {}\n\n", json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_fixture","type":"function","function":{"name":"echo","arguments":""}}]},"finish_reason":null}]}));
+                        for piece in arguments.chars().map(|c| c.to_string()) {
+                            text.push_str(&format!("data: {}\n\n", json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":piece}}]},"finish_reason":null}]})));
+                        }
+                        text.push_str("data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n");
+                        return ([("content-type", "text/event-stream")], text).into_response();
+                    }
+                    return Json(json!({"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_fixture","type":"function","function":{"name":"echo","arguments":arguments}}]},"finish_reason":"tool_calls"}]})).into_response();
+                }
                 if serde_json::to_string(&body).unwrap().contains("inflight-secret") { tokio::time::sleep(std::time::Duration::from_millis(150)).await; }
                 if serde_json::to_string(&body).unwrap().contains("slow-json") {
                     let bytes = serde_json::to_vec(&json!({"choices":[{"message":{"role":"assistant","content":"fictional slow response"},"finish_reason":"stop"}]})).unwrap();
@@ -397,6 +429,90 @@ async fn api_source_legacy_database_copy_preserves_existing_uuid_and_credential_
     );
     gateway.stop().await;
     upstream.abort();
+}
+
+#[tokio::test]
+async fn api_source_nested_tool_json_secret_never_reappears_after_conversion() {
+    let (_root, store, _received, upstream) = source_fixture().await;
+    let gateway = crate::proxy::start(store.clone()).await.unwrap();
+    let mut failures = Vec::new();
+    for source_protocol in ["chat_completions", "responses", "messages"] {
+        store
+            .update(|config| {
+                config
+                    .providers
+                    .iter_mut()
+                    .find(|p| p.id == "coding")
+                    .unwrap()
+                    .api_type = source_protocol.into();
+                config
+                    .models
+                    .iter_mut()
+                    .find(|m| m.id == "uuid-coding")
+                    .unwrap()
+                    .api_type = String::new();
+                config.api_sources.get_mut("coding").unwrap().api_type = source_protocol.into();
+            })
+            .unwrap();
+        for endpoint in ["chat/completions", "responses", "messages"] {
+            for stream in [false, true] {
+                let schema = json!({"type":"object","properties":{"note":{"type":"string"}}});
+                let tool = match endpoint {
+                    "messages" => json!({"name":"echo","input_schema":schema}),
+                    "responses" => json!({"type":"function","name":"echo","parameters":schema}),
+                    _ => json!({"type":"function","function":{"name":"echo","parameters":schema}}),
+                };
+                let mut request = json!({"model":"autojev/model/uuid-coding","max_tokens":16,"stream":stream,"tools":[tool]});
+                if endpoint == "responses" {
+                    request["input"] = "nested-secret".into();
+                } else {
+                    request["messages"] = json!([{"role":"user","content":"nested-secret"}]);
+                }
+                let reply = reqwest::Client::new()
+                    .post(format!("http://127.0.0.1:{}/v1/{endpoint}", gateway.port))
+                    .json(&request)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(reply.status(), 200);
+                let body = reply.bytes().await.unwrap();
+                let value = if stream {
+                    crate::protocol::collect_debug_stream(
+                        &body,
+                        crate::protocol::Protocol::parse(endpoint).unwrap(),
+                        "fixture",
+                    )
+                    .unwrap()
+                } else {
+                    serde_json::from_slice(&body).unwrap()
+                };
+                let input = match endpoint {
+                    "messages" => value["content"][0]["input"].clone(),
+                    "responses" => {
+                        serde_json::from_str(value["output"][0]["arguments"].as_str().unwrap())
+                            .unwrap()
+                    }
+                    _ => serde_json::from_str(
+                        value["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
+                            .as_str()
+                            .unwrap(),
+                    )
+                    .unwrap(),
+                };
+                if input["note"] != "[REDACTED]" {
+                    failures.push(format!(
+                        "{source_protocol}/{endpoint}/stream={stream}: {value}"
+                    ));
+                }
+            }
+        }
+    }
+    gateway.stop().await;
+    upstream.abort();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    assert!(!serde_json::to_string(&store.request_logs("").unwrap())
+        .unwrap()
+        .contains("fictional-coding"));
 }
 
 #[tokio::test]

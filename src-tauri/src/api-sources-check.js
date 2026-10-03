@@ -139,6 +139,10 @@
     const secretDebug = await invoke('debug_curl', { id: `r2-delta-${run_id}`, endpoint: 'responses', body: { model: target, input: 'delta-secret-r2', stream: true }, headers: {}, onProgress: channel });
     check(secretDebug.body.includes('response.completed') && secretDebug.body.includes('[REDACTED]'), 'Debug stream must redact across logical deltas and preserve terminal');
     check(!JSON.stringify(secretDebug).includes('fictional-r2-coding'), 'Converted Debug output and parsed body must not reconstruct a generation key');
+    for (const stream of [false, true]) {
+      const toolDebug = await invoke('debug_curl', { id: `r2-nested-${stream}-${run_id}`, endpoint: 'messages', body: { model: target, messages: [{ role: 'user', content: 'nested-secret-r2' }], max_tokens: 16, stream, tools: [{ name: 'echo', input_schema: { type: 'object', properties: { note: { type: 'string' } } } }] }, headers: {}, onProgress: channel });
+      check(JSON.stringify(toolDebug).includes('[REDACTED]') && !JSON.stringify(toolDebug).includes('fictional-r2-coding'), 'Debug JSON/stream nested tool input must not reconstruct a generation key');
+    }
     for (const endpoint of ['/v1/chat/completions', '/v1/responses', '/v1/messages']) {
       for (const stream of [false, true]) {
         const request = endpoint === '/v1/responses' ? { model: target, input: 'fictional protocol probe', max_output_tokens: 8, stream }
@@ -176,7 +180,7 @@
     const catalog = await control('/__gateway', { port: snapshot.proxy.port, endpoint: '/v1/models' });
     const logs = await invoke('get_request_logs', { since: '2000-01-01T00:00:00Z' });
     for (const source of sources) check(!JSON.stringify([logs, catalog]).includes(`fictional-r2-${source.id}`), 'Directory and logs must not expose a generation key');
-    report.checks.push('missing credential denied; manual probe and Debug hit saved source; Debug logical delta echoes are redacted; three compatible downstream text/stream protocols preserve fixed source and terminal; directory/logs contain no generation secrets');
+    report.checks.push('missing credential denied; manual probe and Debug hit saved source; Debug logical delta and nested tool JSON/SSE echoes are redacted; three compatible downstream text/stream protocols preserve fixed source and terminal; directory/logs contain no generation secrets');
     check(await recordsCount() > 0, 'This run must have real receiver evidence');
     report.ok = true;
   } catch (error) { report.error = `${error?.message || error}\n${error?.stack || ''}`; }
