@@ -5,6 +5,12 @@ use serde::Deserialize;
 use serde_json::Value;
 
 const COMMIT: &str = "e2bff0107bb307337aaa19018ccddd55f64253d5";
+#[derive(PartialEq, Eq)]
+pub enum SessionStatus {
+    Waiting,
+    Complete,
+    Expired,
+}
 pub struct Client {
     base: reqwest::Url,
     key: String,
@@ -149,13 +155,14 @@ impl Client {
         );
         Ok((state, url.into()))
     }
-    pub async fn status(&self, state: &str) -> Result<String> {
+    pub async fn status(&self, state: &str) -> Result<SessionStatus> {
         let value = self
             .request(reqwest::Method::GET, "oauth/status", &[("state", state)])
             .await?;
         match value["status"].as_str() {
-            Some("ok") => Ok("ok".into()),
-            Some("wait") => Ok("wait".into()),
+            Some("ok") => Ok(SessionStatus::Complete),
+            Some("wait") => Ok(SessionStatus::Waiting),
+            Some("error") if value["error"] == "unknown or expired state" => Ok(SessionStatus::Expired),
             _ => anyhow::bail!("CPA authorization failed or expired"),
         }
     }

@@ -126,14 +126,14 @@ pub struct Manager {
     clients: Mutex<HashMap<String, Arc<client::Client>>>,
     attempts: Mutex<HashMap<String, Attempt>>,
     cleaning: Mutex<HashSet<String>>,
-    fixture: Option<Arc<client::Client>>,
+    fixture: Mutex<Option<Arc<client::Client>>>,
 }
 
 impl Manager {
     #[cfg(any(test, feature = "isolation-check"))]
     pub fn owned_fixture(base: String) -> Result<Self> {
         Ok(Self {
-            fixture: Some(Arc::new(client::Client::owned_fixture(base)?)),
+            fixture: Mutex::new(Some(Arc::new(client::Client::owned_fixture(base)?))),
             ..Default::default()
         })
     }
@@ -158,6 +158,16 @@ impl Manager {
             active: &self.cleaning,
             id: id.into(),
         })
+    }
+    fn retire_profile(&self, id: &str, client: &Arc<client::Client>) {
+        let mut clients = self.clients.lock().unwrap();
+        if clients.get(id).is_some_and(|owned| Arc::ptr_eq(owned, client)) {
+            clients.remove(id);
+        }
+        let mut fixture = self.fixture.lock().unwrap();
+        if fixture.as_ref().is_some_and(|owned| Arc::ptr_eq(owned, client)) {
+            *fixture = None;
+        }
     }
     pub fn cleanup_finished(&self, id: &str) -> bool {
         !self.attempts.lock().unwrap().contains_key(id)
@@ -230,7 +240,7 @@ impl Manager {
             );
         })?;
         if clients.is_empty() {
-            if let Some(client) = &self.fixture {
+            if let Some(client) = self.fixture.lock().unwrap().as_ref() {
                 clients.insert(id.clone(), client.clone());
             }
         }
@@ -384,7 +394,11 @@ impl Manager {
             .ok_or_else(|| anyhow::anyhow!("No owned authorization session"))?;
         let result = async {
             let session=attempt.state.as_deref().ok_or_else(||anyhow::anyhow!("Authorization request is still starting"))?;
-            if client.status(session).await? == "wait" { return Ok(None); }
+            match client.status(session).await? {
+                client::SessionStatus::Waiting => return Ok(None),
+                client::SessionStatus::Complete => {},
+                client::SessionStatus::Expired => anyhow::bail!("CPA authorization record expired; disconnect to isolate the old service profile"),
+            }
             let mut files=client.credentials().await?;
             ensure!(files.len()==1 && files[0].provider==store.read().cpa_subscriptions[id].provider && !files[0].disabled, "Dedicated CPA profile must contain exactly one active credential of the expected provider");
             Ok(Some(files.remove(0)))
@@ -472,10 +486,21 @@ impl Manager {
                     // An already persisted cleanup reference outlives CPA's completed-session TTL.
                     let files = client.credentials().await?;
                     if !files.is_empty() {
-                        ensure!(
-                            client.status(session).await? == "ok",
-                            "Owned authorization has not completed"
-                        );
+                        match client.status(session).await? {
+                            client::SessionStatus::Expired => {
+                                // No session-to-file proof remains. Detach this profile;
+                                // never adopt or delete its unclaimed credentials.
+                                store.update(|config| -> Result<()> {
+                                    current(config, id, cleanup_stamp)?.error = Some(
+                                        "Authorization record expired; old service profile isolated. 授权记录已到期，旧服务配置已隔离；请删除旧连接并配置新的专用服务。未认领凭据不会删除。".into());
+                                    Ok(())
+                                })??;
+                                self.retire_profile(id, &client);
+                                return Ok(());
+                            },
+                            client::SessionStatus::Complete => {},
+                            client::SessionStatus::Waiting => anyhow::bail!("Owned authorization has not completed"),
+                        }
                         ensure!(
                             files.len() == 1
                                 && files[0].provider == store.read().cpa_subscriptions[id].provider,

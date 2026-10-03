@@ -156,6 +156,36 @@ async fn failed_reads_keep_history_but_changed_accounts_require_explicit_rebindi
 }
 
 #[tokio::test]
+async fn an_expired_unclaimed_flow_can_be_removed_without_adopting_or_deleting_credentials() {
+    for check_first in [false, true] {
+        let fixture = AccountFixture::start().await;
+        let temp = tempfile::tempdir().unwrap();
+        let store = ConfigStore::load(temp.path().join("expired-unclaimed.db")).unwrap();
+        let manager = Manager::owned_fixture(fixture.base.clone()).unwrap();
+        let id = manager.create(&store, "codex", "Expired authorization").unwrap();
+        manager.begin(&store, &id).await.unwrap();
+        *fixture.account.lock().unwrap() = Some("unclaimed-account");
+        fixture.cancelled.store(false, std::sync::atomic::Ordering::SeqCst);
+        fixture.status_failed.store(true, std::sync::atomic::Ordering::SeqCst);
+        if check_first {
+            assert!(manager.poll(&store, &id).await.is_err());
+        }
+        manager.disconnect(&store, &id, !check_first).await.unwrap();
+        let view = manager.views(&store.read()).remove(0);
+        assert!(view.account.is_none() && view.plan.is_none());
+        assert!(view.authorization_url.is_none() && !view.service_available);
+        assert!(view.error.as_deref().unwrap().contains("isolated"));
+        assert_eq!(*fixture.account.lock().unwrap(), Some("unclaimed-account"));
+        assert!(manager.cleanup_finished(&id));
+        assert!(manager.begin(&store, &id).await.is_err());
+        manager.remove(&store, &id).unwrap();
+        let replacement = manager.create(&store, "codex", "Fresh service required").unwrap();
+        assert!(!manager.views(&store.read()).iter()
+            .find(|c| c.provider_id == replacement).unwrap().service_available);
+    }
+}
+
+#[tokio::test]
 async fn completed_authorization_cancel_can_retry_only_its_owned_cleanup() {
     let fixture = AccountFixture::start().await;
     let temp = tempfile::tempdir().unwrap();

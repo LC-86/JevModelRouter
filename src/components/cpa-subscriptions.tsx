@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { getSnapshot, createCpaSubscription, cpaSubscriptionAction, selectCpaModel } from '../lib/bridge';
+import { getSnapshot, createCpaSubscription, cpaSubscriptionAction, selectCpaModel, deleteProvider } from '../lib/bridge';
 import { cpaStageLabel, type CpaView } from '../lib/cpa';
 import type { DashboardSnapshot } from '../types';
 
@@ -47,6 +47,7 @@ export function CpaSubscriptions({connections,onSnapshot,onNotify}: {
           <button className="button" disabled={!c.service_available||!!busy[c.provider_id]||c.stage!=='connected'} onClick={()=>action('refresh')}>读取目录</button>
           <button className="button" disabled={!!busy[c.provider_id]} onClick={()=>action('disconnect')}>退出连接</button>
           <button className="button" disabled={!c.service_available||!!busy[c.provider_id]||c.stage!=='connected'} onClick={()=>action('switch')}>更换账号</button>
+          <button className="button" disabled={!!busy[c.provider_id]||pending||c.stage==='connected'} onClick={()=>void run(c.provider_id,'remove',()=>deleteProvider(c.provider_id))}>删除连接</button>
         </div>
         {c.models.map(m=><div className="cpa-model" key={m.id} data-cpa-model={m.id}>
           <span>{m.name} · {m.model_id} · {m.bound?'已绑定当前身份':'旧目标/尚未绑定'}</span>
