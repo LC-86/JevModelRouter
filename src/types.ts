@@ -3,6 +3,23 @@ export type ModelTier = 'fast' | 'balanced' | 'strong';
 export type RoutingMode = 'observe' | 'assist' | 'auto';
 export type DecisionProvider = 'openrouter' | 'zenmux';
 
+export type ApiSourceKind = 'official_api' | 'third_party_api' | 'coding_plan';
+export interface ApiSourceDraft {
+  kind: ApiSourceKind;
+  account_label?: string | null;
+  plan_label?: string | null;
+}
+/** Non-secret connection projection; labels do not verify account or plan eligibility. */
+export interface ApiSourceConnection extends ApiSourceDraft {
+  connection_instance_id: string;
+  generation: number;
+  endpoint: string;
+  api_type: string;
+  credential_reference: string;
+  account_state: 'unknown' | 'user_declared';
+  plan_state: 'unknown' | 'user_declared';
+}
+
 export interface Provider {
   preset?: string;
   api_type?: string;
@@ -297,6 +314,7 @@ export interface GatewaySettings {
 }
 export interface GatewayHealth { model_id: string; failures: number; state: string; retry_after_seconds: number; last_status: number }
 export interface DashboardSnapshot {
+  api_sources?: Record<string, ApiSourceConnection>;
   recovery_notice?: string | null;
   gateway?: GatewaySettings;
   health?: GatewayHealth[];

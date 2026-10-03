@@ -1,0 +1,323 @@
+//! R2 public persistence and listening-gateway acceptance; fictional keys only.
+use crate::config::{AppConfig, ConfigStore};
+use axum::{
+    extract::OriginalUri,
+    http::{HeaderMap, StatusCode},
+    response::IntoResponse,
+    routing::post,
+    Json, Router,
+};
+use serde_json::json;
+use std::sync::{Arc, Mutex};
+
+async fn source_fixture() -> (
+    tempfile::TempDir,
+    Arc<ConfigStore>,
+    Arc<Mutex<Vec<serde_json::Value>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let records = received.clone();
+    let task = tokio::spawn(async move {
+        axum::serve(listener, Router::new().fallback(post(move |uri: OriginalUri, headers: HeaderMap, Json(body): Json<serde_json::Value>| {
+            let records = records.clone();
+            async move {
+                let path = uri.0.path().to_string();
+                records.lock().unwrap().push(json!({"path":path,"authorization":headers.get("authorization").and_then(|v|v.to_str().ok()),"model":body["model"]}));
+                if body.pointer("/messages/0/content").and_then(|v| v.as_str()) == Some("split-secret") {
+                    let key = headers["authorization"].to_str().unwrap().trim_start_matches("Bearer ");
+                    let text = format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"你好 {key} {key}\"}},\"finish_reason\":null}}]}}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n");
+                    let chunks: std::collections::VecDeque<_> = text.as_bytes().chunks(3).map(axum::body::Bytes::copy_from_slice).collect();
+                    let stream = futures_util::stream::unfold(chunks, |mut chunks| async move {
+                        let chunk = chunks.pop_front()?;
+                        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                        Some((Ok::<_, std::io::Error>(chunk), chunks))
+                    });
+                    return axum::response::Response::builder().header("content-type", "text/event-stream")
+                        .header("x-request-id", key).body(axum::body::Body::from_stream(stream)).unwrap();
+                }
+                if let Some(status) = body.pointer("/messages/0/content").and_then(|v|v.as_str()).and_then(|v| v.strip_prefix("fail-")).and_then(|v| v.parse::<u16>().ok()) {
+                    return (StatusCode::from_u16(status).unwrap(), Json(json!({"error":{"message":headers["authorization"].to_str().unwrap()}}))).into_response();
+                }
+                if !["/official/v1/chat/completions","/third/api/v1/chat/completions","/coding/v4/chat/completions"].contains(&path.as_str()) {
+                    return (StatusCode::NOT_FOUND, Json(json!({"error":{"message":"unsupported endpoint"}}))).into_response();
+                }
+                Json(json!({"id":"fixture","choices":[{"message":{"role":"assistant","content":path},"finish_reason":"stop"}]})).into_response()
+            }
+        }))).await.unwrap();
+    });
+    let root = tempfile::tempdir().unwrap();
+    let store = Arc::new(ConfigStore::load(root.path().join("sources.db")).unwrap());
+    store.update(|config| {
+        let original_provider = config.providers[0].clone();
+        let original_model = config.models[0].clone();
+        config.providers.clear(); config.models.clear(); config.port = 0;
+        config.gateway.proxy_mode = "direct".into();
+        config.gateway.failure_threshold = 20;
+        config.policy.use_jev_when_ambiguous = true;
+        for (id, kind, endpoint) in [("official","official_api","/official/v1"),("third","third_party_api","/third/api/v1"),("coding","coding_plan","/coding/v4")] {
+            let mut provider = original_provider.clone();
+            provider.id = id.into(); provider.name = id.into(); provider.base_url = format!("http://{address}{endpoint}"); provider.api_type = "chat_completions".into();
+            let mut model = original_model.clone(); model.id = format!("uuid-{id}"); model.provider_id = id.into(); model.model_id = "same-model".into();
+            config.api_sources.insert(id.into(), serde_json::from_value(json!({"connection_instance_id":format!("instance-{id}"),"generation":1,"kind":kind,"endpoint":provider.base_url,"api_type":"chat_completions","credential_reference":format!("provider:{id}"),"account_label":null,"plan_label":null})).unwrap());
+            config.providers.push(provider); config.models.push(model);
+        }
+    }).unwrap();
+    for id in ["official", "third", "coding"] {
+        store
+            .write_secret(&format!("provider:{id}"), &format!("fictional-{id}"))
+            .unwrap();
+    }
+    (root, store, received, task)
+}
+
+#[tokio::test]
+async fn api_sources_same_model_hits_only_the_explicit_endpoint_and_generation_key() {
+    let (_root, store, received, upstream) = source_fixture().await;
+    // A decision key exists but must never be used for generation.
+    store
+        .write_secret("autojev-cloud", "fictional-decision-only")
+        .unwrap();
+    let gateway = crate::proxy::start(store).await.unwrap();
+    for id in ["official", "third", "coding"] {
+        let reply = reqwest::Client::new().post(format!("http://127.0.0.1:{}/v1/chat/completions", gateway.port))
+            .json(&json!({"model":format!("autojev/model/uuid-{id}"),"messages":[{"role":"user","content":"fictional request"}]})).send().await.unwrap();
+        assert_eq!(reply.status(), 200, "{id}: {}", reply.text().await.unwrap());
+    }
+    let records = received.lock().unwrap().clone();
+    assert_eq!(records.len(), 3);
+    for (record, id) in records.iter().zip(["official", "third", "coding"]) {
+        assert_eq!(record["authorization"], format!("Bearer fictional-{id}"));
+        assert_eq!(record["model"], "same-model");
+    }
+    gateway.stop().await;
+    upstream.abort();
+}
+
+#[test]
+fn api_source_identity_survives_reopen_without_projecting_a_secret() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("sources.db");
+    let store = ConfigStore::load(path.clone()).unwrap();
+    let mut value = serde_json::to_value(store.read()).unwrap();
+    value["api_sources"] = json!({"openrouter": {
+        "connection_instance_id":"fixture-connection", "generation":1,
+        "kind":"third_party_api", "endpoint":"https://example.invalid/api/v1",
+        "api_type":"chat_completions", "credential_reference":"provider:openrouter",
+        "account_label":null, "plan_label":null,
+        "account_state":"unknown", "plan_state":"unknown"
+    }});
+    store
+        .update(|config| *config = serde_json::from_value::<AppConfig>(value).unwrap())
+        .unwrap();
+    store
+        .write_secret("provider:openrouter", "fictional-generation-key")
+        .unwrap();
+    drop(store);
+    let reopened = ConfigStore::load(path).unwrap();
+    let projection = serde_json::to_value(reopened.read()).unwrap();
+    assert_eq!(
+        projection["api_sources"]["openrouter"]["connection_instance_id"],
+        "fixture-connection"
+    );
+    assert_eq!(
+        projection["api_sources"]["openrouter"]["plan_state"],
+        "unknown"
+    );
+    assert!(!projection.to_string().contains("fictional-generation-key"));
+}
+
+#[tokio::test]
+async fn api_source_changed_endpoint_is_rejected_without_any_upstream_request() {
+    let (_root, store, received, upstream) = source_fixture().await;
+    store
+        .update(|config| config.providers[2].base_url = config.providers[0].base_url.clone())
+        .unwrap();
+    let gateway = crate::proxy::start(store).await.unwrap();
+    let reply = reqwest::Client::new().post(format!("http://127.0.0.1:{}/v1/chat/completions", gateway.port))
+        .json(&json!({"model":"autojev/model/uuid-coding","messages":[{"role":"user","content":"fixture"}]})).send().await.unwrap();
+    assert!(!reply.status().is_success());
+    assert!(reply
+        .text()
+        .await
+        .unwrap()
+        .contains("source_target_changed"));
+    assert!(received.lock().unwrap().is_empty());
+    gateway.stop().await;
+    upstream.abort();
+}
+
+#[tokio::test]
+async fn api_source_upstream_failure_never_projects_its_generation_secret() {
+    let (_root, store, received, upstream) = source_fixture().await;
+    for status in [200, 401, 429, 500] {
+        // Each error starts with a healthy fixed target; 401 otherwise cools down the next request.
+        let gateway = crate::proxy::start(store.clone()).await.unwrap();
+        let reply = reqwest::Client::new().post(format!("http://127.0.0.1:{}/v1/chat/completions", gateway.port))
+            .json(&json!({"model":"autojev/model/uuid-coding","messages":[{"role":"user","content":format!("fail-{status}")}]})).send().await.unwrap();
+        assert_eq!(
+            reply.status().as_u16(),
+            if status == 200 { 502 } else { status }
+        );
+        let body = reply.text().await.unwrap();
+        assert!(!body.contains("fictional-coding"));
+        assert!(body.contains("[REDACTED]"));
+        gateway.stop().await;
+    }
+    assert_eq!(received.lock().unwrap().len(), 4);
+    assert!(received
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|record| record["path"] == "/coding/v4/chat/completions"));
+    assert!(!serde_json::to_string(&store.request_logs("").unwrap())
+        .unwrap()
+        .contains("fictional-coding"));
+    upstream.abort();
+}
+
+#[tokio::test]
+async fn api_sources_all_refused_targets_dispatch_zero_to_every_other_source() {
+    let (_root, store, received, upstream) = source_fixture().await;
+    let gateway = crate::proxy::start(store.clone()).await.unwrap();
+    let original = store.read();
+    for id in ["official", "third", "coding"] {
+        for condition in ["missing", "disabled", "removed", "protocol"] {
+            store
+                .update(|config| {
+                    *config = original.clone();
+                    if condition == "disabled" {
+                        config
+                            .providers
+                            .iter_mut()
+                            .find(|p| p.id == id)
+                            .unwrap()
+                            .enabled = false;
+                    }
+                    if condition == "removed" {
+                        config.models.retain(|m| m.provider_id != id);
+                    }
+                    if condition == "protocol" {
+                        config
+                            .models
+                            .iter_mut()
+                            .find(|m| m.provider_id == id)
+                            .unwrap()
+                            .api_type = "responses".into();
+                    }
+                })
+                .unwrap();
+            if condition == "missing" {
+                store.delete_secret(&format!("provider:{id}")).unwrap();
+            }
+            let reply = reqwest::Client::new().post(format!("http://127.0.0.1:{}/v1/chat/completions", gateway.port))
+                .json(&json!({"model":format!("autojev/model/uuid-{id}"),"messages":[{"role":"user","content":"fixture"}]})).send().await.unwrap();
+            assert!(!reply.status().is_success(), "{id}/{condition}");
+            let body = reply.text().await.unwrap();
+            assert!(
+                body.contains(match condition {
+                    "missing" => "source_credential_missing",
+                    "disabled" => "source_disabled",
+                    "removed" => "Unknown model",
+                    _ => "source_protocol_unsupported",
+                }),
+                "{id}/{condition}: {body}"
+            );
+            assert!(
+                received.lock().unwrap().is_empty(),
+                "{id}/{condition} dispatched"
+            );
+            store
+                .write_secret(&format!("provider:{id}"), &format!("fictional-{id}"))
+                .unwrap();
+        }
+    }
+    gateway.stop().await;
+    upstream.abort();
+}
+
+#[tokio::test]
+async fn api_source_split_stream_secret_never_reaches_output_headers_or_logs() {
+    let (_root, store, received, upstream) = source_fixture().await;
+    let gateway = crate::proxy::start(store.clone()).await.unwrap();
+    let reply = reqwest::Client::new().post(format!("http://127.0.0.1:{}/v1/chat/completions", gateway.port))
+        .json(&json!({"model":"autojev/model/uuid-coding","stream":true,"messages":[{"role":"user","content":"split-secret"}]})).send().await.unwrap();
+    assert_eq!(reply.status(), 200);
+    assert!(!reply.headers().contains_key("x-request-id"));
+    let body = reply.text().await.unwrap();
+    assert!(body.contains("你好 [REDACTED] [REDACTED]"), "{body}");
+    assert!(body.contains("data: [DONE]"));
+    assert!(!body.contains("fictional-coding"));
+    assert_eq!(received.lock().unwrap().len(), 1);
+    assert!(!serde_json::to_string(&store.request_logs("").unwrap())
+        .unwrap()
+        .contains("fictional-coding"));
+    gateway.stop().await;
+    upstream.abort();
+}
+
+#[tokio::test]
+async fn api_source_legacy_database_copy_preserves_existing_uuid_and_credential_reference() {
+    let (root, store, received, upstream) = source_fixture().await;
+    store
+        .update(|config| {
+            config.api_sources.clear();
+            config.providers.truncate(1);
+            config.models.truncate(1);
+        })
+        .unwrap();
+    let expected = store.read().models[0].clone();
+    let mut legacy = serde_json::to_value(store.read()).unwrap();
+    legacy.as_object_mut().unwrap().remove("api_sources");
+    drop(store);
+    let original = root.path().join("sources.db");
+    let database = rusqlite::Connection::open(&original).unwrap();
+    database
+        .execute(
+            "UPDATE app_meta SET value = ?1 WHERE key = 'config'",
+            [legacy.to_string()],
+        )
+        .unwrap();
+    drop(database);
+    let original_bytes = std::fs::read(&original).unwrap();
+    let copy = root.path().join("isolated-copy.db");
+    std::fs::copy(&original, &copy).unwrap();
+    let reopened = Arc::new(ConfigStore::load(copy).unwrap());
+    let config = reopened.read();
+    assert!(config.api_sources.is_empty());
+    assert_eq!(config.models[0].id, expected.id);
+    assert_eq!(config.models[0].provider_id, expected.provider_id);
+    let gateway = crate::proxy::start(reopened).await.unwrap();
+    let reply = reqwest::Client::new().post(format!("http://127.0.0.1:{}/v1/chat/completions", gateway.port))
+        .json(&json!({"model":format!("autojev/model/{}", expected.id),"messages":[{"role":"user","content":"fixture"}]})).send().await.unwrap();
+    assert_eq!(reply.status(), 200);
+    assert_eq!(
+        received.lock().unwrap()[0]["authorization"],
+        "Bearer fictional-official"
+    );
+    assert_eq!(
+        std::fs::read(original).unwrap(),
+        original_bytes,
+        "Only the isolated copy may be changed"
+    );
+    gateway.stop().await;
+    upstream.abort();
+}
+
+#[tokio::test]
+async fn api_sources_background_schedule_never_generates_or_speed_tests() {
+    let (_root, store, received, upstream) = source_fixture().await;
+    store
+        .update(|config| config.performance_settings.enabled = true)
+        .unwrap();
+    let task = tokio::spawn(crate::performance::schedule(
+        store,
+        Arc::new(crate::performance::Runner::default()),
+    ));
+    tokio::time::sleep(std::time::Duration::from_secs(65)).await;
+    assert!(received.lock().unwrap().is_empty());
+    task.abort();
+    upstream.abort();
+}

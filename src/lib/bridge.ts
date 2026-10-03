@@ -1,4 +1,5 @@
 import type {
+  ApiSourceDraft,
   RouteRule,
   AgentStatus,
   DashboardSnapshot,
@@ -133,7 +134,7 @@ export async function getSnapshot(): Promise<DashboardSnapshot> {
   return invoke('get_snapshot');
 }
 
-export async function saveProvider(provider: Provider, apiKey?: string, addTestModel = false, originalId?: string, creating = false): Promise<DashboardSnapshot> {
+export async function saveProvider(provider: Provider, apiKey?: string, addTestModel = false, originalId?: string, creating = false, source?: ApiSourceDraft): Promise<DashboardSnapshot> {
   if (!isTauri()) {
     const oldId = originalId ?? provider.id;
     if ((creating || oldId !== provider.id) && MOCK.providers.some(p => p.id === provider.id)) throw new Error('Provider ID already exists');
@@ -143,13 +144,19 @@ export async function saveProvider(provider: Provider, apiKey?: string, addTestM
     const next = { ...provider, has_api_key: Boolean(apiKey) || provider.has_api_key };
     if (i >= 0) MOCK.providers[i] = next;
     else MOCK.providers.push(next);
+    if (source && !MOCK.api_sources?.[provider.id]) {
+      MOCK.api_sources ??= {};
+      MOCK.api_sources[provider.id] = { ...source, connection_instance_id: crypto.randomUUID(), generation: 1,
+        endpoint: provider.base_url.replace(/\/+$/, ''), api_type: provider.api_type || 'chat_completions',
+        credential_reference: `provider:${provider.id}`, account_state: source.account_label ? 'user_declared' : 'unknown', plan_state: source.plan_label ? 'user_declared' : 'unknown' };
+    }
     const testedModelId = provider.test_model?.trim();
     if (addTestModel && testedModelId && !MOCK.models.some(m => m.provider_id === provider.id && m.model_id === testedModelId)) {
       MOCK.models.push({ id: crypto.randomUUID(), provider_id: provider.id, model_id: testedModelId, name: testedModelId, api_type: provider.api_type, enabled: true, tier: 'balanced', supports_tools: true, supports_vision: false, supports_reasoning: false, context_window: 1000000, input_cost_per_million: 0, output_cost_per_million: 0, cache_cost_per_million: 0 });
     }
     return structuredClone(MOCK);
   }
-  return invoke('save_provider', { provider, apiKey: apiKey || null, addTestModel, originalId, creating });
+  return invoke('save_provider', { provider, apiKey: apiKey || null, addTestModel, originalId, creating, source });
 }
 
 export async function deleteProvider(id: string): Promise<DashboardSnapshot> {
@@ -294,9 +301,9 @@ export async function importProviders(source: ImportSource): Promise<{ snapshot:
   return invoke('import_providers', { source });
 }
 
-export async function testProviderDraft(provider: Provider, apiKey?: string): Promise<string> {
+export async function testProviderDraft(provider: Provider, apiKey?: string, source?: ApiSourceDraft): Promise<string> {
   if (!isTauri()) throw new Error('Open the desktop app to test provider connections.');
-  return invoke('test_provider_draft', { provider, apiKey: apiKey || null });
+  return invoke('test_provider_draft', { provider, apiKey: apiKey || null, source });
 }
 
 /** 只读刷新订阅连接：生成被拒绝或网关暂停时仍然可用，且不派发任何生成请求。 */

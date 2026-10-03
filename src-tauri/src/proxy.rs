@@ -405,6 +405,15 @@ async fn forward_attempt(context: ProxyContext, headers: HeaderMap, body: Value,
                     if let Err(denial) = crate::subscription::admit_model(&stored, model, provider, protocol) {
                         return subscription_denial(denial, protocol);
                     }
+                    if stored.api_sources.contains_key(&provider.id) {
+                        let upstream = match Protocol::upstream(model, provider) {
+                            Ok(upstream) => upstream,
+                            Err(error) => return protocol_error_response(StatusCode::UNPROCESSABLE_ENTITY, protocol, &error.to_string()),
+                        };
+                        if let Err(error) = crate::api_sources::generation_key(&context.store, &stored, provider, model, upstream) {
+                            return protocol_error_response(StatusCode::PRECONDITION_REQUIRED, protocol, &error.to_string());
+                        }
+                    }
                 }
             }
         }
@@ -517,6 +526,14 @@ async fn forward_attempt(context: ProxyContext, headers: HeaderMap, body: Value,
     if let Err(denial) = crate::subscription::admit_model(&config, &resolved.model, &resolved.provider, source) {
         return subscription_denial(denial, source);
     }
+    let target_protocol = match Protocol::upstream(&resolved.model, &resolved.provider) {
+        Ok(protocol) => protocol,
+        Err(error) => return protocol_error_response(StatusCode::UNPROCESSABLE_ENTITY, source, &error.to_string()),
+    };
+    let generation_key = match crate::api_sources::generation_key(&context.store, &config, &resolved.provider, &resolved.model, target_protocol) {
+        Ok(key) => key,
+        Err(error) => return protocol_error_response(StatusCode::PRECONDITION_REQUIRED, source, &error.to_string()),
+    };
 
     *lease = context.health.acquire(&model_health_id(&config, &resolved.model));
     if lease.is_none() {return error_response(StatusCode::SERVICE_UNAVAILABLE, "Candidate is being probed by another request. Retry shortly.");}
@@ -587,20 +604,14 @@ async fn forward_attempt(context: ProxyContext, headers: HeaderMap, body: Value,
         if !body["stream_options"].is_object() { body["stream_options"] = json!({}); }
         body["stream_options"]["include_usage"] = json!(true);
     }
-    let url = endpoint_url(&resolved.provider.base_url, target.path());
+    let url = crate::api_sources::endpoint_url(&config, &resolved.provider, target);
     let mut request = context.client.post(url).json(&body)
         .header(header::ACCEPT, if streaming { "text/event-stream" } else { "application/json" });
     if target == Protocol::Messages {
         request = request.header("anthropic-version", "2023-06-01");
     }
     if resolved.provider.kind != ProviderKind::Ollama && !crate::subscription::is_subscription_provider(&resolved.provider) {
-        let account = format!("provider:{}", resolved.provider.id);
-        let Some(key) = context.store.read_secret(&account) else {
-            return (StatusCode::PRECONDITION_REQUIRED, Json(source.error(&format!(
-                "{} requires an API key. Add it in AutoJev → Providers.", resolved.provider.name
-            ))),
-            ).into_response();
-        };
+        let key = generation_key.as_ref().expect("admitted API generation credential");
         request = if target == Protocol::Messages { request.header("x-api-key", key) } else { request.bearer_auth(key) };
     }
     if let Some(value) = headers.get("user-agent") { request = request.header("user-agent", value); }
@@ -627,6 +638,8 @@ async fn forward_attempt(context: ProxyContext, headers: HeaderMap, body: Value,
     };
     let status = upstream.status();
     let response_headers = upstream.headers().clone();
+    let redaction_key = config.api_sources.contains_key(&resolved.provider.id).then(|| generation_key.clone()).flatten();
+    let upstream_stream = crate::api_sources::redacted_stream(upstream.bytes_stream(), redaction_key.clone());
     let success = status.is_success();
     capture.lock().unwrap().upstream(target, response_headers.get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok()).is_some_and(|v| v.starts_with("text/event-stream")),
@@ -649,12 +662,12 @@ async fn forward_attempt(context: ProxyContext, headers: HeaderMap, body: Value,
 
     let mut builder = Response::builder().status(status);
     for name in [header::CONTENT_TYPE, header::CACHE_CONTROL, header::RETRY_AFTER] {
-        if let Some(value) = response_headers.get(&name) {
+        if let Some(value) = response_headers.get(&name).filter(|value| !redaction_key.as_ref().is_some_and(|key| value.as_bytes().windows(key.len()).any(|part| part == key.as_bytes()))) {
             builder = builder.header(name, value);
         }
     }
     for name in ["x-request-id", "openai-request-id", "request-id"] {
-        if let Some(value) = response_headers.get(name) {
+        if let Some(value) = response_headers.get(name).filter(|value| !redaction_key.as_ref().is_some_and(|key| value.as_bytes().windows(key.len()).any(|part| part == key.as_bytes()))) {
             builder = builder.header(name, value);
         }
     }
@@ -663,7 +676,7 @@ async fn forward_attempt(context: ProxyContext, headers: HeaderMap, body: Value,
         .header("x-autojev-route-source", &resolved.decision.source);
     if source != target {
         if !success {
-            let error = read_upstream_json(upstream, capture.clone(), config.gateway.stream_idle_seconds).await.ok();
+            let error = read_upstream_json(upstream_stream, capture.clone(), config.gateway.stream_idle_seconds).await.ok();
             let message = error.as_ref().and_then(|body| body.pointer("/error/message").and_then(Value::as_str))
                 .unwrap_or("Upstream rejected the converted request");
             return builder.header(header::CONTENT_TYPE, "application/json")
@@ -677,10 +690,10 @@ async fn forward_attempt(context: ProxyContext, headers: HeaderMap, body: Value,
             }
             return builder.header(header::CONTENT_TYPE, "text/event-stream")
                 .header(header::CACHE_CONTROL, "no-cache")
-                .body(Body::from_stream(protocol::converted_stream_observed(crate::traffic::observe(timed_stream(upstream.bytes_stream(), config.gateway.stream_idle_seconds), capture.clone()), target, source, resolved.model.model_id, tool_map, { let capture = capture.clone(); move || capture.lock().unwrap().log.error = "Response conversion failed".into() },
+                .body(Body::from_stream(protocol::converted_stream_observed(crate::traffic::observe(timed_stream(upstream_stream, config.gateway.stream_idle_seconds), capture.clone()), target, source, resolved.model.model_id, tool_map, { let capture = capture.clone(); move || capture.lock().unwrap().log.error = "Response conversion failed".into() },
                 ))).unwrap();
         }
-        let converted = match read_upstream_json(upstream, capture.clone(), config.gateway.stream_idle_seconds).await.and_then(|body|
+        let converted = match read_upstream_json(upstream_stream, capture.clone(), config.gateway.stream_idle_seconds).await.and_then(|body|
             protocol::convert_response(&body, target, source, &resolved.model.model_id, &tool_map)) {
             Ok(body) => body,
             Err(error) => return (StatusCode::BAD_GATEWAY, Json(source.error(&error.to_string()))).into_response(),
@@ -689,7 +702,7 @@ async fn forward_attempt(context: ProxyContext, headers: HeaderMap, body: Value,
             .body(Body::from(converted.to_string())).unwrap();
     }
     if !streaming && success {
-        return match read_upstream_json(upstream,capture.clone(),config.gateway.stream_idle_seconds).await {
+        return match read_upstream_json(upstream_stream,capture.clone(),config.gateway.stream_idle_seconds).await {
             Ok(body)=>{
                 if body.get("error").is_some_and(|v|!v.is_null()) {
                     let code=body.pointer("/error/code").and_then(Value::as_u64).filter(|n|(400..600).contains(n)).unwrap_or(502) as u16;
@@ -700,7 +713,7 @@ async fn forward_attempt(context: ProxyContext, headers: HeaderMap, body: Value,
             Err(_)=>error_response(StatusCode::BAD_GATEWAY,"Upstream returned invalid JSON or the response body timed out"),
         };
     }
-    let stream = crate::traffic::observe(timed_stream(upstream.bytes_stream(), config.gateway.stream_idle_seconds), capture).map(|chunk| chunk.map_err(std::io::Error::other));
+    let stream = crate::traffic::observe(timed_stream(upstream_stream, config.gateway.stream_idle_seconds), capture).map(|chunk| chunk.map_err(std::io::Error::other));
     builder.body(Body::from_stream(stream)).unwrap_or_else(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "Could not construct upstream response"))
 }
 
@@ -1700,9 +1713,9 @@ mod codex_sse_tests {
     }
 }
 
-async fn read_upstream_json(response: reqwest::Response, capture: crate::traffic::SharedCapture, idle: u64) -> anyhow::Result<Value> {
+async fn read_upstream_json(response: impl futures_util::Stream<Item = Result<axum::body::Bytes, std::io::Error>> + Send, capture: crate::traffic::SharedCapture, idle: u64) -> anyhow::Result<Value> {
     let mut body = Vec::new();
-    let stream = crate::traffic::observe(response.bytes_stream(), capture.clone());
+    let stream = crate::traffic::observe(response, capture.clone());
     futures_util::pin_mut!(stream);
     while let Some(chunk) = tokio::time::timeout(std::time::Duration::from_secs(idle), stream.next()).await? {
         let chunk = chunk?;

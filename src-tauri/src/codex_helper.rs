@@ -4456,7 +4456,7 @@ done
             proxy: Arc::new(tokio::sync::Mutex::new(Some(gateway))),
             sessions: Arc::new(tokio::sync::Mutex::new(crate::subscription::SessionState::default())),
         });
-        let outcome = crate::test_provider_draft(app.state::<crate::AppState>(), draft, None).await;
+        let outcome = crate::test_provider_draft(app.state::<crate::AppState>(), draft, None, None).await;
         let calls = std::fs::read_to_string(format!("{}.calls", log.to_string_lossy())).unwrap_or_default();
         let turn_starts = calls.lines().filter(|method| *method == "turn/start").count();
         let error = outcome.expect_err("a draft Grok provider must not test through the saved Codex connection");
@@ -5840,7 +5840,7 @@ async fn review_pr44_rename_preserves_spent_budget_for_same_generation() {
     provider.id = "codex-renamed".into();
     let app = tauri::test::mock_app();
     app.manage(review_pr44_app_state(store.clone()));
-    crate::save_provider(app.state::<crate::AppState>(), provider.clone(), None, None, Some("codex-fixture".into()), Some(false)).await.unwrap();
+    crate::save_provider(app.state::<crate::AppState>(), provider.clone(), None, None, Some("codex-fixture".into()), Some(false), None).await.unwrap();
     let after = store.read().subscriptions["codex-renamed"].clone();
     assert_eq!(after.generation, before.generation);
     assert_eq!(after.identity, before.identity);
@@ -5883,7 +5883,7 @@ async fn review_pr44_delete_and_recreate_does_not_inherit_consent() {
     let app = tauri::test::mock_app();
     app.manage(review_pr44_app_state(store.clone()));
     crate::delete_provider(app.state::<crate::AppState>(), provider.id.clone()).await.unwrap();
-    crate::save_provider(app.state::<crate::AppState>(), provider.clone(), None, None, None, Some(true)).await.unwrap();
+    crate::save_provider(app.state::<crate::AppState>(), provider.clone(), None, None, None, Some(true), None).await.unwrap();
     // Local callback fixture: account B confirms identity without OAuth or model dispatch.
     store.update(|config| {
         let connection = config.subscriptions.get_mut(&provider.id).unwrap();
@@ -5931,7 +5931,7 @@ async fn review_pr44_recreated_connection_same_account_rejects_old_confirmation(
     let app = tauri::test::mock_app();
     app.manage(review_pr44_app_state(store.clone()));
     crate::delete_provider(app.state::<crate::AppState>(), provider.id.clone()).await.unwrap();
-    crate::save_provider(app.state::<crate::AppState>(), provider.clone(), None, None, None, Some(true)).await.unwrap();
+    crate::save_provider(app.state::<crate::AppState>(), provider.clone(), None, None, None, Some(true), None).await.unwrap();
     crate::begin_subscription_login(app.state::<crate::AppState>(), provider.id.clone()).await.unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(3), async {
         while store.read().subscriptions[&provider.id].state != crate::subscription::ConnectionState::Connected {

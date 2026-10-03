@@ -18,6 +18,9 @@ mod provider_import;
 mod provider_test;
 mod router;
 mod dispatch;
+mod api_sources;
+#[cfg(test)]
+mod api_source_tests;
 mod subscription;
 mod subscription_catalog;
 mod codex_helper;
@@ -68,6 +71,7 @@ struct DashboardSnapshot {
     health: Vec<resilience::Status>,
     agent_catalogs: std::collections::HashMap<String, Vec<agent_catalog::Entry>>,
     providers: Vec<Provider>,
+    api_sources: std::collections::HashMap<String, api_sources::Connection>,
     models: Vec<Model>,
     /// 订阅服务商的连接、只读证据与当前拒绝原因。API 服务商不出现在这里。
     subscriptions: Vec<subscription::SubscriptionView>,
@@ -123,6 +127,7 @@ async fn snapshot(state: &AppState) -> DashboardSnapshot {
         gateway: config.gateway.clone(),
         health: state.proxy.lock().await.as_ref().map_or_else(Vec::new, |p|p.health.statuses()),
         agent_catalogs: config.agent_catalogs.clone(),
+        api_sources: config.api_sources.clone(),
         providers: config.providers,
         models: config.models,
         subscriptions,
@@ -409,6 +414,7 @@ async fn save_provider(
     add_test_model: Option<bool>,
     original_id: Option<String>,
     creating: Option<bool>,
+    source: Option<api_sources::SourceDraft>,
 ) -> Result<DashboardSnapshot, String> {
     provider.id = provider.id.trim().to_owned();
     validate_provider(&provider).map_err(|error| error.to_string())?;
@@ -418,6 +424,7 @@ async fn save_provider(
     provider.has_api_key = false;
     let creating = creating.unwrap_or(false);
     let old_id = original_id.as_deref().unwrap_or(&provider.id).to_owned();
+    api_sources::validate_edit(&state.store.read(), &provider, original_id.as_deref(), source.as_ref(), api_key.as_deref().is_some_and(|key| !key.trim().is_empty())).map_err(|e| e.to_string())?;
     // 重命名/新建的冲突检查必须早于授权迁移：否则 home 已经搬走，配置才失败。
     if let Some(message) = provider_edit_conflict(&state.store.read(), &provider, original_id.as_deref(), creating) {
         return Err(message.to_owned());
@@ -438,7 +445,10 @@ async fn save_provider(
     let new_account = format!("provider:{new_id}");
     let outcome = state.store.update_checked(
         |config| {
+            api_sources::validate_edit(config, &provider, original_id.as_deref(), source.as_ref(), api_key.as_deref().is_some_and(|key| !key.trim().is_empty()))?;
+            let source_provider = provider.clone();
             apply_provider_edit(config, provider, original_id.as_deref(), creating, add_test_model.unwrap_or(false))?;
+            api_sources::apply_edit(config, &source_provider, source.as_ref());
             // 授权已经丢失且连接还需要保留时（迁移失败、跨 kind 变更）：重置连接，逼重新登录。
             // 订阅→非订阅不走这里：sync_provider 已丢弃连接，重置反而会重建订阅条目。
             if needs_connection_reset(transition) {
@@ -714,6 +724,7 @@ async fn delete_provider(
         .update(|config| {
             config.providers.retain(|provider| provider.id != id);
             config.models.retain(|model| model.provider_id != id);
+            config.api_sources.remove(&id);
             subscription::forget_provider(config, &id);
         })
         .map_err(|error| error.to_string())?;
@@ -1190,9 +1201,21 @@ async fn restore_agent(
 }
 
 #[tauri::command]
-async fn test_provider_draft(state: State<'_, AppState>, provider: Provider, api_key: Option<String>) -> Result<String, String> {
+async fn test_provider_draft(state: State<'_, AppState>, provider: Provider, api_key: Option<String>, source: Option<api_sources::SourceDraft>) -> Result<String, String> {
     validate_provider(&provider).map_err(|e| e.to_string())?;
     if provider.test_model.trim().is_empty() { return Err("Enter a test model".into()); }
+    let config = state.store.read();
+    if config.api_sources.contains_key(&provider.id) {
+        api_sources::validate_edit(&config, &provider, Some(&provider.id), source.as_ref(), api_key.as_deref().is_some_and(|key| !key.trim().is_empty())).map_err(|e| e.to_string())?;
+        let model = config.models.iter().find(|model| model.provider_id == provider.id && model.model_id == provider.test_model.trim())
+            .ok_or_else(|| "Save this source model before testing".to_string())?;
+        let protocol = protocol::Protocol::upstream(model, &provider).map_err(|e| e.to_string())?;
+        api_sources::generation_key(&state.store, &config, &provider, model, protocol).map_err(|e| e.to_string())?;
+        let target = format!("autojev/model/{}", model.id);
+        ensure_proxy_running(&state).await?;
+        return test_api_source_target(state.store.clone(), &target, protocol).await;
+    }
+    if source.is_some() { return Err("Save this source connection and model before testing".into()); }
     // 订阅服务商的测试入口共用订阅准入，且不经过 API Key 与 base_url 路径。
     if subscription::is_subscription_provider(&provider) {
         let stored = state.store.read().providers.into_iter()
@@ -1283,7 +1306,19 @@ async fn test_provider(state: State<'_, AppState>, id: String) -> Result<String,
     let provider = state.store.read().providers.into_iter()
         .find(|provider| provider.id == id)
         .ok_or_else(|| "Provider not found".to_string())?;
-    test_provider_draft(state, provider, None).await
+    test_provider_draft(state, provider, None, None).await
+}
+
+async fn test_api_source_target(store: Arc<ConfigStore>, target: &str, protocol: protocol::Protocol) -> Result<String, String> {
+    let body = match protocol {
+        protocol::Protocol::Responses => serde_json::json!({"model":target,"input":"Say OK","max_output_tokens":16,"stream":false}),
+        _ => serde_json::json!({"model":target,"messages":[{"role":"user","content":"Say OK"}],"max_tokens":16,"stream":false}),
+    };
+    let request = dispatch::local_gateway_request(store.read().port, protocol, &body).map_err(|e| e.to_string())?
+        .header("user-agent", "AutoJev/ProviderTest").timeout(std::time::Duration::from_secs(30));
+    let response = dispatch::send_http(request, true).await.map_err(|_| "Source test request failed or timed out".to_string())?;
+    provider_test::check_response(response, None).await?;
+    Ok("Test request succeeded.".into())
 }
 
 fn validate_provider(provider: &Provider) -> anyhow::Result<()> {
@@ -1318,6 +1353,7 @@ fn validate_provider(provider: &Provider) -> anyhow::Result<()> {
 }
 
 fn validate_model(config: &AppConfig, model: &Model) -> anyhow::Result<()> {
+    api_sources::validate_model_identity(config, model)?;
     if model.id.trim().is_empty()
         || model.name.trim().is_empty()
         || model.model_id.trim().is_empty()

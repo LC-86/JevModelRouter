@@ -1,0 +1,53 @@
+# R2：显式 API 来源的隔离验收
+
+依据：[当前规格 #51](https://github.com/LC-86/JevModelRouter/issues/51) 与 [R2 / #53](https://github.com/LC-86/JevModelRouter/issues/53)。本票复用既有 API 派发、三协议转换和固定模型 UUID 网关；订阅认证与 CPA 连接由 R3 接续。
+
+## 实际支持范围
+
+来源表单区分官方 API、第三方 API、使用 Key 的 Coding Plan。OpenRouter 与 ZenMux 是生成来源选项；不需要配置 Choice 或决策密钥。ZenMux 和 Coding Plan 的 endpoint 由用户明确填写，不猜测品牌、套餐或版本路径。
+
+![Coding Plan 来源表单：未知账号/套餐、独立协议入口、保存后才测试](assets/api-sources-r2.png)
+
+截图为本地网页预览，未输入密钥；原生 IPC 与实际请求证据来自下述独立桌面验收。
+
+| 接口 | 本票证据 | 限制 |
+| --- | --- | --- |
+| 官方、OpenRouter、ZenMux、Coding Plan 的 Chat 兼容生成 | 原生 React 表单 → IPC 保存 → 新进程重开 → 固定 UUID 网关 → 各自回环接收器 | 虚构 Key；没有验证任一真实 provider 的权益、额度或生产可用性 |
+| Chat、Responses、Messages 客户端文本与 SSE | 原生验收的三种下游协议均命中固定 Chat 兼容来源并保留终态 | 复用既有转换；不增加该来源未声明的上游协议能力 |
+| 显式 Responses / Messages 上游 | 表单可声明，派发复用现有协议实现 | 本票逐来源桌面验收只验证 Chat 上游；真实接口仍待 R7 |
+| 使用 Key 的 Coding Plan | 独立连接及显式套餐协议基址，例如回环 `/coding/v4` | 不提供全 OAuth；非兼容私有协议、自动套餐识别、权益和额度查询未支持 |
+
+默认价格字段的 `*_price_known` 保持 false，界面显示未知；数值占位不构成零费用证据。Key、用户声明的账号/套餐标签以及模型条目都不证明套餐资格。
+
+## 共享数据与调用边界
+
+`AppConfig.api_sources` / `DashboardSnapshot.api_sources` 是按 Provider ID 索引的非秘密元数据：连接实例 UUID、世代、分类、显式协议基址、上游协议、后端生成的 `provider:<id>` 凭据引用，以及账号/套餐的 unknown 或 user_declared 状态。Provider/Model 既有字段和模型 UUID 保持兼容；没有迁移进订阅连接。
+
+每个新来源连接只绑定一种生成用途。保存后，来源 ID、分类、账号/套餐标签、endpoint、协议和凭据不允许原地替换；更换这些信息或补缺凭据时创建新连接及新模型 UUID。名称、测试模型、选择和停用仍可编辑。模型 UUID 不能原地改绑另一来源或裸模型。
+
+显式来源的网关、已保存来源测试、Debug 与手动测速经过同一生成准入；手动探测也使用本地固定 UUID 网关。缺凭据、停用、模型失效、身份不匹配或未声明的上游协议在派发前拒绝；上游 401/429/5xx/404 只影响该固定目标，不转给其它付费来源。显式来源排除在后台测速调度之外。
+
+新凭据只进入既有后端 credential 存储。DTO、模型目录和日志不返回密钥；上游错误/流内容在解析和记录之前脱敏，跨 HTTP 分块仍有效，携带本次密钥的响应标头不向下游转发。决策密钥使用独立的既有 `autojev-cloud` 引用。
+
+旧 API 配置缺少 api_sources 字段时仍按原协议基址语义加载；旧 UUID、provider 引用、凭据用途、选择状态保持。通用兼容 API 的未分类模式保留旧工作流；已有未分类来源要获得新身份须另建连接。
+
+## 已执行的验收
+
+原生桌面两次独立进程均返回当前 run_id 的成功终态报告：第一次通过实际表单添加四来源，第二次从同一自有临时 DB 重开。两次连接实例、模型 UUID 和 endpoint 完全一致；共 50 次请求的接收记录均核对来源路径、裸模型及虚构凭据匹配，无决策密钥。
+
+Rust 听网关验收覆盖三类来源同名模型、决策/生成凭据隔离、身份篡改拒绝、缺凭据/停用/移除/协议不支持的零请求矩阵、200 错误体与 401/429/500 脱敏、跨 HTTP 分块 SSE/标头/日志脱敏，以及旧格式 DB 的隔离副本 UUID 与有效引用。另启用真实后台调度 65 秒，三类新来源的生成与测速请求均为零。完整精确提交的检查及独立两轴审查结果以 PR Evidence 为准。
+
+首个持久化红灯是 api_sources 重开丢失；endpoint 红灯是 Coding Plan 被追加 `/v1` 后得到 404；准入红灯是篡改身份仍派发成功；秘密红灯是上游错误回显了虚构生成 Key。对应纵向切片修复后均通过。失败矩阵每个上游错误使用独立健康状态，避免把前一次 401 冷却误当作后一次上游的拒绝证据。
+
+复现时只使用本次自有构建目录和脚本创建的临时运行空间：
+
+```sh
+TAURI_DEV_HOST=127.0.0.1 pnpm test
+pnpm build
+pnpm release:check
+CARGO_TARGET_DIR=/absolute/owned-target cargo test --locked --offline --manifest-path src-tauri/Cargo.toml --lib
+CARGO_TARGET_DIR=/absolute/owned-target cargo build --locked --offline --manifest-path src-tauri/Cargo.toml --features isolation-check
+node scripts/check-api-sources-desktop.mjs /absolute/owned-target/debug/autojev
+```
+
+原生脚本输出自有临时证据目录，保留 first/reload 报告、桌面日志、接收记录与仅含虚构凭据的 DB；超时或退出只回收本次启动的进程组和回环服务。isolation-check 仍是显式开发入口，没有新增生产管理端点、登录入口或持久权限。真实模型调用、真实登录、账户额度查询均为 0。
