@@ -396,10 +396,12 @@ impl Service {
         format!("http://127.0.0.1:{}", self.profile.port)
     }
 
-    fn view(&self) -> View {
-        View { running: self.child.id().is_some(), pid: self.child.id(), base_url: self.base(), model_client_key: MODEL_KEY,
+    fn view(&mut self) -> Result<View> {
+        let running = self.child.try_wait()?.is_none();
+        if !running { crate::runtime::cpa_validation_port(0); }
+        Ok(View { running, pid: self.child.id(), base_url: self.base(), model_client_key: MODEL_KEY,
             artifact: serde_json::from_str(include_str!("../../scripts/cpa-artifact.json")).expect("Bundled artifact manifest"),
-            targets: self.profile.targets.iter().map(|t|json!({"prefix":t.prefix,"source":t.source,"account":t.account,"plan":t.plan,"model":t.model,"disabled":t.disabled})).collect() }
+            targets: self.profile.targets.iter().map(|t|json!({"prefix":t.prefix,"source":t.source,"account":t.account,"plan":t.plan,"model":t.model,"disabled":t.disabled})).collect() })
     }
 
     pub async fn stop(mut self) -> Result<()> {
@@ -423,13 +425,22 @@ pub async fn start_cpa_validation(
     profile: Profile,
 ) -> Result<View, String> {
     let mut owned = state.cpa_validation.lock().await;
+    let exited = match owned.as_mut() {
+        Some(service) => service.child.try_wait().map_err(|e| e.to_string())?.is_some(),
+        None => false,
+    };
+    if exited {
+        if let Some(service) = owned.take() {
+            service.stop().await.map_err(|e| format!("{e:#}"))?;
+        }
+    }
     if owned.is_some() {
         return Err("Stop the owned CPA before starting another profile".into());
     }
-    let service = Service::start(binary, profile)
+    let mut service = Service::start(binary, profile)
         .await
         .map_err(|e| format!("{e:#}"))?;
-    let view = service.view();
+    let view = service.view().map_err(|e| format!("{e:#}"))?;
     *owned = Some(service);
     Ok(view)
 }
@@ -458,7 +469,7 @@ pub async fn reload_cpa_validation(
             "CPA reload failed; owned service stopped: {error:#}"
         ));
     }
-    Ok(service.view())
+    service.view().map_err(|e| format!("{e:#}"))
 }
 
 #[tauri::command]
@@ -467,4 +478,67 @@ pub async fn stop_cpa_validation(state: State<'_, crate::AppState>) -> Result<()
         service.stop().await.map_err(|e| format!("{e:#}"))?;
     }
     Ok(())
+}
+
+#[derive(Serialize)]
+pub struct DevelopmentView {
+    state: &'static str,
+    binary: String,
+    port: u16,
+    service: Option<View>,
+    real_generation_enabled: bool,
+    artifact: Value,
+}
+
+// This entry is deliberately absent from ordinary builds. It never provisions
+// OAuth or real credentials, and shares the R1 single-credential fixture rules.
+fn development_profile() -> Result<Option<(String, Profile)>> {
+    if !crate::runtime::isolated() || !cfg!(debug_assertions) { return Ok(None); }
+    let args: Vec<_> = std::env::args().collect();
+    let Some(index) = args.iter().position(|s| s == "--autojev-cpa-service") else { return Ok(None); };
+    let binary = args.get(index + 1).context("Missing pinned CPA artifact path")?.clone();
+    let upstream = args.iter().position(|s| s == "--autojev-upstream")
+        .and_then(|i| args.get(i + 1)).context("Missing loopback fixture")?.clone();
+    let path = crate::runtime::home_dir().context("Missing isolation home")?.join(".autojev/cpa-development-port.json");
+    let port = if path.exists() { serde_json::from_slice(&fs::read(path)?)? } else { 0 };
+    let profile = Profile { upstream, port, targets: ["a1", "a2", "b1", "paid"].iter().map(|account| Target {
+        prefix: format!("jev-{account}"),
+        source: if account.starts_with('a') { "source-a".into() } else { format!("source-{account}") },
+        account: (*account).into(), plan: format!("fictional-plan-{account}"), model: "same-model".into(),
+        aliases: vec!["same-model".into()], keys: vec![format!("fictional-{account}")], disabled: false,
+    }).collect() };
+    profile.validate()?;
+    Ok(Some((binary, profile)))
+}
+
+#[tauri::command]
+pub async fn get_cpa_development_service(state: State<'_, crate::AppState>) -> Result<Option<DevelopmentView>, String> {
+    let Some((binary, profile)) = development_profile().map_err(|e| format!("{e:#}"))? else { return Ok(None); };
+    let mut owned = state.cpa_validation.lock().await;
+    let service = owned.as_mut().map(Service::view).transpose().map_err(|e| format!("{e:#}"))?;
+    let phase = match &service {
+        Some(view) if view.running => "ready",
+        Some(_) => "exited",
+        None if !std::path::Path::new(&binary).is_file() => "missing",
+        None => "stopped",
+    };
+    Ok(Some(DevelopmentView { state: phase, binary, port: profile.port, service,
+        real_generation_enabled: false,
+        artifact: serde_json::from_str(include_str!("../../scripts/cpa-artifact.json")).map_err(|e|e.to_string())?,
+    }))
+}
+
+#[tauri::command]
+pub async fn start_cpa_development_service(state: State<'_, crate::AppState>, binary: String, port: u16) -> Result<View, String> {
+    let Some((_, mut profile)) = development_profile().map_err(|e| format!("{e:#}"))? else {
+        return Err("CPA development service requires the explicit isolated debug profile".into());
+    };
+    profile.port = port;
+    let view = start_cpa_validation(state.clone(), binary, profile).await?;
+    let path = crate::runtime::home_dir().expect("Validated isolation home").join(".autojev/cpa-development-port.json");
+    if let Err(error) = fs::write(path, serde_json::to_vec(&reqwest::Url::parse(&view.base_url).expect("Owned endpoint").port().expect("Owned port")).expect("Port JSON")) {
+        stop_cpa_validation(state).await?;
+        return Err(format!("CPA stopped because its recovery port could not be saved: {error}"));
+    }
+    Ok(view)
 }

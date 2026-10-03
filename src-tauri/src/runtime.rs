@@ -30,6 +30,10 @@ static GROK_HELPER_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 
 pub fn init() -> Result<()> {
     let args: Vec<_> = std::env::args_os().collect();
+    ensure!(
+        option_env!("AUTOJEV_DEVELOPMENT_ISOLATION") != Some("1") || args.iter().any(|arg| arg == "--autojev-isolated"),
+        "This Mac development artifact requires the isolated runner"
+    );
     if let Some(index) = args.iter().position(|arg| arg == "--autojev-isolated") {
         ensure!(
             cfg!(debug_assertions),
