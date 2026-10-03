@@ -185,6 +185,12 @@ pub fn script() -> anyhow::Result<Option<String>> {
             .ok_or_else(|| anyhow::anyhow!("Missing loopback fixture URL"))?,
     )?;
     crate::dispatch::ensure_loopback(&url)?;
+    if let Some(cpa_index) = args.iter().position(|s| s == "--autojev-cpa-check") {
+        let binary = args.get(cpa_index + 1).context("Missing pinned CPA binary path")?;
+        let run_id = args.iter().position(|s| s == "--autojev-cpa-run").and_then(|i|args.get(i + 1)).context("Missing CPA acceptance run ID")?;
+        let config = serde_json::json!({"base": url.to_string().trim_end_matches('/'), "binary": binary, "run_id": run_id, "reload": args.iter().any(|s| s == "--autojev-check-reload")});
+        return Ok(Some(format!("window.__CPA_CHECK__ = {config};\n{}", include_str!("cpa-validation-check.js"))));
+    }
     // Optional login-lifecycle mode: the acceptance driver only rehearses one scenario per run.
     // `catalog` is the #15 read-only directory/quota acceptance path; it signs in first and then
     // rehearses one catalog + quota scenario queue per refresh.

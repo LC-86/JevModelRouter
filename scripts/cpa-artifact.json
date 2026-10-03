@@ -1,0 +1,19 @@
+{
+  "repository": "https://github.com/router-for-me/CLIProxyAPI",
+  "commit": "e2bff0107bb307337aaa19018ccddd55f64253d5",
+  "source_url": "https://codeload.github.com/router-for-me/CLIProxyAPI/tar.gz/e2bff0107bb307337aaa19018ccddd55f64253d5",
+  "source_sha256": "ac4e6e84142973138367efa2e734f08ed2a1b06c75c979e2a8837a09ffb09661",
+  "license": "MIT",
+  "license_url": "https://github.com/router-for-me/CLIProxyAPI/blob/e2bff0107bb307337aaa19018ccddd55f64253d5/LICENSE",
+  "module": "github.com/router-for-me/CLIProxyAPI/v8",
+  "go": "go1.26.0",
+  "toolchain_url": "https://go.dev/dl/go1.26.0.darwin-arm64.tar.gz",
+  "toolchain_sha256": "b1640525dfe68f066d56f200bef7bf4dce955a1a893bd061de6754c211431023",
+  "platform": "darwin/arm64",
+  "version": "r1-e2bff010",
+  "build_date": "2026-10-02",
+  "binary_sha256": "b92fd27a406361a409c04e2c9e1ac54f864e7ecfd4ac202b48ef164038586809",
+  "config_version": 8,
+  "model_api": "/v1/chat/completions",
+  "management_api": "/v8/management/config"
+}
