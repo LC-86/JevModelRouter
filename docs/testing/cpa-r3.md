@@ -98,3 +98,17 @@ R2 原生基线也在此合并结果运行两次，首轮 `97f4d183-cbd8-41d7-9f
 原生首轮 `3cb499be-da70-45fc-8f67-9d3bcfbdc143` / 重启 `7edf3557-7bec-4a5e-aef0-1661475edf56` 均 ok:true。Waiting 取消后保留服务、再次授权进入 waiting，两次删除保留 UUID `8b52355d-8b65-46bc-bc32-fc425e6273a1` 和绑定，重启保持引用；模型/下载/账户查询均 0。本轮测试与文档之外没有生产文件变更，前端96/build/release/native构建属于 b480b45 已通过的相同生产树。
 
 完整 Rust 两次各为 **538 passed / 1 failed**：第一次未改动的旧 CLI 替身测试 `a_superseded_attempt_never_reclaims_the_current_attempt` 报 helper_exited，第二次未改动的 `exclusive_file_lock_prevents_recovery_race` 报 WouldBlock；两项分别定点重跑通过，失败原因未确认。新有界并发回归在两次完整运行都通过。原始证据 `pr61-p1-lock-check` 保留结果，不冒称全量539通过；按父线程指示不扩展旧 CLI/文件锁修复或复审轮次。真实操作仍为 0。
+
+## b5b9e35 全量失败的隔离对照
+
+实际读取上述两个失败日志后，使用全新独占 Cargo target 和每轮专用 TMPDIR，在未改动的 `b5b9e35878def23a1a76ed81938a04639d2cdc3e` 上串行全量 **539/539**（144.13 秒）及默认并行全量 **539/539**（65.61 秒）通过。PR 基线 main `ca5f24a13da5a9e69164329a1d12429b23ceca28` 的自有独立 worktree 默认并行和 64 线程全量各 **525/525** 通过；不写原仓或其他 worktree，不凭定点通过推断偶发。
+
+独立诊断程序重复原文件锁测试的相同操作：独跑 10,000 次阻塞 0 次；同进程并发启动 4 组自有 `/usr/bin/true` 子进程时，drop 后重新加锁阻塞 1,031 次，全部处于 spawn 期间，重试均在 788 微秒内恢复；显式 unlock 对照 10,000 次阻塞 0 次。这实测支持子进程启动继承 flock 引用的并发机制，不是临时文件重名；原失败运行没有 FD 跟踪，不能声称已追踪到那一次具体子进程。
+
+旧 CLI 测试在旧 main 的私有临时目录连续 200 次均通过。源码仅等待计数文件存在，没有等待写入完成，存在候选时序窗口，但本轮没有复现 helper_exited，也没有目标目录碰撞证据；其原失败根因仍未确认，不称“旧 main 已复现”或“已知偶发”。完整命令、精确 head、日志摘要与诊断限制见 `b5-isolated-regression`。没有修改这些模块的生产代码或测试。
+
+## 14:32 的 preflight 外来凭据 P2
+
+用户明确批准处理 [审查意见](https://github.com/LC-86/JevModelRouter/pull/61#discussion_r4173550659)。在 b5b9e35 未修复生产代码上，新增公开 Manager/虚构回环/临时 SQLite 回归实际失败：拒绝非空、未认领凭据空间后 service_available 仍为 true，删除连接后可重新附着同一污染 profile。临时管理 HTTP 失败后显式重试的对照已通过。
+
+现在只有成功读取且列表非空时，隔离匹配的 client 及保留 fixture，随后沿用原失败收尾。失败连接可以退出并删除，替代连接不会重新附着该空间；不认领、不删除外来凭据，也不发起 OAuth。HTTP 失败仍保留专用 profile，原连接恢复后显式授权和清理后的替代连接均可进入 Waiting。两项公开必要回归 **2/2** 通过；外来空间的完整管理收据只有一次 GET credentials。最终提交后的精确 head 全量结果由 PR61 与交付记录补充，真实操作仍为 0。

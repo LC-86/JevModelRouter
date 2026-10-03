@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 struct AccountFixture {
     base: String,
+    requests: Arc<std::sync::Mutex<Vec<(String, String)>>>,
     account: Arc<std::sync::Mutex<Option<&'static str>>>,
     fail: Arc<std::sync::atomic::AtomicBool>,
     entered: Arc<tokio::sync::Notify>,
@@ -84,6 +85,15 @@ impl AccountFixture {
                 (axum::http::StatusCode::OK,Json(json!({"models":[{"id":"same-model"}]})))
             }}))
             .layer(axum::middleware::from_fn(|req,next:axum::middleware::Next|async move {let mut response=next.run(req).await;response.headers_mut().insert("x-cpa-commit","e2bff0107bb307337aaa19018ccddd55f64253d5".parse().unwrap());response}));
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = requests.clone();
+        let router = router.layer(axum::middleware::from_fn(move |request: axum::extract::Request, next: axum::middleware::Next| {
+            let recorded = recorded.clone();
+            async move {
+                recorded.lock().unwrap().push((request.method().to_string(), request.uri().path().to_string()));
+                next.run(request).await
+            }
+        }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move {
@@ -91,6 +101,7 @@ impl AccountFixture {
         });
         Self {
             base,
+            requests,
             account,
             fail,
             entered,
@@ -794,4 +805,58 @@ fn concurrent_begin_disconnect_and_shutdown_finish_within_a_wall_clock_deadline(
     }));
     runtime.shutdown_background();
     if let Err(panic) = result { std::panic::resume_unwind(panic); }
+}
+
+#[tokio::test]
+async fn preflight_foreign_credentials_retire_the_profile_without_adoption_or_deletion() {
+    let fixture = AccountFixture::start().await;
+    *fixture.account.lock().unwrap() = Some("foreign-account");
+    let temp = tempfile::tempdir().unwrap();
+    let store = ConfigStore::load(temp.path().join("foreign-preflight.db")).unwrap();
+    let manager = Manager::owned_fixture(fixture.base.clone()).unwrap();
+    let id = manager.create(&store, "codex", "Foreign preflight").unwrap();
+    let error = manager.begin(&store, &id).await.unwrap_err();
+    assert!(error.to_string().contains("unclaimed credential"));
+    let view = manager.views(&store.read()).remove(0);
+    assert_eq!(view.stage, Stage::Failed);
+    assert!(view.account.is_none() && view.plan.is_none() && view.authorization_url.is_none());
+    assert!(store.read().cpa_subscriptions[&id].credential_ref.is_none());
+    assert!(!view.service_available, "A rejected foreign profile must not be reused");
+    assert!(manager.cleanup_finished(&id));
+    assert!(manager.begin(&store, &id).await.is_err());
+    manager.disconnect(&store, &id, false).await.unwrap();
+    manager.remove(&store, &id).unwrap();
+    let replacement = manager.create(&store, "codex", "Replacement").unwrap();
+    assert!(!manager.views(&store.read())[0].service_available);
+    assert!(manager.begin(&store, &replacement).await.is_err());
+    assert_eq!(*fixture.account.lock().unwrap(), Some("foreign-account"));
+    assert_eq!(*fixture.requests.lock().unwrap(), vec![("GET".into(), "/v8/management/credentials".into())], "No OAuth start, credential deletion, or replacement-profile request");
+}
+
+#[tokio::test]
+async fn preflight_http_failure_keeps_the_profile_available_for_explicit_retry() {
+    let fixture = AccountFixture::start().await;
+    fixture.credentials_failed.store(true, std::sync::atomic::Ordering::SeqCst);
+    let temp = tempfile::tempdir().unwrap();
+    let store = ConfigStore::load(temp.path().join("retry-preflight.db")).unwrap();
+    let manager = Manager::owned_fixture(fixture.base.clone()).unwrap();
+    let id = manager.create(&store, "codex", "Temporary preflight failure").unwrap();
+    assert!(manager.begin(&store, &id).await.is_err());
+    let view = manager.views(&store.read()).remove(0);
+    assert_eq!(view.stage, Stage::Failed);
+    assert!(view.service_available && view.account.is_none() && view.plan.is_none());
+    assert!(manager.cleanup_finished(&id));
+    fixture.credentials_failed.store(false, std::sync::atomic::Ordering::SeqCst);
+    manager.begin(&store, &id).await.unwrap();
+    assert_eq!(manager.views(&store.read())[0].stage, Stage::Waiting);
+    manager.disconnect(&store, &id, false).await.unwrap();
+    manager.remove(&store, &id).unwrap();
+    let replacement = manager.create(&store, "codex", "Replacement after retry").unwrap();
+    assert!(manager.views(&store.read())[0].service_available);
+    manager.begin(&store, &replacement).await.unwrap();
+    manager.disconnect(&store, &replacement, false).await.unwrap();
+    let requests = fixture.requests.lock().unwrap();
+    assert_eq!(requests.iter().filter(|(method, path)| method == "GET" && path.ends_with("/oauth/auth-url")).count(), 2);
+    assert!(!requests.iter().any(|(method, path)| method == "DELETE" && path.ends_with("/credentials")));
+    assert!(fixture.account.lock().unwrap().is_none());
 }

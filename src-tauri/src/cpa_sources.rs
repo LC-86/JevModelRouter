@@ -348,10 +348,12 @@ impl Manager {
             stamp
         };
         let result = async {
-            ensure!(
-                client.credentials().await?.is_empty(),
-                "Dedicated CPA profile contains an unclaimed credential; do not adopt or delete it"
-            );
+            if !client.credentials().await?.is_empty() {
+                self.retire_profile(id, &client);
+                anyhow::bail!(
+                    "Dedicated CPA profile contains an unclaimed credential; old service profile isolated. 旧服务配置已隔离；请删除旧连接并配置新的专用服务。未认领凭据不会删除。"
+                );
+            }
             client
                 .begin(&store.read().cpa_subscriptions[id].provider)
                 .await

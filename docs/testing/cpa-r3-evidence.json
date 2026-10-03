@@ -1066,5 +1066,207 @@
       "account_quota_queries": 0,
       "model_calls": 0
     }
+  },
+  "b5-isolated-regression": {
+    "runs": [
+      {
+        "head": "b5b9e35878def23a1a76ed81938a04639d2cdc3e",
+        "cwd": "/Users/cuilei/Documents/Codex/2026-10-03/task-9/worktree",
+        "command": [
+          "cargo",
+          "test",
+          "--locked",
+          "--offline",
+          "--manifest-path",
+          "src-tauri/Cargo.toml",
+          "--lib",
+          "--",
+          "--test-threads=1"
+        ],
+        "target": "/Users/cuilei/Documents/Codex/2026-10-03/task-9/regression-exclusive-target",
+        "temporary": "/Users/cuilei/Documents/Codex/2026-10-03/task-9/regression-b5-serial/tmp",
+        "threads": 1,
+        "started": "2026-10-03T14:37:19.374645+00:00",
+        "exit_code": 0,
+        "elapsed_seconds": 187.77,
+        "finished": "2026-10-03T14:40:27.146418+00:00",
+        "test_result": "test result: ok. 539 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 144.13s",
+        "log_sha256": "92871194ddf9d5a3bc19f642d36c3f2e74612d35e6a9a097e2f4ebc453579e70"
+      },
+      {
+        "head": "b5b9e35878def23a1a76ed81938a04639d2cdc3e",
+        "cwd": "/Users/cuilei/Documents/Codex/2026-10-03/task-9/worktree",
+        "command": [
+          "cargo",
+          "test",
+          "--locked",
+          "--offline",
+          "--manifest-path",
+          "src-tauri/Cargo.toml",
+          "--lib"
+        ],
+        "target": "/Users/cuilei/Documents/Codex/2026-10-03/task-9/regression-exclusive-target",
+        "temporary": "/Users/cuilei/Documents/Codex/2026-10-03/task-9/regression-b5-parallel/tmp",
+        "threads": "default",
+        "started": "2026-10-03T14:41:18.242006+00:00",
+        "exit_code": 0,
+        "elapsed_seconds": 72.003,
+        "finished": "2026-10-03T14:42:30.245660+00:00",
+        "test_result": "test result: ok. 539 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 65.61s",
+        "log_sha256": "1af0ad260ec999efe899785ebb2a1bc4b6d94b5d4055e6d12ec24d01a24201e9"
+      },
+      {
+        "head": "ca5f24a13da5a9e69164329a1d12429b23ceca28",
+        "cwd": "/Users/cuilei/Documents/Codex/2026-10-03/task-9/regression-main-source",
+        "command": [
+          "cargo",
+          "test",
+          "--locked",
+          "--offline",
+          "--manifest-path",
+          "src-tauri/Cargo.toml",
+          "--lib"
+        ],
+        "target": "/Users/cuilei/Documents/Codex/2026-10-03/task-9/regression-exclusive-target",
+        "temporary": "/Users/cuilei/Documents/Codex/2026-10-03/task-9/regression-main-parallel/tmp",
+        "threads": "default",
+        "started": "2026-10-03T14:43:05.032475+00:00",
+        "exit_code": 0,
+        "elapsed_seconds": 84.342,
+        "finished": "2026-10-03T14:44:29.375767+00:00",
+        "test_result": "test result: ok. 525 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 65.64s",
+        "log_sha256": "6741dac2827d5851a61633cb110fdd06a87815e04b4e3c84412cb8163ac3277b"
+      },
+      {
+        "head": "ca5f24a13da5a9e69164329a1d12429b23ceca28",
+        "cwd": "/Users/cuilei/Documents/Codex/2026-10-03/task-9/regression-main-source",
+        "command": [
+          "cargo",
+          "test",
+          "--locked",
+          "--offline",
+          "--manifest-path",
+          "src-tauri/Cargo.toml",
+          "--lib",
+          "--",
+          "--test-threads=64"
+        ],
+        "target": "/Users/cuilei/Documents/Codex/2026-10-03/task-9/regression-exclusive-target",
+        "temporary": "/Users/cuilei/Documents/Codex/2026-10-03/task-9/regression-main-parallel-stress/tmp",
+        "threads": 64,
+        "started": "2026-10-03T14:46:29.022518+00:00",
+        "exit_code": 0,
+        "elapsed_seconds": 65.968,
+        "finished": "2026-10-03T14:47:34.991060+00:00",
+        "test_result": "test result: ok. 525 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 65.43s",
+        "log_sha256": "2c5c1ac40d18a5d6d6fe92185d35250a9c61870c5db45e114681f18a4a40aa30"
+      }
+    ],
+    "isolation": "Fresh exclusively owned target; new private TMPDIR per run; sequential execution; protected original workspace and other worktrees untouched.",
+    "unchanged_modules": [
+      "src-tauri/src/lifecycle.rs",
+      "src-tauri/src/subscription/auth.rs",
+      "src-tauri/src/subscription/helper.rs"
+    ],
+    "compared_heads": [
+      "5dd59847cc3afb998a6b747fa5153dfef6394d1a",
+      "ca5f24a13da5a9e69164329a1d12429b23ceca28",
+      "b5b9e35878def23a1a76ed81938a04639d2cdc3e"
+    ],
+    "lock_diagnostic": {
+      "artifact": "/Users/cuilei/Documents/Codex/2026-10-03/task-9/lifecycle-lock-probe.rs",
+      "source_sha256": "8f387b6b9b21f3344400c78d20783b12d5c712c3530fd7d11e800149c46d5c50",
+      "results": [
+        {
+          "phase": "alone",
+          "iterations": 10000,
+          "workers": 0,
+          "owned_spawns": 0,
+          "would_block_after_drop": 0,
+          "while_spawning": 0,
+          "recovered": 0,
+          "max_retry_us": 0
+        },
+        {
+          "phase": "absolute-posix-spawn",
+          "iterations": 10000,
+          "workers": 4,
+          "owned_spawns": 7529,
+          "would_block_after_drop": 1031,
+          "while_spawning": 1031,
+          "recovered": 1031,
+          "max_retry_us": 788
+        },
+        {
+          "phase": "absolute-posix-spawn-unlock-control",
+          "iterations": 10000,
+          "workers": 4,
+          "owned_spawns": 4473,
+          "would_block_after_drop": 0,
+          "while_spawning": 0,
+          "recovered": 0,
+          "max_retry_us": 0
+        },
+        {
+          "phase": "path-override-fork",
+          "iterations": 10000,
+          "workers": 4,
+          "owned_spawns": 5087,
+          "would_block_after_drop": 824,
+          "while_spawning": 824,
+          "recovered": 824,
+          "max_retry_us": 3505
+        }
+      ],
+      "mechanism": "Same-process dummy child spawning can retain a flock reference after the parent File drops; explicit unlock removes the observed interference.",
+      "limitation": "Focused controlled reproduction of the unchanged test pattern. Historical failed full run lacks FD tracing; old main full runs did not reproduce the failure."
+    },
+    "cli_diagnostic": {
+      "head": "ca5f24a13da5a9e69164329a1d12429b23ceca28",
+      "unchanged_test": "subscription::auth::lifecycle_tests::a_superseded_attempt_never_reclaims_the_current_attempt",
+      "repeated_runs": 200,
+      "passed": 200,
+      "failed": 0,
+      "result_artifact": "/Users/cuilei/Documents/Codex/2026-10-03/task-9/regression-main-cli-repeat/result.json",
+      "conclusion": "Not reproduced. is_file only waits for counter-file creation, leaving a write-completion timing window, but no evidence proves that window caused the historical helper_exited. Do not label it a known old-main flake or a proven TMPDIR/target collision."
+    },
+    "real_operations": {
+      "oauth_login": 0,
+      "account_quota_queries": 0,
+      "model_calls": 0
+    }
+  },
+  "pr61-preflight-profile": {
+    "review_head": "b5b9e35878def23a1a76ed81938a04639d2cdc3e",
+    "review_id": 5401242099,
+    "discussion_id": 4173550659,
+    "red": {
+      "test": "preflight_foreign_credentials_retire_the_profile_without_adoption_or_deletion",
+      "failure": "A rejected foreign profile must not be reused",
+      "production_changes": false
+    },
+    "green": {
+      "tests": [
+        "preflight_foreign_credentials_retire_the_profile_without_adoption_or_deletion",
+        "preflight_http_failure_keeps_the_profile_available_for_explicit_retry"
+      ],
+      "passed": 2,
+      "failed": 0
+    },
+    "behavior": "Only a confirmed nonempty preflight credential list retires the matching client and fixture. HTTP failures keep the dedicated profile retryable.",
+    "foreign_profile_receipts": [
+      [
+        "GET",
+        "/v8/management/credentials"
+      ]
+    ],
+    "foreign_credential": "unchanged; never adopted or deleted; replacement connection has no retained profile",
+    "transient_failure": "same connection retries into Waiting; after cleanup/removal the retained clean profile also supports a replacement",
+    "after_commit_full_validation": "Recorded on the precise final head in PR61 description and workspace handoff.",
+    "real_operations": {
+      "oauth_login": 0,
+      "account_quota_queries": 0,
+      "model_calls": 0
+    }
   }
 }
