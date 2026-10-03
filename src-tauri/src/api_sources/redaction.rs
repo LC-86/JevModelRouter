@@ -53,6 +53,7 @@ fn redact_json(bytes: &[u8], key: &str) -> Vec<u8> {
 }
 
 struct Frame {
+    event: String,
     text: String,
     data: String,
     value: Option<serde_json::Value>,
@@ -72,17 +73,24 @@ impl Frame {
             .join("\n");
         let mut value: Option<serde_json::Value> = serde_json::from_str(&data).ok();
         if let Some(value) = &mut value {
-            if value["type"].is_null() && value.is_object() {
-                if let Some(event) = text.lines().find_map(|line| line.strip_prefix("event:")) {
-                    value["type"] = event.trim_start().into();
-                }
-            }
             redact_value(value, key);
         }
         Ok(Self {
+            event: text.lines().find_map(|line| line.strip_prefix("event:"))
+                .unwrap_or("").trim_start().into(),
             text: text.into(),
             data,
             value,
+        })
+    }
+
+    // Event-name fallback is classification metadata, never a downstream JSON field.
+    fn kind(&self) -> &str {
+        let Some(value) = self.value.as_ref().filter(|value| value.is_object()) else {
+            return "";
+        };
+        value["type"].as_str().unwrap_or_else(|| {
+            if value["type"].is_null() { &self.event } else { "" }
         })
     }
 
@@ -118,17 +126,9 @@ impl Frame {
 
     fn terminal(&self) -> bool {
         self.data == "[DONE]"
-            || self.value.as_ref().is_some_and(|value| {
-                matches!(
-                    value["type"].as_str(),
-                    Some(
-                        "message_stop"
-                            | "response.completed"
-                            | "response.incomplete"
-                            | "response.failed"
-                    )
-                )
-            })
+            || matches!(self.kind(),
+                "message_stop" | "response.completed" | "response.incomplete" | "response.failed"
+            )
             || self
                 .text
                 .lines()
@@ -155,7 +155,7 @@ struct Channel {
 }
 
 /// Match existing bridge/Debug fields and same-protocol legacy function arguments.
-fn delta_fields(value: &serde_json::Value) -> Vec<(String, String)> {
+fn delta_fields(value: &serde_json::Value, kind: &str) -> Vec<(String, String)> {
     let mut fields = Vec::new();
     if let Some(choices) = value["choices"].as_array() {
         for (i, choice) in choices.iter().enumerate() {
@@ -180,7 +180,7 @@ fn delta_fields(value: &serde_json::Value) -> Vec<(String, String)> {
             }
         }
     }
-    match value["type"].as_str().unwrap_or("") {
+    match kind {
         "content_block_start" => {
             for (name, channel) in [("text", "text"), ("thinking", "reasoning")] {
                 if value["content_block"]["type"] == name {
@@ -241,7 +241,7 @@ fn channels(frames: &[Frame]) -> std::collections::BTreeMap<String, Channel> {
     let mut channels: std::collections::BTreeMap<String, Channel> = Default::default();
     for (frame, item) in frames.iter().enumerate() {
         let Some(value) = &item.value else { continue };
-        for (name, pointer) in delta_fields(value) {
+        for (name, pointer) in delta_fields(value, item.kind()) {
             let Some(text) = value.pointer(&pointer).and_then(|v| v.as_str()) else {
                 continue;
             };

@@ -215,6 +215,23 @@ async fn source_fixture() -> (
                     let stream = futures_util::stream::unfold(chunks, |mut chunks| async move { let chunk = chunks.pop_front()?; tokio::task::yield_now().await; Some((Ok::<_, std::io::Error>(chunk), chunks)) });
                     return axum::response::Response::builder().header("content-type", "text/event-stream").body(axum::body::Body::from_stream(stream)).unwrap();
                 }
+                if let Some(terminal) = body["input"].as_str().or_else(|| body.pointer("/messages/0/content").and_then(|v| v.as_str())).and_then(|v| v.strip_prefix("review-event-meta-")) {
+                    let key = headers.get("authorization").or_else(|| headers.get("x-api-key")).unwrap().to_str().unwrap().trim_start_matches("Bearer ");
+                    let split = key.find("coding").unwrap();
+                    let mut text = "event: ping\ndata: {\"sequence\":1}\n\nevent: ping\ndata: {\"type\":\"provider.original\",\"sequence\":2}\n\nevent: ping\ndata: {\"type\":null,\"sequence\":3}\n\n".to_owned();
+                    for delta in [format!("first: {}", &key[..split]), format!("{} done; ", &key[split..]), key[..split].to_owned()] {
+                        let (event, value) = if terminal == "message_stop" {
+                            ("content_block_delta", json!({"index":0,"delta":{"type":"text_delta","text":delta}}))
+                        } else { ("response.output_text.delta", json!({"output_index":0,"content_index":0,"delta":delta})) };
+                        text.push_str(&format!("event: {event}\ndata: {value}\n\n"));
+                    }
+                    text.push_str(&format!("event: {terminal}\ndata: {{}}\n\n"));
+                    let stream = futures_util::stream::unfold(Some(text), |text| async move {
+                        if let Some(text) = text { Some((Ok::<_, std::io::Error>(axum::body::Bytes::from(text)), None)) }
+                        else { tokio::time::sleep(std::time::Duration::from_secs(2)).await; None }
+                    });
+                    return axum::response::Response::builder().header("content-type", "text/event-stream").body(axum::body::Body::from_stream(stream)).unwrap();
+                }
                 if let Some(mode) = body["input"].as_str().or_else(|| body.pointer("/messages/0/content").and_then(|v| v.as_str())).and_then(|v| v.strip_prefix("review-field-")) {
                     let key = headers["authorization"].to_str().unwrap().trim_start_matches("Bearer ");
                     return ([("content-type", "text/event-stream")], review_distinct_field_stream(mode, key)).into_response();
@@ -869,6 +886,52 @@ async fn api_source_mixed_case_sse_media_type_remains_incremental_and_redacted()
 #[tokio::test]
 async fn api_source_cr_only_sse_remains_incremental_and_redacted() {
     check_api_source_wire_stream("review-wire-cr").await;
+}
+
+#[tokio::test]
+async fn api_source_event_names_classify_without_mutating_json_payloads() {
+    use std::time::Duration;
+    let (_root, store, received, upstream) = source_fixture().await;
+    let gateway = crate::proxy::start(store.clone()).await.unwrap();
+    let mut failures = Vec::new();
+    for terminal in ["response.completed", "response.incomplete", "response.failed", "message_stop"] {
+        let messages = terminal == "message_stop";
+        set_review_source_protocol(&store, if messages { "messages" } else { "responses" });
+        let mut body = json!({"model":"autojev/model/uuid-coding","stream":true});
+        let prompt = format!("review-event-meta-{terminal}");
+        if messages { body["messages"] = json!([{"role":"user","content":prompt}]); body["max_tokens"] = 8.into(); }
+        else { body["input"] = prompt.into(); }
+        let start = tokio::time::Instant::now();
+        let mut reply = reqwest::Client::new().post(format!("http://127.0.0.1:{}/v1/{}", gateway.port, if messages { "messages" } else { "responses" })).timeout(Duration::from_secs(8)).json(&body).send().await.unwrap();
+        assert_eq!(reply.status(), 200);
+        let mut bytes = Vec::new();
+        let marker = format!("event: {terminal}\n");
+        let early = tokio::time::timeout_at(start + Duration::from_secs(1), async {
+            while !String::from_utf8_lossy(&bytes).contains(&marker) {
+                bytes.extend_from_slice(&reply.chunk().await?.ok_or_else(|| anyhow::anyhow!("EOF before terminal"))?);
+            }
+            Ok::<_, anyhow::Error>(())
+        }).await;
+        if !matches!(early, Ok(Ok(()))) { failures.push(format!("{terminal}: terminal not flushed before delayed EOF: {early:?}")); }
+        while let Some(chunk) = reply.chunk().await.unwrap() { bytes.extend_from_slice(&chunk); }
+        let mut text = String::new();
+        let mut pings = Vec::new();
+        for (event, data) in crate::protocol::SseParser::default().push(&bytes).unwrap() {
+            let value: serde_json::Value = serde_json::from_str(&data).unwrap();
+            if event == "ping" { pings.push(value); }
+            else {
+                if value.get("type").is_some() { failures.push(format!("{terminal}/{event}: synthetic type changed payload")); }
+                if let Some(delta) = value["delta"].as_str().or_else(|| value.pointer("/delta/text").and_then(|v| v.as_str())) { text.push_str(delta); }
+            }
+        }
+        if pings != vec![json!({"sequence":1}), json!({"type":"provider.original","sequence":2}), json!({"type":null,"sequence":3})] || text != "first: [REDACTED] done; fictional-" {
+            failures.push(format!("{terminal}: pings={pings:?}, text={text:?}"));
+        }
+    }
+    assert_eq!(received.lock().unwrap().len(), 4);
+    assert!(received.lock().unwrap().iter().all(|r| r["path"].as_str().unwrap().starts_with("/coding/v4/")));
+    gateway.stop().await; upstream.abort();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 #[tokio::test]
