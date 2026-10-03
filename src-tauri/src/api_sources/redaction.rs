@@ -182,20 +182,30 @@ fn delta_fields(value: &serde_json::Value) -> Vec<(String, String)> {
         }
     }
     match value["type"].as_str().unwrap_or("") {
-        "content_block_start" if value["content_block"]["type"] == "text" => {
-            fields.push(("text".into(), "/content_block/text".into()))
+        "content_block_start" => {
+            for (name, channel) in [("text", "text"), ("thinking", "reasoning")] {
+                if value["content_block"]["type"] == name {
+                    fields.push((
+                        format!("{channel}:block:{}", value["index"]),
+                        format!("/content_block/{name}"),
+                    ));
+                }
+            }
         }
         "content_block_delta" => {
             for (name, channel) in [
-                ("text", "text".into()),
-                ("thinking", "reasoning".into()),
+                ("text", format!("text:block:{}", value["index"])),
+                ("thinking", format!("reasoning:block:{}", value["index"])),
                 ("partial_json", format!("tool:{}", value["index"])),
             ] {
                 fields.push((channel, format!("/delta/{name}")));
             }
         }
         "response.output_text.delta" | "response.refusal.delta" => {
-            fields.push(("text".into(), "/delta".into()))
+            fields.push((
+                format!("text:{}:{}", value["output_index"], value["content_index"]),
+                "/delta".into(),
+            ))
         }
         "response.function_call_arguments.delta" => {
             fields.push((format!("tool:{}", value["output_index"]), "/delta".into()))
@@ -204,8 +214,24 @@ fn delta_fields(value: &serde_json::Value) -> Vec<(String, String)> {
             format!("tool:{}", value["output_index"]),
             "/item/arguments".into(),
         )),
+        "response.custom_tool_call_input.delta" => {
+            fields.push((format!("custom:{}", value["output_index"]), "/delta".into()))
+        }
+        "response.output_item.added" if value["item"]["type"] == "custom_tool_call" => fields.push((
+            format!("custom:{}", value["output_index"]),
+            "/item/input".into(),
+        )),
         kind if kind.starts_with("response.reasoning") => {
-            fields.push(("reasoning".into(), "/delta".into()))
+            fields.push((
+                format!(
+                    "reasoning:{kind}:{}:{}",
+                    value["output_index"],
+                    value.get("summary_index")
+                        .or_else(|| value.get("content_index"))
+                        .unwrap_or(&serde_json::Value::Null)
+                ),
+                "/delta".into(),
+            ))
         }
         _ => {}
     }

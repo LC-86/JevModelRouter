@@ -93,8 +93,9 @@ pub fn validate_edit(
         validate_endpoint(&provider.base_url)?;
         crate::protocol::Protocol::parse(&provider.api_type)?;
         ensure!(
-            draft.account_label.as_ref().is_none_or(|s| s.len() <= 160)
-                && draft.plan_label.as_ref().is_none_or(|s| s.len() <= 160),
+            // Match the existing HTML input maxLength, including non-BMP characters.
+            draft.account_label.as_ref().is_none_or(|s| s.encode_utf16().count() <= 160)
+                && draft.plan_label.as_ref().is_none_or(|s| s.encode_utf16().count() <= 160),
             "Source labels must be at most 160 characters"
         );
     }

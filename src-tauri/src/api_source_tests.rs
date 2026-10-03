@@ -10,6 +10,32 @@ use axum::{
 use serde_json::json;
 use std::sync::{Arc, Mutex};
 
+fn review_response_event(kind: &str, mut value: serde_json::Value) -> String {
+    value["type"] = kind.into();
+    format!("event: {kind}\ndata: {value}\n\n")
+}
+
+fn review_custom_input_stream(key: &str) -> String {
+    let mut text = String::new();
+    let mut items: Vec<_> = (0..2).map(|index| json!({"type":"custom_tool_call","id":format!("ctc_{index}"),"call_id":format!("call_{index}"),"name":"echo","input":"","status":"in_progress"})).collect();
+    text.push_str(&review_response_event("response.created", json!({"response":{"id":"fixture","status":"in_progress","output":[]}})));
+    for (index, item) in items.iter().enumerate() {
+        text.push_str(&review_response_event("response.output_item.added", json!({"output_index":index,"item":item})));
+    }
+    let split = key.find("coding").unwrap();
+    for (index, delta) in [(0, format!("你好 {}", &key[..split])), (1, "other raw input".into()), (0, format!("{} 完成", &key[split..])), (1, " retained".into())] {
+        text.push_str(&review_response_event("response.custom_tool_call_input.delta", json!({"output_index":index,"item_id":format!("ctc_{index}"),"delta":delta})));
+    }
+    for (index, item) in items.iter_mut().enumerate() {
+        item["input"] = if index == 0 { format!("你好 {key} 完成") } else { "other raw input retained".into() }.into();
+        item["status"] = "completed".into();
+        text.push_str(&review_response_event("response.custom_tool_call_input.done", json!({"output_index":index,"item_id":item["id"],"input":item["input"]})));
+        text.push_str(&review_response_event("response.output_item.done", json!({"output_index":index,"item":item})));
+    }
+    text.push_str(&review_response_event("response.completed", json!({"response":{"id":"fixture","status":"completed","output":items}})));
+    text
+}
+
 fn review_choice_stream(field: &str, key: &str) -> String {
     let mut choices = Vec::new();
     if field == "tools" {
@@ -40,6 +66,67 @@ fn review_choice_stream(field: &str, key: &str) -> String {
     text
 }
 
+fn review_indexed_stream(mode: &str) -> String {
+    let mut text = String::new();
+    if mode.starts_with("messages-") {
+        let field = if mode == "messages-text" { "text" } else { "thinking" };
+        text.push_str(&review_response_event("message_start", json!({"message":{"id":"fixture","role":"assistant","content":[],"usage":{}}})));
+        for index in 0..2 {
+            let (initial, delta) = if field == "thinking" {
+                if index == 0 { ("fictional-", "coding") } else { ("other", " retained") }
+            } else if index == 0 { ("fictional", "-") } else { ("coding", " 完成") };
+            let mut block = json!({"type":field}); block[field] = initial.into();
+            text.push_str(&review_response_event("content_block_start", json!({"index":index,"content_block":block})));
+            let mut value = json!({"type":format!("{field}_delta")}); value[field] = delta.into();
+            text.push_str(&review_response_event("content_block_delta", json!({"index":index,"delta":value})));
+            if field == "thinking" { text.push_str(&review_response_event("content_block_delta", json!({"index":index,"delta":{"type":"signature_delta","signature":"fixture-signature"}}))); }
+            text.push_str(&review_response_event("content_block_stop", json!({"index":index})));
+        }
+        text.push_str(&review_response_event("message_delta", json!({"delta":{"stop_reason":"end_turn"},"usage":{}})));
+        text.push_str(&review_response_event("message_stop", json!({})));
+    } else {
+        let kind = if mode.starts_with("text") { "response.output_text.delta" } else if mode.starts_with("refusal") { "response.refusal.delta" } else if mode == "reasoning-text" { "response.reasoning_text.delta" } else { "response.reasoning_summary_text.delta" };
+        let mut output = Vec::new();
+        text.push_str(&review_response_event("response.created", json!({"response":{"id":"fixture","status":"in_progress","output":[]}})));
+        for index in 0..2 {
+            let output_index = if mode.ends_with("items") { index } else { 0 };
+            let part_index = if mode.ends_with("items") { 0 } else { index };
+            if mode.ends_with("items") || index == 0 {
+                let item = if mode.starts_with("reasoning") { json!({"id":format!("item_{output_index}"),"type":"reasoning","summary":[]}) } else { json!({"id":format!("item_{output_index}"),"type":"message","role":"assistant","content":[],"status":"in_progress"}) };
+                text.push_str(&review_response_event("response.output_item.added", json!({"output_index":output_index,"item":item})));
+                output.push(item);
+            }
+            let delta = if index == 0 { "fictional-" } else { "coding 完成" };
+            let mut value = json!({"item_id":format!("item_{output_index}"),"output_index":output_index,"delta":delta});
+            value[if mode == "reasoning-summary" { "summary_index" } else { "content_index" }] = part_index.into();
+            if mode.starts_with("text") || mode.starts_with("refusal") {
+                let part = if mode.starts_with("text") { json!({"type":"output_text","text":"","annotations":[]}) } else { json!({"type":"refusal","refusal":""}) };
+                text.push_str(&review_response_event("response.content_part.added", json!({"output_index":output_index,"content_index":part_index,"item_id":value["item_id"],"part":part})));
+            }
+            text.push_str(&review_response_event(kind, value));
+            if mode.starts_with("text") || mode.starts_with("refusal") {
+                let part = if mode.starts_with("text") { json!({"type":"output_text","text":delta,"annotations":[]}) } else { json!({"type":"refusal","refusal":delta}) };
+                output[output_index]["content"].as_array_mut().unwrap().push(part.clone());
+                let field = if mode.starts_with("text") { "text" } else { "refusal" };
+                let mut done = json!({"output_index":output_index,"content_index":part_index,"item_id":format!("item_{output_index}")});
+                done[field] = delta.into();
+                text.push_str(&review_response_event(&kind.replace(".delta", ".done"), done));
+                text.push_str(&review_response_event("response.content_part.done", json!({"output_index":output_index,"content_index":part_index,"item_id":format!("item_{output_index}"),"part":part})));
+            } else {
+                let field = if mode == "reasoning-summary" { "summary" } else { "content" };
+                if output[output_index][field].is_null() { output[output_index][field] = json!([]); }
+                output[output_index][field].as_array_mut().unwrap().push(json!({"type":if field == "summary" { "summary_text" } else { "reasoning_text" },"text":delta}));
+            }
+        }
+        for (index, item) in output.iter_mut().enumerate() {
+            if item["type"] == "message" { item["status"] = "completed".into(); }
+            text.push_str(&review_response_event("response.output_item.done", json!({"output_index":index,"item":item})));
+        }
+        text.push_str(&review_response_event("response.completed", json!({"response":{"id":"fixture","status":"completed","output":output}})));
+    }
+    text
+}
+
 async fn source_fixture() -> (
     tempfile::TempDir,
     Arc<ConfigStore>,
@@ -56,6 +143,16 @@ async fn source_fixture() -> (
             async move {
                 let path = uri.0.path().to_string();
                 records.lock().unwrap().push(json!({"path":path,"authorization":headers.get("authorization").and_then(|v|v.to_str().ok()),"model":body["model"],"n":body["n"]}));
+                if let Some(mode) = body["input"].as_str().or_else(|| body.pointer("/messages/0/content").and_then(|v| v.as_str())).and_then(|v| v.strip_prefix("review-indexed-")) {
+                    return ([("content-type", "text/event-stream")], review_indexed_stream(mode)).into_response();
+                }
+                if body["input"] == "review-custom-input" {
+                    let key = headers["authorization"].to_str().unwrap().trim_start_matches("Bearer ");
+                    let text = review_custom_input_stream(key);
+                    let chunks: std::collections::VecDeque<_> = text.as_bytes().chunks(71).map(axum::body::Bytes::copy_from_slice).collect();
+                    let stream = futures_util::stream::unfold(chunks, |mut chunks| async move { let chunk = chunks.pop_front()?; tokio::task::yield_now().await; Some((Ok::<_, std::io::Error>(chunk), chunks)) });
+                    return axum::response::Response::builder().header("content-type", "text/event-stream").body(axum::body::Body::from_stream(stream)).unwrap();
+                }
                 if let Some(field) = body.pointer("/messages/0/content").and_then(|v| v.as_str()).and_then(|v| v.strip_prefix("review-choice-")) {
                     let key = headers["authorization"].to_str().unwrap().trim_start_matches("Bearer ");
                     let text = review_choice_stream(field, key);
@@ -398,6 +495,101 @@ async fn api_sources_all_refused_targets_dispatch_zero_to_every_other_source() {
     }
     gateway.stop().await;
     upstream.abort();
+}
+
+#[tokio::test]
+async fn api_source_existing_delta_fields_preserve_block_item_and_part_boundaries() {
+    let (_root, store, received, upstream) = source_fixture().await;
+    let gateway = crate::proxy::start(store.clone()).await.unwrap();
+    let mut failures = Vec::new();
+    for mode in ["messages-text", "messages-thinking", "text-items", "text-parts", "refusal-items", "refusal-parts", "reasoning-text", "reasoning-summary"] {
+        let messages = mode.starts_with("messages-");
+        set_review_source_protocol(&store, if messages { "messages" } else { "responses" });
+        let endpoint = if messages { "messages" } else { "responses" };
+        let mut request = json!({"model":"autojev/model/uuid-coding","stream":true,"max_tokens":16});
+        let prompt = format!("review-indexed-{mode}");
+        if messages { request["messages"] = json!([{"role":"user","content":prompt}]); } else { request["input"] = prompt.into(); }
+        let reply = reqwest::Client::new().post(format!("http://127.0.0.1:{}/v1/{endpoint}", gateway.port)).json(&request).send().await.unwrap();
+        assert_eq!(reply.status(), 200);
+        let bytes = reply.bytes().await.unwrap();
+        let mut output = [String::new(), String::new()];
+        let mut terminal = false;
+        for (_, data) in crate::protocol::SseParser::default().push(&bytes).unwrap() {
+            let value: serde_json::Value = serde_json::from_str(&data).unwrap();
+            let kind = value["type"].as_str().unwrap();
+            terminal |= kind == "message_stop" || kind == "response.completed";
+            if messages {
+                let field = if mode == "messages-text" { "text" } else { "thinking" };
+                let piece = if kind == "content_block_start" { value["content_block"][field].as_str() } else if kind == "content_block_delta" { value["delta"][field].as_str() } else { None };
+                if let Some(piece) = piece { output[value["index"].as_u64().unwrap() as usize].push_str(piece); }
+                if value["delta"]["type"] == "signature_delta" { assert_eq!(value["delta"]["signature"], "fixture-signature"); }
+            } else if kind.ends_with(".delta") {
+                let index = if mode.ends_with("items") { &value["output_index"] } else if mode == "reasoning-summary" { &value["summary_index"] } else { &value["content_index"] };
+                output[index.as_u64().unwrap() as usize].push_str(value["delta"].as_str().unwrap());
+            }
+        }
+        assert!(terminal);
+        let expected = if mode == "messages-thinking" { ["[REDACTED]", "other retained"] } else { ["fictional-", "coding 完成"] };
+        if output != expected { failures.push(format!("{mode}: {output:?}")); }
+    }
+    assert_eq!(received.lock().unwrap().len(), 8);
+    assert!(received.lock().unwrap().iter().all(|r| r["path"].as_str().unwrap().starts_with("/coding/v4/")));
+    gateway.stop().await;
+    upstream.abort();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[tokio::test]
+async fn api_source_responses_custom_input_preserves_raw_text_and_item_identity() {
+    let (_root, store, received, upstream) = source_fixture().await;
+    set_review_source_protocol(&store, "responses");
+    let gateway = crate::proxy::start(store).await.unwrap();
+    let reply = reqwest::Client::new().post(format!("http://127.0.0.1:{}/v1/responses", gateway.port))
+        .json(&json!({"model":"autojev/model/uuid-coding","stream":true,"input":"review-custom-input","tools":[{"type":"custom","name":"echo"}]})).send().await.unwrap();
+    assert_eq!(reply.status(), 200);
+    let bytes = reply.bytes().await.unwrap();
+    let mut input = [String::new(), String::new()];
+    let mut done = [String::new(), String::new()];
+    let mut final_output = serde_json::Value::Null;
+    let mut item_ids = [String::new(), String::new()];
+    for (_, data) in crate::protocol::SseParser::default().push(&bytes).unwrap() {
+        let value: serde_json::Value = serde_json::from_str(&data).unwrap();
+        match value["type"].as_str().unwrap() {
+            "response.output_item.added" => {
+                let index = value["output_index"].as_u64().unwrap() as usize;
+                assert_eq!(value["item"]["type"], "custom_tool_call");
+                item_ids[index] = value["item"]["id"].as_str().unwrap().into();
+            }
+            "response.custom_tool_call_input.delta" => {
+                let index = value["output_index"].as_u64().unwrap() as usize;
+                assert_eq!(value["item_id"], item_ids[index]);
+                input[index].push_str(value["delta"].as_str().unwrap());
+            }
+            "response.custom_tool_call_input.done" => {
+                let index = value["output_index"].as_u64().unwrap() as usize;
+                done[index] = value["input"].as_str().unwrap().into();
+            }
+            "response.completed" => final_output = value["response"]["output"].clone(),
+            _ => {}
+        }
+    }
+    assert_eq!(item_ids, ["ctc_0", "ctc_1"]);
+    assert_eq!(done, ["你好 [REDACTED] 完成", "other raw input retained"]);
+    assert_eq!(final_output[0]["input"], done[0]);
+    assert_eq!(final_output[1]["input"], done[1]);
+    assert_eq!(received.lock().unwrap().len(), 1);
+    assert_eq!(received.lock().unwrap()[0]["path"], "/coding/v4/responses");
+    gateway.stop().await;
+    upstream.abort();
+    assert_eq!(input, done, "Raw custom input deltas must match each item's done value");
+}
+
+fn set_review_source_protocol(store: &ConfigStore, protocol: &str) {
+    store.update(|config| {
+        config.providers.iter_mut().find(|p| p.id == "coding").unwrap().api_type = protocol.into();
+        config.models.iter_mut().find(|m| m.id == "uuid-coding").unwrap().api_type.clear();
+        config.api_sources.get_mut("coding").unwrap().api_type = protocol.into();
+    }).unwrap();
 }
 
 #[tokio::test]

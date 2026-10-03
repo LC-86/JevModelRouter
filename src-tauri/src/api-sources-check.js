@@ -39,6 +39,7 @@
         await set('.provider-dialog input[type="url"]', `${base}/${source.id}/${source.id === 'coding' ? 'v4' : 'v1'}`);
         await set('.provider-dialog input[type="password"]', `fictional-r2-${source.id}`);
         await set('#provider-test-model', 'same-model');
+        for (const name of ['account', 'plan']) check(document.querySelector(`[data-testid="api-source-${name}"]`).maxLength === 160, 'Source label UI limit remains 160 UTF-16 units');
         check(document.querySelector('.provider-dialog-actions button[type="button"]').disabled, 'New explicit sources require save before testing');
         await click('.provider-dialog-actions button[type="submit"]');
         await wait(() => !document.querySelector('.provider-dialog'), 'source saved');
@@ -67,6 +68,25 @@
     });
     for (const id of [...sources.map(s => s.id), 'legacy']) check(!JSON.stringify(snapshot).includes(`fictional-r2-${id}`), 'Snapshot must never contain a generation credential');
     report.checks.push(reload ? 'new desktop process preserves source categories, unknown account/plan states and stable UUIDs' : 'desktop creates and saves four classified sources without generation; legacy API identity remains compatible');
+    const labelTemplate = snapshot.providers.find(p => p.id === 'r2-official');
+    const beforeLabels = (await control('/__records')).length;
+    for (const field of ['account_label', 'plan_label']) {
+      for (const [name, label, accepted] of [['chinese60', '中'.repeat(60), true], ['chinese160', '中'.repeat(160), true], ['chinese161', '中'.repeat(161), false], ['emoji80', '😀'.repeat(80), true], ['emoji81', '😀'.repeat(81), false]]) {
+        const id = `r2-label-${field}-${name}-${run_id}`;
+        const args = { provider: { ...labelTemplate, id, name: 'fictional label boundary' }, apiKey: 'fictional-r2-labels', creating: true, addTestModel: false, source: { kind: 'official_api', [field]: label } };
+        if (accepted) {
+          const saved = await invoke('save_provider', args);
+          check(saved.api_sources[id][field] === label && saved.api_sources[id][field.replace('label', 'state')] === 'user_declared', `${field}/${name}: persisted declaration must match`);
+          await invoke('delete_provider', { id });
+        } else {
+          await rejected('save_provider', args, 'Source labels must be at most 160');
+          const saved = await invoke('get_snapshot');
+          check(!saved.providers.some(p => p.id === id) && !saved.api_sources[id], `${field}/${name}: refused label must not persist`);
+        }
+      }
+    }
+    check((await control('/__records')).length === beforeLabels, 'Label saves/refusals must dispatch zero generation');
+    report.checks.push('account/plan labels match UI 160 UTF-16 units: 60/160 Chinese and 80 emoji accepted, overflow rejected before persistence with zero generation');
     await invoke('save_gateway_settings', { gateway: { ...snapshot.gateway, proxy_mode: 'direct', failure_threshold: 20 } });
     snapshot = await invoke('start_proxy');
     const gateway = (target, prompt = 'R2 fictional request', endpoint = '/v1/chat/completions', stream = false) => control('/__gateway', {

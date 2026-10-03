@@ -27,6 +27,8 @@ Chat 同协议沿用既有 `n>1` 透传，文本、拒绝、推理及工具参�
 
 每个新来源连接只绑定一种生成用途。保存后，来源 ID、分类、账号/套餐标签、endpoint、协议和凭据不允许原地替换；更换这些信息或补缺凭据时创建新连接及新模型 UUID。名称、测试模型、选择和停用仍可编辑。模型 UUID 不能原地改绑另一来源或裸模型；模型协议必须继承或匹配来源协议，不匹配的新增和编辑在保存前拒绝。
 
+账号/套餐标签的 160 长度限制与既有 HTML `maxLength` 使用相同的 UTF-16 单位：[浏览器规则](https://developer.mozilla.org/en-US/docs/Web/HTML/Reference/Attributes/maxlength)。中文计一个单位，常用 emoji 计两个；原生保存允许 60/160 个中文与 80 个 emoji，拒绝 161 个中文及 81 个 emoji，失败不持久化、不生成请求。
+
 删除来源会删除其生成凭据，但保留 retired 标记和非秘密 model_bindings；删除模型也保留原 UUID 与裸模型的关系。退休来源 ID 不得重用，重新连接使用新 ID。旧 UUID 和 `<provider>/<model>` 别名不能指向新账号；在途请求持有的连接专属凭据引用不会读到另一个账号或决策用途的 Key。
 
 显式来源的网关、已保存来源测试、Debug 与手动测速经过同一生成准入；手动探测也使用本地固定 UUID 网关。缺凭据、停用、模型失效、身份不匹配或未声明的上游协议在派发前拒绝；上游 401/429/5xx/404 只影响该固定目标，不转给其它付费来源。显式来源排除在后台测速调度之外。
@@ -34,6 +36,27 @@ Chat 同协议沿用既有 `n>1` 透传，文本、拒绝、推理及工具参�
 新凭据只进入既有后端 credential 存储。DTO、模型目录和日志不返回密钥；上游 JSON 解码后的字符串与 SSE data 在记录或转换之前脱敏，JSON 转义、跨 HTTP 分块和跨逻辑 delta 都不能绕过。SSE 使用既有有界解析器；来源脱敏暂存可能构成密钥的 delta 前缀，保持事件及块终态顺序，普通不完整前缀在终态完整放行。既有工具 arguments 字段按内层 JSON 脱敏；分段参数在 JSON 完整后按原事件顺序放行，沿用 16 MiB 上限，避免现有转换器再次解码后重现 Key。注释及来源扩展保留；携带本次密钥的响应标头不向下游转发。决策密钥使用独立的既有 `autojev-cloud` 引用。
 
 旧 API 配置缺少 api_sources 字段时仍按原协议基址语义加载；旧 UUID、provider 引用、凭据用途、选择状态保持。通用兼容 API 的未分类模式保留旧工作流；已有未分类来源要获得新身份须另建连接。
+
+## 既有流式事件的有限对照
+
+对照范围仅为 `protocol/stream.rs` 的 Bridge 产生/消费事件与 DebugProgress 已识别字段，沿用现有 Frame 递归处理、增量通道和终态，不新增协议解析或转换能力。
+
+| 现有事件/字段 | 处理边界 |
+| --- | --- |
+| Chat choices 的 content/refusal、reasoning_content/reasoning | choice index 独立文本/推理通道 |
+| Chat tool_calls.function.arguments | choice + tool index；既有内层 JSON 完整性处理 |
+| Messages content_block_start 的 text/thinking 与对应 text_delta/thinking_delta | block index；初始文本和后续 delta 共用该块通道 |
+| Messages input_json_delta.partial_json | block index；既有 JSON 参数通道 |
+| Responses output_text.delta/refusal.delta | output_index + content_index |
+| Responses function_call_arguments.delta 与 output_item.added 的 function_call.arguments | output_index；既有 JSON 参数通道 |
+| Responses custom_tool_call_input.delta 与 output_item.added 的 custom_tool_call.input | output_index；原始文本通道，保留非 JSON 输入 |
+| 已识别的 response.reasoning*.delta | 事件种类 + output_index + content_index/summary_index |
+| Chat role、工具 ID/name、usage；Messages message_start、tool_use.input、signature_delta、redacted_thinking、ping、message_delta、block_stop | 非追加内容按原帧递归处理；不作为正文/参数拼接 |
+| Responses created/in_progress、content_part.added/done、output_text/refusal/function_call_arguments/custom_tool_call_input.done、output_item.done、reasoning added/done 快照 | 原帧递归处理完整值；不重复追加 done 快照 |
+| Chat DONE；Messages message_stop；Responses completed/incomplete/failed/error | 保留既有终态及错误行为，完整快照递归处理 |
+| SSE 注释、provider extension、非 JSON 多 data 行 | 沿用帧处理，保留逻辑事件内容及元数据 |
+
+同协议 Responses custom-tool input 由既有透传支持；跨协议上游 custom-tool 的既有限制保持。公开回环新增 custom input 的两输出项交错回归，并以八个合法流场景验证 Messages 文本/思考起始块、Responses 文本/拒绝的输出项与内容段、已识别推理文本/摘要段的索引边界。不同输出中的普通前缀不会互相拼接而误改内容；已有三协议文本/参数矩阵继续覆盖其余已支持追加字段。
 
 ## 已执行的验收
 
@@ -54,6 +77,8 @@ Rust 听网关验收覆盖三类来源同名模型、决策/生成凭据隔离�
 PR62 的两项自动代码审查反馈也补出公开行为红灯：round_robin/jev 在429/500/503后依次请求三来源；原生 save_model 接受不匹配协议。修复在解析到显式来源后关闭本次请求重试，并在模型保存前校验协议。六个路由失败组合现在各只请求一个目标；原生新增/编辑拒绝保持配置、零生成，继承和匹配协议仍可使用。未分类旧 API 的既有重试规则保持。
 
 随后两项流式反馈均通过真实回环网关复现：交错 choice 的四种文本/推理字段重组出虚构 Key，同索引工具片段导致流中断；LF/CRLF 非 JSON 多 data 行事件只剩第一行。最小修复为通道键加入上游 choice index，并为每个逻辑行重新输出 data 前缀。五种同协议双 choice 请求保留各自内容、工具 ID/合法参数及终态；两种换行事件完整保留中文、空 data 行和元数据。未新增协议或认证能力。
+
+最新两项反馈补出 custom-tool 原始 input delta 与 done 不一致、原生保存拒绝 60 个中文标签。按既有事件清单对照还复现独立输出前缀误拼、思考块初始字段遗漏；修复限于现有通道的字段/索引映射及标签 UTF-16 计数。custom input、八个索引场景与两次原生进程中的账号/套餐中文、emoji 边界通过。
 
 复现时只使用本次自有构建目录和脚本创建的临时运行空间：
 
