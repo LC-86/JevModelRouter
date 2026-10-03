@@ -15,6 +15,7 @@ use serde_json::{json, Value};
 pub use stream::converted_stream;
 pub use stream::converted_stream_observed;
 pub use stream::{collect_debug_stream, DebugProgress};
+pub(crate) use stream::SseParser;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Protocol {

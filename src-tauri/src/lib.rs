@@ -89,7 +89,7 @@ async fn snapshot(state: &AppState) -> DashboardSnapshot {
     let (mut config, decision_key) = state.store.read_with_decision_key();
     for provider in &mut config.providers {
         provider.has_api_key = (provider.kind == ProviderKind::Ollama
-            || state.store.read_secret(&format!("provider:{}", provider.id)).is_some())
+            || state.store.read_secret(&config.api_sources.get(&provider.id).map(|source| source.credential_reference.clone()).unwrap_or_else(|| format!("provider:{}", provider.id))).is_some())
             && !subscription::is_subscription_provider(provider);
     }
     config.policy.has_autojev_key = decision_key.is_some();
@@ -441,14 +441,16 @@ async fn save_provider(
         AuthTransition::None
     };
     let new_id = provider.id.clone();
-    let old_account = format!("provider:{old_id}");
-    let new_account = format!("provider:{new_id}");
+    let instance_id = uuid::Uuid::new_v4().to_string();
+    let existing_account = state.store.read().api_sources.get(&old_id).map(|source| source.credential_reference.clone());
+    let new_account = existing_account.clone().unwrap_or_else(|| if source.is_some() { format!("api-generation:{instance_id}") } else { format!("provider:{new_id}") });
+    let old_account = existing_account.unwrap_or_else(|| if source.is_some() { new_account.clone() } else { format!("provider:{old_id}") });
     let outcome = state.store.update_checked(
         |config| {
             api_sources::validate_edit(config, &provider, original_id.as_deref(), source.as_ref(), api_key.as_deref().is_some_and(|key| !key.trim().is_empty()))?;
             let source_provider = provider.clone();
             apply_provider_edit(config, provider, original_id.as_deref(), creating, add_test_model.unwrap_or(false))?;
-            api_sources::apply_edit(config, &source_provider, source.as_ref());
+            api_sources::apply_edit(config, &source_provider, source.as_ref(), &instance_id);
             // 授权已经丢失且连接还需要保留时（迁移失败、跨 kind 变更）：重置连接，逼重新登录。
             // 订阅→非订阅不走这里：sync_provider 已丢弃连接，重置反而会重建订阅条目。
             if needs_connection_reset(transition) {
@@ -719,16 +721,17 @@ async fn delete_provider(
     if managed_by_grok_auth(&state.store.read(), &id) {
         prepare_provider_deletion(&state.store.read(), &*state.store.auth, &id)?;
     }
+    let account = state.store.read().api_sources.get(&id).map(|source| source.credential_reference.clone()).unwrap_or_else(|| format!("provider:{id}"));
     state
         .store
         .update(|config| {
             config.providers.retain(|provider| provider.id != id);
             config.models.retain(|model| model.provider_id != id);
-            config.api_sources.remove(&id);
+            if let Some(source) = config.api_sources.get_mut(&id) { source.retired = true; }
             subscription::forget_provider(config, &id);
         })
         .map_err(|error| error.to_string())?;
-    state.store.delete_secret(&format!("provider:{id}")).map_err(|error| error.to_string())?;
+    state.store.delete_secret(&account).map_err(|error| error.to_string())?;
     Ok(snapshot(&state).await)
 }
 
@@ -772,6 +775,7 @@ async fn save_model(state: State<'_, AppState>, mut model: Model) -> Result<Dash
     model.model_id = model.model_id.trim().to_owned();
     state.store.update(|config| -> anyhow::Result<()> {
         validate_model(config, &model)?;
+        api_sources::remember_model(config, &model);
         if let Some(existing) = config.models.iter_mut().find(|item| item.id == model.id) {
             *existing = model;
         } else { config.models.push(model); }
@@ -1210,7 +1214,7 @@ async fn test_provider_draft(state: State<'_, AppState>, provider: Provider, api
         let model = config.models.iter().find(|model| model.provider_id == provider.id && model.model_id == provider.test_model.trim())
             .ok_or_else(|| "Save this source model before testing".to_string())?;
         let protocol = protocol::Protocol::upstream(model, &provider).map_err(|e| e.to_string())?;
-        api_sources::generation_key(&state.store, &config, &provider, model, protocol).map_err(|e| e.to_string())?;
+        api_sources::admit_generation_target(&state.store, &config, &provider, model, protocol).map_err(|e| e.to_string())?;
         let target = format!("autojev/model/{}", model.id);
         ensure_proxy_running(&state).await?;
         return test_api_source_target(state.store.clone(), &target, protocol).await;

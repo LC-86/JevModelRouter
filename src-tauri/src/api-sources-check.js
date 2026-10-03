@@ -51,6 +51,7 @@
       check(!snapshot.api_sources['r2-legacy'], 'Legacy API remains unclassified and keeps its existing dispatch path');
     }
     let snapshot = await invoke('get_snapshot');
+    if (reload) check(Object.entries(snapshot.api_sources).some(([id, source]) => id.startsWith('r2-retired-') && source.retired && Object.keys(source.model_bindings).length > 0), 'Retired connection/model identities must survive a new process');
     report.saved = [...sources.map(s => s.id), 'legacy'].map(id => {
       const provider = snapshot.providers.find(p => p.id === `r2-${id}`);
       const model = snapshot.models.find(m => m.provider_id === provider?.id && m.model_id === 'same-model');
@@ -60,7 +61,7 @@
         check(source && source.kind === sources.find(s => s.id === id).kind && source.generation === 1, 'Source category or generation changed');
         check(source.plan_state === 'unknown' && source.account_state === 'unknown', 'Key/model entry cannot establish account or plan eligibility');
         check(model.input_price_known === false && model.output_price_known === false, 'Unknown fees must stay unknown');
-        check(source.credential_reference === `provider:${provider.id}`, 'Generation credential must have its own purpose reference');
+        check(source.credential_reference === `api-generation:${source.connection_instance_id}`, 'Generation credential must be bound to this immutable connection instance');
       }
       return { id, provider_id: provider.id, model_uuid: model.id, source_instance: source?.connection_instance_id || null, endpoint: provider.base_url };
     });
@@ -122,13 +123,14 @@
     check((await gateway('same-model')).body.includes('Ambiguous model'), 'A bare same-name model must not choose a source');
     check(await recordsCount() === before, 'Invalid/ambiguous targets dispatch zero requests');
     report.checks.push('identity edits rejected; 401/429/503/404 stay on the fixed source; deselection preserves UUID; disabled/invalid/unsupported/ambiguous targets dispatch zero through gateway, test, Debug and manual probe');
-    let next = await invoke('save_provider', { provider: { ...provider, id: 'r2-missing', name: 'missing fictional credential' }, creating: true, source: { kind: 'official_api' }, addTestModel: true });
-    const missing = next.models.find(m => m.provider_id === 'r2-missing');
+    const missingId = `r2-missing-${run_id}`;
+    let next = await invoke('save_provider', { provider: { ...provider, id: missingId, name: 'missing fictional credential' }, creating: true, source: { kind: 'official_api' }, addTestModel: true });
+    const missing = next.models.find(m => m.provider_id === missingId);
     before = await recordsCount();
     check((await gateway(`autojev/model/${missing.id}`)).body.includes('source_credential_missing'), 'Missing generation key must not use the decision key');
-    await rejected('test_provider', { id: 'r2-missing' }, 'source_credential_missing');
+    await rejected('test_provider', { id: missingId }, 'source_credential_missing');
     check(await recordsCount() === before, 'Missing generation credential must dispatch zero');
-    await invoke('delete_provider', { id: 'r2-missing' });
+    await invoke('delete_provider', { id: missingId });
     // Explicit manual probes and Debug go through the same normal gateway target.
     await invoke('start_model_speed_tests', { ids: [coding.model_uuid] });
     await wait(async () => !(await invoke('get_model_performance')).job.running, 'manual probe complete');
@@ -143,12 +145,29 @@
         if (stream) check(result.body.includes(endpoint.endsWith('responses') ? 'response.completed' : endpoint.endsWith('messages') ? 'message_stop' : '[DONE]'), 'Require explicit stream terminal');
       }
     }
+    const retiredSnapshot = await invoke('save_provider', { provider: { ...provider, id: `r2-retired-${run_id}`, name: 'retired fictional source' }, apiKey: 'fictional-r2-coding', source: { kind: 'coding_plan' }, creating: true, addTestModel: true });
+    const retiredId = `r2-retired-${run_id}`;
+    const retiredModel = retiredSnapshot.models.find(m => m.provider_id === retiredId);
+    before = await recordsCount();
+    await invoke('delete_model', { id: retiredModel.id });
+    await rejected('save_model', { model: { ...retiredModel, provider_id: 'r2-openrouter' } }, 'Create a new model');
+    await invoke('save_model', { model: retiredModel });
+    const inflight = gateway(`autojev/model/${retiredModel.id}`, 'inflight-r2');
+    await wait(async () => await recordsCount() > before, 'fixed inflight target reached');
+    await invoke('delete_provider', { id: retiredId });
+    await rejected('save_provider', { provider: { ...provider, id: retiredId, base_url: `${base}/official/v1` }, apiKey: 'fictional-r2-official', source: { kind: 'official_api' }, creating: true }, 'Create a new source connection');
+    check((await inflight).body.includes('OK coding'), 'An inflight request keeps its original source and credential after deletion');
+    before = await recordsCount();
+    check((await gateway(`autojev/model/${retiredModel.id}`)).status !== 200, 'A deleted fixed target must stay invalid');
+    check((await gateway(`${retiredId}/same-model`)).status !== 200, 'A deleted provider alias must stay invalid');
+    check(await recordsCount() === before, 'Deleted UUID/connection references must never dispatch to a new source');
+    report.checks.push('deleted UUIDs/provider aliases cannot be rebound; an inflight request keeps its original source/credential');
     const catalog = await control('/__gateway', { port: snapshot.proxy.port, endpoint: '/v1/models' });
     const logs = await invoke('get_request_logs', { since: '2000-01-01T00:00:00Z' });
     for (const source of sources) check(!JSON.stringify([logs, catalog]).includes(`fictional-r2-${source.id}`), 'Directory and logs must not expose a generation key');
     report.checks.push('missing credential denied; manual probe and Debug hit saved source; three compatible downstream text/stream protocols preserve fixed source and terminal; directory/logs contain no generation secrets');
     check(await recordsCount() > 0, 'This run must have real receiver evidence');
     report.ok = true;
-  } catch (error) { report.error = String(error?.stack || error); }
+  } catch (error) { report.error = `${error?.message || error}\n${error?.stack || ''}`; }
   await invoke('isolation_check_report', { report });
 })();

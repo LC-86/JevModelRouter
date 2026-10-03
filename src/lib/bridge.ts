@@ -146,9 +146,10 @@ export async function saveProvider(provider: Provider, apiKey?: string, addTestM
     else MOCK.providers.push(next);
     if (source && !MOCK.api_sources?.[provider.id]) {
       MOCK.api_sources ??= {};
-      MOCK.api_sources[provider.id] = { ...source, connection_instance_id: crypto.randomUUID(), generation: 1,
+      const instanceId = crypto.randomUUID();
+      MOCK.api_sources[provider.id] = { ...source, connection_instance_id: instanceId, generation: 1,
         endpoint: provider.base_url.replace(/\/+$/, ''), api_type: provider.api_type || 'chat_completions',
-        credential_reference: `provider:${provider.id}`, account_state: source.account_label ? 'user_declared' : 'unknown', plan_state: source.plan_label ? 'user_declared' : 'unknown' };
+        credential_reference: `api-generation:${instanceId}`, retired: false, model_bindings: {}, account_state: source.account_label ? 'user_declared' : 'unknown', plan_state: source.plan_label ? 'user_declared' : 'unknown' };
     }
     const testedModelId = provider.test_model?.trim();
     if (addTestModel && testedModelId && !MOCK.models.some(m => m.provider_id === provider.id && m.model_id === testedModelId)) {

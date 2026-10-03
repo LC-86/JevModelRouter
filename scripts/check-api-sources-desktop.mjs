@@ -37,6 +37,7 @@ const fixture = createServer(async (req, res) => {
     res.writeHead(400, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: { message: 'Wrong fixed fixture target' } })); return;
   }
   const mode = modes.get(source) || 200;
+  if (JSON.stringify(body).includes('inflight-r2')) await new Promise(r => setTimeout(r, 300));
   if (mode !== 200) {
     res.writeHead(mode, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ error: { message: `fixture rejection ${req.headers.authorization}` } })); return;

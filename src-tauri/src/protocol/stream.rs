@@ -7,11 +7,27 @@ use std::collections::{HashMap, VecDeque};
 const MAX_FRAME: usize = 2 * 1024 * 1024;
 const MAX_OUTPUT: usize = 16 * 1024 * 1024;
 #[derive(Default)]
-pub(super) struct SseParser {
+pub(crate) struct SseParser {
     buffer: Vec<u8>,
 }
 impl SseParser {
     pub fn push(&mut self, bytes: &[u8]) -> Result<Vec<(String, String)>> {
+        let mut frames = vec![];
+        for frame in self.push_raw(bytes)? {
+            let frame = String::from_utf8(frame)?;
+            let mut event = String::new();
+            let mut data = vec![];
+            for line in frame.lines() {
+                if let Some(value) = line.strip_prefix("event:") { event = value.trim_start().into(); }
+                if let Some(value) = line.strip_prefix("data:") { data.push(value.strip_prefix(' ').unwrap_or(value)); }
+            }
+            if !data.is_empty() { frames.push((event, data.join("\n"))); }
+        }
+        Ok(frames)
+    }
+
+    /// Preserve comments and provider extensions while sharing the same bounded framing.
+    pub fn push_raw(&mut self, bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
         self.buffer.extend_from_slice(bytes);
         let mut frames = vec![];
         loop {
@@ -35,20 +51,7 @@ impl SseParser {
             if end > MAX_FRAME {
                 bail!("Upstream SSE frame is too large");
             }
-            let frame = String::from_utf8(self.buffer.drain(..end + length).collect())?;
-            let mut event = String::new();
-            let mut data = vec![];
-            for line in frame.lines() {
-                if let Some(value) = line.strip_prefix("event:") {
-                    event = value.trim_start().into();
-                }
-                if let Some(value) = line.strip_prefix("data:") {
-                    data.push(value.strip_prefix(' ').unwrap_or(value));
-                }
-            }
-            if !data.is_empty() {
-                frames.push((event, data.join("\n")));
-            }
+            frames.push(self.buffer.drain(..end + length).collect());
         }
         if self.buffer.len() > MAX_FRAME {
             bail!("Upstream SSE frame is too large");

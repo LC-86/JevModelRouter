@@ -41,6 +41,25 @@ async fn source_fixture() -> (
                 if let Some(status) = body.pointer("/messages/0/content").and_then(|v|v.as_str()).and_then(|v| v.strip_prefix("fail-")).and_then(|v| v.parse::<u16>().ok()) {
                     return (StatusCode::from_u16(status).unwrap(), Json(json!({"error":{"message":headers["authorization"].to_str().unwrap()}}))).into_response();
                 }
+                if serde_json::to_string(&body).unwrap().contains("escaped-secret") {
+                    let key = headers["authorization"].to_str().unwrap().trim_start_matches("Bearer ");
+                    let escaped = format!("\\u0066{}", &key[1..]);
+                    if body["stream"] == true {
+                        return ([("content-type", "text/event-stream")], format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"{escaped}\"}},\"finish_reason\":null}}]}}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n")).into_response();
+                    }
+                    return ([("content-type", "application/json")], format!("{{\"error\":{{\"message\":\"{escaped}\"}}}}")).into_response();
+                }
+                if serde_json::to_string(&body).unwrap().contains("inflight-secret") { tokio::time::sleep(std::time::Duration::from_millis(150)).await; }
+                if serde_json::to_string(&body).unwrap().contains("slow-json") {
+                    let bytes = serde_json::to_vec(&json!({"choices":[{"message":{"role":"assistant","content":"fictional slow response"},"finish_reason":"stop"}]})).unwrap();
+                    let chunks: std::collections::VecDeque<_> = bytes.chunks(16).map(axum::body::Bytes::copy_from_slice).collect();
+                    let stream = futures_util::stream::unfold(chunks, |mut chunks| async move {
+                        let chunk = chunks.pop_front()?;
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        Some((Ok::<_, std::io::Error>(chunk), chunks))
+                    });
+                    return axum::response::Response::builder().header("content-type", "application/json").body(axum::body::Body::from_stream(stream)).unwrap();
+                }
                 if !["/official/v1/chat/completions","/third/api/v1/chat/completions","/coding/v4/chat/completions"].contains(&path.as_str()) {
                     return (StatusCode::NOT_FOUND, Json(json!({"error":{"message":"unsupported endpoint"}}))).into_response();
                 }
@@ -61,13 +80,16 @@ async fn source_fixture() -> (
             let mut provider = original_provider.clone();
             provider.id = id.into(); provider.name = id.into(); provider.base_url = format!("http://{address}{endpoint}"); provider.api_type = "chat_completions".into();
             let mut model = original_model.clone(); model.id = format!("uuid-{id}"); model.provider_id = id.into(); model.model_id = "same-model".into();
-            config.api_sources.insert(id.into(), serde_json::from_value(json!({"connection_instance_id":format!("instance-{id}"),"generation":1,"kind":kind,"endpoint":provider.base_url,"api_type":"chat_completions","credential_reference":format!("provider:{id}"),"account_label":null,"plan_label":null})).unwrap());
+            config.api_sources.insert(id.into(), serde_json::from_value(json!({"connection_instance_id":format!("instance-{id}"),"generation":1,"kind":kind,"endpoint":provider.base_url,"api_type":"chat_completions","credential_reference":format!("api-generation:instance-{id}"),"model_bindings":std::collections::HashMap::from([(model.id.clone(), model.model_id.clone())]),"account_label":null,"plan_label":null})).unwrap());
             config.providers.push(provider); config.models.push(model);
         }
     }).unwrap();
     for id in ["official", "third", "coding"] {
         store
-            .write_secret(&format!("provider:{id}"), &format!("fictional-{id}"))
+            .write_secret(
+                &format!("api-generation:instance-{id}"),
+                &format!("fictional-{id}"),
+            )
             .unwrap();
     }
     (root, store, received, task)
@@ -105,7 +127,7 @@ fn api_source_identity_survives_reopen_without_projecting_a_secret() {
     value["api_sources"] = json!({"openrouter": {
         "connection_instance_id":"fixture-connection", "generation":1,
         "kind":"third_party_api", "endpoint":"https://example.invalid/api/v1",
-        "api_type":"chat_completions", "credential_reference":"provider:openrouter",
+        "api_type":"chat_completions", "credential_reference":"api-generation:fixture-connection",
         "account_label":null, "plan_label":null,
         "account_state":"unknown", "plan_state":"unknown"
     }});
@@ -113,7 +135,7 @@ fn api_source_identity_survives_reopen_without_projecting_a_secret() {
         .update(|config| *config = serde_json::from_value::<AppConfig>(value).unwrap())
         .unwrap();
     store
-        .write_secret("provider:openrouter", "fictional-generation-key")
+        .write_secret("api-generation:fixture-connection", "fictional-generation-key")
         .unwrap();
     drop(store);
     let reopened = ConfigStore::load(path).unwrap();
@@ -210,7 +232,9 @@ async fn api_sources_all_refused_targets_dispatch_zero_to_every_other_source() {
                 })
                 .unwrap();
             if condition == "missing" {
-                store.delete_secret(&format!("provider:{id}")).unwrap();
+                store
+                    .delete_secret(&format!("api-generation:instance-{id}"))
+                    .unwrap();
             }
             let reply = reqwest::Client::new().post(format!("http://127.0.0.1:{}/v1/chat/completions", gateway.port))
                 .json(&json!({"model":format!("autojev/model/uuid-{id}"),"messages":[{"role":"user","content":"fixture"}]})).send().await.unwrap();
@@ -230,7 +254,10 @@ async fn api_sources_all_refused_targets_dispatch_zero_to_every_other_source() {
                 "{id}/{condition} dispatched"
             );
             store
-                .write_secret(&format!("provider:{id}"), &format!("fictional-{id}"))
+                .write_secret(
+                    &format!("api-generation:instance-{id}"),
+                    &format!("fictional-{id}"),
+                )
                 .unwrap();
         }
     }
@@ -259,6 +286,46 @@ async fn api_source_split_stream_secret_never_reaches_output_headers_or_logs() {
 }
 
 #[tokio::test]
+async fn api_source_escaped_json_secret_never_reaches_text_or_stream_output() {
+    let (_root, store, _received, upstream) = source_fixture().await;
+    let gateway = crate::proxy::start(store.clone()).await.unwrap();
+    for endpoint in ["chat/completions", "responses", "messages"] {
+        for streaming in [false, true] {
+            let mut body = json!({"model":"autojev/model/uuid-coding","messages":[{"role":"user","content":"escaped-secret"}],"max_tokens":8,"stream":streaming});
+            if endpoint == "responses" {
+                body["input"] = json!("escaped-secret");
+                body.as_object_mut().unwrap().remove("messages");
+            }
+            let reply = reqwest::Client::new()
+                .post(format!("http://127.0.0.1:{}/v1/{endpoint}", gateway.port))
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            let output = reply.text().await.unwrap();
+            assert!(!output.contains("fictional-coding"), "{endpoint}: {output}");
+            for data in output
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+            {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(data) {
+                    assert!(
+                        !value.to_string().contains("fictional-coding"),
+                        "Decoded SSE leaked a credential"
+                    );
+                }
+            }
+            assert!(output.contains("[REDACTED]"), "{endpoint}: {output}");
+        }
+    }
+    assert!(!serde_json::to_string(&store.request_logs("").unwrap())
+        .unwrap()
+        .contains("fictional-coding"));
+    gateway.stop().await;
+    upstream.abort();
+}
+
+#[tokio::test]
 async fn api_source_legacy_database_copy_preserves_existing_uuid_and_credential_reference() {
     let (root, store, received, upstream) = source_fixture().await;
     store
@@ -267,6 +334,9 @@ async fn api_source_legacy_database_copy_preserves_existing_uuid_and_credential_
             config.providers.truncate(1);
             config.models.truncate(1);
         })
+        .unwrap();
+    store
+        .write_secret("provider:official", "fictional-official")
         .unwrap();
     let expected = store.read().models[0].clone();
     let mut legacy = serde_json::to_value(store.read()).unwrap();
@@ -302,6 +372,60 @@ async fn api_source_legacy_database_copy_preserves_existing_uuid_and_credential_
         original_bytes,
         "Only the isolated copy may be changed"
     );
+    gateway.stop().await;
+    upstream.abort();
+}
+
+#[tokio::test]
+async fn api_source_redaction_preserves_json_progress_for_idle_timeout() {
+    let (_root, store, _received, upstream) = source_fixture().await;
+    store
+        .update(|config| config.gateway.stream_idle_seconds = 1)
+        .unwrap();
+    let gateway = crate::proxy::start(store).await.unwrap();
+    let reply = reqwest::Client::new().post(format!("http://127.0.0.1:{}/v1/chat/completions", gateway.port))
+        .json(&json!({"model":"autojev/model/uuid-coding","messages":[{"role":"user","content":"slow-json"}]})).send().await.unwrap();
+    assert_eq!(reply.status(), 200);
+    assert!(reply
+        .text()
+        .await
+        .unwrap()
+        .contains("fictional slow response"));
+    gateway.stop().await;
+    upstream.abort();
+}
+
+#[tokio::test]
+async fn api_source_inflight_generation_never_uses_replaced_legacy_or_decision_credentials() {
+    let (_root, store, received, upstream) = source_fixture().await;
+    let gateway = crate::proxy::start(store.clone()).await.unwrap();
+    let request = json!({"model":"autojev/model/uuid-coding","messages":[{"role":"user","content":"inflight-secret"}]});
+    let client = reqwest::Client::new();
+    let url = format!("http://127.0.0.1:{}/v1/chat/completions", gateway.port);
+    let inflight = tokio::spawn(client.post(&url).json(&request).send());
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while received.lock().unwrap().is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    store
+        .write_secret("provider:coding", "fictional-replacement-account")
+        .unwrap();
+    store
+        .write_secret("autojev-cloud", "fictional-replacement-decision")
+        .unwrap();
+    let second = client.post(url).json(&request).send().await.unwrap();
+    assert_eq!(second.status(), 200);
+    assert_eq!(inflight.await.unwrap().unwrap().status(), 200);
+    let records = received.lock().unwrap();
+    assert_eq!(records.len(), 2);
+    assert!(records.iter().all(
+        |record| record["authorization"] == "Bearer fictional-coding"
+            && record["path"] == "/coding/v4/chat/completions"
+    ));
+    drop(records);
     gateway.stop().await;
     upstream.abort();
 }

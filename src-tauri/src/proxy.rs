@@ -410,7 +410,7 @@ async fn forward_attempt(context: ProxyContext, headers: HeaderMap, body: Value,
                             Ok(upstream) => upstream,
                             Err(error) => return protocol_error_response(StatusCode::UNPROCESSABLE_ENTITY, protocol, &error.to_string()),
                         };
-                        if let Err(error) = crate::api_sources::generation_key(&context.store, &stored, provider, model, upstream) {
+                        if let Err(error) = crate::api_sources::admit_generation_target(&context.store, &stored, provider, model, upstream) {
                             return protocol_error_response(StatusCode::PRECONDITION_REQUIRED, protocol, &error.to_string());
                         }
                     }
@@ -530,7 +530,7 @@ async fn forward_attempt(context: ProxyContext, headers: HeaderMap, body: Value,
         Ok(protocol) => protocol,
         Err(error) => return protocol_error_response(StatusCode::UNPROCESSABLE_ENTITY, source, &error.to_string()),
     };
-    let generation_key = match crate::api_sources::generation_key(&context.store, &config, &resolved.provider, &resolved.model, target_protocol) {
+    let generation_key = match crate::api_sources::admit_generation_target(&context.store, &config, &resolved.provider, &resolved.model, target_protocol) {
         Ok(key) => key,
         Err(error) => return protocol_error_response(StatusCode::PRECONDITION_REQUIRED, source, &error.to_string()),
     };
@@ -639,7 +639,7 @@ async fn forward_attempt(context: ProxyContext, headers: HeaderMap, body: Value,
     let status = upstream.status();
     let response_headers = upstream.headers().clone();
     let redaction_key = config.api_sources.contains_key(&resolved.provider.id).then(|| generation_key.clone()).flatten();
-    let upstream_stream = crate::api_sources::redacted_stream(upstream.bytes_stream(), redaction_key.clone());
+    let upstream_stream = crate::api_sources::redacted_stream(upstream.bytes_stream(), redaction_key.clone(), response_headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|v| v.starts_with("text/event-stream")));
     let success = status.is_success();
     capture.lock().unwrap().upstream(target, response_headers.get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok()).is_some_and(|v| v.starts_with("text/event-stream")),
@@ -661,12 +661,7 @@ async fn forward_attempt(context: ProxyContext, headers: HeaderMap, body: Value,
     });
 
     let mut builder = Response::builder().status(status);
-    for name in [header::CONTENT_TYPE, header::CACHE_CONTROL, header::RETRY_AFTER] {
-        if let Some(value) = response_headers.get(&name).filter(|value| !redaction_key.as_ref().is_some_and(|key| value.as_bytes().windows(key.len()).any(|part| part == key.as_bytes()))) {
-            builder = builder.header(name, value);
-        }
-    }
-    for name in ["x-request-id", "openai-request-id", "request-id"] {
+    for name in ["content-type", "cache-control", "retry-after", "x-request-id", "openai-request-id", "request-id"] {
         if let Some(value) = response_headers.get(name).filter(|value| !redaction_key.as_ref().is_some_and(|key| value.as_bytes().windows(key.len()).any(|part| part == key.as_bytes()))) {
             builder = builder.header(name, value);
         }

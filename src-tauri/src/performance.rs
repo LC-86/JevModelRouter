@@ -379,7 +379,7 @@ pub(crate) async fn probe(store: &ConfigStore, id: &str) -> Result<()> {
         .find(|p| p.id == model.provider_id && p.enabled)
         .ok_or_else(|| anyhow::anyhow!("Provider unavailable"))?;
     let protocol = Protocol::upstream(model, provider)?;
-    let generation_key = crate::api_sources::generation_key(store, &config, provider, model, protocol)?;
+    let generation_key = crate::api_sources::admit_generation_target(store, &config, provider, model, protocol)?;
     // 模型测试与手动测速和网关共用订阅准入；被拒绝时先记录原因，再向上游派发零请求。
     if let Err(denial) = crate::subscription::admit_model(&config, model, provider, protocol) {
         let reason = denial.summary();

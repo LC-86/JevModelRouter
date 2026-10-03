@@ -16,6 +16,8 @@ export interface ApiSourceConnection extends ApiSourceDraft {
   endpoint: string;
   api_type: string;
   credential_reference: string;
+  retired: boolean;
+  model_bindings: Record<string, string>;
   account_state: 'unknown' | 'user_declared';
   plan_state: 'unknown' | 'user_declared';
 }
