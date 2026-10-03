@@ -17,6 +17,11 @@ pub use stream::converted_stream_observed;
 pub use stream::{collect_debug_stream, DebugProgress};
 pub(crate) use stream::SseParser;
 
+/// Media type tokens are ASCII case-insensitive; parameters do not change SSE framing.
+pub(crate) fn is_event_stream(content_type: &str) -> bool {
+    content_type.split(';').next().unwrap_or("").trim().eq_ignore_ascii_case("text/event-stream")
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Protocol {
     Chat,

@@ -156,6 +156,23 @@ async fn source_fixture() -> (
             async move {
                 let path = uri.0.path().to_string();
                 records.lock().unwrap().push(json!({"path":path,"authorization":headers.get("authorization").and_then(|v|v.to_str().ok()),"model":body["model"],"n":body["n"]}));
+                if serde_json::to_string(&body).unwrap().contains("review-wire-upper") || serde_json::to_string(&body).unwrap().contains("review-wire-cr") {
+                    let upper = serde_json::to_string(&body).unwrap().contains("review-wire-upper");
+                    let key = headers["authorization"].to_str().unwrap().trim_start_matches("Bearer ");
+                    let split = key.find("coding").unwrap();
+                    let mut chunks = std::collections::VecDeque::new();
+                    for content in ["early", &key[..split], &key[split..]] {
+                        chunks.push_back(format!("data: {}\n\n", json!({"choices":[{"index":0,"delta":{"content":content},"finish_reason":null}]})));
+                    }
+                    chunks.push_back("data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".into());
+                    if !upper { for chunk in &mut chunks { *chunk = chunk.replace('\n', "\r"); } }
+                    let stream = futures_util::stream::unfold((chunks, 0), |(mut chunks, index)| async move {
+                        let chunk = chunks.pop_front()?;
+                        if index == 1 { tokio::time::sleep(std::time::Duration::from_secs(2)).await; }
+                        Some((Ok::<_, std::io::Error>(axum::body::Bytes::from(chunk)), (chunks, index + 1)))
+                    });
+                    return axum::response::Response::builder().header("content-type", if upper { "Text/Event-Stream; charset=utf-8" } else { "text/event-stream" }).body(axum::body::Body::from_stream(stream)).unwrap();
+                }
                 if body.pointer("/messages/0/content").and_then(|v| v.as_str()) == Some("review-legacy-function") {
                     assert_eq!(body["functions"][0]["name"], "echo");
                     let key = headers["authorization"].to_str().unwrap().trim_start_matches("Bearer ");
@@ -187,7 +204,7 @@ async fn source_fixture() -> (
                 }
                 if let Some(style) = body.pointer("/messages/0/content").and_then(|v| v.as_str()).and_then(|v| v.strip_prefix("review-multiline-")) {
                     let text = ": keepalive\nevent: provider.extension\nid: extension-1\nretry: 1000\ndata: line one\ndata:\ndata: 第二行\ndata:\nprovider-extension: retained\n\ndata:\n\ndata: [DONE]\n\n";
-                    return ([("content-type", "text/event-stream")], if style == "crlf" { text.replace('\n', "\r\n") } else { text.into() }).into_response();
+                    return ([("content-type", "text/event-stream")], match style { "crlf" => text.replace('\n', "\r\n"), "cr" => text.replace('\n', "\r"), _ => text.into() }).into_response();
                 }
                 if body.pointer("/messages/0/content").and_then(|v| v.as_str()) == Some("split-secret") {
                     let key = headers["authorization"].to_str().unwrap().trim_start_matches("Bearer ");
@@ -716,12 +733,78 @@ async fn api_source_chat_choices_keep_separate_text_reasoning_and_tools() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
+async fn check_api_source_wire_stream(marker: &str) {
+    use std::time::Duration;
+    let (_root, store, received, upstream) = source_fixture().await;
+    let gateway = crate::proxy::start(store).await.unwrap();
+    let mut failures = Vec::new();
+    for protocol in [crate::protocol::Protocol::Chat, crate::protocol::Protocol::Responses] {
+        let mut body = json!({"model":"autojev/model/uuid-coding","stream":true});
+        if protocol == crate::protocol::Protocol::Chat {
+            body["messages"] = json!([{"role":"user","content":marker}]);
+        } else {
+            body["input"] = json!([{"role":"user","content":marker}]);
+        }
+        let start = tokio::time::Instant::now();
+        let mut reply = reqwest::Client::new().post(format!("http://127.0.0.1:{}{}", gateway.port, protocol.path()))
+            .timeout(Duration::from_secs(8)).json(&body).send().await.unwrap();
+        let status = reply.status();
+        let mut bytes = Vec::new();
+        let early = tokio::time::timeout_at(start + Duration::from_secs(1), async {
+            while !String::from_utf8_lossy(&bytes).contains("early") {
+                bytes.extend_from_slice(&reply.chunk().await?.ok_or_else(|| anyhow::anyhow!("EOF before early content"))?);
+            }
+            Ok::<_, anyhow::Error>(())
+        }).await;
+        if !matches!(early, Ok(Ok(()))) { failures.push(format!("{marker}/{protocol:?}: no incremental early content: {early:?}")); }
+        loop {
+            match reply.chunk().await {
+                Ok(Some(chunk)) => bytes.extend_from_slice(&chunk),
+                Ok(None) => break,
+                Err(error) => { failures.push(format!("{marker}/{protocol:?}: body error: {error}")); break; }
+            }
+        }
+        if status != 200 { failures.push(format!("{marker}/{protocol:?}: status {status}")); }
+        let events = crate::protocol::SseParser::default().push(&bytes).unwrap();
+        let mut text = String::new();
+        let mut terminal = false;
+        for (event, data) in events {
+            if data == "[DONE]" { terminal = true; continue; }
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&data) else { continue; };
+            let delta = if protocol == crate::protocol::Protocol::Chat {
+                value.pointer("/choices/0/delta/content").and_then(|v| v.as_str())
+            } else if event == "response.output_text.delta" { value["delta"].as_str() } else { None };
+            if let Some(delta) = delta { text.push_str(delta); }
+            terminal |= event == "response.completed";
+        }
+        if text != "early[REDACTED]" || !terminal {
+            failures.push(format!("{marker}/{protocol:?}: text={text:?}, terminal={terminal}"));
+        }
+    }
+    let records = received.lock().unwrap().clone();
+    assert_eq!(records.len(), 2);
+    assert!(records.iter().all(|r| r["path"] == "/coding/v4/chat/completions"));
+    gateway.stop().await;
+    upstream.abort();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[tokio::test]
+async fn api_source_mixed_case_sse_media_type_remains_incremental_and_redacted() {
+    check_api_source_wire_stream("review-wire-upper").await;
+}
+
+#[tokio::test]
+async fn api_source_cr_only_sse_remains_incremental_and_redacted() {
+    check_api_source_wire_stream("review-wire-cr").await;
+}
+
 #[tokio::test]
 async fn api_source_multiline_sse_keeps_every_data_line_and_event_metadata() {
     let (_root, store, received, upstream) = source_fixture().await;
     let gateway = crate::proxy::start(store).await.unwrap();
     let mut failures = Vec::new();
-    for style in ["lf", "crlf"] {
+    for style in ["lf", "crlf", "cr"] {
         let reply = reqwest::Client::new().post(format!("http://127.0.0.1:{}/v1/chat/completions", gateway.port))
             .json(&json!({"model":"autojev/model/uuid-coding","stream":true,"messages":[{"role":"user","content":format!("review-multiline-{style}")}]})).send().await.unwrap();
         assert_eq!(reply.status(), 200);
@@ -734,7 +817,7 @@ async fn api_source_multiline_sse_keeps_every_data_line_and_event_metadata() {
             assert!(text.contains(metadata), "{style}: missing {metadata}");
         }
     }
-    assert_eq!(received.lock().unwrap().len(), 2);
+    assert_eq!(received.lock().unwrap().len(), 3);
     gateway.stop().await;
     upstream.abort();
     assert!(failures.is_empty(), "{}", failures.join("\n"));

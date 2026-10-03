@@ -643,10 +643,10 @@ async fn forward_attempt(context: ProxyContext, headers: HeaderMap, body: Value,
     let status = upstream.status();
     let response_headers = upstream.headers().clone();
     let redaction_key = config.api_sources.contains_key(&resolved.provider.id).then(|| generation_key.clone()).flatten();
-    let upstream_stream = crate::api_sources::redacted_stream(upstream.bytes_stream(), redaction_key.clone(), response_headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|v| v.starts_with("text/event-stream")));
+    let upstream_stream = crate::api_sources::redacted_stream(upstream.bytes_stream(), redaction_key.clone(), response_headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(crate::protocol::is_event_stream));
     let success = status.is_success();
     capture.lock().unwrap().upstream(target, response_headers.get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok()).is_some_and(|v| v.starts_with("text/event-stream")),
+        .and_then(|v| v.to_str().ok()).is_some_and(crate::protocol::is_event_stream),
     );
 
     let request_metadata = capture.lock().unwrap().log.clone();
@@ -683,7 +683,7 @@ async fn forward_attempt(context: ProxyContext, headers: HeaderMap, body: Value,
         }
         if streaming {
             let is_sse = response_headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok())
-                .is_some_and(|v| v.starts_with("text/event-stream"));
+                .is_some_and(crate::protocol::is_event_stream);
             if !is_sse {
                 return (StatusCode::BAD_GATEWAY, Json(source.error("Upstream did not return the requested event stream"))).into_response();
             }

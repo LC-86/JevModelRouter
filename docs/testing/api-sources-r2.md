@@ -87,6 +87,9 @@ PR62 的两项自动代码审查反馈也补出公开行为红灯：round_robin/
 
 随后 legacy 同协议 SSE 参数重组虚构 Key、新建显式来源无 Key 仍持久化两条红灯均复现。修复只增加 legacy choice 参数通道与创建前 Key 准入；客户端给表单明确错误，已有连接/旧 API 兼容行为由原生验证。未新增凭据补挂流程或协议转换能力。
 
+随后 HTTP/SSE 两项标准兼容性反馈的公开回环红灯已复现。Content-Type 的类型/子类型按 ASCII 大小写无关比较并允许参数；共用有界 SSE 解析器支持 LF、CRLF、CR 及混合换行，保留跨 HTTP 分块的 CRLF 状态。两种响应形态分别通过同协议 Chat 和既有 Responses 转换验证：上游首段与剩余段间隔 2 秒，下游在 1 秒内取得首段，跨 delta 的虚构 Key 被遮蔽且终态保留；非 JSON 多 data 行与元数据另覆盖 CR。逐字节切分覆盖三类换行及混合换行。这些是指定响应形态的有限回环证据，不扩展协议能力或真实供应商覆盖。依据：[RFC 9110 §8.3.1](https://www.rfc-editor.org/rfc/rfc9110.html#name-media-type)、[HTML SSE parsing](https://html.spec.whatwg.org/multipage/server-sent-events.html#parsing-an-event-stream)。
+
+
 复现时只使用本次自有构建目录和脚本创建的临时运行空间：
 
 ```sh

@@ -984,7 +984,7 @@ async fn debug_request(state: State<'_, AppState>, target: String, endpoint: Str
         .timeout(std::time::Duration::from_secs(90))
         .header("x-autojev-session-id", session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()))
         .header("user-agent", "AutoJev/Debug"), true).await.map_err(|_| "Debug request failed or timed out".to_string())?;
-    let is_sse = response.headers().get("content-type").and_then(|v| v.to_str().ok()).is_some_and(|v| v.contains("text/event-stream"));
+    let is_sse = response.headers().get("content-type").and_then(|v| v.to_str().ok()).is_some_and(crate::protocol::is_event_stream);
     let status = response.status().as_u16();
     let request_id = response.headers().get("x-autojev-request-id").and_then(|v| v.to_str().ok()).unwrap_or("").to_owned();
     let model = response.headers().get("x-autojev-model").and_then(|v| v.to_str().ok()).unwrap_or("").to_owned();
