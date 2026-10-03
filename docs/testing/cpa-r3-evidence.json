@@ -759,15 +759,15 @@
     },
     "first.report": {
       "api_source": {
-        "connection_instance_id": "558ab59a-6d64-4cd1-a452-2878e7b8f600",
+        "connection_instance_id": "4d193adc-c162-418f-9a78-800810726213",
         "generation": 1,
-        "model_id": "535d9db3-a6ac-4736-a07b-60d4cbe81e55",
+        "model_id": "31f795ec-8942-437d-9931-9b78d63b3bfb",
         "provider_id": "same-name-paid"
       },
       "bound_rediscovery": {
         "bound": true,
-        "deleted_id": "85bbe1f3-a6da-40fe-8299-73ab80bad799",
-        "restored_id": "85bbe1f3-a6da-40fe-8299-73ab80bad799",
+        "deleted_id": "b99a203a-b031-4832-bfed-3ab5476c05e3",
+        "restored_id": "b99a203a-b031-4832-bfed-3ab5476c05e3",
         "selected": false
       },
       "checks": [
@@ -795,22 +795,22 @@
         ]
       },
       "rediscovery": {
-        "deleted_id": "85bbe1f3-a6da-40fe-8299-73ab80bad799",
-        "restored_id": "85bbe1f3-a6da-40fe-8299-73ab80bad799",
+        "deleted_id": "b99a203a-b031-4832-bfed-3ab5476c05e3",
+        "restored_id": "b99a203a-b031-4832-bfed-3ab5476c05e3",
         "selected": false
       },
-      "run_id": "630834c2-0fc8-41e4-bccc-365d830471ee",
+      "run_id": "22c9edae-b564-41a2-a81d-90e75fb95076",
       "saved": {
         "generation": 8,
-        "model_id": "85bbe1f3-a6da-40fe-8299-73ab80bad799",
-        "provider_id": "cpa-8026d690-0972-4289-8dc9-1b9f48b8c830"
+        "model_id": "b99a203a-b031-4832-bfed-3ab5476c05e3",
+        "provider_id": "cpa-fba7b879-d085-40fa-9d62-9f8de9e36c59"
       }
     },
     "reload.report": {
       "api_source": {
-        "connection_instance_id": "558ab59a-6d64-4cd1-a452-2878e7b8f600",
+        "connection_instance_id": "4d193adc-c162-418f-9a78-800810726213",
         "generation": 1,
-        "model_id": "535d9db3-a6ac-4736-a07b-60d4cbe81e55",
+        "model_id": "31f795ec-8942-437d-9931-9b78d63b3bfb",
         "provider_id": "same-name-paid"
       },
       "checks": [
@@ -831,11 +831,11 @@
           "fictional-2"
         ]
       },
-      "run_id": "d1ee9221-c9f9-4db6-a506-d861d31afbb6",
+      "run_id": "8577d543-435a-4fdd-8c1f-00e52b9fc706",
       "saved": {
         "generation": 8,
-        "model_id": "85bbe1f3-a6da-40fe-8299-73ab80bad799",
-        "provider_id": "cpa-8026d690-0972-4289-8dc9-1b9f48b8c830"
+        "model_id": "b99a203a-b031-4832-bfed-3ab5476c05e3",
+        "provider_id": "cpa-fba7b879-d085-40fa-9d62-9f8de9e36c59"
       }
     },
     "receiver-records": {
@@ -855,7 +855,8 @@
       "frontend": "96 passed in 16 files",
       "build": "passed",
       "release_check": "passed",
-      "native_build": "passed, isolation-check feature"
+      "native_build": "passed, isolation-check feature",
+      "standards_refactor": "One Connection method registers existing row UUIDs for discovery and deletion."
     },
     "real_operations": {
       "oauth_login": 0,

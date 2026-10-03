@@ -73,8 +73,8 @@ R2 原生基线也在此合并结果运行两次，首轮 `97f4d183-cbd8-41d7-9f
 复现基线为 `d5bc6e133ac997309be062bd31bc9d6d48dedf7a`，Codex review `5400758293`；本轮只处理取消迟到清理与删除后 UUID 漂移。
 
 - [取消与轮询重叠](https://github.com/LC-86/JevModelRouter/pull/61#discussion_r4173157765)：现有公开管理/回环测试新增清理责任断言后实际失败，取消返回时旧 poll 未结束但 `cleanup_finished` 已为 true。修复后在途 poll 保留清理责任，阻止连接删除/复用；迟到结果结束后隔离旧专用服务，不认领或删除未证明归属的凭据，也不恢复身份。该配置不能再用于新连接。
-- [删除后重新发现](https://github.com/LC-86/JevModelRouter/pull/61#discussion_r4173157773)：原生 webview 调用公开 `delete_model` 后点击读取目录，UUID 从 `cd212aff-4636-4687-8663-b577b897d3e5` 变为 `f2ad9c32-dbb5-4c8a-a2e6-3b8321a98781`，断言实际失败。连接现在持久保存原 ID 到 UUID 的非秘密记录，公开删除也为既有配置补记 UUID；重新发现沿用 UUID，默认未选择，已有绑定引用保持可解析，换号仍须明确重新绑定。
+- [删除后重新发现](https://github.com/LC-86/JevModelRouter/pull/61#discussion_r4173157773)：原生 webview 调用公开 `delete_model` 后点击读取目录，UUID 从 `cd212aff-4636-4687-8663-b577b897d3e5` 变为 `f2ad9c32-dbb5-4c8a-a2e6-3b8321a98781`，断言实际失败。连接现在持久保存原 ID 到 UUID 的非秘密记录，公开删除也为既有配置补记 UUID；两处共用连接的 UUID 登记方法；重新发现沿用 UUID，默认未选择，已有绑定引用保持可解析，换号仍须明确重新绑定。
 
-修复代码重新通过 Rust **534/534**、前端 **96/96**、build/release 与原生隔离构建。原生首轮 `630834c2-0fc8-41e4-bccc-365d830471ee`、重启 `d1ee9221-c9f9-4db6-a506-d861d31afbb6` 均 `ok:true`，覆盖未选择及已绑定模型的公开删除/目录重建、明确重新选择与重启。两次删除均恢复 UUID `85bbe1f3-a6da-40fe-8299-73ab80bad799`；已绑定模型恢复时 `bound:true / selected:false`。临时读失败、换号拒绝旧目标和同名 API 零接替继续通过。
+修复代码重新通过 Rust **534/534**、前端 **96/96**、build/release 与原生隔离构建。原生首轮 `22c9edae-b564-41a2-a81d-90e75fb95076`、重启 `8577d543-435a-4fdd-8c1f-00e52b9fc706` 均 `ok:true`，覆盖未选择及已绑定模型的公开删除/目录重建、明确重新选择与重启。两次删除均恢复 UUID `b99a203a-b031-4832-bfed-3ab5476c05e3`；已绑定模型恢复时 `bound:true / selected:false`。临时读失败、换号拒绝旧目标和同名 API 零接替继续通过。
 
 [原始报告](cpa-r3-evidence.json) 的 `pr61-p2-fixes` 保存失败与通过报告、接收记录；上述 R2 原生 66 次记录仍标记为 `d5bc6e1` 历史组合回归，没有冒称本轮重跑。当前截图更新到本轮重启的自有原生窗口。普通等待/取消驱动等待检查按钮重新可用，取消重叠由上述回环竞态测试覆盖。真实登录、账号/额度和模型操作继续为 **0**；本票没有真实账号验收。

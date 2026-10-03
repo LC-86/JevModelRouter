@@ -833,7 +833,7 @@ async fn delete_model(state: State<'_, AppState>, id: String) -> Result<Dashboar
             // 下一次目录核对会按同一个 model_id 用原 internal_id 重新建档，标识不会漂移。
             if let Some(model) = config.models.iter().find(|model| model.id == id) {
                 if let Some(connection) = config.cpa_subscriptions.get_mut(&model.provider_id) {
-                    connection.model_ids.entry(model.model_id.clone()).or_insert_with(|| model.id.clone());
+                    connection.retain_model_uuid(model);
                 }
             }
             config.models.retain(|model| model.id != id);

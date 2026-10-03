@@ -49,6 +49,12 @@ pub struct Connection {
     pub error: Option<String>,
 }
 
+impl Connection {
+    pub fn retain_model_uuid(&mut self, model: &Model) {
+        self.model_ids.entry(model.model_id.clone()).or_insert_with(|| model.id.clone());
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IdentityStamp {
     pub provider_id: String,
@@ -669,15 +675,14 @@ impl Manager {
                         Err(_) => mark_read_failed(c),
                     }
                     if let Ok(models) = &result {
-                        let model_ids = &mut config.cpa_subscriptions.get_mut(id)
-                            .expect("current connection validated above").model_ids;
+                        let connection = config.cpa_subscriptions.get_mut(id)
+                            .expect("current connection validated above");
                         for discovered in models {
                             if let Some(existing) = config.models.iter()
                                 .find(|m| m.provider_id == id && m.model_id == discovered.model_id) {
-                                model_ids.entry(discovered.model_id.clone())
-                                    .or_insert_with(|| existing.id.clone());
+                                connection.retain_model_uuid(existing);
                             } else {
-                                let internal_id = model_ids.entry(discovered.model_id.clone())
+                                let internal_id = connection.model_ids.entry(discovered.model_id.clone())
                                     .or_insert_with(|| uuid::Uuid::new_v4().to_string()).clone();
                                 config.models.push(Model {
                                     id: internal_id,
