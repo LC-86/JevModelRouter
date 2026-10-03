@@ -234,6 +234,36 @@
       check(await recordsCount() === before, 'Retired namespace collision must dispatch zero to all sources');
       await invoke('delete_model', { id: collision.id });
     }
+    // Public save IPC must reject a retired destination before moving config or credentials.
+    const renameProjection = value => JSON.stringify(Object.fromEntries(['providers', 'models', 'api_sources', 'subscriptions', 'subscription_auth', 'routes', 'policy', 'gateway', 'agent_catalogs'].map(key => [key, value[key]])));
+    const subscriptionId = `r2-rename-subscription-${run_id}`;
+    const legacyProvider = (await invoke('get_snapshot')).providers.find(p => p.id === 'r2-legacy');
+    await invoke('save_provider', { provider: { ...legacyProvider, id: subscriptionId, name: 'fictional disconnected subscription', kind: 'codex_subscription', base_url: '', api_type: '', test_model: 'same-model' }, creating: true, addTestModel: true });
+    const renameResults = [];
+    for (const id of ['r2-legacy', subscriptionId]) {
+      const initial = await invoke('get_snapshot');
+      const original = initial.providers.find(p => p.id === id);
+      const modelIds = initial.models.filter(m => m.provider_id === id).map(m => m.id);
+      check(modelIds.length > 0, 'Rename fixture must include an existing model');
+      const beforeRename = await recordsCount();
+      await rejected('save_provider', { provider: { ...original, id: retiredId }, originalId: id, creating: false }, 'Create a new source connection');
+      check(renameProjection(await invoke('get_snapshot')) === renameProjection(initial), 'Retired destination refusal must preserve original config, models, connection and credentials');
+      check(await recordsCount() === beforeRename, 'Retired destination refusal must send zero generation');
+      const availableId = `${id}-available`;
+      const renamed = await invoke('save_provider', { provider: { ...original, id: availableId }, originalId: id, creating: false });
+      check(!renamed.providers.some(p => p.id === id) && renamed.providers.some(p => p.id === availableId && p.kind === original.kind), 'Available destination must allow a normal provider rename');
+      check(JSON.stringify(renamed.models.filter(m => m.provider_id === availableId).map(m => m.id)) === JSON.stringify(modelIds), 'Normal rename must preserve model UUIDs and move their provider binding');
+      await invoke('save_provider', { provider: original, originalId: availableId, creating: false });
+      check(renameProjection(await invoke('get_snapshot')) === renameProjection(initial), 'Normal rename back must retain the original configuration and remain editable');
+      check(await recordsCount() === beforeRename, 'Provider rename saves must dispatch zero generation');
+      renameResults.push({ kind: original.kind, refused: 1, normal_saves: 2 });
+    }
+    await invoke('delete_provider', { id: subscriptionId });
+    const legacyTarget = report.saved.find(s => s.id === 'legacy');
+    before = await recordsCount();
+    check((await gateway(`autojev/model/${legacyTarget.model_uuid}`)).status === 200 && await recordsCount() === before + 1, 'Legacy generation key must remain usable on the fixed loopback source after renaming back');
+    report.retired_rename = { cases: renameResults, generation_during_saves: 0, legacy_fixed_requests: 1 };
+    report.checks.push('legacy and disconnected subscription public saves reject retired destination IDs without config changes or generation; normal renames and rename-back preserve model UUIDs; legacy fixed credential remains usable');
     report.checks.push('deleted UUIDs/provider aliases cannot be rebound or captured by another source bare ID; an inflight request keeps its original source/credential');
     const catalog = await control('/__gateway', { port: snapshot.proxy.port, endpoint: '/v1/models' });
     const logs = await invoke('get_request_logs', { since: '2000-01-01T00:00:00Z' });

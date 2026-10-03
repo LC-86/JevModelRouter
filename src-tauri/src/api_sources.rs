@@ -72,6 +72,10 @@ pub fn validate_edit(
     has_new_key: bool,
 ) -> Result<()> {
     let old_id = original_id.unwrap_or(&provider.id);
+    ensure!(
+        !config.api_sources.get(&provider.id).is_some_and(|source| source.retired),
+        "Create a new source connection with a new ID; this deleted source ID remains reserved"
+    );
     if let Some(saved) = config.api_sources.get(old_id) {
         ensure!(
             !saved.retired,
