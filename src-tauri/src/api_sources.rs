@@ -205,6 +205,14 @@ pub fn endpoint_url(
 
 /// Stable saved targets cannot silently change source/account/plan or upstream model.
 pub fn validate_model_identity(config: &AppConfig, model: &Model) -> Result<()> {
+    if let Some(source) = config.api_sources.get(&model.provider_id) {
+        ensure!(
+            model.api_type.is_empty()
+                || crate::protocol::Protocol::parse(&model.api_type)?
+                    == crate::protocol::Protocol::parse(&source.api_type)?,
+            "source_protocol_unsupported: Model protocol must inherit or match its explicit source"
+        );
+    }
     for (provider_id, source) in &config.api_sources {
         if let Some(original) = source.model_bindings.get(&model.id) {
             ensure!(

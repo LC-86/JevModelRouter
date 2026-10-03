@@ -507,6 +507,10 @@ async fn forward_attempt(context: ProxyContext, headers: HeaderMap, body: Value,
         },
     };
 
+    // Once an explicit source is selected, errors belong to that target alone.
+    if config.api_sources.contains_key(&resolved.provider.id) {
+        *allow_retry = false;
+    }
     // 订阅模型与固定直调共用同一准入：未连接、未验证能力或缺额度依据时真实上游零派发。
     if crate::subscription::is_subscription_provider(&resolved.provider) {
         // An app-server turn may already have consumed work even when it returns an error. Never

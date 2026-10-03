@@ -207,6 +207,45 @@ fn api_source_identity_survives_reopen_without_projecting_a_secret() {
 }
 
 #[tokio::test]
+async fn api_source_route_failure_never_retries_another_paid_target() {
+    let mut failures = Vec::new();
+    for strategy in ["round_robin", "jev"] {
+        for status in [429, 500, 503] {
+            let (_root, store, received, upstream) = source_fixture().await;
+            let route_id = format!("review-{}", uuid::Uuid::new_v4().simple());
+            store.update(|config| {
+                config.policy.use_jev_when_ambiguous = false;
+                config.gateway.max_attempts = 3;
+                config.routes = vec![serde_json::from_value(json!({
+                    "id":route_id,"name":"Fictional review route","strategy":strategy,
+                    "enabled":true,"all_models":false,"model_ids":config.models.iter().map(|m|m.id.clone()).collect::<Vec<_>>(),
+                    "model_settings":{},"automatic_policy":null
+                })).unwrap()];
+            }).unwrap();
+            let gateway = crate::proxy::start(store).await.unwrap();
+            let reply = reqwest::Client::new().post(format!("http://127.0.0.1:{}/v1/chat/completions", gateway.port))
+                .json(&json!({"model":format!("autojev/{route_id}"),"messages":[{"role":"user","content":format!("fail-{status}")}]})).send().await.unwrap();
+            let actual_status = reply.status().as_u16();
+            let body = reply.text().await.unwrap();
+            let records = received.lock().unwrap().clone();
+            if actual_status != status || records.len() != 1 {
+                failures.push(format!(
+                    "{strategy}/{status}: response={actual_status}, targets={:?}",
+                    records
+                        .iter()
+                        .map(|r| r["path"].clone())
+                        .collect::<Vec<_>>()
+                ));
+            }
+            assert!(!body.contains("fictional-"));
+            gateway.stop().await;
+            upstream.abort();
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[tokio::test]
 async fn api_source_changed_endpoint_is_rejected_without_any_upstream_request() {
     let (_root, store, received, upstream) = source_fixture().await;
     store

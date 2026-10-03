@@ -113,11 +113,18 @@
     await rejected('start_model_speed_tests', { ids: [coding.model_uuid] }, 'Select enabled');
     check(await recordsCount() === before, 'Disabled gateway/test/Debug/manual probe must dispatch zero requests');
     await invoke('save_provider', { provider });
-    await invoke('save_model', { model: { ...model, api_type: 'responses' } });
     before = await recordsCount();
-    check((await gateway(target)).body.includes('source_protocol_unsupported'), 'Protocol mismatch must not alter the endpoint');
-    check(await recordsCount() === before, 'Unsupported endpoint protocol must dispatch zero requests');
+    await rejected('save_model', { model: { ...model, api_type: 'responses' } }, 'source_protocol_unsupported');
+    await rejected('save_model', { model: { ...model, id: crypto.randomUUID(), api_type: 'messages' } }, 'source_protocol_unsupported');
+    const protocolSnapshot = await invoke('get_snapshot');
+    check(protocolSnapshot.models.find(m => m.id === model.id).api_type === model.api_type && protocolSnapshot.models.length === snapshot.models.length, 'Rejected protocol edits must preserve saved models');
+    check(await recordsCount() === before, 'Saving an incompatible protocol must dispatch zero requests');
+    for (const api_type of ['', 'chat/completions']) {
+      await invoke('save_model', { model: { ...model, api_type } });
+      check((await gateway(target)).status === 200, 'Inherited or matching protocol must remain usable');
+    }
     await invoke('save_model', { model });
+    report.checks.push('incompatible existing/new model protocols rejected before persistence with zero generation; inherited or matching protocols remain usable');
     before = await recordsCount();
     check((await gateway('autojev/model/missing-r2-target')).status === 422, 'Missing fixed target must not become a fallback');
     check((await gateway('same-model')).body.includes('Ambiguous model'), 'A bare same-name model must not choose a source');
