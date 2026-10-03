@@ -316,6 +316,7 @@ export interface GatewaySettings {
 }
 export interface GatewayHealth { model_id: string; failures: number; state: string; retry_after_seconds: number; last_status: number }
 export interface DashboardSnapshot {
+  cpa_subscriptions?: import('./lib/cpa').CpaView[];
   api_sources?: Record<string, ApiSourceConnection>;
   recovery_notice?: string | null;
   gateway?: GatewaySettings;

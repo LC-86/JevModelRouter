@@ -129,6 +129,19 @@ async function invoke<T>(command: string, args?: Record<string, unknown>): Promi
   return tauriInvoke<T>(command, args);
 }
 
+export async function createCpaSubscription(name:string):Promise<DashboardSnapshot> {
+  if (!isTauri()) throw new Error('CPA 连接需要桌面应用；服务交付待 R6');
+  return invoke('create_cpa_subscription',{provider:'codex',name});
+}
+export async function cpaSubscriptionAction(providerId:string,action:'begin'|'poll'|'refresh'|'cancel'|'disconnect'|'switch'):Promise<DashboardSnapshot> {
+  if (!isTauri()) throw new Error('CPA 连接需要桌面应用');
+  return invoke('cpa_subscription_action',{providerId,action});
+}
+export async function selectCpaModel(providerId:string,modelId:string,selected:boolean):Promise<DashboardSnapshot> {
+  if (!isTauri()) throw new Error('CPA 模型选择需要桌面应用');
+  return invoke('select_cpa_model',{providerId,modelId,selected});
+}
+
 export async function getSnapshot(): Promise<DashboardSnapshot> {
   if (!isTauri()) return structuredClone(MOCK);
   return invoke('get_snapshot');

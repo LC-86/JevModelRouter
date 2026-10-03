@@ -185,6 +185,11 @@ pub fn script() -> anyhow::Result<Option<String>> {
             .ok_or_else(|| anyhow::anyhow!("Missing loopback fixture URL"))?,
     )?;
     crate::dispatch::ensure_loopback(&url)?;
+    if args.iter().any(|s|s=="--autojev-cpa-auth-check") {
+        let run_id=args.iter().position(|s|s=="--autojev-cpa-auth-run").and_then(|i|args.get(i+1)).context("Missing CPA auth run ID")?;
+        let config=serde_json::json!({"base":url.to_string().trim_end_matches('/'),"run_id":run_id,"reload":args.iter().any(|s|s=="--autojev-check-reload")});
+        return Ok(Some(format!("window.__CPA_AUTH_CHECK__={config};\n{}",include_str!("cpa-auth-check.js"))));
+    }
     if let Some(index) = args.iter().position(|s| s == "--autojev-api-source-check") {
         let run_id = args.get(index + 1).context("Missing R2 acceptance run ID")?;
         let config = serde_json::json!({"base":url.to_string().trim_end_matches('/'),"run_id":run_id,"reload":args.iter().any(|s|s == "--autojev-check-reload")});

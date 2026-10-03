@@ -61,6 +61,7 @@ import { useAppUpdate } from './components/app-update';
 import { SettingsDialog, type SettingsSection } from './components/settings-dialog';
 import { SubscriptionAuthDialog } from './components/subscription-auth-dialog';
 import { GrokReadOnlyStatus } from './components/grok-readonly-status';
+import { CpaSubscriptions } from './components/cpa-subscriptions';
 import { usePreferences } from './lib/preferences-context';
 import { SearchSelect } from './components/search-select';
 import { BrandMark } from './components/brand-mark';
@@ -687,11 +688,12 @@ function ProvidersPage({ snapshot, onAdd, onEdit, onDelete, onTest, onImport, on
       setSubscriptionBusy((previous) => { const next = { ...previous }; delete next[provider.id]; return next; });
     }
   };
-  const providers = sortProviders(snapshot.providers, testStates);
+  const providers = sortProviders(snapshot.providers.filter(p=>!snapshot.cpa_subscriptions?.some(c=>c.provider_id===p.id)), testStates);
   return (
     <div className="stack lg">
       <PageIntro title={t("Providers")} body={t("Keys are stored in the local database.")} action={<div className="provider-actions"><ProviderImport onImport={onImport} /><button className="button primary" onClick={onAdd}><Plus size={16} /> {t("Add provider")}</button></div>} />
       <GrokReadOnlyStatus t={t} />
+      <CpaSubscriptions connections={snapshot.cpa_subscriptions??[]} onSnapshot={onSnapshot} onNotify={onNotify} />
       <div className="table-panel provider-table-panel">
         <table className="provider-table">
           <thead><tr><th>{t('Provider')}</th><th>{t('Base URL')}</th><th>{t('Enabled status')}</th><th>{t('Subscription')}</th><th>{t('API key')}</th><th className="provider-actions-heading">{t('Actions')}</th></tr></thead>

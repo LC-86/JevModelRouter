@@ -193,6 +193,10 @@ pub struct AppConfig {
     /// 因此退出或换号只作废资格，不重建标识、也不丢失配置。
     #[serde(default)]
     pub subscription_catalogs: std::collections::HashMap<String, crate::subscription_catalog::ProviderCatalog>,
+    #[serde(default)]
+    pub cpa_subscriptions: std::collections::HashMap<String, crate::cpa_sources::Connection>,
+    #[serde(default)]
+    pub cpa_model_bindings: std::collections::HashMap<String, crate::cpa_sources::Binding>,
     /// 用户对当前连接世代的一次有限真实生成许可。仅驻留进程内存，重启、退出或换号后不会沿用。
     #[serde(skip)]
     pub codex_real_generation_grants: std::collections::HashMap<String, CodexRealGenerationGrant>,
@@ -223,6 +227,8 @@ impl Default for AppConfig {
             subscriptions: Default::default(),
             api_sources: Default::default(),
             subscription_catalogs: Default::default(),
+            cpa_subscriptions: Default::default(),
+            cpa_model_bindings: Default::default(),
             codex_real_generation_grants: Default::default(),
             grok_real_generation_grants: Default::default(),
             install_id: Uuid::new_v4().to_string(),
@@ -305,6 +311,7 @@ pub struct ConfigStore {
     pub subscription: std::sync::Arc<crate::subscription::SubscriptionAdapters>,
     /// 订阅登录/退出边界。生产构造只注入 [`crate::subscription::auth::GrokCliAuth`]。
     pub auth: std::sync::Arc<dyn crate::subscription::auth::SubscriptionAuth>,
+    pub cpa: std::sync::Arc<crate::cpa_sources::Manager>,
     path: PathBuf,
     value: RwLock<AppConfig>,
     /// 进程内、按服务商递增的刷新序号；不持久化、不跨异步读取持锁。
@@ -374,8 +381,10 @@ impl ConfigStore {
             value.performance_settings = Default::default();
             transaction.execute("UPDATE app_meta SET value = ?1 WHERE key = 'config'", [serde_json::to_string(&value)?])?;
         }
-        if value.models.iter().any(|model| !model.supports_tools) {
-            for model in &mut value.models { model.supports_tools = true; }
+        if value.models.iter().any(|model| !model.supports_tools && !value.cpa_subscriptions.contains_key(&model.provider_id)) {
+            for model in &mut value.models {
+                if !value.cpa_subscriptions.contains_key(&model.provider_id) {model.supports_tools = true;}
+            }
             transaction.execute("UPDATE app_meta SET value = ?1 WHERE key = 'config'", [serde_json::to_string(&value)?])?;
         }
         // Import previously retained route events once; their token usage remains unknown.
@@ -398,7 +407,8 @@ impl ConfigStore {
                 resumed.push(provider_id.clone());
             }
         }
-        if !resumed.is_empty() {
+        let cpa_resumed=crate::cpa_sources::reconcile_loaded(&mut value)?;
+        if !resumed.is_empty() || cpa_resumed {
             transaction.execute("UPDATE app_meta SET value = ?1 WHERE key = 'config'", [serde_json::to_string(&value)?])?;
         }
         transaction.commit()?;
@@ -409,7 +419,7 @@ impl ConfigStore {
                 eprintln!("AutoJev subscription cleanup for {provider_id}: {}", crate::subscription::helper::redact(&error));
             }
         }
-        Ok(Self { path, value: RwLock::new(value), dispatcher, subscription, auth, subscription_refreshes: Default::default() })
+        Ok(Self { path, value: RwLock::new(value), dispatcher, subscription, auth, cpa:Default::default(), subscription_refreshes: Default::default() })
 
     }
 

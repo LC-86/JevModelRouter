@@ -975,3 +975,11 @@ main.debug-main { height: 100dvh; min-height: 0; overflow: hidden; }
 .provider-subscription-removed { color: var(--faint); font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
 .provider-subscription-reference { font-size: 11px; overflow-wrap: anywhere; }
 .provider-subscription-evidence-note { color: var(--faint); font-size: 11px; line-height: 1.5; }
+/* CPA connection controls keep identity, discovery and verification visibly separate. */
+.cpa-subscriptions { padding: 20px; }
+.cpa-subscriptions-intro p, .cpa-connection p { color: var(--muted); font-size: 13px; line-height: 1.6; }
+.cpa-subscriptions-intro form { display:flex; gap:10px; flex-wrap:wrap; }
+.cpa-connection { border-top:1px solid var(--border); margin-top:18px; padding-top:18px; }
+.cpa-connection header { display:flex; gap:12px; justify-content:space-between; overflow-wrap:anywhere; }
+.cpa-connection .provider-actions { flex-wrap:wrap; }
+.cpa-model { display:flex; align-items:center; gap:12px; margin-top:12px; flex-wrap:wrap; font-size:13px; }

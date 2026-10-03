@@ -1,0 +1,1272 @@
+{
+  "first.report": {
+    "api_source": {
+      "connection_instance_id": "8b6d5ffa-5ea8-4e9c-9bee-dcbe3f4e745f",
+      "generation": 1,
+      "model_id": "7c3763cc-b9ad-4292-96e5-31412b1215ce",
+      "provider_id": "same-name-paid"
+    },
+    "checks": [
+      "begin/wait/cancel public desktop loop",
+      "failure/disconnect public desktop loop",
+      "public model edits retain the CPA fixed target and unknown capabilities",
+      "connection/directory/selection/listening gateway rejection; no same-name API fallback",
+      "stale directory retained; switch disables old target; explicit rebind",
+      "R2 explicit API and R3 CPA identities coexist and persist independently"
+    ],
+    "layer": "native-desktop-fictional-cpa",
+    "ok": true,
+    "receipts": {
+      "accountQueries": 0,
+      "deleted": [
+        "fictional-fictional-a.json"
+      ],
+      "downloads": 0,
+      "models": 0,
+      "sessions": [
+        "fictional-1",
+        "fictional-2"
+      ]
+    },
+    "run_id": "ebf73ee4-4fcd-4952-8a1c-1900839ba0c6",
+    "saved": {
+      "generation": 8,
+      "model_id": "dbaa54bd-60b5-4202-855f-790586876241",
+      "provider_id": "cpa-3ce8d0e8-ece1-451d-ab12-57809fc0a7dd"
+    }
+  },
+  "reload.report": {
+    "api_source": {
+      "connection_instance_id": "8b6d5ffa-5ea8-4e9c-9bee-dcbe3f4e745f",
+      "generation": 1,
+      "model_id": "7c3763cc-b9ad-4292-96e5-31412b1215ce",
+      "provider_id": "same-name-paid"
+    },
+    "checks": [
+      "isolated DB restart re-read; no automatic authorization",
+      "R2 explicit API and R3 CPA identities coexist and persist independently"
+    ],
+    "layer": "native-desktop-fictional-cpa",
+    "ok": true,
+    "receipts": {
+      "accountQueries": 0,
+      "deleted": [
+        "fictional-fictional-a.json"
+      ],
+      "downloads": 0,
+      "models": 0,
+      "sessions": [
+        "fictional-1",
+        "fictional-2"
+      ]
+    },
+    "run_id": "8c66f7c1-c39e-4751-becb-c5cec7d9fdf9",
+    "saved": {
+      "generation": 8,
+      "model_id": "dbaa54bd-60b5-4202-855f-790586876241",
+      "provider_id": "cpa-3ce8d0e8-ece1-451d-ab12-57809fc0a7dd"
+    }
+  },
+  "receiver-records": {
+    "models": 0,
+    "downloads": 0,
+    "accountQueries": 0,
+    "sessions": [
+      "fictional-1",
+      "fictional-2"
+    ],
+    "deleted": [
+      "fictional-fictional-a.json"
+    ]
+  },
+  "before-fixed-target-edit": {
+    "checks": [
+      "begin/wait/cancel public desktop loop",
+      "failure/disconnect public desktop loop"
+    ],
+    "error": "Error: A CPA fixed UUID must reject provider/upstream reassignment through public model editing",
+    "layer": "native-desktop-fictional-cpa",
+    "ok": false,
+    "run_id": "a1ea957b-4afc-474a-ad7b-7d6d9dec317d"
+  },
+  "integrated-main": "ca5f24a13da5a9e69164329a1d12429b23ceca28",
+  "r2-first.report": {
+    "checks": [
+      "desktop creates and saves four classified sources without generation; legacy API identity remains compatible",
+      "account/plan labels match UI 160 UTF-16 units: 60/160 Chinese and 80 emoji accepted, overflow rejected before persistence with zero generation",
+      "all same-name source models, saved provider tests and legacy API hit their own fictional credential and endpoint without a decision key",
+      "incompatible existing/new model protocols rejected before persistence with zero generation; inherited or matching protocols remain usable",
+      "identity edits rejected; 401/429/503/404 stay on the fixed source; deselection preserves UUID; disabled/invalid/unsupported/ambiguous targets dispatch zero through gateway, test, Debug and manual probe",
+      "new official/third-party/coding sources reject absent/blank generation key before persistence with zero generation; existing edits retain stored credential; legacy unclassified optional-key creation remains compatible",
+      "native form shows an explicit generation-key error without persistence or requests; correcting the same ID saves and dispatches exactly once to its fixed source",
+      "public import rejects a batch containing a retired source ID before provider/model/credential writes; normal import and duplicate skip remain compatible, with zero generation",
+      "legacy and disconnected subscription public saves reject retired destination IDs without config changes or generation; normal renames and rename-back preserve model UUIDs; legacy fixed credential remains usable",
+      "deleted UUIDs/provider aliases cannot be rebound or captured by another source bare ID; an inflight request keeps its original source/credential",
+      "missing credential refused before creation; manual probe and Debug hit saved source; Debug logical delta and nested tool JSON/SSE echoes are redacted; three compatible downstream text/stream protocols preserve fixed source and terminal; directory/logs contain no generation secrets"
+    ],
+    "import_reservation": {
+      "accounts": [
+        "provider:import-termany-aef3ee1f5de06bc880fc1a11f053b5dffcefaa95b7bf4fbce794ce8568741a85",
+        "provider:import-termany-86eaeb992b40d6d2e92ca33c8c9b0531d3cd2252fbc9c3c31db0c9246ead9eb4",
+        "provider:import-ccswitch-840d2cc01ccd324fd55cd57f6de6d8c4306c57a096c92f5975bab8bb29e63113"
+      ],
+      "duplicate_skips": 1,
+      "generation": 0,
+      "refused_batches": 1,
+      "successful_imports": 1
+    },
+    "layer": "native-desktop-api-sources-loopback",
+    "ok": true,
+    "retired_rename": {
+      "cases": [
+        {
+          "kind": "openai_compatible",
+          "normal_saves": 2,
+          "refused": 1
+        },
+        {
+          "kind": "codex_subscription",
+          "normal_saves": 2,
+          "refused": 1
+        }
+      ],
+      "generation_during_saves": 0,
+      "legacy_fixed_requests": 1
+    },
+    "run_id": "97f4d183-cbd8-41d7-9fb2-600fa44c3607",
+    "saved": [
+      {
+        "endpoint": "http://127.0.0.1:63244/official/v1",
+        "id": "official",
+        "model_uuid": "2831c09d-9398-49f0-bbf7-f4cb1264eb82",
+        "provider_id": "r2-official",
+        "source_instance": "a222a26c-3260-4101-a328-1b1eb9f465d6"
+      },
+      {
+        "endpoint": "http://127.0.0.1:63244/openrouter/v1",
+        "id": "openrouter",
+        "model_uuid": "c7a39808-266b-4c33-83e6-5469af283c72",
+        "provider_id": "r2-openrouter",
+        "source_instance": "05e2c047-6024-4a2d-8854-12db38210715"
+      },
+      {
+        "endpoint": "http://127.0.0.1:63244/zenmux/v1",
+        "id": "zenmux",
+        "model_uuid": "9ce15e14-fe5a-4223-8b86-1de185ba6a9e",
+        "provider_id": "r2-zenmux",
+        "source_instance": "ccadd00e-0c13-44c5-bc89-a66396a12d19"
+      },
+      {
+        "endpoint": "http://127.0.0.1:63244/coding/v4",
+        "id": "coding",
+        "model_uuid": "a4e022d8-1880-43f1-b7b3-cb7018c73cc0",
+        "provider_id": "r2-coding",
+        "source_instance": "de4ef534-efb5-4ff0-80cf-ae2de9016e7d"
+      },
+      {
+        "endpoint": "http://127.0.0.1:63244/legacy/v1",
+        "id": "legacy",
+        "model_uuid": "cba9ef3d-86f9-400d-8361-ba8761ed988f",
+        "provider_id": "r2-legacy",
+        "source_instance": null
+      }
+    ]
+  },
+  "r2-reload.report": {
+    "checks": [
+      "new desktop process preserves source categories, unknown account/plan states and stable UUIDs",
+      "account/plan labels match UI 160 UTF-16 units: 60/160 Chinese and 80 emoji accepted, overflow rejected before persistence with zero generation",
+      "all same-name source models, saved provider tests and legacy API hit their own fictional credential and endpoint without a decision key",
+      "incompatible existing/new model protocols rejected before persistence with zero generation; inherited or matching protocols remain usable",
+      "identity edits rejected; 401/429/503/404 stay on the fixed source; deselection preserves UUID; disabled/invalid/unsupported/ambiguous targets dispatch zero through gateway, test, Debug and manual probe",
+      "new official/third-party/coding sources reject absent/blank generation key before persistence with zero generation; existing edits retain stored credential; legacy unclassified optional-key creation remains compatible",
+      "native form shows an explicit generation-key error without persistence or requests; correcting the same ID saves and dispatches exactly once to its fixed source",
+      "public import rejects a batch containing a retired source ID before provider/model/credential writes; normal import and duplicate skip remain compatible, with zero generation",
+      "legacy and disconnected subscription public saves reject retired destination IDs without config changes or generation; normal renames and rename-back preserve model UUIDs; legacy fixed credential remains usable",
+      "deleted UUIDs/provider aliases cannot be rebound or captured by another source bare ID; an inflight request keeps its original source/credential",
+      "missing credential refused before creation; manual probe and Debug hit saved source; Debug logical delta and nested tool JSON/SSE echoes are redacted; three compatible downstream text/stream protocols preserve fixed source and terminal; directory/logs contain no generation secrets"
+    ],
+    "import_reservation": {
+      "accounts": [
+        "provider:import-termany-e6ebb847a4ae406ac27aac2c04dd6d826090c2cd4abe72c823af025160e1d4da",
+        "provider:import-termany-5359997573c9a94a3d1a3aa3482b9580c045f23565f6f9b870b79ec23db06827",
+        "provider:import-ccswitch-11d82b3ab94f441b6057761d47fb16932f2567fb119d22fde9ab5e6a62cc1265"
+      ],
+      "duplicate_skips": 1,
+      "generation": 0,
+      "refused_batches": 1,
+      "successful_imports": 1
+    },
+    "layer": "native-desktop-api-sources-loopback",
+    "ok": true,
+    "retired_rename": {
+      "cases": [
+        {
+          "kind": "openai_compatible",
+          "normal_saves": 2,
+          "refused": 1
+        },
+        {
+          "kind": "codex_subscription",
+          "normal_saves": 2,
+          "refused": 1
+        }
+      ],
+      "generation_during_saves": 0,
+      "legacy_fixed_requests": 1
+    },
+    "run_id": "d42ad08a-1647-4c9c-a632-8280f07f95f3",
+    "saved": [
+      {
+        "endpoint": "http://127.0.0.1:63244/official/v1",
+        "id": "official",
+        "model_uuid": "2831c09d-9398-49f0-bbf7-f4cb1264eb82",
+        "provider_id": "r2-official",
+        "source_instance": "a222a26c-3260-4101-a328-1b1eb9f465d6"
+      },
+      {
+        "endpoint": "http://127.0.0.1:63244/openrouter/v1",
+        "id": "openrouter",
+        "model_uuid": "c7a39808-266b-4c33-83e6-5469af283c72",
+        "provider_id": "r2-openrouter",
+        "source_instance": "05e2c047-6024-4a2d-8854-12db38210715"
+      },
+      {
+        "endpoint": "http://127.0.0.1:63244/zenmux/v1",
+        "id": "zenmux",
+        "model_uuid": "9ce15e14-fe5a-4223-8b86-1de185ba6a9e",
+        "provider_id": "r2-zenmux",
+        "source_instance": "ccadd00e-0c13-44c5-bc89-a66396a12d19"
+      },
+      {
+        "endpoint": "http://127.0.0.1:63244/coding/v4",
+        "id": "coding",
+        "model_uuid": "a4e022d8-1880-43f1-b7b3-cb7018c73cc0",
+        "provider_id": "r2-coding",
+        "source_instance": "de4ef534-efb5-4ff0-80cf-ae2de9016e7d"
+      },
+      {
+        "endpoint": "http://127.0.0.1:63244/legacy/v1",
+        "id": "legacy",
+        "model_uuid": "cba9ef3d-86f9-400d-8361-ba8761ed988f",
+        "provider_id": "r2-legacy",
+        "source_instance": null
+      }
+    ]
+  },
+  "r2-receiver-records": [
+    {
+      "source": "official",
+      "path": "/official/v1/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "official",
+      "path": "/official/v1/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "openrouter",
+      "path": "/openrouter/v1/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "openrouter",
+      "path": "/openrouter/v1/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "zenmux",
+      "path": "/zenmux/v1/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "zenmux",
+      "path": "/zenmux/v1/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "legacy",
+      "path": "/legacy/v1/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "legacy",
+      "path": "/legacy/v1/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": true
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": true
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": true
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": true
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": true
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": true
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": true
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": true
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "legacy",
+      "path": "/legacy/v1/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "official",
+      "path": "/official/v1/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "official",
+      "path": "/official/v1/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "openrouter",
+      "path": "/openrouter/v1/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "openrouter",
+      "path": "/openrouter/v1/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "zenmux",
+      "path": "/zenmux/v1/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "zenmux",
+      "path": "/zenmux/v1/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "legacy",
+      "path": "/legacy/v1/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "legacy",
+      "path": "/legacy/v1/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": true
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": true
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": true
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": true
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": true
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": true
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": true
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": true
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "legacy",
+      "path": "/legacy/v1/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    }
+  ],
+  "pr61-p2-fixes": {
+    "review_head": "d5bc6e133ac997309be062bd31bc9d6d48dedf7a",
+    "review_id": 5400758293,
+    "cancel-poll": {
+      "discussion_id": 4173157765,
+      "test": "cpa_sources::tests::cancel_discards_a_late_success_and_only_cancels_its_owned_session",
+      "before": {
+        "exit_code": 101,
+        "failed_assertion": "A pending poll must retain cleanup ownership after cancellation",
+        "seam": "public Manager operations, temporary SQLite and pinned fictional management HTTP"
+      },
+      "after": {
+        "result": "passed in all 13 CPA lifecycle tests and full 538-test Rust run",
+        "observations": [
+          "cleanup unfinished while the poll is pending",
+          "begin/remove blocked until completion",
+          "late identity rejected and old service profile isolated",
+          "replacement cannot reuse the retired profile"
+        ]
+      }
+    },
+    "delete-rediscovery": {
+      "discussion_id": 4173157773,
+      "before.report": {
+        "checks": [
+          "begin/wait/cancel public desktop loop",
+          "failure/disconnect public desktop loop"
+        ],
+        "error": "Error: Delete/rediscovery must retain the fixed model UUID",
+        "layer": "native-desktop-fictional-cpa",
+        "ok": false,
+        "rediscovery": {
+          "deleted_id": "cd212aff-4636-4687-8663-b577b897d3e5",
+          "restored_id": "f2ad9c32-dbb5-4c8a-a2e6-3b8321a98781",
+          "selected": false
+        },
+        "run_id": "54cb4ee9-4529-4383-95ac-e0092adf2d4b"
+      }
+    },
+    "first.report": {
+      "api_source": {
+        "connection_instance_id": "e70dd804-501b-4846-b75a-8071e38bc85a",
+        "generation": 1,
+        "model_id": "73303e7a-013a-4d36-b709-ded406df3d10",
+        "provider_id": "same-name-paid"
+      },
+      "bound_rediscovery": {
+        "bound": true,
+        "deleted_id": "8dedb686-093a-4e0f-858d-7ec7d7868175",
+        "restored_id": "8dedb686-093a-4e0f-858d-7ec7d7868175",
+        "selected": false
+      },
+      "cancel_waiting": {
+        "account": null,
+        "generation": 3,
+        "plan": null,
+        "retry_stage": "waiting",
+        "service_available": true,
+        "stage": "cancelled"
+      },
+      "checks": [
+        "begin/wait/cancel public desktop loop",
+        "cancel with an in-flight Waiting poll preserves the profile and retries authorization",
+        "failure/disconnect public desktop loop",
+        "public delete_model and directory rediscovery preserve an unselected fixed UUID",
+        "public delete_model preserves an existing binding UUID; reselection stays explicit",
+        "public model edits retain the CPA fixed target and unknown capabilities",
+        "connection/directory/selection/listening gateway rejection; no same-name API fallback",
+        "stale directory retained; switch disables old target; explicit rebind",
+        "R2 explicit API and R3 CPA identities coexist and persist independently"
+      ],
+      "layer": "native-desktop-fictional-cpa",
+      "ok": true,
+      "receipts": {
+        "accountQueries": 0,
+        "deleted": [
+          "fictional-fictional-a.json"
+        ],
+        "downloads": 0,
+        "models": 0,
+        "sessions": [
+          "fictional-1",
+          "fictional-2"
+        ],
+        "waitingAfterCancel": {
+          "cancelledSessions": 1,
+          "credentialPresent": false
+        }
+      },
+      "rediscovery": {
+        "deleted_id": "8dedb686-093a-4e0f-858d-7ec7d7868175",
+        "restored_id": "8dedb686-093a-4e0f-858d-7ec7d7868175",
+        "selected": false
+      },
+      "run_id": "866470dc-1c49-4236-9bf7-c5585f080fee",
+      "saved": {
+        "generation": 8,
+        "model_id": "8dedb686-093a-4e0f-858d-7ec7d7868175",
+        "provider_id": "cpa-57fefe6d-f7b5-4aa8-9800-a8ee83e41d3c"
+      }
+    },
+    "reload.report": {
+      "api_source": {
+        "connection_instance_id": "e70dd804-501b-4846-b75a-8071e38bc85a",
+        "generation": 1,
+        "model_id": "73303e7a-013a-4d36-b709-ded406df3d10",
+        "provider_id": "same-name-paid"
+      },
+      "checks": [
+        "isolated DB restart re-read; no automatic authorization",
+        "R2 explicit API and R3 CPA identities coexist and persist independently"
+      ],
+      "layer": "native-desktop-fictional-cpa",
+      "ok": true,
+      "receipts": {
+        "accountQueries": 0,
+        "deleted": [
+          "fictional-fictional-a.json"
+        ],
+        "downloads": 0,
+        "models": 0,
+        "sessions": [
+          "fictional-1",
+          "fictional-2"
+        ],
+        "waitingAfterCancel": {
+          "cancelledSessions": 1,
+          "credentialPresent": false
+        }
+      },
+      "run_id": "c13fc7b8-07f9-4469-bb8d-abf21352438a",
+      "saved": {
+        "generation": 8,
+        "model_id": "8dedb686-093a-4e0f-858d-7ec7d7868175",
+        "provider_id": "cpa-57fefe6d-f7b5-4aa8-9800-a8ee83e41d3c"
+      }
+    },
+    "receiver-records": {
+      "models": 0,
+      "downloads": 0,
+      "accountQueries": 0,
+      "sessions": [
+        "fictional-1",
+        "fictional-2"
+      ],
+      "deleted": [
+        "fictional-fictional-a.json"
+      ],
+      "waitingAfterCancel": {
+        "cancelledSessions": 1,
+        "credentialPresent": false
+      }
+    },
+    "validation": {
+      "rust": "538 passed; 0 failed",
+      "frontend": "96 passed in 16 files",
+      "build": "passed",
+      "release_check": "passed",
+      "native_build": "passed, isolation-check feature",
+      "standards_refactor": "One Connection method registers existing row UUIDs for discovery and deletion."
+    },
+    "real_operations": {
+      "oauth_login": 0,
+      "account_quota_queries": 0,
+      "model_calls": 0
+    },
+    "cancel-waiting": {
+      "review_head": "6094b395038a3b186208d242739a5e07a85480a1",
+      "review_id": 5400982533,
+      "discussion_id": 4173333931,
+      "test": "cpa_sources::tests::successful_cancel_with_a_late_waiting_poll_keeps_the_profile_retryable",
+      "before": {
+        "exit_code": 101,
+        "failed_assertion": "Successful cancellation and late Waiting must preserve an empty profile"
+      },
+      "after": {
+        "cpa_tests": 13,
+        "rust_tests": 538,
+        "branches": [
+          "cancel acknowledged before late Waiting, empty profile: retryable",
+          "late Waiting before cancellation acknowledgement: ownership retained until acknowledgement, then retryable",
+          "cancellation HTTP failure plus late Waiting: owned cleanup retained, explicit retry succeeds",
+          "late Waiting plus cancelled:false: old profile isolated",
+          "late Waiting plus residual credential: old profile isolated; credential untouched",
+          "late Waiting plus unreadable credential metadata: old profile isolated",
+          "late completed poll plus cancelled:true or false: old profile isolated",
+          "late expired authorization status: old profile isolated"
+        ]
+      },
+      "review_scope": "No further review rounds or low-impact refactoring, as directed by the parent."
+    }
+  },
+  "pr61-p1-lock-check": {
+    "review_head": "b480b45a78f5ebcf79986238c092f94adcedb36a",
+    "review_id": 5401096010,
+    "discussion_id": 4173427257,
+    "conclusion": "The stated two-mutex cycle is not present; CleanupLease stores a reference and ID, not a mutex guard. Parent independently confirmed this false positive.",
+    "production_changes": false,
+    "locking": {
+      "begin_remove_nested_order": [
+        "attempts",
+        "cleaning"
+      ],
+      "disconnect": "cleanup_lease briefly inserts the owned ID under cleaning; that guard is released before cleanup_owned accesses attempts. CleanupLease drop only removes the ID."
+    },
+    "test": "cpa_sources::tests::concurrent_begin_disconnect_and_shutdown_finish_within_a_wall_clock_deadline",
+    "bounded_regression": {
+      "result": "passed",
+      "duration_seconds": 0.11,
+      "wall_clock_budget_seconds": 10,
+      "concurrent_rounds": 32,
+      "controlled_interleaving": "cancel HTTP acknowledgement held open while begin finishes with an owned-cleanup refusal; release acknowledgement, then cleanup and pending shutdown finish",
+      "watchdog": "std::sync::mpsc receiver outside Tokio; runtime shutdown_background on failure avoids hanging teardown"
+    },
+    "full_run_1": {
+      "passed": 538,
+      "failed": 1,
+      "test": "subscription::auth::lifecycle_tests::a_superseded_attempt_never_reclaims_the_current_attempt",
+      "error": "helper_exited: the helper exited before returning a challenge",
+      "targeted_recheck": "1 passed; 0 failed"
+    },
+    "full_run_2": {
+      "passed": 538,
+      "failed": 1,
+      "test": "lifecycle::tests::exclusive_file_lock_prevents_recovery_race",
+      "error": "WouldBlock",
+      "targeted_recheck": "1 passed; 0 failed"
+    },
+    "failure_scope": "Both failed test/production files are unchanged. Cause unconfirmed; do not claim a clean full run or continue unrelated fixes.",
+    "first.report": {
+      "api_source": {
+        "connection_instance_id": "c6838625-771b-4182-bc02-e5612940d8ab",
+        "generation": 1,
+        "model_id": "4766e83a-5648-4a54-b9c6-3469c9ed78f2",
+        "provider_id": "same-name-paid"
+      },
+      "bound_rediscovery": {
+        "bound": true,
+        "deleted_id": "8b52355d-8b65-46bc-bc32-fc425e6273a1",
+        "restored_id": "8b52355d-8b65-46bc-bc32-fc425e6273a1",
+        "selected": false
+      },
+      "cancel_waiting": {
+        "account": null,
+        "generation": 3,
+        "plan": null,
+        "retry_stage": "waiting",
+        "service_available": true,
+        "stage": "cancelled"
+      },
+      "checks": [
+        "begin/wait/cancel public desktop loop",
+        "cancel with an in-flight Waiting poll preserves the profile and retries authorization",
+        "failure/disconnect public desktop loop",
+        "public delete_model and directory rediscovery preserve an unselected fixed UUID",
+        "public delete_model preserves an existing binding UUID; reselection stays explicit",
+        "public model edits retain the CPA fixed target and unknown capabilities",
+        "connection/directory/selection/listening gateway rejection; no same-name API fallback",
+        "stale directory retained; switch disables old target; explicit rebind",
+        "R2 explicit API and R3 CPA identities coexist and persist independently"
+      ],
+      "layer": "native-desktop-fictional-cpa",
+      "ok": true,
+      "receipts": {
+        "accountQueries": 0,
+        "deleted": [
+          "fictional-fictional-a.json"
+        ],
+        "downloads": 0,
+        "models": 0,
+        "sessions": [
+          "fictional-1",
+          "fictional-2"
+        ],
+        "waitingAfterCancel": {
+          "cancelledSessions": 1,
+          "credentialPresent": false
+        }
+      },
+      "rediscovery": {
+        "deleted_id": "8b52355d-8b65-46bc-bc32-fc425e6273a1",
+        "restored_id": "8b52355d-8b65-46bc-bc32-fc425e6273a1",
+        "selected": false
+      },
+      "run_id": "3cb499be-da70-45fc-8f67-9d3bcfbdc143",
+      "saved": {
+        "generation": 8,
+        "model_id": "8b52355d-8b65-46bc-bc32-fc425e6273a1",
+        "provider_id": "cpa-6849eda2-65f0-45b1-b3ef-bb174b119963"
+      }
+    },
+    "reload.report": {
+      "api_source": {
+        "connection_instance_id": "c6838625-771b-4182-bc02-e5612940d8ab",
+        "generation": 1,
+        "model_id": "4766e83a-5648-4a54-b9c6-3469c9ed78f2",
+        "provider_id": "same-name-paid"
+      },
+      "checks": [
+        "isolated DB restart re-read; no automatic authorization",
+        "R2 explicit API and R3 CPA identities coexist and persist independently"
+      ],
+      "layer": "native-desktop-fictional-cpa",
+      "ok": true,
+      "receipts": {
+        "accountQueries": 0,
+        "deleted": [
+          "fictional-fictional-a.json"
+        ],
+        "downloads": 0,
+        "models": 0,
+        "sessions": [
+          "fictional-1",
+          "fictional-2"
+        ],
+        "waitingAfterCancel": {
+          "cancelledSessions": 1,
+          "credentialPresent": false
+        }
+      },
+      "run_id": "7edf3557-7bec-4a5e-aef0-1661475edf56",
+      "saved": {
+        "generation": 8,
+        "model_id": "8b52355d-8b65-46bc-bc32-fc425e6273a1",
+        "provider_id": "cpa-6849eda2-65f0-45b1-b3ef-bb174b119963"
+      }
+    },
+    "receiver-records": {
+      "models": 0,
+      "downloads": 0,
+      "accountQueries": 0,
+      "sessions": [
+        "fictional-1",
+        "fictional-2"
+      ],
+      "deleted": [
+        "fictional-fictional-a.json"
+      ],
+      "waitingAfterCancel": {
+        "cancelledSessions": 1,
+        "credentialPresent": false
+      }
+    },
+    "real_operations": {
+      "oauth_login": 0,
+      "account_quota_queries": 0,
+      "model_calls": 0
+    }
+  },
+  "b5-isolated-regression": {
+    "runs": [
+      {
+        "head": "b5b9e35878def23a1a76ed81938a04639d2cdc3e",
+        "cwd": "/Users/cuilei/Documents/Codex/2026-10-03/task-9/worktree",
+        "command": [
+          "cargo",
+          "test",
+          "--locked",
+          "--offline",
+          "--manifest-path",
+          "src-tauri/Cargo.toml",
+          "--lib",
+          "--",
+          "--test-threads=1"
+        ],
+        "target": "/Users/cuilei/Documents/Codex/2026-10-03/task-9/regression-exclusive-target",
+        "temporary": "/Users/cuilei/Documents/Codex/2026-10-03/task-9/regression-b5-serial/tmp",
+        "threads": 1,
+        "started": "2026-10-03T14:37:19.374645+00:00",
+        "exit_code": 0,
+        "elapsed_seconds": 187.77,
+        "finished": "2026-10-03T14:40:27.146418+00:00",
+        "test_result": "test result: ok. 539 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 144.13s",
+        "log_sha256": "92871194ddf9d5a3bc19f642d36c3f2e74612d35e6a9a097e2f4ebc453579e70"
+      },
+      {
+        "head": "b5b9e35878def23a1a76ed81938a04639d2cdc3e",
+        "cwd": "/Users/cuilei/Documents/Codex/2026-10-03/task-9/worktree",
+        "command": [
+          "cargo",
+          "test",
+          "--locked",
+          "--offline",
+          "--manifest-path",
+          "src-tauri/Cargo.toml",
+          "--lib"
+        ],
+        "target": "/Users/cuilei/Documents/Codex/2026-10-03/task-9/regression-exclusive-target",
+        "temporary": "/Users/cuilei/Documents/Codex/2026-10-03/task-9/regression-b5-parallel/tmp",
+        "threads": "default",
+        "started": "2026-10-03T14:41:18.242006+00:00",
+        "exit_code": 0,
+        "elapsed_seconds": 72.003,
+        "finished": "2026-10-03T14:42:30.245660+00:00",
+        "test_result": "test result: ok. 539 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 65.61s",
+        "log_sha256": "1af0ad260ec999efe899785ebb2a1bc4b6d94b5d4055e6d12ec24d01a24201e9"
+      },
+      {
+        "head": "ca5f24a13da5a9e69164329a1d12429b23ceca28",
+        "cwd": "/Users/cuilei/Documents/Codex/2026-10-03/task-9/regression-main-source",
+        "command": [
+          "cargo",
+          "test",
+          "--locked",
+          "--offline",
+          "--manifest-path",
+          "src-tauri/Cargo.toml",
+          "--lib"
+        ],
+        "target": "/Users/cuilei/Documents/Codex/2026-10-03/task-9/regression-exclusive-target",
+        "temporary": "/Users/cuilei/Documents/Codex/2026-10-03/task-9/regression-main-parallel/tmp",
+        "threads": "default",
+        "started": "2026-10-03T14:43:05.032475+00:00",
+        "exit_code": 0,
+        "elapsed_seconds": 84.342,
+        "finished": "2026-10-03T14:44:29.375767+00:00",
+        "test_result": "test result: ok. 525 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 65.64s",
+        "log_sha256": "6741dac2827d5851a61633cb110fdd06a87815e04b4e3c84412cb8163ac3277b"
+      },
+      {
+        "head": "ca5f24a13da5a9e69164329a1d12429b23ceca28",
+        "cwd": "/Users/cuilei/Documents/Codex/2026-10-03/task-9/regression-main-source",
+        "command": [
+          "cargo",
+          "test",
+          "--locked",
+          "--offline",
+          "--manifest-path",
+          "src-tauri/Cargo.toml",
+          "--lib",
+          "--",
+          "--test-threads=64"
+        ],
+        "target": "/Users/cuilei/Documents/Codex/2026-10-03/task-9/regression-exclusive-target",
+        "temporary": "/Users/cuilei/Documents/Codex/2026-10-03/task-9/regression-main-parallel-stress/tmp",
+        "threads": 64,
+        "started": "2026-10-03T14:46:29.022518+00:00",
+        "exit_code": 0,
+        "elapsed_seconds": 65.968,
+        "finished": "2026-10-03T14:47:34.991060+00:00",
+        "test_result": "test result: ok. 525 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 65.43s",
+        "log_sha256": "2c5c1ac40d18a5d6d6fe92185d35250a9c61870c5db45e114681f18a4a40aa30"
+      }
+    ],
+    "isolation": "Fresh exclusively owned target; new private TMPDIR per run; sequential execution; protected original workspace and other worktrees untouched.",
+    "unchanged_modules": [
+      "src-tauri/src/lifecycle.rs",
+      "src-tauri/src/subscription/auth.rs",
+      "src-tauri/src/subscription/helper.rs"
+    ],
+    "compared_heads": [
+      "5dd59847cc3afb998a6b747fa5153dfef6394d1a",
+      "ca5f24a13da5a9e69164329a1d12429b23ceca28",
+      "b5b9e35878def23a1a76ed81938a04639d2cdc3e"
+    ],
+    "lock_diagnostic": {
+      "artifact": "/Users/cuilei/Documents/Codex/2026-10-03/task-9/lifecycle-lock-probe.rs",
+      "source_sha256": "8f387b6b9b21f3344400c78d20783b12d5c712c3530fd7d11e800149c46d5c50",
+      "results": [
+        {
+          "phase": "alone",
+          "iterations": 10000,
+          "workers": 0,
+          "owned_spawns": 0,
+          "would_block_after_drop": 0,
+          "while_spawning": 0,
+          "recovered": 0,
+          "max_retry_us": 0
+        },
+        {
+          "phase": "absolute-posix-spawn",
+          "iterations": 10000,
+          "workers": 4,
+          "owned_spawns": 7529,
+          "would_block_after_drop": 1031,
+          "while_spawning": 1031,
+          "recovered": 1031,
+          "max_retry_us": 788
+        },
+        {
+          "phase": "absolute-posix-spawn-unlock-control",
+          "iterations": 10000,
+          "workers": 4,
+          "owned_spawns": 4473,
+          "would_block_after_drop": 0,
+          "while_spawning": 0,
+          "recovered": 0,
+          "max_retry_us": 0
+        },
+        {
+          "phase": "path-override-fork",
+          "iterations": 10000,
+          "workers": 4,
+          "owned_spawns": 5087,
+          "would_block_after_drop": 824,
+          "while_spawning": 824,
+          "recovered": 824,
+          "max_retry_us": 3505
+        }
+      ],
+      "mechanism": "Same-process dummy child spawning can retain a flock reference after the parent File drops; explicit unlock removes the observed interference.",
+      "limitation": "Focused controlled reproduction of the unchanged test pattern. Historical failed full run lacks FD tracing; old main full runs did not reproduce the failure."
+    },
+    "cli_diagnostic": {
+      "head": "ca5f24a13da5a9e69164329a1d12429b23ceca28",
+      "unchanged_test": "subscription::auth::lifecycle_tests::a_superseded_attempt_never_reclaims_the_current_attempt",
+      "repeated_runs": 200,
+      "passed": 200,
+      "failed": 0,
+      "result_artifact": "/Users/cuilei/Documents/Codex/2026-10-03/task-9/regression-main-cli-repeat/result.json",
+      "conclusion": "Not reproduced. is_file only waits for counter-file creation, leaving a write-completion timing window, but no evidence proves that window caused the historical helper_exited. Do not label it a known old-main flake or a proven TMPDIR/target collision."
+    },
+    "real_operations": {
+      "oauth_login": 0,
+      "account_quota_queries": 0,
+      "model_calls": 0
+    }
+  },
+  "pr61-preflight-profile": {
+    "review_head": "b5b9e35878def23a1a76ed81938a04639d2cdc3e",
+    "review_id": 5401242099,
+    "discussion_id": 4173550659,
+    "red": {
+      "test": "preflight_foreign_credentials_retire_the_profile_without_adoption_or_deletion",
+      "failure": "A rejected foreign profile must not be reused",
+      "production_changes": false
+    },
+    "green": {
+      "tests": [
+        "preflight_foreign_credentials_retire_the_profile_without_adoption_or_deletion",
+        "preflight_http_failure_keeps_the_profile_available_for_explicit_retry"
+      ],
+      "passed": 2,
+      "failed": 0
+    },
+    "behavior": "Only a confirmed nonempty preflight credential list retires the matching client and fixture. HTTP failures keep the dedicated profile retryable.",
+    "foreign_profile_receipts": [
+      [
+        "GET",
+        "/v8/management/credentials"
+      ]
+    ],
+    "foreign_credential": "unchanged; never adopted or deleted; replacement connection has no retained profile",
+    "transient_failure": "same connection retries into Waiting; after cleanup/removal the retained clean profile also supports a replacement",
+    "after_commit_full_validation": "Recorded on the precise final head in PR61 description and workspace handoff.",
+    "real_operations": {
+      "oauth_login": 0,
+      "account_quota_queries": 0,
+      "model_calls": 0
+    }
+  }
+}
