@@ -46,7 +46,7 @@ export function CpaDevelopmentService() {
     } catch (e) { setError(String(e)); }
     finally { setBusy(false); }
   };
-  return <section className="table-panel" data-testid="cpa-development-service" aria-label="隔离 CPA 开发服务">
+  return <section className="table-panel cpa-subscriptions" data-testid="cpa-development-service" aria-label="隔离 CPA 开发服务">
     <div className="cpa-subscriptions-intro">
       <strong>隔离 CPA 开发服务</strong>
       <p role="status" data-testid="cpa-service-state">{labels[status.state]} · {status.artifact.version} · {status.artifact.platform}</p>
@@ -54,7 +54,8 @@ export function CpaDevelopmentService() {
       {status.service && <p>本地地址：{status.service.base_url} · 自有进程：{status.service.pid ?? '已退出'}</p>}
       <label>固定 CPA 文件 <input data-testid="cpa-service-binary" value={binary} disabled={busy || status.state === 'ready'} onChange={e => setBinary(e.target.value)} /></label>
       <label>独立端口（0 自动分配） <input data-testid="cpa-service-port" inputMode="numeric" value={port} disabled={busy || status.state === 'ready'} onChange={e => setPort(e.target.value)} /></label>
-      {error && <p role="alert" data-testid="cpa-service-error">{error}。核对固定文件/版本，或释放端口、选择独立端口后显式启动；不回收外部实例。</p>}
+      {status.port > 0 && <p>恢复须使用已保存端口 {status.port}。端口被占用时先由其所有者释放；改端口须用新隔离目录并建立新的来源与模型引用。</p>}
+      {error && <p role="alert" data-testid="cpa-service-error">{error}。核对固定文件/版本；首次启动可选独立端口，恢复须保留绑定端口。不回收外部实例。</p>}
       {status.state === 'exited' && <p>自有服务已退出。核对文件和端口后点恢复；保留来源与模型引用，生成仍受原准入限制。</p>}
       <div className="provider-actions">
         <button className="button" data-testid="cpa-service-start" disabled={busy || status.state === 'ready'} onClick={() => void run(false)}>{status.state === 'exited' ? '恢复自有服务' : '启动自有服务'}</button>

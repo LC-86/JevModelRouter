@@ -4,7 +4,7 @@
 
 ## 产物与职责
 
-这是 macOS arm64 的 unsigned development folder，包含 Jev `isolation-check` 原生开发二进制、构建后的前端、独立固定 CPA、源码归档、随附许可、虚构运行入口和 HAND_RUN。不把 CPA 链接进 Jev，不重写 OAuth、刷新或协议内核。只有显式隔离 debug profile 的 Providers 页显示开发服务控制；普通构建没有这些 IPC，真实 CPA 授权仍未配置。
+这是 macOS arm64 的 unsigned development folder，包含 Jev `isolation-check` 原生开发二进制、构建后的前端、独立固定 CPA、源码归档、随附许可和依赖通知、虚构运行入口和 HAND_RUN。不把 CPA 链接进 Jev，不重写 OAuth、刷新或协议内核。只有显式隔离 debug profile 的 Providers 页显示开发服务控制；普通构建没有这些 IPC，真实 CPA 授权仍未配置。
 
 | 产物 | source / version | checksum / 许可 |
 | --- | --- | --- |
@@ -20,10 +20,10 @@
 先有已验证的 CPA 文件和 `<CPA>.LICENSE`、现成 Node 22+/pnpm 10+/Rust/Tauri 工具链及本项目依赖。使用自有 source、Cargo cache/target；锁文件不变，不下载系统软件。将 CPA 放在本任务拥有目录，不能把前序 checkout/target 作为输出目录。
 
 ```sh
-CARGO_HOME=/absolute/owned-cargo-cache node scripts/build-mac-development.mjs /absolute/pinned-cpa /absolute/new-development-folder /absolute/owned-target
+CARGO_HOME=/absolute/owned-cargo-cache node scripts/build-mac-development.mjs /absolute/pinned-cpa /absolute/new-development-folder /absolute/owned-target /absolute/verified-cpa-module-cache /absolute/verified-go/LICENSE
 ```
 
-构建脚本要求干净、已提交 source，设置编译期 `AUTOJEV_DEVELOPMENT_ISOLATION=1`（普通构建不变），执行 `pnpm build` 和 locked/offline 原生 build，核对 source 未改变、两份 Mach-O arm64 文件及 CPA/许可 pin，然后生成新目录与逐文件 SHA manifest。已存在目录不会覆盖。产物有源码归档与构建命令，可重建/重新验契约；不修改 AGENTS、全局技能或系统配置。
+构建脚本要求干净、已提交 source，设置编译期 `AUTOJEV_DEVELOPMENT_ISOLATION=1`（普通构建不变），执行 `pnpm build` 和 locked/offline 原生 build，核对 source 未改变、两份 Mach-O arm64 文件及 CPA/许可 pin，保留 Node（含 React、字体 OFL）、locked Rust、固定 CPA 模块缓存与 Go 的许可通知，再生成新目录与逐文件 SHA manifest。依赖通知包含构建依赖，不改变 Jev/CPA 自身许可。已存在目录不会覆盖。产物有源码归档与构建命令，可重建/重新验契约；不修改 AGENTS、全局技能或系统配置。
 
 从任意目录运行产物的隔离验收，前端静态资源随附，不依赖开发服务器/node_modules：
 
@@ -40,7 +40,7 @@ node /absolute/folder/scripts/check-dsh-desktop.mjs /absolute/folder/bin/jev /ab
 | 状态 | 具体动作 | 不改变的准入事实 |
 | --- | --- | --- |
 | 文件缺失 / 版本或 checksum 不兼容 | 面板报错；指定 manifest 对应的现成文件，再显式启动 | 不下载更新、不配置真实凭据；校验失败前不启动 CPA |
-| 端口占用 | 面板显示 occupied；释放自有端口或选其它独立端口 | 不杀、不认领该端口的外部服务 |
+| 端口占用 | 首次启动可选独立端口；恢复时须由占用者释放保存端口，或新建隔离目录及来源引用 | 不杀、不认领该端口的外部服务 |
 | 自有 CPA 退出 | 状态显示退出，撤回该服务 endpoint；点恢复回收旧 child handle，再校验启动 | 固定请求失败，不换来源；恢复不赋予资格或真实生成许可 |
 | 安全退出 / 重开应用 | 回收并 wait 自有 CPA；重开显式启动保存端口 | 稳定 UUID、连接实例/世代与 namespace 绑定保留；不自动登录/查询/生成 |
 | 身份、模型、协议或费用依据不成立 | 保持拒绝；按 [逐来源 HAND_RUN](relay-hand-run.md)记录未测/禁用与缺失依据 | 不能靠服务恢复、模型选择、provider enabled 或 Debug/测速旁路 |

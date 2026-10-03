@@ -5,10 +5,11 @@ import { createHash } from 'node:crypto';
 import { cp, mkdir, readFile, writeFile, readdir, access } from 'node:fs/promises';
 import { resolve, join, isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { collectDevelopmentNotices } from './development-notices.mjs';
 
 const checkout = fileURLToPath(new URL('../', import.meta.url));
-const [cpa, output, target] = process.argv.slice(2);
-assert.ok([cpa, output, target].every(p => p && isAbsolute(p)), 'Provide absolute CPA, new output folder and owned Cargo target paths');
+const [cpa, output, target, cpaModuleCache, goLicense] = process.argv.slice(2);
+assert.ok([cpa, output, target, cpaModuleCache, goLicense, process.env.CARGO_HOME].every(p => p && isAbsolute(p)), 'Provide absolute CPA, new output, owned Cargo target/cache, CPA module cache and Go license paths');
 assert.equal(process.platform, 'darwin'); assert.equal(process.arch, 'arm64', 'Only the pinned Mac arm64 artifact has been verified');
 assert.ok(!resolve(output).startsWith(resolve(checkout)), 'Keep the artifact outside the source checkout');
 let exists = true; try { await access(output); } catch (e) { if (e.code === 'ENOENT') exists = false; else throw e; }
@@ -35,6 +36,7 @@ await mkdir(output); await mkdir(join(output, 'bin')); await mkdir(join(output, 
 await cp(binary, join(output, 'bin/jev')); await cp(cpa, join(output, 'bin/cpa'));
 await cp(`${cpa}.LICENSE`, join(output, 'CPA.LICENSE'));
 await cp(join(checkout, 'LICENSE'), join(output, 'JEV.LICENSE')); await cp(join(checkout, 'NOTICE'), join(output, 'NOTICE'));
+const notices = await collectDevelopmentNotices({ checkout, output, cargoHome: process.env.CARGO_HOME, cpaModuleCache, goLicense });
 await cp(join(checkout, 'dist'), join(output, 'web'), { recursive: true });
 await mkdir(join(output, 'docs'));
 await cp(join(checkout, 'docs/testing'), join(output, 'docs/testing'), { recursive: true });
@@ -51,5 +53,5 @@ async function inventory(dir, prefix = '') {
   }
 }
 await inventory(output);
-await writeFile(join(output, 'manifest.json'), JSON.stringify({ schema_version: 1, kind: 'unsigned-isolated-development-folder', platform: 'darwin/arm64', built_at: new Date().toISOString(), jev: { repository: 'https://github.com/LC-86/JevModelRouter', source, version: '0.1.2', license: 'AGPL-3.0-only' }, cpa: pin, real_capabilities_enabled: false, build_commands: ['pnpm build', 'cargo build --locked --offline --manifest-path src-tauri/Cargo.toml --features isolation-check'], files }, null, 2) + '\n');
+await writeFile(join(output, 'manifest.json'), JSON.stringify({ schema_version: 1, kind: 'unsigned-isolated-development-folder', platform: 'darwin/arm64', built_at: new Date().toISOString(), jev: { repository: 'https://github.com/LC-86/JevModelRouter', source, version: '0.1.2', license: 'AGPL-3.0-only' }, cpa: pin, real_capabilities_enabled: false, dependency_notice_count: notices, build_commands: ['pnpm build', 'cargo build --locked --offline --manifest-path src-tauri/Cargo.toml --features isolation-check'], files }, null, 2) + '\n');
 console.log(`Development artifact: ${output}; manifest SHA-256 ${hash(await readFile(join(output, 'manifest.json')))}`);

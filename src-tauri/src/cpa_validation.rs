@@ -533,6 +533,9 @@ pub async fn start_cpa_development_service(state: State<'_, crate::AppState>, bi
     let Some((_, mut profile)) = development_profile().map_err(|e| format!("{e:#}"))? else {
         return Err("CPA development service requires the explicit isolated debug profile".into());
     };
+    if profile.port != 0 && port != profile.port {
+        return Err("Use the saved port to preserve fixed targets; release its occupant or create a new isolated home and new source references".into());
+    }
     profile.port = port;
     let view = start_cpa_validation(state.clone(), binary, profile).await?;
     let path = crate::runtime::home_dir().expect("Validated isolation home").join(".autojev/cpa-development-port.json");

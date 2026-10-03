@@ -41,8 +41,10 @@
         await wait(() => document.querySelector('[data-testid="cpa-service-error"]')?.textContent.includes(reason), reason);
       }
       await set('[data-testid="cpa-service-binary"]', binary);
-      await set('[data-testid="cpa-service-port"]', new URL(base).port); await click('[data-testid="cpa-service-start"]');
-      await wait(() => document.querySelector('[data-testid="cpa-service-error"]')?.textContent.includes('port is already occupied'), 'occupied port recovery message');
+      if (!reload) {
+        await set('[data-testid="cpa-service-port"]', new URL(base).port); await click('[data-testid="cpa-service-start"]');
+        await wait(() => document.querySelector('[data-testid="cpa-service-error"]')?.textContent.includes('port is already occupied'), 'occupied port recovery message');
+      }
       await set('[data-testid="cpa-service-port"]', String(profile.port));
       await uiStart();
       await control('/__own_cpa', { pid: report.service.pid });
@@ -88,9 +90,14 @@
       await wait(async () => (await invoke('get_cpa_development_service')).state === 'exited', 'owned child exit status');
       const failed = await call(request('a1', tag('service-exit')));
       check(failed.status >= 400, 'Exited service must reject a fixed target'); await only(offset, 'a1', 0);
+      await set('[data-testid="cpa-service-port"]', '0'); await click('[data-testid="cpa-service-start"]');
+      const recovered = await invoke('get_cpa_development_service');
+      check(recovered.state === 'exited', 'Changing the recovery port must not strand saved fixed targets');
+      await wait(() => document.querySelector('[data-testid="cpa-service-error"]')?.textContent.includes('saved port'), 'saved port recovery guidance');
+      await set('[data-testid="cpa-service-port"]', String(profile.port));
       await uiStart();
       check(report.service.base_url === snapshot.providers.find(p => p.id === 'r5-a1').base_url.replace(/\/v1$/, ''), 'Recovery preserves the saved endpoint and target bindings');
-      report.checks.push('service-exit fixed request fails with zero upstream dispatch; UI recovery preserves source/model binding');
+      report.checks.push('service-exit fixed request fails with zero upstream dispatch; recovery rejects port changes and preserves source/model binding');
     }
     const text = await call(request('a1', tag('text'))); check(text.status === 200 && text.body.includes('a1:'), 'Plain fixed text'); await only(offset, 'a1', 1);
     offset = (await records()).length;
