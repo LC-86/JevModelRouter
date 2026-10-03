@@ -717,5 +717,150 @@
       "model": "same-model",
       "stream": false
     }
-  ]
+  ],
+  "pr61-p2-fixes": {
+    "review_head": "d5bc6e133ac997309be062bd31bc9d6d48dedf7a",
+    "review_id": 5400758293,
+    "cancel-poll": {
+      "discussion_id": 4173157765,
+      "test": "cpa_sources::tests::cancel_discards_a_late_success_and_only_cancels_its_owned_session",
+      "before": {
+        "exit_code": 101,
+        "failed_assertion": "A pending poll must retain cleanup ownership after cancellation",
+        "seam": "public Manager operations, temporary SQLite and pinned fictional management HTTP"
+      },
+      "after": {
+        "result": "passed in all 9 CPA lifecycle tests and full 534-test Rust run",
+        "observations": [
+          "cleanup unfinished while the poll is pending",
+          "begin/remove blocked until completion",
+          "late identity rejected and old service profile isolated",
+          "replacement cannot reuse the retired profile"
+        ]
+      }
+    },
+    "delete-rediscovery": {
+      "discussion_id": 4173157773,
+      "before.report": {
+        "checks": [
+          "begin/wait/cancel public desktop loop",
+          "failure/disconnect public desktop loop"
+        ],
+        "error": "Error: Delete/rediscovery must retain the fixed model UUID",
+        "layer": "native-desktop-fictional-cpa",
+        "ok": false,
+        "rediscovery": {
+          "deleted_id": "cd212aff-4636-4687-8663-b577b897d3e5",
+          "restored_id": "f2ad9c32-dbb5-4c8a-a2e6-3b8321a98781",
+          "selected": false
+        },
+        "run_id": "54cb4ee9-4529-4383-95ac-e0092adf2d4b"
+      }
+    },
+    "first.report": {
+      "api_source": {
+        "connection_instance_id": "558ab59a-6d64-4cd1-a452-2878e7b8f600",
+        "generation": 1,
+        "model_id": "535d9db3-a6ac-4736-a07b-60d4cbe81e55",
+        "provider_id": "same-name-paid"
+      },
+      "bound_rediscovery": {
+        "bound": true,
+        "deleted_id": "85bbe1f3-a6da-40fe-8299-73ab80bad799",
+        "restored_id": "85bbe1f3-a6da-40fe-8299-73ab80bad799",
+        "selected": false
+      },
+      "checks": [
+        "begin/wait/cancel public desktop loop",
+        "failure/disconnect public desktop loop",
+        "public delete_model and directory rediscovery preserve an unselected fixed UUID",
+        "public delete_model preserves an existing binding UUID; reselection stays explicit",
+        "public model edits retain the CPA fixed target and unknown capabilities",
+        "connection/directory/selection/listening gateway rejection; no same-name API fallback",
+        "stale directory retained; switch disables old target; explicit rebind",
+        "R2 explicit API and R3 CPA identities coexist and persist independently"
+      ],
+      "layer": "native-desktop-fictional-cpa",
+      "ok": true,
+      "receipts": {
+        "accountQueries": 0,
+        "deleted": [
+          "fictional-fictional-a.json"
+        ],
+        "downloads": 0,
+        "models": 0,
+        "sessions": [
+          "fictional-1",
+          "fictional-2"
+        ]
+      },
+      "rediscovery": {
+        "deleted_id": "85bbe1f3-a6da-40fe-8299-73ab80bad799",
+        "restored_id": "85bbe1f3-a6da-40fe-8299-73ab80bad799",
+        "selected": false
+      },
+      "run_id": "630834c2-0fc8-41e4-bccc-365d830471ee",
+      "saved": {
+        "generation": 8,
+        "model_id": "85bbe1f3-a6da-40fe-8299-73ab80bad799",
+        "provider_id": "cpa-8026d690-0972-4289-8dc9-1b9f48b8c830"
+      }
+    },
+    "reload.report": {
+      "api_source": {
+        "connection_instance_id": "558ab59a-6d64-4cd1-a452-2878e7b8f600",
+        "generation": 1,
+        "model_id": "535d9db3-a6ac-4736-a07b-60d4cbe81e55",
+        "provider_id": "same-name-paid"
+      },
+      "checks": [
+        "isolated DB restart re-read; no automatic authorization",
+        "R2 explicit API and R3 CPA identities coexist and persist independently"
+      ],
+      "layer": "native-desktop-fictional-cpa",
+      "ok": true,
+      "receipts": {
+        "accountQueries": 0,
+        "deleted": [
+          "fictional-fictional-a.json"
+        ],
+        "downloads": 0,
+        "models": 0,
+        "sessions": [
+          "fictional-1",
+          "fictional-2"
+        ]
+      },
+      "run_id": "d1ee9221-c9f9-4db6-a506-d861d31afbb6",
+      "saved": {
+        "generation": 8,
+        "model_id": "85bbe1f3-a6da-40fe-8299-73ab80bad799",
+        "provider_id": "cpa-8026d690-0972-4289-8dc9-1b9f48b8c830"
+      }
+    },
+    "receiver-records": {
+      "models": 0,
+      "downloads": 0,
+      "accountQueries": 0,
+      "sessions": [
+        "fictional-1",
+        "fictional-2"
+      ],
+      "deleted": [
+        "fictional-fictional-a.json"
+      ]
+    },
+    "validation": {
+      "rust": "534 passed; 0 failed",
+      "frontend": "96 passed in 16 files",
+      "build": "passed",
+      "release_check": "passed",
+      "native_build": "passed, isolation-check feature"
+    },
+    "real_operations": {
+      "oauth_login": 0,
+      "account_quota_queries": 0,
+      "model_calls": 0
+    }
+  }
 }

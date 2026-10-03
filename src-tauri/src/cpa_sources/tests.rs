@@ -504,6 +504,12 @@ async fn cancel_discards_a_late_success_and_only_cancels_its_owned_session() {
         .await
         .unwrap();
     manager.disconnect(&store, &id, true).await.unwrap();
+    assert!(
+        !manager.cleanup_finished(&id),
+        "A pending poll must retain cleanup ownership after cancellation"
+    );
+    assert!(manager.remove(&store, &id).is_err());
+    assert!(manager.begin(&store, &id).await.is_err());
     release.notify_one();
     assert!(operation
         .await
@@ -516,9 +522,19 @@ async fn cancel_discards_a_late_success_and_only_cancels_its_owned_session() {
     assert!(view.generation > old_generation);
     assert!(view.account.is_none() && view.plan.is_none() && view.authorization_url.is_none());
     assert_eq!(*cancels.lock().unwrap(), vec!["owned-old-session"]);
+    assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(
+        !view.service_available,
+        "A late credential must isolate the old service profile without restoring identity"
+    );
     assert!(
         manager.begin(&store, &id).await.is_err(),
         "Never adopt a credential saved after a cancelled flow"
     );
+    assert!(manager.cleanup_finished(&id));
+    manager.remove(&store, &id).unwrap();
+    let replacement = manager.create(&store, "codex", "New connection").unwrap();
+    assert!(!manager.views(&store.read())[0].service_available);
+    assert!(manager.begin(&store, &replacement).await.is_err());
     server.abort();
 }

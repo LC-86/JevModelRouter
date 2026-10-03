@@ -43,7 +43,7 @@ CPA 管理 key、会话 state 和 HTTP 客户端只在后端；桌面只取得�
 
 最高层接缝沿用规格已确认的本地网关、临时 SQLite、公开桌面操作和回环管理替身。已观察：原生 webview 按钮闭环、A→B 换号后的旧固定目标拒绝、失败陈旧目录、显式重新绑定、两次原生进程的保存/重读和新的 run ID 报告。图片为本任务启动的原生窗口，按其 PID 限定截图，未截取其它应用：[原生截图](../screenshots/cpa-r3-native.png)。
 
-2026-10-03 的当前实现通过前端 96 项、Rust 534 项（其中新增 CPA 行为 9 项与界面投影 1 项），以及构建和 release 检查。[原始桌面报告](cpa-r3-evidence.json) 保留首轮 `ebf73ee4-4fcd-4952-8a1c-1900839ba0c6` 与重启 `8c66f7c1-c39e-4751-becb-c5cec7d9fdf9` 两个 run ID；两轮 `ok:true`、同一 provider/model UUID 与世代 8，接收端模型请求、凭据下载及额度查询均为 0。截图来自后一次重启，服务不自动重连。公共管理/临时 DB 测试覆盖取消迟到授权、换号迟到目录、账号变化且目录失败、待授权进程重启、完成后取消的清理重试、首次认领前到期的安全隔离/删除及授权 URL 迟到时的 profile 复用阻止；原生流程覆盖公开模型编辑不能重指固定来源/原 ID。
+2026-10-03 集成提交 `d5bc6e1` 的实现通过前端 96 项、Rust 534 项（其中新增 CPA 行为 9 项与界面投影 1 项），以及构建和 release 检查。[原始桌面报告](cpa-r3-evidence.json) 保留首轮 `ebf73ee4-4fcd-4952-8a1c-1900839ba0c6` 与重启 `8c66f7c1-c39e-4751-becb-c5cec7d9fdf9` 两个 run ID；两轮 `ok:true`、同一 provider/model UUID 与世代 8，接收端模型请求、凭据下载及额度查询均为 0。截图来自后一次重启，服务不自动重连。公共管理/临时 DB 测试覆盖取消迟到授权、换号迟到目录、账号变化且目录失败、待授权进程重启、完成后取消的清理重试、首次认领前到期的安全隔离/删除及授权 URL 迟到时的 profile 复用阻止；原生流程覆盖公开模型编辑不能重指固定来源/原 ID。
 
 隔离 SQLite/重启与应用专用临时路径已验证；**真实 macOS Keychain、CPA OAuth auth-dir 写入/刷新、真实账号和真实额度尚未验证**。本票管理替身使用虚构元数据，未安装真实服务或凭据。CPA R1 的实际 API 定向结果不推广到 OAuth。
 
@@ -58,7 +58,7 @@ node scripts/check-cpa-subscriptions.mjs /absolute/owned-target/debug/autojev --
 
 桌面驱动保留 `first.report.json`、`reload.report.json`、`receiver-records.json` 和本轮 run ID 截图。两份报告均需 `ok:true`，保存的 provider/model/generation 必须一致。缺报告、锁屏、超时均不计通过。清理仅针对该驱动启动的桌面进程组、Vite 和回环服务；截图失败如实输出，不改变产品验证报告。
 
-## R2 合并后的组合回归
+## R2 合并后的组合回归（d5bc6e1）
 
 已将 PR62 的 main 合并提交 `ca5f24a13da5a9e69164329a1d12429b23ceca28`（R2 验收 head `de57f04f6753de3b8361cd6dccd78d755ae5c192`）集成到 R3 分支。实际文本冲突仅为 `isolation_check.rs` 的脚本选择与 `types.ts` 的 Snapshot 字段：保留两个显式验收入口，并同时保留 API/CPA 的独立投影。自动合并的配置、保存/删除、固定模型校验、Provider 页面与共同准入已复核，两类来源继续使用既有 UUID 和各自身份记录；未改 R2 协议/脱敏实现。
 
@@ -67,3 +67,14 @@ node scripts/check-cpa-subscriptions.mjs /absolute/owned-target/debug/autojev --
 R2 原生基线也在此合并结果运行两次，首轮 `97f4d183-cbd8-41d7-9fb2-600fa44c3607`、重启 `d42ad08a-1647-4c9c-a632-8280f07f95f3` 均 `ok:true`，66 次虚构回环请求的固定 endpoint、模型与凭据匹配全部通过；保存/重开、停用/删除、测试、Debug、拒绝与既有三下游文本/SSE 也保持通过。完整报告与非秘密接收记录加入同一原始证据文件。所有运行只使用任务自有临时 DB、虚构 Key 和回环服务；真实登录、账号/额度及模型操作保持 0。
 
 合入顺序由父线程协调 R2 后 R3，合入后需重新验证共有接缝。共享字段集中在 AppConfig/Snapshot 的独立 CPA map，服务商、模型 UUID 与网关准入沿用已有接口。可能交叠的位置包括配置 loader、`save_model`/`validate_model`、服务商删除与页面、Snapshot 和共同准入。
+
+## PR61 的两项 P2 修复
+
+复现基线为 `d5bc6e133ac997309be062bd31bc9d6d48dedf7a`，Codex review `5400758293`；本轮只处理取消迟到清理与删除后 UUID 漂移。
+
+- [取消与轮询重叠](https://github.com/LC-86/JevModelRouter/pull/61#discussion_r4173157765)：现有公开管理/回环测试新增清理责任断言后实际失败，取消返回时旧 poll 未结束但 `cleanup_finished` 已为 true。修复后在途 poll 保留清理责任，阻止连接删除/复用；迟到结果结束后隔离旧专用服务，不认领或删除未证明归属的凭据，也不恢复身份。该配置不能再用于新连接。
+- [删除后重新发现](https://github.com/LC-86/JevModelRouter/pull/61#discussion_r4173157773)：原生 webview 调用公开 `delete_model` 后点击读取目录，UUID 从 `cd212aff-4636-4687-8663-b577b897d3e5` 变为 `f2ad9c32-dbb5-4c8a-a2e6-3b8321a98781`，断言实际失败。连接现在持久保存原 ID 到 UUID 的非秘密记录，公开删除也为既有配置补记 UUID；重新发现沿用 UUID，默认未选择，已有绑定引用保持可解析，换号仍须明确重新绑定。
+
+修复代码重新通过 Rust **534/534**、前端 **96/96**、build/release 与原生隔离构建。原生首轮 `630834c2-0fc8-41e4-bccc-365d830471ee`、重启 `d1ee9221-c9f9-4db6-a506-d861d31afbb6` 均 `ok:true`，覆盖未选择及已绑定模型的公开删除/目录重建、明确重新选择与重启。两次删除均恢复 UUID `85bbe1f3-a6da-40fe-8299-73ab80bad799`；已绑定模型恢复时 `bound:true / selected:false`。临时读失败、换号拒绝旧目标和同名 API 零接替继续通过。
+
+[原始报告](cpa-r3-evidence.json) 的 `pr61-p2-fixes` 保存失败与通过报告、接收记录；上述 R2 原生 66 次记录仍标记为 `d5bc6e1` 历史组合回归，没有冒称本轮重跑。当前截图更新到本轮重启的自有原生窗口。普通等待/取消驱动等待检查按钮重新可用，取消重叠由上述回环竞态测试覆盖。真实登录、账号/额度和模型操作继续为 **0**；本票没有真实账号验收。

@@ -42,6 +42,8 @@ pub struct Connection {
     pub plan: Option<String>,
     pub credential_ref: Option<String>,
     pub catalog: Vec<Discovered>,
+    #[serde(default)]
+    pub model_ids: HashMap<String, String>,
     pub catalog_state: EvidenceState,
     pub observed_at: Option<String>,
     pub error: Option<String>,
@@ -126,6 +128,7 @@ pub struct Manager {
     clients: Mutex<HashMap<String, Arc<client::Client>>>,
     attempts: Mutex<HashMap<String, Attempt>>,
     cleaning: Mutex<HashSet<String>>,
+    polling: Mutex<HashSet<String>>,
     fixture: Mutex<Option<Arc<client::Client>>>,
 }
 
@@ -172,12 +175,15 @@ impl Manager {
     pub fn cleanup_finished(&self, id: &str) -> bool {
         !self.attempts.lock().unwrap().contains_key(id)
             && !self.cleaning.lock().unwrap().contains(id)
+            && !self.polling.lock().unwrap().contains(id)
     }
     pub fn remove(&self, store: &ConfigStore, id: &str) -> Result<()> {
         let attempts = self.attempts.lock().unwrap();
         let cleaning = self.cleaning.lock().unwrap();
         ensure!(
-            !attempts.contains_key(id) && !cleaning.contains(id),
+            !attempts.contains_key(id)
+                && !cleaning.contains(id)
+                && !self.polling.lock().unwrap().contains(id),
             "Finish owned CPA cleanup before deleting this connection"
         );
         store.update(|config| -> Result<()> {
@@ -233,6 +239,7 @@ impl Manager {
                     plan: None,
                     credential_ref: None,
                     catalog: vec![],
+                    model_ids: HashMap::new(),
                     catalog_state: EvidenceState::Unknown,
                     observed_at: None,
                     error: None,
@@ -299,7 +306,9 @@ impl Manager {
             let mut attempts = self.attempts.lock().unwrap();
             let cleaning = self.cleaning.lock().unwrap();
             ensure!(
-                !attempts.contains_key(id) && !cleaning.contains(id),
+                !attempts.contains_key(id)
+                    && !cleaning.contains(id)
+                    && !self.polling.lock().unwrap().contains(id),
                 "Wait for the previous owned authorization/cleanup to finish"
             );
             let stamp = store.update(|config| -> Result<IdentityStamp> {
@@ -385,48 +394,91 @@ impl Manager {
 
     pub async fn poll(&self, store: &ConfigStore, id: &str) -> Result<()> {
         let client = self.client(id)?;
-        let attempt = self
-            .attempts
-            .lock()
-            .unwrap()
-            .get(id)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("No owned authorization session"))?;
-        let result = async {
-            let session=attempt.state.as_deref().ok_or_else(||anyhow::anyhow!("Authorization request is still starting"))?;
-            match client.status(session).await? {
-                client::SessionStatus::Waiting => return Ok(None),
-                client::SessionStatus::Complete => {},
-                client::SessionStatus::Expired => anyhow::bail!("CPA authorization record expired; disconnect to isolate the old service profile"),
-            }
-            let mut files=client.credentials().await?;
-            ensure!(files.len()==1 && files[0].provider==store.read().cpa_subscriptions[id].provider && !files[0].disabled, "Dedicated CPA profile must contain exactly one active credential of the expected provider");
-            Ok(Some(files.remove(0)))
-        }.await;
-        let credential = match result {
-            Ok(None) => return Ok(()),
-            Ok(Some(c)) => c,
-            Err(e) => {
-                fail(store, id, &attempt.stamp, &e.to_string())?;
-                return Err(e);
-            }
+        let (attempt, provider, _poll) = {
+            let attempts = self.attempts.lock().unwrap();
+            let attempt = attempts
+                .get(id)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("No owned authorization session"))?;
+            let config = store.read();
+            let c = config
+                .cpa_subscriptions
+                .get(id)
+                .ok_or_else(|| anyhow::anyhow!("Unknown CPA connection"))?;
+            ensure!(
+                attempt.stamp.matches(id, c) && c.stage == Stage::Waiting,
+                "Authorization was superseded"
+            );
+            ensure!(
+                self.polling.lock().unwrap().insert(id.into()),
+                "Owned authorization poll is already in progress"
+            );
+            (
+                attempt,
+                c.provider.clone(),
+                CleanupLease {
+                    active: &self.polling,
+                    id: id.into(),
+                },
+            )
         };
-        let mut attempts = self.attempts.lock().unwrap();
-        store.update(|config| -> Result<()> {
-            let c = current(config, id, &attempt.stamp)?;
-            ensure!(c.stage == Stage::Waiting, "Authorization was superseded");
-            c.identity.state = ConnectionState::Connected;
-            c.identity.identity = known(credential.id_token.chatgpt_account_id);
-            c.plan = known(credential.id_token.plan_type);
-            c.credential_ref = Some(credential.name);
-            c.stage = Stage::Connected;
-            c.error = None;
+        let outcome = async {
+            let result = async {
+                let session=attempt.state.as_deref().ok_or_else(||anyhow::anyhow!("Authorization request is still starting"))?;
+                match client.status(session).await? {
+                    client::SessionStatus::Waiting => return Ok(None),
+                    client::SessionStatus::Complete => {},
+                    client::SessionStatus::Expired => anyhow::bail!("CPA authorization record expired; disconnect to isolate the old service profile"),
+                }
+                let mut files=client.credentials().await?;
+                ensure!(files.len()==1 && files[0].provider==provider && !files[0].disabled, "Dedicated CPA profile must contain exactly one active credential of the expected provider");
+                Ok(Some(files.remove(0)))
+            }.await;
+            let credential = match result {
+                Ok(None) => return Ok(()),
+                Ok(Some(c)) => c,
+                Err(e) => {
+                    fail(store, id, &attempt.stamp, &e.to_string())?;
+                    return Err(e);
+                }
+            };
+            let mut attempts = self.attempts.lock().unwrap();
+            store.update(|config| -> Result<()> {
+                let c = current(config, id, &attempt.stamp)?;
+                ensure!(c.stage == Stage::Waiting, "Authorization was superseded");
+                c.identity.state = ConnectionState::Connected;
+                c.identity.identity = known(credential.id_token.chatgpt_account_id);
+                c.plan = known(credential.id_token.plan_type);
+                c.credential_ref = Some(credential.name);
+                c.stage = Stage::Connected;
+                c.error = None;
+                Ok(())
+            })??;
+            if attempts.get(id).is_some_and(|a| a.stamp == attempt.stamp) {
+                attempts.remove(id);
+            }
             Ok(())
-        })??;
-        if attempts.get(id).is_some_and(|a| a.stamp == attempt.stamp) {
-            attempts.remove(id);
+        }.await;
+        // A cancelled poll still owns its late service result. Block reuse/removal
+        // until it settles, then isolate that profile without adopting its credentials.
+        let mut attempts = self.attempts.lock().unwrap();
+        let config = store.read();
+        if !config.cpa_subscriptions.get(id).is_some_and(|c| {
+            c.identity.connection_instance_id == attempt.stamp.connection_instance_id
+                && c.identity.generation == attempt.stamp.generation
+        }) {
+            self.retire_profile(id, &client);
+            store.update(|config| {
+                if let Some(c) = config.cpa_subscriptions.get_mut(id) {
+                    c.credential_ref = None;
+                    c.error = Some("Cancelled authorization poll settled; old service profile isolated. 迟到授权结果已隔离；请删除旧连接并配置新的专用服务。未认领凭据不会删除。".into());
+                }
+            })?;
+            if attempts.get(id).is_some_and(|a| a.stamp == attempt.stamp) {
+                attempts.remove(id);
+            }
         }
-        Ok(())
+        outcome
     }
 
     pub async fn disconnect(&self, store: &ConfigStore, id: &str, cancel: bool) -> Result<()> {
@@ -480,7 +532,13 @@ impl Manager {
             if let Some(a) = &attempt {
                 let client = self.client(id)?;
                 let session = a.state.as_deref().expect("pending start handled above");
-                if !client.cancel(session).await? && credential.is_none() {
+                let cancelled = client.cancel(session).await?;
+                if self.polling.lock().unwrap().contains(id)
+                    || !self.clients.lock().unwrap().contains_key(id) {
+                    // The poll retains this attempt and isolates its profile when it settles.
+                    return Ok(());
+                }
+                if !cancelled && credential.is_none() {
                     // Fixed CPA returns false after completion. This attempt started with an
                     // empty, exclusive profile: claim a proven completion for cleanup only.
                     // An already persisted cleanup reference outlives CPA's completed-session TTL.
@@ -542,9 +600,10 @@ impl Manager {
                     c.credential_ref = None;
                 }
             })?;
-            if attempts
-                .get(id)
-                .is_some_and(|a| attempt.as_ref().is_some_and(|old| old.stamp == a.stamp))
+            if !self.polling.lock().unwrap().contains(id)
+                && attempts
+                    .get(id)
+                    .is_some_and(|a| attempt.as_ref().is_some_and(|old| old.stamp == a.stamp))
             {
                 attempts.remove(id);
             }
@@ -610,14 +669,18 @@ impl Manager {
                         Err(_) => mark_read_failed(c),
                     }
                     if let Ok(models) = &result {
+                        let model_ids = &mut config.cpa_subscriptions.get_mut(id)
+                            .expect("current connection validated above").model_ids;
                         for discovered in models {
-                            if !config
-                                .models
-                                .iter()
-                                .any(|m| m.provider_id == id && m.model_id == discovered.model_id)
-                            {
+                            if let Some(existing) = config.models.iter()
+                                .find(|m| m.provider_id == id && m.model_id == discovered.model_id) {
+                                model_ids.entry(discovered.model_id.clone())
+                                    .or_insert_with(|| existing.id.clone());
+                            } else {
+                                let internal_id = model_ids.entry(discovered.model_id.clone())
+                                    .or_insert_with(|| uuid::Uuid::new_v4().to_string()).clone();
                                 config.models.push(Model {
-                                    id: uuid::Uuid::new_v4().to_string(),
+                                    id: internal_id,
                                     provider_id: id.into(),
                                     model_id: discovered.model_id.clone(),
                                     name: discovered.name.clone(),
@@ -708,6 +771,10 @@ impl Manager {
             failures.is_empty(),
             "CPA owned-session cleanup failed: {}",
             failures.join("; ")
+        );
+        ensure!(
+            self.polling.lock().unwrap().is_empty(),
+            "Owned CPA authorization poll is still finishing; retry shutdown"
         );
         ensure!(
             self.attempts
