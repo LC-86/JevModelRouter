@@ -1,0 +1,88 @@
+{
+  "layer": "read-only-installed-published-code",
+  "runtime_started": false,
+  "user_configuration_read_or_written": false,
+  "real_model_calls": 0,
+  "logins": 0,
+  "account_quota_queries": 0,
+  "files": [
+    {
+      "package": "@deepseek-ai/dsh",
+      "version": "0.1.7-rc.1",
+      "file": "package.json",
+      "sha256": "0180a9a66d09c6ea3530dbc78f2a2c654851c7745becb664988aaecb50ae16cb"
+    },
+    {
+      "package": "@deepseek-ai/dsh",
+      "version": "0.1.7-rc.1",
+      "file": "lib/bin.js",
+      "sha256": "7694036ad5f089385894f8b76c24ecc910a1b8c6ef096412c5a11cd8b53d7854"
+    },
+    {
+      "package": "@deepseek-ai/dsh-llm-pi-ai",
+      "version": "0.1.7-rc.1",
+      "file": "package.json",
+      "sha256": "b27444d29b7f1fcfbdc1c01e027a28641c952f15de6494dd147a737e69c980a5"
+    },
+    {
+      "package": "@deepseek-ai/dsh-llm-pi-ai",
+      "version": "0.1.7-rc.1",
+      "file": "lib/index.js",
+      "sha256": "b49de2029fc843b1212e5df1324e875f0cf38aef8789d84ff5fa8bba378aa56e"
+    },
+    {
+      "package": "@deepseek-ai/dsh-agent",
+      "version": "0.1.7-rc.1",
+      "file": "package.json",
+      "sha256": "f074c8bb69275eb1faa8be454189f57bb1800f3b6dd21738bab8de19c4c260e3"
+    },
+    {
+      "package": "@deepseek-ai/dsh-agent",
+      "version": "0.1.7-rc.1",
+      "file": "lib/index.js",
+      "sha256": "7b9aa39474de83115cf890dd7f8904cf0d59df0811cb335ab85565a04f1aac93"
+    },
+    {
+      "package": "@deepseek-ai/dsh-agent-default-model",
+      "version": "0.1.7-rc.1",
+      "file": "package.json",
+      "sha256": "d4afef87f78c9945524e7f272b7fb7a1e822ba77b845956ba338968c41091b84"
+    },
+    {
+      "package": "@deepseek-ai/dsh-agent-default-model",
+      "version": "0.1.7-rc.1",
+      "file": "lib/index.js",
+      "sha256": "2206d4e1d3dcc9cbe4ea7c47f6ed6db1b6b1cf838dfe27ab34faef9359be324c"
+    },
+    {
+      "package": "@deepseek-ai/dsh-api-session-controller",
+      "version": "0.1.7-rc.1",
+      "file": "package.json",
+      "sha256": "86bbc078f22a26aea15b54c4736bf6f291f3534cb025048b1e9987aabec97d94"
+    },
+    {
+      "package": "@deepseek-ai/dsh-api-session-controller",
+      "version": "0.1.7-rc.1",
+      "file": "lib/index.js",
+      "sha256": "05daaaf854eabc9db0e1171a55d54fa2f631ca63fe6a91feb0d9c60d827ad79e"
+    },
+    {
+      "package": "@earendil-works/pi-ai",
+      "version": "0.85.1",
+      "file": "dist/api/openai-completions.js",
+      "sha256": "1e2097ced37cf0e21aa5711297eecc77916de8a4ed81a9019bc7d97b22825fa3"
+    }
+  ],
+  "contract": {
+    "adapter": "@deepseek-ai/dsh-llm-pi-ai",
+    "profile": "config.providers.<route>: api, baseURL, apiKeyEnv, models[].id, retryPolicy",
+    "protocol": "openai-completions",
+    "model_endpoint": "POST {baseURL}/chat/completions",
+    "catalog_endpoint": "GET {baseURL}/models (discovery only)",
+    "selection": "AgentDefaultModelConfig {provider, model}; session controller selectModel({sessionId, provider, model}) calls selectForNextRequest",
+    "request_snapshot": "installModelSelection snapshots provider/model at prompt assembly; PiAdapter captures current() before streamWithSnapshot",
+    "cancellation": "GenerateOptions.signal is combined with consumer AbortController",
+    "tools": "client function schemas; tool_calls[].id; history tool_call_id; streamed arguments and finish_reason=tool_calls",
+    "default_retries": "normal mode defaults to 5; fictional profile explicitly sets maxRetries=0"
+  }
+}
