@@ -690,21 +690,25 @@ async fn import_providers(state: State<'_, AppState>, source: String) -> Result<
     let (candidates, mut skipped) = tauri::async_runtime::spawn_blocking(move || provider_import::read(&source))
         .await.map_err(|_| "Could not read import source".to_string())?
         .map_err(|error| error.to_string())?;
+    // Validate every destination, including duplicates, before any credential/config write.
+    let config = state.store.read();
+    for item in &candidates {
+        api_sources::validate_destination_id(&config, &item.provider.id)
+            .map_err(|error| error.to_string())?;
+    }
     let mut imported = 0;
     for item in candidates {
         if provider_import::already_imported(&state.store.read().providers, &item.provider) {
             skipped += 1;
             continue;
         }
-        if !item.key.is_empty() {
-            state.store.write_secret(&format!("provider:{}", item.provider.id), &item.key)
-                .map_err(|_| format!("Could not store credentials. {imported} providers imported before this error."))?;
-        }
-        let id = item.provider.id.clone();
-        if state.store.update(|config| config.providers.push(item.provider)).is_err() {
-            let _ = state.store.delete_secret(&format!("provider:{id}"));
-            return Err(format!("Could not save provider. {imported} providers imported before this error."));
-        }
+        let account = format!("provider:{}", item.provider.id);
+        state.store.update_checked(|config| {
+            api_sources::validate_edit(config, &item.provider, None, None, !item.key.is_empty())?;
+            config.providers.push(item.provider.clone());
+            Ok(())
+        }, Some((&account, &account, (!item.key.is_empty()).then_some(item.key.as_str()))))
+            .map_err(|error| format!("{error}. {imported} providers imported before this error."))?;
         imported += 1;
     }
     Ok(ImportResult { snapshot: snapshot(&state).await, imported, skipped })

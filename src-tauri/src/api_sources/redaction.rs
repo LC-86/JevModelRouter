@@ -165,13 +165,8 @@ fn delta_fields(value: &serde_json::Value) -> Vec<(String, String)> {
                 format!("/choices/{i}/delta/function_call/arguments"),
             ));
             for name in ["content", "refusal", "reasoning_content", "reasoning"] {
-                let channel = if name.starts_with("reasoning") {
-                    "reasoning"
-                } else {
-                    "text"
-                };
                 fields.push((
-                    format!("{channel}:{choice_index}"),
+                    format!("chat:{name}:{choice_index}"),
                     format!("/choices/{i}/delta/{name}"),
                 ));
             }
@@ -205,9 +200,9 @@ fn delta_fields(value: &serde_json::Value) -> Vec<(String, String)> {
                 fields.push((channel, format!("/delta/{name}")));
             }
         }
-        "response.output_text.delta" | "response.refusal.delta" => {
+        kind @ ("response.output_text.delta" | "response.refusal.delta") => {
             fields.push((
-                format!("text:{}:{}", value["output_index"], value["content_index"]),
+                format!("responses:{kind}:{}:{}", value["output_index"], value["content_index"]),
                 "/delta".into(),
             ))
         }

@@ -104,3 +104,5 @@ node scripts/check-api-sources-desktop.mjs /absolute/owned-target/debug/autojev
 原生脚本输出自有临时证据目录，保留 first/reload 报告、桌面日志、接收记录与仅含虚构凭据的 DB；超时或退出只回收本次启动的进程组和回环服务。isolation-check 仍是显式开发入口，没有新增生产管理端点、登录入口或持久权限。真实模型调用、真实登录、账户额度查询均为 0。
 
 公开保存还覆盖旧 API 与未登录订阅服务商改名至退休显式来源 ID 的配置问题。目的 ID 在现有保存前校验中检查，并在事务内复查，早于凭据/订阅资源迁移；拒绝后保留原服务商、模型 UUID/绑定、来源记录、连接及凭据，生成请求为零。两次原生进程分别验证两类配置的拒绝及可用 ID 改名/改回，旧 API 改回后仍使用原虚构凭据命中固定回环来源。不新增订阅授权或认证能力。
+
+同一 Chat choice 的 content/refusal、reasoning_content/reasoning 现在按字段独立累积；Responses output-text/refusal 按事件类型及 output/content 索引独立累积。六个双向交错公开网关回归同时覆盖目标字段内完整虚构 Key 遮蔽、跨字段普通片段保留与终态。导入入口复用保存校验：先预查整个可导入批次，再在既有原子配置/凭据事务内复查。隔离原生公开 import_providers 回归使用自有虚构 Termany/CC Switch 库，含普通项在前、退休项在后的拒绝批次，验证配置不变、无凭据写入、正常导入及重复跳过。字段检查仍限于已列出的有限场景，不新增认证/协议框架或真实供应商覆盖。

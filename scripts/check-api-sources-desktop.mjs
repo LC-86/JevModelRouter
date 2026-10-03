@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import { mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
@@ -11,6 +11,7 @@ const binary = resolve(process.argv[2] || join(process.env.CARGO_TARGET_DIR || '
 const root = await mkdtemp(join(tmpdir(), 'jev-r2-desktop-'));
 console.log(`Owned R2 fixture: ${root}`);
 const records = [], modes = new Map();
+let currentRunId;
 const fixture = createServer(async (req, res) => {
   res.setHeader('access-control-allow-origin', '*');
   res.setHeader('access-control-allow-headers', 'content-type');
@@ -20,7 +21,7 @@ const fixture = createServer(async (req, res) => {
   const reply = data => { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(data)); };
   if (req.url === '/__records') { reply(records); return; }
   if (req.url === '/__mode') { modes.set(body.source, body.status); reply({ ok: true }); return; }
-  if (req.url === '/__progress') { console.log(body.message); reply({ ok: true }); return; }
+  if (req.url === '/__progress') { if (body.prepareImport) { assert.equal(body.prepareImport, currentRunId); prepareImportFixtures(currentRunId); } console.log(body.message); reply({ ok: true }); return; }
   if (req.url === '/__gateway') {
     assert.ok(Number.isInteger(body.port) && body.port > 0 && ![9526, 9527, 11434].includes(body.port));
     assert.ok(['/v1/chat/completions', '/v1/responses', '/v1/messages', '/v1/models'].includes(body.endpoint));
@@ -75,9 +76,26 @@ const vite = spawn(process.execPath, [resolve('node_modules/vite/bin/vite.js'), 
 let viteLog = ''; vite.stdout.on('data', b => viteLog += b); vite.stderr.on('data', b => viteLog += b);
 let desktop;
 const terminate = () => { if (desktop?.pid) { try { process.kill(-desktop.pid, 'SIGTERM'); } catch (e) { if (e.code !== 'ESRCH') throw e; } } };
+const prepareImportFixtures = runId => execFileSync('python3', ['-c', String.raw`
+import json, sqlite3, sys
+from pathlib import Path
+root, base, run_id = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+termany = root / '.termany'; termany.mkdir(exist_ok=True)
+with sqlite3.connect(termany / 'termany.db') as db:
+    db.execute('CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT)')
+    providers = [{'id': f'{name}-{run_id}', 'name': 'Fictional import', 'kind': 'openai', 'apiBase': f'{base}/import-{name}/v1', 'apiKey': f'fictional-import-{name}', 'models': ['same-model']} for name in ['before', 'retired']]
+    db.execute('INSERT OR REPLACE INTO app_meta VALUES (?, ?)', ('models', json.dumps({'providers': providers})))
+ccswitch = root / '.cc-switch'; ccswitch.mkdir(exist_ok=True)
+with sqlite3.connect(ccswitch / 'cc-switch.db') as db:
+    db.execute('CREATE TABLE IF NOT EXISTS providers (id TEXT, app_type TEXT, name TEXT, settings_config TEXT)')
+    db.execute('DELETE FROM providers')
+    settings = {'config': f'model_provider = "fixture"\nmodel = "same-model"\n[model_providers.fixture]\nbase_url = "{base}/import-normal/v1"\n', 'auth': {'OPENAI_API_KEY': 'fictional-import-normal'}}
+    db.execute('INSERT INTO providers VALUES (?, ?, ?, ?)', (f'normal-{run_id}', 'codex', 'Fictional normal import', json.dumps(settings)))
+`, root, base, runId]);
 const run = async reload => {
   modes.clear();
   const runId = randomUUID();
+  currentRunId = runId;
   await rm(join(root, 'isolation-report.json'), { force: true });
   const args = ['--autojev-isolated', root, '--autojev-upstream', base, '--autojev-ui-url', `http://127.0.0.1:${uiPort}`, '--autojev-ui-check', base, '--autojev-api-source-check', runId];
   if (reload) args.push('--autojev-check-reload');
@@ -91,6 +109,15 @@ const run = async reload => {
   assert.equal(report.run_id, runId, 'Require the current desktop run report');
   await writeFile(join(root, `${label}.report.json`), JSON.stringify(report, null, 2));
   assert.equal(code, 0, report.error || log); assert.equal(report.ok, true, report.error);
+  const absent = JSON.parse(execFileSync('python3', ['-c', String.raw`
+import json, sqlite3, sys
+from pathlib import Path
+root = Path(sys.argv[1]); path = next((root / '.autojev').glob('autojev*.db'))
+with sqlite3.connect(f'file:{path}?mode=ro', uri=True) as db:
+    print(json.dumps([db.execute('SELECT count(*) FROM credentials WHERE account=?', (account,)).fetchone()[0] for account in json.loads(sys.argv[2])]))
+`, root, JSON.stringify(report.import_reservation.accounts)], { encoding: 'utf8' }));
+  assert.deepEqual(absent, [0, 0, 0], 'Blocked imports must persist zero credentials; deleted normal import must clean its credential');
+
   for (const source of ['official', 'openrouter', 'zenmux', 'coding', 'legacy']) {
     const sourceRecords = records.filter(r => r.source === source);
     assert.ok(sourceRecords.length > 0, `Source never reached: ${source}`);

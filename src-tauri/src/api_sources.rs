@@ -62,6 +62,14 @@ impl Connection {
     }
 }
 
+pub fn validate_destination_id(config: &AppConfig, id: &str) -> Result<()> {
+    ensure!(
+        !config.api_sources.get(id).is_some_and(|source| source.retired),
+        "Create a new source connection with a new ID; this deleted source ID remains reserved"
+    );
+    Ok(())
+}
+
 /// Validate before any credential or subscription side effect. API identity is immutable:
 /// changing endpoint, account, plan, protocol or credential requires a new connection.
 pub fn validate_edit(
@@ -72,10 +80,7 @@ pub fn validate_edit(
     has_new_key: bool,
 ) -> Result<()> {
     let old_id = original_id.unwrap_or(&provider.id);
-    ensure!(
-        !config.api_sources.get(&provider.id).is_some_and(|source| source.retired),
-        "Create a new source connection with a new ID; this deleted source ID remains reserved"
-    );
+    validate_destination_id(config, &provider.id)?;
     if let Some(saved) = config.api_sources.get(old_id) {
         ensure!(
             !saved.retired,
