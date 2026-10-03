@@ -187,6 +187,8 @@ pub struct AppConfig {
     /// 订阅服务商的活动连接，按服务商标识索引：每家一个，证据绑定连接世代。
     #[serde(default)]
     pub subscriptions: std::collections::HashMap<String, crate::subscription::Connection>,
+    #[serde(default)]
+    pub api_sources: std::collections::HashMap<String, crate::api_sources::Connection>,
     /// 订阅目录：按服务商保存上游已核实模型目录与账号绑定资格。用户的选择／停用保存在 `models` 行上，
     /// 因此退出或换号只作废资格，不重建标识、也不丢失配置。
     #[serde(default)]
@@ -223,6 +225,7 @@ impl Default for AppConfig {
             custom_agents: Vec::new(),
             routes: Vec::new(),
             subscriptions: Default::default(),
+            api_sources: Default::default(),
             subscription_catalogs: Default::default(),
             cpa_subscriptions: Default::default(),
             cpa_model_bindings: Default::default(),

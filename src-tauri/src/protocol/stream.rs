@@ -7,48 +7,51 @@ use std::collections::{HashMap, VecDeque};
 const MAX_FRAME: usize = 2 * 1024 * 1024;
 const MAX_OUTPUT: usize = 16 * 1024 * 1024;
 #[derive(Default)]
-pub(super) struct SseParser {
+pub(crate) struct SseParser {
     buffer: Vec<u8>,
+    skip_lf: bool,
 }
 impl SseParser {
     pub fn push(&mut self, bytes: &[u8]) -> Result<Vec<(String, String)>> {
-        self.buffer.extend_from_slice(bytes);
+        let mut frames = vec![];
+        for frame in self.push_raw(bytes)? {
+            let frame = String::from_utf8(frame)?;
+            let mut event = String::new();
+            let mut data = vec![];
+            for line in frame.lines() {
+                if let Some(value) = line.strip_prefix("event:") { event = value.trim_start().into(); }
+                if let Some(value) = line.strip_prefix("data:") { data.push(value.strip_prefix(' ').unwrap_or(value)); }
+            }
+            if !data.is_empty() { frames.push((event, data.join("\n"))); }
+        }
+        Ok(frames)
+    }
+
+    /// Preserve comments and provider extensions while sharing the same bounded framing.
+    pub fn push_raw(&mut self, bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
+        // Normalize all SSE line endings, including CRLF split across HTTP chunks.
+        // A CR already ends its line; only its optional following LF is skipped.
+        for &byte in bytes {
+            if self.skip_lf {
+                self.skip_lf = false;
+                if byte == b'\n' { continue; }
+            }
+            if byte == b'\r' {
+                self.buffer.push(b'\n');
+                self.skip_lf = true;
+            } else {
+                self.buffer.push(byte);
+            }
+        }
         let mut frames = vec![];
         loop {
-            let lf = self
-                .buffer
-                .windows(2)
-                .position(|w| w == b"\n\n")
-                .map(|i| (i, 2));
-            let crlf = self
-                .buffer
-                .windows(4)
-                .position(|w| w == b"\r\n\r\n")
-                .map(|i| (i, 4));
-            let boundary = match (lf, crlf) {
-                (Some(a), Some(b)) => Some(if a.0 < b.0 { a } else { b }),
-                (a, b) => a.or(b),
-            };
-            let Some((end, length)) = boundary else {
+            let Some(end) = self.buffer.windows(2).position(|w| w == b"\n\n") else {
                 break;
             };
             if end > MAX_FRAME {
                 bail!("Upstream SSE frame is too large");
             }
-            let frame = String::from_utf8(self.buffer.drain(..end + length).collect())?;
-            let mut event = String::new();
-            let mut data = vec![];
-            for line in frame.lines() {
-                if let Some(value) = line.strip_prefix("event:") {
-                    event = value.trim_start().into();
-                }
-                if let Some(value) = line.strip_prefix("data:") {
-                    data.push(value.strip_prefix(' ').unwrap_or(value));
-                }
-            }
-            if !data.is_empty() {
-                frames.push((event, data.join("\n")));
-            }
+            frames.push(self.buffer.drain(..end + 2).collect());
         }
         if self.buffer.len() > MAX_FRAME {
             bail!("Upstream SSE frame is too large");

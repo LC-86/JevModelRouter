@@ -88,6 +88,7 @@ try{
   while(true){try{if((await fetch(`http://127.0.0.1:${port}`)).ok)break;}catch{}assert.ok(Date.now()<until,log);await new Promise(r=>setTimeout(r,100));}
   const first=await run(false),reload=await run(true);
   assert.deepEqual(reload.saved,first.saved);
+  assert.deepEqual(reload.api_source,first.api_source,'R2 explicit source identity must persist independently of CPA switching');
   await writeFile(join(root,'receiver-records.json'),JSON.stringify(receipts,null,2));
   console.log(JSON.stringify({root,checks:[...first.checks,...reload.checks],receipts},null,2));
 }finally{terminate();vite.kill('SIGTERM');fixture.closeAllConnections();await new Promise(r=>fixture.close(r));}

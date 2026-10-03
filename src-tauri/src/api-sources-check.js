@@ -1,0 +1,296 @@
+// Actual React controls, public Tauri IPC and the listening gateway; fictional sources only.
+(async () => {
+  if (window.__API_SOURCE_CHECK_RUNNING__) return;
+  window.__API_SOURCE_CHECK_RUNNING__ = true;
+  const { base, run_id, reload } = window.__API_SOURCE_CHECK__;
+  const report = { ok: false, run_id, layer: 'native-desktop-api-sources-loopback', checks: [] };
+  const invoke = window.__TAURI_INTERNALS__.invoke;
+  const check = (value, message) => { if (!value) throw new Error(message); };
+  const wait = async (fn, label) => {
+    const deadline = Date.now() + 15000;
+    for (;;) { const value = await fn(); if (value) return value; if (Date.now() > deadline) throw new Error(`Timed out: ${label}`); await new Promise(r => setTimeout(r, 50)); }
+  };
+  const click = async selector => (await wait(() => { const e = document.querySelector(selector); return e && !e.disabled && e; }, selector)).click();
+  const set = async (selector, value) => {
+    const e = await wait(() => document.querySelector(selector), selector);
+    Object.getOwnPropertyDescriptor(Object.getPrototypeOf(e), 'value').set.call(e, value);
+    e.dispatchEvent(new Event(e.tagName === 'SELECT' ? 'change' : 'input', { bubbles: true }));
+    await new Promise(r => setTimeout(r, 0));
+  };
+  const control = async (path, payload = {}) => {
+    const response = await fetch(`${base}${path}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) });
+    check(response.ok, `Fixture control failed: ${path}`); return response.json();
+  };
+  const rejected = async (command, args, expected) => {
+    let error; try { await invoke(command, args); } catch (e) { error = String(e); }
+    check(error && error.includes(expected), `${command} must reject ${expected}: ${error || 'accepted'}`);
+  };
+  try {
+    const sources = [{ id: 'official', kind: 'official_api' }, { id: 'openrouter', kind: 'third_party_api' }, { id: 'zenmux', kind: 'third_party_api' }, { id: 'coding', kind: 'coding_plan' }];
+    (await wait(() => document.querySelectorAll('nav .nav-item')[1], 'provider navigation')).click();
+    if (!reload) {
+      for (const source of sources) {
+        await control('/__progress', { message: `R2 create ${source.id} via desktop form` });
+        await click('.provider-actions .button.primary');
+        await click('.provider-dialog .search-select-trigger');
+        (await wait(() => [...document.querySelectorAll('.provider-dialog [role="option"]')].find(e => /OpenAI Compatible|OpenAI 兼容/.test(e.textContent)), 'compatible provider')).click();
+        await set('[data-testid="api-source-kind"]', source.kind);
+        await set('.provider-dialog input[pattern="[a-zA-Z0-9_-]+"]', `r2-${source.id}`);
+        await set('.provider-dialog input[type="url"]', `${base}/${source.id}/${source.id === 'coding' ? 'v4' : 'v1'}`);
+        await set('.provider-dialog input[type="password"]', `fictional-r2-${source.id}`);
+        await set('#provider-test-model', 'same-model');
+        for (const name of ['account', 'plan']) check(document.querySelector(`[data-testid="api-source-${name}"]`).maxLength === 160, 'Source label UI limit remains 160 UTF-16 units');
+        check(document.querySelector('.provider-dialog-actions button[type="button"]').disabled, 'New explicit sources require save before testing');
+        await click('.provider-dialog-actions button[type="submit"]');
+        await wait(() => !document.querySelector('.provider-dialog'), 'source saved');
+      }
+      const before = await control('/__records');
+      check(before.length === 0, 'Source save/selection must send zero generation requests');
+      let snapshot = await invoke('get_snapshot');
+      const legacy = { ...snapshot.providers.find(p => p.id === 'r2-official'), id: 'r2-legacy', name: 'legacy', base_url: `${base}/legacy/v1`, test_model: 'same-model' };
+      snapshot = await invoke('save_provider', { provider: legacy, apiKey: 'fictional-r2-legacy', addTestModel: true, creating: true });
+      check(!snapshot.api_sources['r2-legacy'], 'Legacy API remains unclassified and keeps its existing dispatch path');
+    }
+    let snapshot = await invoke('get_snapshot');
+    if (reload) check(Object.entries(snapshot.api_sources).some(([id, source]) => id.startsWith('r2-retired-') && source.retired && Object.keys(source.model_bindings).length > 0), 'Retired connection/model identities must survive a new process');
+    report.saved = [...sources.map(s => s.id), 'legacy'].map(id => {
+      const provider = snapshot.providers.find(p => p.id === `r2-${id}`);
+      const model = snapshot.models.find(m => m.provider_id === provider?.id && m.model_id === 'same-model');
+      check(provider && model, `Missing saved target: ${id}`);
+      const source = snapshot.api_sources[provider.id];
+      if (id !== 'legacy') {
+        check(source && source.kind === sources.find(s => s.id === id).kind && source.generation === 1, 'Source category or generation changed');
+        check(source.plan_state === 'unknown' && source.account_state === 'unknown', 'Key/model entry cannot establish account or plan eligibility');
+        check(model.input_price_known === false && model.output_price_known === false, 'Unknown fees must stay unknown');
+        check(source.credential_reference === `api-generation:${source.connection_instance_id}`, 'Generation credential must be bound to this immutable connection instance');
+      }
+      return { id, provider_id: provider.id, model_uuid: model.id, source_instance: source?.connection_instance_id || null, endpoint: provider.base_url };
+    });
+    for (const id of [...sources.map(s => s.id), 'legacy']) check(!JSON.stringify(snapshot).includes(`fictional-r2-${id}`), 'Snapshot must never contain a generation credential');
+    report.checks.push(reload ? 'new desktop process preserves source categories, unknown account/plan states and stable UUIDs' : 'desktop creates and saves four classified sources without generation; legacy API identity remains compatible');
+    const labelTemplate = snapshot.providers.find(p => p.id === 'r2-official');
+    const beforeLabels = (await control('/__records')).length;
+    for (const field of ['account_label', 'plan_label']) {
+      for (const [name, label, accepted] of [['chinese60', '中'.repeat(60), true], ['chinese160', '中'.repeat(160), true], ['chinese161', '中'.repeat(161), false], ['emoji80', '😀'.repeat(80), true], ['emoji81', '😀'.repeat(81), false]]) {
+        const id = `r2-label-${field}-${name}-${run_id}`;
+        const args = { provider: { ...labelTemplate, id, name: 'fictional label boundary' }, apiKey: 'fictional-r2-labels', creating: true, addTestModel: false, source: { kind: 'official_api', [field]: label } };
+        if (accepted) {
+          const saved = await invoke('save_provider', args);
+          check(saved.api_sources[id][field] === label && saved.api_sources[id][field.replace('label', 'state')] === 'user_declared', `${field}/${name}: persisted declaration must match`);
+          await invoke('delete_provider', { id });
+        } else {
+          await rejected('save_provider', args, 'Source labels must be at most 160');
+          const saved = await invoke('get_snapshot');
+          check(!saved.providers.some(p => p.id === id) && !saved.api_sources[id], `${field}/${name}: refused label must not persist`);
+        }
+      }
+    }
+    check((await control('/__records')).length === beforeLabels, 'Label saves/refusals must dispatch zero generation');
+    report.checks.push('account/plan labels match UI 160 UTF-16 units: 60/160 Chinese and 80 emoji accepted, overflow rejected before persistence with zero generation');
+    await invoke('save_gateway_settings', { gateway: { ...snapshot.gateway, proxy_mode: 'direct', failure_threshold: 20 } });
+    snapshot = await invoke('start_proxy');
+    const gateway = (target, prompt = 'R2 fictional request', endpoint = '/v1/chat/completions', stream = false) => control('/__gateway', {
+      port: snapshot.proxy.port, endpoint, request: { model: target, messages: [{ role: 'user', content: `${prompt}@${run_id}` }], max_tokens: 8, stream },
+    });
+    for (const saved of report.saved) {
+      const response = await gateway(`autojev/model/${saved.model_uuid}`);
+      check(response.status === 200 && response.body.includes(`OK ${saved.id}`), `Fixed source failed: ${saved.id}`);
+      check((await invoke('test_provider', { id: saved.provider_id })).includes('succeeded'), 'Saved provider test must use this same target');
+    }
+    report.checks.push('all same-name source models, saved provider tests and legacy API hit their own fictional credential and endpoint without a decision key');
+    const coding = report.saved.find(s => s.id === 'coding');
+    const target = `autojev/model/${coding.model_uuid}`;
+    const recordsCount = async () => (await control('/__records')).length;
+    let before = await recordsCount();
+    const provider = snapshot.providers.find(p => p.id === coding.provider_id);
+    await rejected('save_provider', { provider: { ...provider, base_url: `${base}/official/v1` }, originalId: provider.id }, 'Create a new source connection');
+    await rejected('save_provider', { provider, originalId: provider.id, apiKey: 'fictional-r2-replacement' }, 'Create a new source connection');
+    await rejected('save_model', { model: { ...snapshot.models.find(m => m.id === coding.model_uuid), provider_id: 'r2-official' } }, 'Create a new model');
+    check(await recordsCount() === before, 'Identity edits must not generate');
+    for (const status of [401, 429, 503, 404]) {
+      await control('/__mode', { source: 'coding', status });
+      await invoke('reset_gateway_health', { modelId: coding.model_uuid });
+      before = await recordsCount();
+      const failed = await gateway(target);
+      check(failed.status === status && !failed.body.includes('fictional-r2-coding'), `Failure or credential redaction mismatch: ${status}`);
+      const delta = (await control('/__records')).slice(before);
+      check(delta.length === 1 && delta[0].source === 'coding', `Failure ${status} must not call any other paid source`);
+    }
+    await control('/__mode', { source: 'coding', status: 200 });
+    await invoke('reset_gateway_health', { modelId: coding.model_uuid });
+    // Deselect is list management; the original stable target still passes normal admission.
+    const model = snapshot.models.find(m => m.id === coding.model_uuid);
+    await invoke('save_model', { model: { ...model, selected: false } });
+    check((await gateway(target)).status === 200, 'Deselect must preserve a valid original fixed target');
+    await invoke('save_model', { model });
+    await invoke('save_provider', { provider: { ...provider, enabled: false } });
+    before = await recordsCount();
+    check((await gateway(target)).body.includes('source_disabled'), 'Disabled source must return its own target error');
+    await rejected('test_provider', { id: provider.id }, 'source_disabled');
+    const channel = (() => { const id = window.__TAURI_INTERNALS__.transformCallback(() => {}, false); const serialize = () => `__CHANNEL__:${id}`; return { __TAURI_TO_IPC_KEY__: serialize, toJSON: serialize }; })();
+    const debug = await invoke('debug_curl', { id: `r2-disabled-${run_id}`, endpoint: 'chat/completions', body: { model: target, messages: [{ role: 'user', content: 'fixture' }] }, headers: {}, onProgress: channel });
+    check(debug.body.includes('source_disabled'), 'Debug must use the same source admission');
+    await rejected('start_model_speed_tests', { ids: [coding.model_uuid] }, 'Select enabled');
+    check(await recordsCount() === before, 'Disabled gateway/test/Debug/manual probe must dispatch zero requests');
+    await invoke('save_provider', { provider });
+    before = await recordsCount();
+    await rejected('save_model', { model: { ...model, api_type: 'responses' } }, 'source_protocol_unsupported');
+    await rejected('save_model', { model: { ...model, id: crypto.randomUUID(), api_type: 'messages' } }, 'source_protocol_unsupported');
+    const protocolSnapshot = await invoke('get_snapshot');
+    check(protocolSnapshot.models.find(m => m.id === model.id).api_type === model.api_type && protocolSnapshot.models.length === snapshot.models.length, 'Rejected protocol edits must preserve saved models');
+    check(await recordsCount() === before, 'Saving an incompatible protocol must dispatch zero requests');
+    for (const api_type of ['', 'chat/completions']) {
+      await invoke('save_model', { model: { ...model, api_type } });
+      check((await gateway(target)).status === 200, 'Inherited or matching protocol must remain usable');
+    }
+    await invoke('save_model', { model });
+    report.checks.push('incompatible existing/new model protocols rejected before persistence with zero generation; inherited or matching protocols remain usable');
+    before = await recordsCount();
+    check((await gateway('autojev/model/missing-r2-target')).status === 422, 'Missing fixed target must not become a fallback');
+    check((await gateway('same-model')).body.includes('Ambiguous model'), 'A bare same-name model must not choose a source');
+    check(await recordsCount() === before, 'Invalid/ambiguous targets dispatch zero requests');
+    report.checks.push('identity edits rejected; 401/429/503/404 stay on the fixed source; deselection preserves UUID; disabled/invalid/unsupported/ambiguous targets dispatch zero through gateway, test, Debug and manual probe');
+    const missingId = `r2-missing-${run_id}`;
+    before = await recordsCount();
+    for (const kind of ['official_api', 'third_party_api', 'coding_plan']) {
+      const id = `${missingId}-${kind}`;
+      for (const apiKey of [undefined, ' \t\n ']) {
+        await rejected('save_provider', { provider: { ...provider, id }, apiKey, creating: true, source: { kind }, addTestModel: true }, 'source_credential_missing');
+        const saved = await invoke('get_snapshot');
+        check(!saved.providers.some(p => p.id === id) && !saved.api_sources[id] && !saved.models.some(m => m.provider_id === id), 'Missing-key refusal must not persist provider, source, credential reference or model');
+      }
+    }
+    let next = await invoke('save_provider', { provider: { ...provider, name: 'edited source keeps its credential' }, originalId: provider.id });
+    check(next.providers.find(p => p.id === provider.id).has_api_key && next.api_sources[provider.id].credential_reference === snapshot.api_sources[provider.id].credential_reference, 'Existing source edits with no new key preserve the saved credential reference');
+    const legacyEmptyId = `${missingId}-legacy`;
+    next = await invoke('save_provider', { provider: { ...provider, id: legacyEmptyId }, creating: true, addTestModel: false });
+    check(!next.api_sources[legacyEmptyId] && !next.providers.find(p => p.id === legacyEmptyId).has_api_key, 'Legacy unclassified source creation keeps its optional-key behavior');
+    await invoke('delete_provider', { id: legacyEmptyId });
+    check(await recordsCount() === before, 'Missing-key refusals and compatible edits must dispatch zero');
+    report.checks.push('new official/third-party/coding sources reject absent/blank generation key before persistence with zero generation; existing edits retain stored credential; legacy unclassified optional-key creation remains compatible');
+    await click('.provider-actions .button.primary');
+    await click('.provider-dialog .search-select-trigger');
+    (await wait(() => [...document.querySelectorAll('.provider-dialog [role="option"]')].find(e => /OpenAI Compatible|OpenAI 兼容/.test(e.textContent)), 'compatible provider')).click();
+    await set('[data-testid="api-source-kind"]', 'official_api');
+    const formId = `${missingId}-official_api`;
+    await set('.provider-dialog input[pattern="[a-zA-Z0-9_-]+"]', formId);
+    await set('.provider-dialog input[type="url"]', `${base}/coding/v4`);
+    await set('#provider-test-model', 'same-model');
+    await click('.provider-dialog-actions button[type="submit"]');
+    await wait(() => /Enter a generation API key before saving this source|保存此来源前.*生成用途/.test(document.querySelector('.provider-test-result.error')?.textContent || ''), 'clear missing-generation-key form error');
+    check(!(await invoke('get_snapshot')).providers.some(p => p.id === formId), 'Form error must not persist or reserve the source ID');
+    check(await recordsCount() === before, 'Form error must dispatch zero generation');
+    await set('.provider-dialog input[type="password"]', 'fictional-r2-coding');
+    await click('.provider-dialog-actions button[type="submit"]');
+    await wait(() => !document.querySelector('.provider-dialog'), 'corrected source saved');
+    next = await invoke('get_snapshot');
+    const corrected = next.models.find(m => m.provider_id === formId);
+    check(corrected && next.providers.find(p => p.id === formId).has_api_key, 'The same refused ID can be saved with a fictional generation key');
+    check((await gateway(`autojev/model/${corrected.id}`)).status === 200 && await recordsCount() === before + 1, 'Corrected source reaches exactly its fixed endpoint');
+    await invoke('delete_provider', { id: formId });
+    report.checks.push('native form shows an explicit generation-key error without persistence or requests; correcting the same ID saves and dispatches exactly once to its fixed source');
+    // Explicit manual probes and Debug go through the same normal gateway target.
+    await invoke('start_model_speed_tests', { ids: [coding.model_uuid] });
+    await wait(async () => !(await invoke('get_model_performance')).job.running, 'manual probe complete');
+    const debugOk = await invoke('debug_curl', { id: `r2-ok-${run_id}`, endpoint: 'chat/completions', body: { model: target, messages: [{ role: 'user', content: 'fictional debug' }], stream: false }, headers: {}, onProgress: channel });
+    check(debugOk.body.includes('OK coding'), 'Debug must reach the exact saved source');
+    const secretDebug = await invoke('debug_curl', { id: `r2-delta-${run_id}`, endpoint: 'responses', body: { model: target, input: 'delta-secret-r2', stream: true }, headers: {}, onProgress: channel });
+    check(secretDebug.body.includes('response.completed') && secretDebug.body.includes('[REDACTED]'), 'Debug stream must redact across logical deltas and preserve terminal');
+    check(!JSON.stringify(secretDebug).includes('fictional-r2-coding'), 'Converted Debug output and parsed body must not reconstruct a generation key');
+    for (const stream of [false, true]) {
+      const toolDebug = await invoke('debug_curl', { id: `r2-nested-${stream}-${run_id}`, endpoint: 'messages', body: { model: target, messages: [{ role: 'user', content: 'nested-secret-r2' }], max_tokens: 16, stream, tools: [{ name: 'echo', input_schema: { type: 'object', properties: { note: { type: 'string' } } } }] }, headers: {}, onProgress: channel });
+      check(JSON.stringify(toolDebug).includes('[REDACTED]') && !JSON.stringify(toolDebug).includes('fictional-r2-coding'), 'Debug JSON/stream nested tool input must not reconstruct a generation key');
+    }
+    for (const endpoint of ['/v1/chat/completions', '/v1/responses', '/v1/messages']) {
+      for (const stream of [false, true]) {
+        const request = endpoint === '/v1/responses' ? { model: target, input: 'fictional protocol probe', max_output_tokens: 8, stream }
+          : { model: target, messages: [{ role: 'user', content: 'fictional protocol probe' }], max_tokens: 8, stream };
+        const result = await control('/__gateway', { port: snapshot.proxy.port, endpoint, request });
+        check(result.status === 200 && result.body.includes('OK coding'), `Compatible protocol failed: ${endpoint}/${stream}`);
+        if (stream) check(result.body.includes(endpoint.endsWith('responses') ? 'response.completed' : endpoint.endsWith('messages') ? 'message_stop' : '[DONE]'), 'Require explicit stream terminal');
+      }
+    }
+    const retiredSnapshot = await invoke('save_provider', { provider: { ...provider, id: `r2-retired-${run_id}`, name: 'retired fictional source' }, apiKey: 'fictional-r2-coding', source: { kind: 'coding_plan' }, creating: true, addTestModel: true });
+    const retiredId = `r2-retired-${run_id}`;
+    const retiredModel = retiredSnapshot.models.find(m => m.provider_id === retiredId);
+    before = await recordsCount();
+    await invoke('delete_model', { id: retiredModel.id });
+    await rejected('save_model', { model: { ...retiredModel, provider_id: 'r2-openrouter' } }, 'Create a new model');
+    await invoke('save_model', { model: retiredModel });
+    const inflight = gateway(`autojev/model/${retiredModel.id}`, 'inflight-r2');
+    await wait(async () => await recordsCount() > before, 'fixed inflight target reached');
+    await invoke('delete_provider', { id: retiredId });
+    await rejected('save_provider', { provider: { ...provider, id: retiredId, base_url: `${base}/official/v1` }, apiKey: 'fictional-r2-official', source: { kind: 'official_api' }, creating: true }, 'Create a new source connection');
+    check((await inflight).body.includes('OK coding'), 'An inflight request keeps its original source and credential after deletion');
+    before = await recordsCount();
+    check((await gateway(`autojev/model/${retiredModel.id}`)).status !== 200, 'A deleted fixed target must stay invalid');
+    check((await gateway(`${retiredId}/same-model`)).status !== 200, 'A deleted provider alias must stay invalid');
+    check(await recordsCount() === before, 'Deleted UUID/connection references must never dispatch to a new source');
+    for (const reference of [`${retiredId}/same-model`, retiredModel.id]) {
+      const collision = { ...retiredModel, id: crypto.randomUUID(), provider_id: 'r2-openrouter', model_id: reference };
+      await invoke('save_model', { model: collision });
+      check((await gateway(reference)).status !== 200, 'Another source bare ID must not capture a retired public reference');
+      check((await gateway(`autojev/model/${reference}`)).status !== 200, 'Legacy fixed namespace must not capture a retired public reference');
+      check(await recordsCount() === before, 'Retired namespace collision must dispatch zero to all sources');
+      await invoke('delete_model', { id: collision.id });
+    }
+    // Public save IPC must reject a retired destination before moving config or credentials.
+    const renameProjection = value => JSON.stringify(Object.fromEntries(['providers', 'models', 'api_sources', 'subscriptions', 'subscription_auth', 'routes', 'policy', 'gateway', 'agent_catalogs'].map(key => [key, value[key]])));
+    const subscriptionId = `r2-rename-subscription-${run_id}`;
+    const legacyProvider = (await invoke('get_snapshot')).providers.find(p => p.id === 'r2-legacy');
+    await invoke('save_provider', { provider: { ...legacyProvider, id: subscriptionId, name: 'fictional disconnected subscription', kind: 'codex_subscription', base_url: '', api_type: '', test_model: 'same-model' }, creating: true, addTestModel: true });
+    const renameResults = [];
+    for (const id of ['r2-legacy', subscriptionId]) {
+      const initial = await invoke('get_snapshot');
+      const original = initial.providers.find(p => p.id === id);
+      const modelIds = initial.models.filter(m => m.provider_id === id).map(m => m.id);
+      check(modelIds.length > 0, 'Rename fixture must include an existing model');
+      const beforeRename = await recordsCount();
+      await rejected('save_provider', { provider: { ...original, id: retiredId }, originalId: id, creating: false }, 'Create a new source connection');
+      check(renameProjection(await invoke('get_snapshot')) === renameProjection(initial), 'Retired destination refusal must preserve original config, models, connection and credentials');
+      check(await recordsCount() === beforeRename, 'Retired destination refusal must send zero generation');
+      const availableId = `${id}-available`;
+      const renamed = await invoke('save_provider', { provider: { ...original, id: availableId }, originalId: id, creating: false });
+      check(!renamed.providers.some(p => p.id === id) && renamed.providers.some(p => p.id === availableId && p.kind === original.kind), 'Available destination must allow a normal provider rename');
+      check(JSON.stringify(renamed.models.filter(m => m.provider_id === availableId).map(m => m.id)) === JSON.stringify(modelIds), 'Normal rename must preserve model UUIDs and move their provider binding');
+      await invoke('save_provider', { provider: original, originalId: availableId, creating: false });
+      check(renameProjection(await invoke('get_snapshot')) === renameProjection(initial), 'Normal rename back must retain the original configuration and remain editable');
+      check(await recordsCount() === beforeRename, 'Provider rename saves must dispatch zero generation');
+      renameResults.push({ kind: original.kind, refused: 1, normal_saves: 2 });
+    }
+    await invoke('delete_provider', { id: subscriptionId });
+    const legacyTarget = report.saved.find(s => s.id === 'legacy');
+    before = await recordsCount();
+    check((await gateway(`autojev/model/${legacyTarget.model_uuid}`)).status === 200 && await recordsCount() === before + 1, 'Legacy generation key must remain usable on the fixed loopback source after renaming back');
+    report.retired_rename = { cases: renameResults, generation_during_saves: 0, legacy_fixed_requests: 1 };
+    await control('/__progress', { message: 'R2 fictional public import fixture', prepareImport: run_id });
+    const importedId = async (source, identity) => `import-${source}-${Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(identity)))).map(byte => byte.toString(16).padStart(2, '0')).join('')}`;
+    const importRetiredId = await importedId('termany', `models:retired-${run_id}`);
+    const importBeforeId = await importedId('termany', `models:before-${run_id}`);
+    const importNormalId = await importedId('ccswitch', `codex:normal-${run_id}`);
+    await invoke('save_provider', { provider: { ...provider, id: importRetiredId }, apiKey: 'fictional-r2-coding', source: { kind: 'coding_plan' }, creating: true, addTestModel: true });
+    await invoke('delete_provider', { id: importRetiredId });
+    const importSnapshot = await invoke('get_snapshot');
+    before = await recordsCount();
+    await rejected('import_providers', { source: 'termany' }, 'Create a new source connection');
+    check(renameProjection(await invoke('get_snapshot')) === renameProjection(importSnapshot), 'Import reservation refusal must preserve config for the whole batch');
+    const normalImport = await invoke('import_providers', { source: 'ccswitch' });
+    const importedProvider = normalImport.snapshot.providers.find(p => p.id === importNormalId);
+    check(normalImport.imported === 1 && normalImport.skipped === 0 && importedProvider?.has_api_key && importedProvider.test_model === 'same-model', 'A normal fictional import must retain its key and configured model');
+    const duplicateImport = await invoke('import_providers', { source: 'ccswitch' });
+    check(duplicateImport.imported === 0 && duplicateImport.skipped === 1, 'Existing import duplicate skip behavior must remain usable');
+    await invoke('delete_provider', { id: importNormalId });
+    check(await recordsCount() === before, 'Provider imports must dispatch zero generation');
+    report.import_reservation = { refused_batches: 1, successful_imports: 1, duplicate_skips: 1, generation: 0, accounts: [importBeforeId, importRetiredId, importNormalId].map(id => `provider:${id}`) };
+    report.checks.push('public import rejects a batch containing a retired source ID before provider/model/credential writes; normal import and duplicate skip remain compatible, with zero generation');
+    report.checks.push('legacy and disconnected subscription public saves reject retired destination IDs without config changes or generation; normal renames and rename-back preserve model UUIDs; legacy fixed credential remains usable');
+    report.checks.push('deleted UUIDs/provider aliases cannot be rebound or captured by another source bare ID; an inflight request keeps its original source/credential');
+    const catalog = await control('/__gateway', { port: snapshot.proxy.port, endpoint: '/v1/models' });
+    const logs = await invoke('get_request_logs', { since: '2000-01-01T00:00:00Z' });
+    for (const source of sources) check(!JSON.stringify([logs, catalog]).includes(`fictional-r2-${source.id}`), 'Directory and logs must not expose a generation key');
+    report.checks.push('missing credential refused before creation; manual probe and Debug hit saved source; Debug logical delta and nested tool JSON/SSE echoes are redacted; three compatible downstream text/stream protocols preserve fixed source and terminal; directory/logs contain no generation secrets');
+    check(await recordsCount() > 0, 'This run must have real receiver evidence');
+    report.ok = true;
+  } catch (error) { report.error = `${error?.message || error}\n${error?.stack || ''}`; }
+  await invoke('isolation_check_report', { report });
+})();

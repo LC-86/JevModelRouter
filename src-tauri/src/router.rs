@@ -178,6 +178,7 @@ pub fn validate_available_rule(config: &AppConfig, rule: &crate::config::RouteRu
 // Unprefixed model names are explicit selections, never automatic-routing hints.
 pub fn normalize_requested_model(config: &AppConfig, requested: Option<&str>) -> Result<Option<String>> {
     let Some(requested) = requested else { return Ok(None); };
+    crate::api_sources::validate_public_reference(config, requested)?;
     // Preserve legacy UUID bindings; resolve the public namespaces separately.
     if let Some(id) = requested.strip_prefix("autojev/model/") {
         if config.models.iter().any(|m| m.id == id) { return Ok(Some(requested.into())); }

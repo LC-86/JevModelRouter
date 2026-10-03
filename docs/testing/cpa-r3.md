@@ -43,7 +43,7 @@ CPA 管理 key、会话 state 和 HTTP 客户端只在后端；桌面只取得�
 
 最高层接缝沿用规格已确认的本地网关、临时 SQLite、公开桌面操作和回环管理替身。已观察：原生 webview 按钮闭环、A→B 换号后的旧固定目标拒绝、失败陈旧目录、显式重新绑定、两次原生进程的保存/重读和新的 run ID 报告。图片为本任务启动的原生窗口，按其 PID 限定截图，未截取其它应用：[原生截图](../screenshots/cpa-r3-native.png)。
 
-2026-10-03 的当前实现通过前端 96 项、Rust 508 项（其中新增 CPA 行为 9 项与界面投影 1 项），以及构建和 release 检查。[原始桌面报告](cpa-r3-evidence.json) 保留首轮 `8d723a44-2268-4cd1-9261-9a2ced8556c6` 与重启 `1f8070c8-e85e-4911-b47b-63d85f901ae5` 两个 run ID；两轮 `ok:true`、同一 provider/model UUID 与世代 8，接收端模型请求、凭据下载及额度查询均为 0。截图来自后一次重启，服务不自动重连。公共管理/临时 DB 测试覆盖取消迟到授权、换号迟到目录、账号变化且目录失败、待授权进程重启、完成后取消的清理重试、首次认领前到期的安全隔离/删除及授权 URL 迟到时的 profile 复用阻止；原生流程覆盖公开模型编辑不能重指固定来源/原 ID。
+2026-10-03 的当前实现通过前端 96 项、Rust 534 项（其中新增 CPA 行为 9 项与界面投影 1 项），以及构建和 release 检查。[原始桌面报告](cpa-r3-evidence.json) 保留首轮 `ebf73ee4-4fcd-4952-8a1c-1900839ba0c6` 与重启 `8c66f7c1-c39e-4751-becb-c5cec7d9fdf9` 两个 run ID；两轮 `ok:true`、同一 provider/model UUID 与世代 8，接收端模型请求、凭据下载及额度查询均为 0。截图来自后一次重启，服务不自动重连。公共管理/临时 DB 测试覆盖取消迟到授权、换号迟到目录、账号变化且目录失败、待授权进程重启、完成后取消的清理重试、首次认领前到期的安全隔离/删除及授权 URL 迟到时的 profile 复用阻止；原生流程覆盖公开模型编辑不能重指固定来源/原 ID。
 
 隔离 SQLite/重启与应用专用临时路径已验证；**真实 macOS Keychain、CPA OAuth auth-dir 写入/刷新、真实账号和真实额度尚未验证**。本票管理替身使用虚构元数据，未安装真实服务或凭据。CPA R1 的实际 API 定向结果不推广到 OAuth。
 
@@ -57,5 +57,13 @@ node scripts/check-cpa-subscriptions.mjs /absolute/owned-target/debug/autojev --
 ```
 
 桌面驱动保留 `first.report.json`、`reload.report.json`、`receiver-records.json` 和本轮 run ID 截图。两份报告均需 `ok:true`，保存的 provider/model/generation 必须一致。缺报告、锁屏、超时均不计通过。清理仅针对该驱动启动的桌面进程组、Vite 和回环服务；截图失败如实输出，不改变产品验证报告。
+
+## R2 合并后的组合回归
+
+已将 PR62 的 main 合并提交 `ca5f24a13da5a9e69164329a1d12429b23ceca28`（R2 验收 head `de57f04f6753de3b8361cd6dccd78d755ae5c192`）集成到 R3 分支。实际文本冲突仅为 `isolation_check.rs` 的脚本选择与 `types.ts` 的 Snapshot 字段：保留两个显式验收入口，并同时保留 API/CPA 的独立投影。自动合并的配置、保存/删除、固定模型校验、Provider 页面与共同准入已复核，两类来源继续使用既有 UUID 和各自身份记录；未改 R2 协议/脱敏实现。
+
+本次重新执行合并后的完整 Rust 534 项（包括 65 秒后台零生成/测速）、前端 96 项、build/release 检查与原生隔离构建。CPA 原生流程把同名 API 反例建为 R2 的显式官方 API 来源：同一 DB 与 Snapshot 同时保存 API 与 CPA，CPA 换号到世代 8 时 API 实例/世代 1 不变，重启保留各自模型 UUID 和绑定；CPA 未授予资格，API 替代请求为 0。两次当前 run ID 与非秘密身份由原始报告保存，没有沿用旧 `e4ab65e` 的通过结果。
+
+R2 原生基线也在此合并结果运行两次，首轮 `97f4d183-cbd8-41d7-9fb2-600fa44c3607`、重启 `d42ad08a-1647-4c9c-a632-8280f07f95f3` 均 `ok:true`，66 次虚构回环请求的固定 endpoint、模型与凭据匹配全部通过；保存/重开、停用/删除、测试、Debug、拒绝与既有三下游文本/SSE 也保持通过。完整报告与非秘密接收记录加入同一原始证据文件。所有运行只使用任务自有临时 DB、虚构 Key 和回环服务；真实登录、账号/额度及模型操作保持 0。
 
 合入顺序由父线程协调 R2 后 R3，合入后需重新验证共有接缝。共享字段集中在 AppConfig/Snapshot 的独立 CPA map，服务商、模型 UUID 与网关准入沿用已有接口。可能交叠的位置包括配置 loader、`save_model`/`validate_model`、服务商删除与页面、Snapshot 和共同准入。

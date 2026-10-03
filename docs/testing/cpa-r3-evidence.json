@@ -1,11 +1,18 @@
 {
   "first.report": {
+    "api_source": {
+      "connection_instance_id": "8b6d5ffa-5ea8-4e9c-9bee-dcbe3f4e745f",
+      "generation": 1,
+      "model_id": "7c3763cc-b9ad-4292-96e5-31412b1215ce",
+      "provider_id": "same-name-paid"
+    },
     "checks": [
       "begin/wait/cancel public desktop loop",
       "failure/disconnect public desktop loop",
       "public model edits retain the CPA fixed target and unknown capabilities",
       "connection/directory/selection/listening gateway rejection; no same-name API fallback",
-      "stale directory retained; switch disables old target; explicit rebind"
+      "stale directory retained; switch disables old target; explicit rebind",
+      "R2 explicit API and R3 CPA identities coexist and persist independently"
     ],
     "layer": "native-desktop-fictional-cpa",
     "ok": true,
@@ -21,16 +28,23 @@
         "fictional-2"
       ]
     },
-    "run_id": "8d723a44-2268-4cd1-9261-9a2ced8556c6",
+    "run_id": "ebf73ee4-4fcd-4952-8a1c-1900839ba0c6",
     "saved": {
       "generation": 8,
-      "model_id": "07cd87aa-67d1-48aa-936d-e15c0c2d71f8",
-      "provider_id": "cpa-8d0ac7b1-aab4-41eb-9d75-4a8bb94e3610"
+      "model_id": "dbaa54bd-60b5-4202-855f-790586876241",
+      "provider_id": "cpa-3ce8d0e8-ece1-451d-ab12-57809fc0a7dd"
     }
   },
   "reload.report": {
+    "api_source": {
+      "connection_instance_id": "8b6d5ffa-5ea8-4e9c-9bee-dcbe3f4e745f",
+      "generation": 1,
+      "model_id": "7c3763cc-b9ad-4292-96e5-31412b1215ce",
+      "provider_id": "same-name-paid"
+    },
     "checks": [
-      "isolated DB restart re-read; no automatic authorization"
+      "isolated DB restart re-read; no automatic authorization",
+      "R2 explicit API and R3 CPA identities coexist and persist independently"
     ],
     "layer": "native-desktop-fictional-cpa",
     "ok": true,
@@ -46,11 +60,11 @@
         "fictional-2"
       ]
     },
-    "run_id": "1f8070c8-e85e-4911-b47b-63d85f901ae5",
+    "run_id": "8c66f7c1-c39e-4751-becb-c5cec7d9fdf9",
     "saved": {
       "generation": 8,
-      "model_id": "07cd87aa-67d1-48aa-936d-e15c0c2d71f8",
-      "provider_id": "cpa-8d0ac7b1-aab4-41eb-9d75-4a8bb94e3610"
+      "model_id": "dbaa54bd-60b5-4202-855f-790586876241",
+      "provider_id": "cpa-3ce8d0e8-ece1-451d-ab12-57809fc0a7dd"
     }
   },
   "receiver-records": {
@@ -74,5 +88,634 @@
     "layer": "native-desktop-fictional-cpa",
     "ok": false,
     "run_id": "a1ea957b-4afc-474a-ad7b-7d6d9dec317d"
-  }
+  },
+  "integrated-main": "ca5f24a13da5a9e69164329a1d12429b23ceca28",
+  "r2-first.report": {
+    "checks": [
+      "desktop creates and saves four classified sources without generation; legacy API identity remains compatible",
+      "account/plan labels match UI 160 UTF-16 units: 60/160 Chinese and 80 emoji accepted, overflow rejected before persistence with zero generation",
+      "all same-name source models, saved provider tests and legacy API hit their own fictional credential and endpoint without a decision key",
+      "incompatible existing/new model protocols rejected before persistence with zero generation; inherited or matching protocols remain usable",
+      "identity edits rejected; 401/429/503/404 stay on the fixed source; deselection preserves UUID; disabled/invalid/unsupported/ambiguous targets dispatch zero through gateway, test, Debug and manual probe",
+      "new official/third-party/coding sources reject absent/blank generation key before persistence with zero generation; existing edits retain stored credential; legacy unclassified optional-key creation remains compatible",
+      "native form shows an explicit generation-key error without persistence or requests; correcting the same ID saves and dispatches exactly once to its fixed source",
+      "public import rejects a batch containing a retired source ID before provider/model/credential writes; normal import and duplicate skip remain compatible, with zero generation",
+      "legacy and disconnected subscription public saves reject retired destination IDs without config changes or generation; normal renames and rename-back preserve model UUIDs; legacy fixed credential remains usable",
+      "deleted UUIDs/provider aliases cannot be rebound or captured by another source bare ID; an inflight request keeps its original source/credential",
+      "missing credential refused before creation; manual probe and Debug hit saved source; Debug logical delta and nested tool JSON/SSE echoes are redacted; three compatible downstream text/stream protocols preserve fixed source and terminal; directory/logs contain no generation secrets"
+    ],
+    "import_reservation": {
+      "accounts": [
+        "provider:import-termany-aef3ee1f5de06bc880fc1a11f053b5dffcefaa95b7bf4fbce794ce8568741a85",
+        "provider:import-termany-86eaeb992b40d6d2e92ca33c8c9b0531d3cd2252fbc9c3c31db0c9246ead9eb4",
+        "provider:import-ccswitch-840d2cc01ccd324fd55cd57f6de6d8c4306c57a096c92f5975bab8bb29e63113"
+      ],
+      "duplicate_skips": 1,
+      "generation": 0,
+      "refused_batches": 1,
+      "successful_imports": 1
+    },
+    "layer": "native-desktop-api-sources-loopback",
+    "ok": true,
+    "retired_rename": {
+      "cases": [
+        {
+          "kind": "openai_compatible",
+          "normal_saves": 2,
+          "refused": 1
+        },
+        {
+          "kind": "codex_subscription",
+          "normal_saves": 2,
+          "refused": 1
+        }
+      ],
+      "generation_during_saves": 0,
+      "legacy_fixed_requests": 1
+    },
+    "run_id": "97f4d183-cbd8-41d7-9fb2-600fa44c3607",
+    "saved": [
+      {
+        "endpoint": "http://127.0.0.1:63244/official/v1",
+        "id": "official",
+        "model_uuid": "2831c09d-9398-49f0-bbf7-f4cb1264eb82",
+        "provider_id": "r2-official",
+        "source_instance": "a222a26c-3260-4101-a328-1b1eb9f465d6"
+      },
+      {
+        "endpoint": "http://127.0.0.1:63244/openrouter/v1",
+        "id": "openrouter",
+        "model_uuid": "c7a39808-266b-4c33-83e6-5469af283c72",
+        "provider_id": "r2-openrouter",
+        "source_instance": "05e2c047-6024-4a2d-8854-12db38210715"
+      },
+      {
+        "endpoint": "http://127.0.0.1:63244/zenmux/v1",
+        "id": "zenmux",
+        "model_uuid": "9ce15e14-fe5a-4223-8b86-1de185ba6a9e",
+        "provider_id": "r2-zenmux",
+        "source_instance": "ccadd00e-0c13-44c5-bc89-a66396a12d19"
+      },
+      {
+        "endpoint": "http://127.0.0.1:63244/coding/v4",
+        "id": "coding",
+        "model_uuid": "a4e022d8-1880-43f1-b7b3-cb7018c73cc0",
+        "provider_id": "r2-coding",
+        "source_instance": "de4ef534-efb5-4ff0-80cf-ae2de9016e7d"
+      },
+      {
+        "endpoint": "http://127.0.0.1:63244/legacy/v1",
+        "id": "legacy",
+        "model_uuid": "cba9ef3d-86f9-400d-8361-ba8761ed988f",
+        "provider_id": "r2-legacy",
+        "source_instance": null
+      }
+    ]
+  },
+  "r2-reload.report": {
+    "checks": [
+      "new desktop process preserves source categories, unknown account/plan states and stable UUIDs",
+      "account/plan labels match UI 160 UTF-16 units: 60/160 Chinese and 80 emoji accepted, overflow rejected before persistence with zero generation",
+      "all same-name source models, saved provider tests and legacy API hit their own fictional credential and endpoint without a decision key",
+      "incompatible existing/new model protocols rejected before persistence with zero generation; inherited or matching protocols remain usable",
+      "identity edits rejected; 401/429/503/404 stay on the fixed source; deselection preserves UUID; disabled/invalid/unsupported/ambiguous targets dispatch zero through gateway, test, Debug and manual probe",
+      "new official/third-party/coding sources reject absent/blank generation key before persistence with zero generation; existing edits retain stored credential; legacy unclassified optional-key creation remains compatible",
+      "native form shows an explicit generation-key error without persistence or requests; correcting the same ID saves and dispatches exactly once to its fixed source",
+      "public import rejects a batch containing a retired source ID before provider/model/credential writes; normal import and duplicate skip remain compatible, with zero generation",
+      "legacy and disconnected subscription public saves reject retired destination IDs without config changes or generation; normal renames and rename-back preserve model UUIDs; legacy fixed credential remains usable",
+      "deleted UUIDs/provider aliases cannot be rebound or captured by another source bare ID; an inflight request keeps its original source/credential",
+      "missing credential refused before creation; manual probe and Debug hit saved source; Debug logical delta and nested tool JSON/SSE echoes are redacted; three compatible downstream text/stream protocols preserve fixed source and terminal; directory/logs contain no generation secrets"
+    ],
+    "import_reservation": {
+      "accounts": [
+        "provider:import-termany-e6ebb847a4ae406ac27aac2c04dd6d826090c2cd4abe72c823af025160e1d4da",
+        "provider:import-termany-5359997573c9a94a3d1a3aa3482b9580c045f23565f6f9b870b79ec23db06827",
+        "provider:import-ccswitch-11d82b3ab94f441b6057761d47fb16932f2567fb119d22fde9ab5e6a62cc1265"
+      ],
+      "duplicate_skips": 1,
+      "generation": 0,
+      "refused_batches": 1,
+      "successful_imports": 1
+    },
+    "layer": "native-desktop-api-sources-loopback",
+    "ok": true,
+    "retired_rename": {
+      "cases": [
+        {
+          "kind": "openai_compatible",
+          "normal_saves": 2,
+          "refused": 1
+        },
+        {
+          "kind": "codex_subscription",
+          "normal_saves": 2,
+          "refused": 1
+        }
+      ],
+      "generation_during_saves": 0,
+      "legacy_fixed_requests": 1
+    },
+    "run_id": "d42ad08a-1647-4c9c-a632-8280f07f95f3",
+    "saved": [
+      {
+        "endpoint": "http://127.0.0.1:63244/official/v1",
+        "id": "official",
+        "model_uuid": "2831c09d-9398-49f0-bbf7-f4cb1264eb82",
+        "provider_id": "r2-official",
+        "source_instance": "a222a26c-3260-4101-a328-1b1eb9f465d6"
+      },
+      {
+        "endpoint": "http://127.0.0.1:63244/openrouter/v1",
+        "id": "openrouter",
+        "model_uuid": "c7a39808-266b-4c33-83e6-5469af283c72",
+        "provider_id": "r2-openrouter",
+        "source_instance": "05e2c047-6024-4a2d-8854-12db38210715"
+      },
+      {
+        "endpoint": "http://127.0.0.1:63244/zenmux/v1",
+        "id": "zenmux",
+        "model_uuid": "9ce15e14-fe5a-4223-8b86-1de185ba6a9e",
+        "provider_id": "r2-zenmux",
+        "source_instance": "ccadd00e-0c13-44c5-bc89-a66396a12d19"
+      },
+      {
+        "endpoint": "http://127.0.0.1:63244/coding/v4",
+        "id": "coding",
+        "model_uuid": "a4e022d8-1880-43f1-b7b3-cb7018c73cc0",
+        "provider_id": "r2-coding",
+        "source_instance": "de4ef534-efb5-4ff0-80cf-ae2de9016e7d"
+      },
+      {
+        "endpoint": "http://127.0.0.1:63244/legacy/v1",
+        "id": "legacy",
+        "model_uuid": "cba9ef3d-86f9-400d-8361-ba8761ed988f",
+        "provider_id": "r2-legacy",
+        "source_instance": null
+      }
+    ]
+  },
+  "r2-receiver-records": [
+    {
+      "source": "official",
+      "path": "/official/v1/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "official",
+      "path": "/official/v1/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "openrouter",
+      "path": "/openrouter/v1/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "openrouter",
+      "path": "/openrouter/v1/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "zenmux",
+      "path": "/zenmux/v1/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "zenmux",
+      "path": "/zenmux/v1/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "legacy",
+      "path": "/legacy/v1/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "legacy",
+      "path": "/legacy/v1/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": true
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": true
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": true
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": true
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": true
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": true
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": true
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": true
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "legacy",
+      "path": "/legacy/v1/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "official",
+      "path": "/official/v1/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "official",
+      "path": "/official/v1/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "openrouter",
+      "path": "/openrouter/v1/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "openrouter",
+      "path": "/openrouter/v1/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "zenmux",
+      "path": "/zenmux/v1/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "zenmux",
+      "path": "/zenmux/v1/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "legacy",
+      "path": "/legacy/v1/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "legacy",
+      "path": "/legacy/v1/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": true
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": true
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": true
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": true
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": true
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": true
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": true
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": true
+    },
+    {
+      "source": "coding",
+      "path": "/coding/v4/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    },
+    {
+      "source": "legacy",
+      "path": "/legacy/v1/chat/completions",
+      "credentialMatch": true,
+      "model": "same-model",
+      "stream": false
+    }
+  ]
 }

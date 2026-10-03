@@ -10,6 +10,8 @@ import { WindowFrame } from './components/window-frame';
 import { TrafficPage } from './components/traffic-page';
 import { RoutesPage } from './components/routes-page';
 import { sortProviders } from './lib/provider-sort';
+import { ApiSourceFields, API_SOURCE_LABELS } from './components/api-source-fields';
+import type { ApiSourceDraft } from './types';
 import { providerTestError, type ProviderTestStatus } from './lib/provider-test';
 import { providerIdentifier } from './lib/provider-name';
 import { Select } from './components/select';
@@ -114,7 +116,7 @@ const EMPTY_PROVIDER: Provider = {
   id: '',
   name: '',
   kind: 'openrouter',
-  base_url: 'https://openrouter.ai/api',
+  base_url: 'https://openrouter.ai/api/v1',
   enabled: true,
   has_api_key: false,
 };
@@ -409,10 +411,11 @@ export default function App() {
         <ProviderDialog
           onTestStatus={async (status) => { if (providerModal.id) setProviderTests((previous) => ({ ...previous, [providerModal.id]: status })); if (status === 'success' || status === 'error') { try { await refreshBudgetSnapshot(); } catch { /* Keep the test result visible. */ } } }}
           initial={providerModal}
+          initialSource={snapshot.api_sources?.[providerModal.id]}
           subscriptionTargets={providerModal.id ? subscriptionCatalog(subscriptionView(snapshot, providerModal.id)) : []}
           onClose={() => setProviderModal(null)}
-          onSave={async (provider, apiKey, addTestModel) => {
-            setSnapshot(await saveProvider(provider, apiKey, addTestModel, providerModal.id || undefined, !providerModal.id));
+          onSave={async (provider, apiKey, addTestModel, source) => {
+            setSnapshot(await saveProvider(provider, apiKey, addTestModel, providerModal.id || undefined, !providerModal.id, source));
             setProviderModal(null);
             setToast(t("Provider saved"));
           }}
@@ -728,7 +731,7 @@ function ProvidersPage({ snapshot, onAdd, onEdit, onDelete, onTest, onImport, on
               };
               return (
               <tr key={provider.id}>
-                <td><div className="provider-table-name"><span className="provider-table-icon"><ProviderLogo id={providerPreset(provider)} /></span><div><strong>{provider.name}</strong><small>{provider.id}</small></div></div></td>
+                <td><div className="provider-table-name"><span className="provider-table-icon"><ProviderLogo id={providerPreset(provider)} /></span><div><strong>{provider.name}</strong><small>{provider.id}</small>{snapshot.api_sources?.[provider.id] && <small data-testid={`source-identity-${provider.id}`}>{t(API_SOURCE_LABELS[snapshot.api_sources[provider.id].kind])} · {snapshot.api_sources[provider.id].plan_label || t('Unknown')} · {t('Plan eligibility and fees unknown')}</small>}</div></div></td>
                 <td>{subscription ? <span className="provider-subscription-identity" title={t('Subscription identity')}><ShieldCheck size={14} aria-hidden="true" />{identityLabel(view, t)}</span> : <code className="provider-table-url" title={provider.base_url}>{provider.base_url}</code>}</td>
                 <td><div className="provider-enabled-cell"><button type="button" role="switch" aria-checked={provider.enabled} aria-label={t('Enable {provider}', { provider: provider.name })} disabled={toggling[provider.id]} className={cx('switch', provider.enabled && 'on')} onClick={() => void toggle(provider)}><span /></button><span>{t(provider.enabled ? 'ENABLED' : 'DISABLED')}</span></div></td>
                 <td>{subscription ? <div className="provider-subscription-status"><span className={cx('provider-connection', connectionStateTone(view?.state ?? 'not_connected'))}><Plug size={14} aria-hidden="true" />{connectionStateLabel(view?.state ?? 'not_connected', t)}</span><span className="provider-subscription-detail">{view && view.models.length > 0 ? t('{count} discovered models', { count: view.models.length }) : t('No discovered models yet')}</span><span className="provider-subscription-state" data-testid={`sub-status-${provider.id}`}>{subscriptionStatusText(view, t)}</span>{login && login.stage !== 'idle' && <span className={cx('provider-subscription-login', loginStageTone(login.stage))} role="status">{loginStageLabel(login.stage, t)}</span>}{authorizationUrl && <a className="provider-subscription-auth-link" href={authorizationUrl} target="_blank" rel="noreferrer" onClick={(event) => { if (isTauri()) { event.preventDefault(); void openUrl(authorizationUrl).catch(() => onNotify(t('Open authorization link'), true)); } }}>{t('Open authorization link')}</a>}{awaitingAuthorization && login?.user_code && <span className="provider-subscription-user-code"><span>{t('Authorization code')}</span><code>{login.user_code}</code></span>}{awaitingAuthorization && !authorizationUrl && !login?.user_code && <span className="provider-subscription-login">{t('Complete the authorization in your browser. This row updates automatically.')}</span>}{login?.error && <span className="provider-subscription-error" role="status">{login.error}</span>}{view?.logout && <span className="provider-subscription-logout" role="status">{localLogoutLabel(view.logout.local, t)} · {remoteRevocationLabel(view.logout.remote, t)}</span>}{subscriptionErrors[provider.id] && <span className="provider-subscription-error" role="status">{subscriptionErrors[provider.id]}</span>}{subscriptionReason(view, t) && <span className="provider-subscription-reason" role="status" title={subscriptionReason(view, t)}>{denialLabel(view?.denial ?? view?.admission_denial, t) || quotaLabel(view?.quota?.state ?? 'unknown', t)}</span>}{subscription && <span className="provider-subscription-catalog" data-testid={`sub-catalog-${provider.id}`}>{subscriptionCatalogText(view)}</span>}{subscription && <span className="provider-subscription-catalog-human">{t('Model catalog')} · {catalogLabel(catalog?.state ?? 'unknown', t)} · {catalog?.observed_at?.trim() || t('Unknown')}{catalog?.source?.trim() ? ` · ${catalog.source.trim()}` : ''}</span>}{subscription && <span className="provider-subscription-quota" data-testid={`sub-quota-${provider.id}`}>{subscriptionQuotaText(view)}</span>}{subscription && <span className="provider-subscription-quota-human">{quotaLabel(quota?.state ?? 'unknown', t)} · {quotaViewLabel(quota?.view, t)}</span>}{subscription && (quota?.buckets ?? []).map((bucket) => <span key={`${provider.id}-${bucket.limit_id}`} className="provider-subscription-quota-bucket">{quotaPermissionLabel(bucket.permission, t)}{bucket.credits?.balance?.trim() ? <code title={t('Raw balance text as reported; the unit is not inferred.')}>{bucket.credits.balance.trim()}</code> : null}<span className="provider-subscription-credits">{creditsAxisText(bucket.credits, t)}</span></span>)}{subscription && !(quota?.buckets ?? []).length && <span className="provider-subscription-quota-bucket">{quotaPermissionLabel(undefined, t)}</span>}{subscription && catalogRemoved && <span className="provider-subscription-removed" role="status">{catalogRemoved}</span>}{subscription && quotaHistory && <span className="provider-subscription-quota-history" role="status">{quotaHistory}</span>}{showCatalogReference && <a className="provider-subscription-reference" href={CATALOG_REFERENCE_URL} target="_blank" rel="noreferrer" title={CATALOG_REFERENCE_URL} onClick={openReference(CATALOG_REFERENCE_URL)}>{t('Official catalog reference')}</a>}{showQuotaReference && <a className="provider-subscription-reference" href={QUOTA_REFERENCE_URL} target="_blank" rel="noreferrer" title={QUOTA_REFERENCE_URL} onClick={openReference(QUOTA_REFERENCE_URL)}>{t('Official quota reference')}</a>}{(showCatalogReference || showQuotaReference) && <span className="provider-subscription-evidence-note">{t('Viewing the official reference is not a bypass for admission.')}</span>}</div> : <span className="provider-table-key">{t('Not a subscription provider')}</span>}</td>
@@ -1134,8 +1137,9 @@ function EventList({ events, detailed }: { events: DashboardSnapshot['events']; 
 
 const PROVIDER_PRESETS = [
   { id: 'openai', name: 'OpenAI', kind: 'openai_compatible', url: 'https://api.openai.com/v1' },
-  { id: 'deepseek', name: 'DeepSeek', kind: 'openai_compatible', url: 'https://api.deepseek.com' },
-  { id: 'openrouter', name: 'OpenRouter', kind: 'openrouter', url: 'https://openrouter.ai/api' },
+  { id: 'deepseek', name: 'DeepSeek', kind: 'openai_compatible', url: 'https://api.deepseek.com/v1' },
+  { id: 'openrouter', name: 'OpenRouter', kind: 'openrouter', url: 'https://openrouter.ai/api/v1' },
+  { id: 'zenmux', name: 'ZenMux', kind: 'openai_compatible', url: '' },
   { id: 'ollama', name: 'Ollama', kind: 'ollama', url: 'http://127.0.0.1:11434' },
   { id: 'custom-openai', name: 'OpenAI Compatible', kind: 'openai_compatible', url: '' },
   { id: 'custom-anthropic', name: 'Anthropic Compatible', kind: 'openai_compatible', url: '' },
@@ -1158,7 +1162,7 @@ function providerPreset(provider: Provider) {
 }
 
 function ProviderLogo({ id }: { id: string }) {
-  if (id.startsWith('custom-') || id.endsWith('-subscription')) return <Server size={18} aria-hidden="true" />;
+  if (id === 'zenmux' || id.startsWith('custom-') || id.endsWith('-subscription')) return <Server size={18} aria-hidden="true" />;
   return <img alt="" className={cx('provider-logo', ['openai', 'ollama'].includes(id) && 'monochrome-logo')} src={`/icons/providers/${id}${['deepseek', 'anthropic', 'openrouter'].includes(id) ? '-color' : ''}.svg`} />;
 }
 
@@ -1166,7 +1170,7 @@ function normalizeApiType(value?: string) {
   return value === 'responses' || value === 'messages' ? value : 'chat_completions';
 }
 
-function ProviderDialog({ initial, subscriptionTargets, onClose, onSave, onTestStatus }: { onTestStatus: (status: ProviderTestStatus) => void | Promise<void>; initial: Provider; subscriptionTargets: SubscriptionCatalogEntry[]; onClose: () => void; onSave: (p: Provider, key?: string, addTestModel?: boolean) => Promise<void> }) {
+function ProviderDialog({ initial, initialSource, subscriptionTargets, onClose, onSave, onTestStatus }: { onTestStatus: (status: ProviderTestStatus) => void | Promise<void>; initial: Provider; initialSource?: ApiSourceDraft; subscriptionTargets: SubscriptionCatalogEntry[]; onClose: () => void; onSave: (p: Provider, key?: string, addTestModel?: boolean, source?: ApiSourceDraft) => Promise<void> }) {
   const { t } = usePreferences();
   const edit = Boolean(initial.id);
   const inferred = PROVIDER_PRESETS.find((p) => p.id === initial.preset)?.id
@@ -1175,6 +1179,9 @@ function ProviderDialog({ initial, subscriptionTargets, onClose, onSave, onTestS
     || (initial.api_type === 'messages' ? 'custom-anthropic' : 'custom-openai');
   const [provider, setProvider] = useState(() => ({ ...initial, id: initial.id || crypto.randomUUID(), name: initial.name || (inferred.startsWith('custom-') ? 'Custom' : PROVIDER_PRESETS.find((p) => p.id === inferred)?.name) || '', preset: inferred, api_type: normalizeApiType(initial.api_type), test_model: initial.test_model || '' }));
   const [identifier, setIdentifier] = useState(initial.id || (inferred.startsWith('custom-') ? 'custom' : inferred));
+  const [source, setSource] = useState<ApiSourceDraft | undefined>(() => initialSource || (!edit && !inferred.startsWith('custom-') && initial.kind !== 'ollama' && !isSubscriptionKind(initial.kind) ? { kind: inferred === 'openrouter' || inferred === 'zenmux' ? 'third_party_api' : 'official_api' } : undefined));
+  const [addSourceModel, setAddSourceModel] = useState(true);
+  const lockedSource = Boolean(initialSource);
   const [apiKey, setApiKey] = useState('');
   const [showKey, setShowKey] = useState(false);
   const [testing, setTesting] = useState(false);
@@ -1190,6 +1197,7 @@ function ProviderDialog({ initial, subscriptionTargets, onClose, onSave, onTestS
     const preset = PROVIDER_PRESETS.find((p) => p.id === id)!;
     const kind = preset.kind as Provider['kind'];
     const subscriptionPreset = isSubscriptionKind(kind);
+    if (!edit) setSource(subscriptionPreset || kind === 'ollama' || id.startsWith('custom-') ? undefined : { kind: id === 'openrouter' || id === 'zenmux' ? 'third_party_api' : 'official_api' });
     setProvider({ ...provider, preset: preset.id, kind, base_url: preset.url, name: id.startsWith('custom-') ? 'Custom' : preset.name, api_type: subscriptionPreset ? '' : id === 'custom-anthropic' ? 'messages' : 'chat_completions', test_model: '' });
     if (!edit) setIdentifier(id.startsWith('custom-') ? 'custom' : id);
     // 订阅条目没有密钥字段：切到订阅时丢弃已输入的密钥，避免隐藏字段的残留值随保存提交。
@@ -1205,7 +1213,7 @@ function ProviderDialog({ initial, subscriptionTargets, onClose, onSave, onTestS
     event.preventDefault(); if (testing) return;
     setTesting(true); setTestResult('');
     const next = draft();
-    try { await onSave(next, isSubscriptionKind(next.kind) ? undefined : apiKey || undefined, !edit && testedFingerprint === fingerprint()); }
+    try { await onSave(next, isSubscriptionKind(next.kind) ? undefined : apiKey || undefined, source ? !edit && addSourceModel && Boolean(next.test_model?.trim()) : !edit && testedFingerprint === fingerprint(), source); setApiKey(''); }
     catch (error) { setTestFailed(true); setTestResult(t(String(error instanceof Error ? error.message : error))); }
     finally { setTesting(false); }
   };
@@ -1216,7 +1224,7 @@ function ProviderDialog({ initial, subscriptionTargets, onClose, onSave, onTestS
     }
     if (!provider.test_model.trim()) { setTestFailed(true); setTestResult(t('Enter a test model')); await onTestStatus('error'); return; }
     setTestedFingerprint(''); setTesting(true); setTestResult(''); setTestFailed(false); await onTestStatus('testing');
-    try { const result = await testProviderDraft({ ...draft(), id: initial.id || draft().id }, apiKey || undefined); setTestedFingerprint(fingerprint()); if (!edit) setProvider(previous => ({ ...previous, enabled: true })); setTestResult(t(result)); await onTestStatus('success'); }
+    try { const result = await testProviderDraft({ ...draft(), id: initial.id || draft().id }, apiKey || undefined, source); setTestedFingerprint(fingerprint()); if (!edit) setProvider(previous => ({ ...previous, enabled: true })); setTestResult(t(result)); await onTestStatus('success'); }
     catch (error) {
       setTestFailed(true);
       setTestResult(providerTestError(error, t));
@@ -1225,7 +1233,7 @@ function ProviderDialog({ initial, subscriptionTargets, onClose, onSave, onTestS
     finally { setTesting(false); }
   };
   let base = provider.base_url.trim().replace(/\/+$/, '');
-  if (!base.endsWith('/v1')) base += '/v1';
+  if (!source && !base.endsWith('/v1')) base += '/v1';
   const endpoint = `${base}/${provider.api_type === 'messages' ? 'messages' : provider.api_type === 'responses' ? 'responses' : 'chat/completions'}`;
   return <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && !testing && onClose()}>
     <div className="dialog provider-dialog" role="dialog" aria-modal="true" aria-labelledby="provider-dialog-title">
@@ -1233,21 +1241,24 @@ function ProviderDialog({ initial, subscriptionTargets, onClose, onSave, onTestS
       <form autoComplete="off" ref={form} onSubmit={submit} className="provider-dialog-form">
         <fieldset disabled={testing}>
           <div className="field-pair">
-            <div className="form-field"><span>{t('Provider type')}</span><SearchSelect value={provider.preset} disabled={testing} label={t('Provider type')} placeholder={t('Search providers…')} empty={t('No providers found')} onChange={changePreset} options={[...PROVIDER_PRESETS.filter((p) => !p.id.startsWith('custom-')).sort((a, b) => a.name.localeCompare(b.name, 'en')), ...PROVIDER_PRESETS.filter((p) => p.id.startsWith('custom-'))].map((p) => ({ value: p.id, label: t(p.name), icon: <ProviderLogo id={p.id} />, group: p.id.startsWith('custom-') ? t('Custom') : t('Recommended'), keywords: `${p.name} ${p.id} ${p.url}` }))} /></div>
-            {!subscription && <label className="form-field"><span>{t('API type')}</span><Select searchable={false} value={provider.api_type} onChange={(e) => { setProvider({ ...provider, api_type: e.target.value }); setTestResult(''); }}><option value="chat_completions">OpenAI Chat Completions</option><option value="responses">OpenAI Responses</option><option value="messages">Anthropic Messages</option></Select></label>}
+            <div className="form-field"><span>{t('Provider type')}</span><SearchSelect value={provider.preset} disabled={testing || lockedSource} label={t('Provider type')} placeholder={t('Search providers…')} empty={t('No providers found')} onChange={changePreset} options={[...PROVIDER_PRESETS.filter((p) => !p.id.startsWith('custom-')).sort((a, b) => a.name.localeCompare(b.name, 'en')), ...PROVIDER_PRESETS.filter((p) => p.id.startsWith('custom-'))].map((p) => ({ value: p.id, label: t(p.name), icon: <ProviderLogo id={p.id} />, group: p.id.startsWith('custom-') ? t('Custom') : t('Recommended'), keywords: `${p.name} ${p.id} ${p.url}` }))} /></div>
+            {!subscription && <label className="form-field"><span>{t('API type')}</span><Select disabled={lockedSource} searchable={false} value={provider.api_type} onChange={(e) => { setProvider({ ...provider, api_type: e.target.value }); setTestResult(''); }}><option value="chat_completions">OpenAI Chat Completions</option><option value="responses">OpenAI Responses</option><option value="messages">Anthropic Messages</option></Select></label>}
           </div>
+          {!subscription && provider.kind !== 'ollama' && (!edit || lockedSource) && <ApiSourceFields source={source} locked={lockedSource} onChange={setSource}/>}
           <div className="field-pair">
-            <label className="form-field"><span>{t('Provider name')}</span><input autoComplete="off" autoCapitalize="none" autoCorrect="off" spellCheck={false} required pattern="[a-zA-Z0-9_-]+" value={identifier} onChange={(e) => setIdentifier(e.target.value)} /></label>
+            <label className="form-field"><span>{t('Provider name')}</span><input autoComplete="off" autoCapitalize="none" autoCorrect="off" spellCheck={false} required pattern="[a-zA-Z0-9_-]+" disabled={lockedSource} value={identifier} onChange={(e) => setIdentifier(e.target.value)} /></label>
             <label className="form-field"><span>{t('Display name')} <small>{t('(optional)')}</small></span><input autoComplete="off" autoCapitalize="none" autoCorrect="off" spellCheck={false} value={provider.name} placeholder={identifier} onChange={(e) => setProvider({ ...provider, name: e.target.value })} /></label>
           </div>
-          {!subscription && <label className="form-field"><span>{t('Base URL')}</span><input autoComplete="off" autoCapitalize="none" autoCorrect="off" spellCheck={false} required type="url" value={provider.base_url} placeholder="https://api.example.com/v1" onChange={(e) => setProvider({ ...provider, base_url: e.target.value })} /></label>}
-          {!subscription && <label className="form-field"><span>{t('API key')}</span><div className="secret-input"><input autoComplete="off" autoCapitalize="none" autoCorrect="off" spellCheck={false} value={apiKey} type={showKey ? 'text' : 'password'} placeholder={provider.has_api_key ? t('Leave blank to keep the stored credential.') : provider.kind === 'ollama' ? t('No API key required') : 'sk-…'} onChange={(e) => setApiKey(e.target.value)} /><button type="button" aria-label={t('API key')} onClick={() => setShowKey(!showKey)}>{showKey ? <EyeOff size={16} /> : <Eye size={16} />}</button></div></label>}
+          {!subscription && <label className="form-field"><span>{t(source ? 'Source protocol base URL' : 'Base URL')}</span><input disabled={lockedSource} autoComplete="off" autoCapitalize="none" autoCorrect="off" spellCheck={false} required type="url" value={provider.base_url} placeholder="https://api.example.com/v1" onChange={(e) => setProvider({ ...provider, base_url: e.target.value })} /></label>}
+          {!subscription && <label className="form-field"><span>{t(source ? 'Generation API key' : 'API key')}</span><div className="secret-input"><input disabled={lockedSource} autoComplete="off" autoCapitalize="none" autoCorrect="off" spellCheck={false} value={apiKey} type={showKey ? 'text' : 'password'} placeholder={provider.has_api_key ? t('Leave blank to keep the stored credential.') : provider.kind === 'ollama' ? t('No API key required') : 'sk-…'} onChange={(e) => setApiKey(e.target.value)} /><button type="button" aria-label={t('API key')} onClick={() => setShowKey(!showKey)}>{showKey ? <EyeOff size={16} /> : <Eye size={16} />}</button></div></label>}
           {subscription && <div className="form-field subscription-provider-note"><ShieldCheck size={16} aria-hidden="true" /><p className="provider-test-help">{t('Subscription providers keep authorization in the official helper managed by this app. Generation stays denied until identity, capability and quota are verified.')}</p></div>}
           {subscription && <div className="form-field" data-testid="provider-subscription-test-field"><label htmlFor="provider-subscription-test-model">{t('Test model')}</label><select id="provider-subscription-test-model" data-testid="provider-subscription-test-model" value={provider.test_model || ''} disabled={testing || !edit || providerTypeChanged || (!availableSubscriptionTargets.length && !provider.test_model)} onChange={(event) => { setProvider({ ...provider, test_model: event.target.value }); setTestResult(''); }}><option value="">{providerTypeChanged ? t('Save this provider type and refresh its model catalog before testing.') : availableSubscriptionTargets.length ? t('Choose a discovered model') : t('Refresh the model catalog before testing.')}</option>{availableSubscriptionTargets.map((entry) => <option key={entry.internal_id} value={entry.model_id}>{entry.name?.trim() || entry.model_id}{entry.eligibility === 'eligible' ? '' : ` · ${t('Eligibility unknown or unavailable')}`}</option>)}{provider.test_model && !providerTypeChanged && !availableSubscriptionTargets.some((entry) => entry.model_id === provider.test_model) && <option value={provider.test_model}>{provider.test_model} · {t('Saved test target')}</option>}</select><p className="provider-test-help" data-testid={providerTypeChanged ? 'provider-kind-change-warning' : undefined}>{t(providerTypeChanged ? 'Save this provider type and refresh its model catalog before testing.' : 'A subscription provider test sends a short Chat text request through the shared admission gate. It may consume subscription allowance.')}</p></div>}
           {!subscription && <div className="form-field"><label htmlFor="provider-test-model">{t('Test model')}</label><div className="provider-test-fields"><input autoComplete="off" autoCapitalize="none" autoCorrect="off" spellCheck={false} id="provider-test-model" value={provider.test_model} placeholder={t('Enter a model ID')} onChange={(e) => setProvider({ ...provider, test_model: e.target.value })} /><Select searchable={false} aria-label={t('Test type')} value="text" onChange={() => {}}><option value="text">{t('Text generation')}</option></Select></div><p className="provider-test-help">{t('Send a minimal text request using the selected API format to verify the URL and credential. Upstream usage charges may apply.')}</p><p className="provider-test-endpoint">{t('Test endpoint')}: <code>{endpoint}</code></p></div>}
         </fieldset>
+        {source && !edit && <label className="model-selection api-source-add-model"><input data-testid="api-source-add-model" type="checkbox" checked={addSourceModel} onChange={event => setAddSourceModel(event.target.checked)}/>{t('Add the entered model to my pool when saving')}</label>}
+        {source && !edit && <p className="provider-test-help">{t('Save this source connection and model before testing. Saving sends no request.')}</p>}
         {testResult && <p className={cx('provider-test-result', testFailed && 'error')} role="status">{testResult}</p>}
-        <div className="provider-dialog-actions">{(!subscription || edit) && <button type="button" className="button ghost" data-testid={subscription ? 'provider-subscription-test-action' : undefined} disabled={testing || (subscription && (providerTypeChanged || !provider.test_model.trim()))} onClick={() => void test()}>{testing ? <LoaderCircle size={16} className="import-spinner" /> : <Play size={16} />}{t(testing ? 'Testing…' : 'Test')}</button>}<button className="button primary" type="submit" disabled={testing}>{t('Save provider')}</button></div>
+        <div className="provider-dialog-actions">{(!subscription || edit) && <button type="button" className="button ghost" data-testid={subscription ? 'provider-subscription-test-action' : undefined} disabled={testing || (Boolean(source) && !edit) || (subscription && (providerTypeChanged || !provider.test_model.trim()))} onClick={() => void test()}>{testing ? <LoaderCircle size={16} className="import-spinner" /> : <Play size={16} />}{t(testing ? 'Testing…' : 'Test')}</button>}<button className="button primary" type="submit" disabled={testing}>{t('Save provider')}</button></div>
       </form>
     </div>
   </div>;

@@ -610,6 +610,7 @@ main.debug-main { height: 100dvh; min-height: 0; overflow: hidden; }
 .models-table .model-speed-check { width: 48px; padding: 0 8px 0 12px; text-align: center; }
 
 .model-selection { display: inline-grid; place-items: center; width: 28px; height: 28px; vertical-align: middle; cursor: pointer; }
+.provider-dialog .api-source-add-model { display: flex; align-items: center; width: auto; height: auto; gap: 8px; font-size: 11px; }
 .model-selection input[type="checkbox"] { appearance: none; -webkit-appearance: none; display: grid; place-content: center; width: 16px; height: 16px; min-height: 16px; margin: 0; padding: 0; border: 1px solid var(--line-light); border-radius: 3px; background: var(--surface); color: var(--accent-ink); cursor: pointer; }
 .model-selection:hover input:not(:disabled) { border-color: var(--orange); }
 .model-selection input:checked, .model-selection input:indeterminate { border-color: var(--orange); background: var(--orange); }

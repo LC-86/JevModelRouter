@@ -379,6 +379,7 @@ pub(crate) async fn probe(store: &ConfigStore, id: &str) -> Result<()> {
         .find(|p| p.id == model.provider_id && p.enabled)
         .ok_or_else(|| anyhow::anyhow!("Provider unavailable"))?;
     let protocol = Protocol::upstream(model, provider)?;
+    let generation_key = crate::api_sources::admit_generation_target(store, &config, provider, model, protocol)?;
     // 模型测试与手动测速和网关共用订阅准入；被拒绝时先记录原因，再向上游派发零请求。
     if let Err(denial) = crate::subscription::admit_model(&config, model, provider, protocol) {
         let reason = denial.summary();
@@ -387,14 +388,15 @@ pub(crate) async fn probe(store: &ConfigStore, id: &str) -> Result<()> {
         return Err(anyhow::anyhow!(reason));
     }
     let is_subscription = crate::subscription::is_subscription_provider(provider);
-    let target = if is_subscription {
+    let fixed_gateway = is_subscription || config.api_sources.contains_key(&provider.id);
+    let target = if fixed_gateway {
         format!("autojev/model/{}", model.id)
     } else {
         model.model_id.clone()
     };
     let body = probe_body(protocol, &target, !is_subscription);
-    if is_subscription {
-        return probe_subscription_gateway(store, &config, model, provider, protocol, &body).await;
+    if fixed_gateway {
+        return probe_fixed_gateway(store, &config, model, provider, protocol, &body).await;
     }
     let mut test_headers = axum::http::HeaderMap::new();
     test_headers.insert("user-agent", "AutoJev/ModelSpeedTest".parse().unwrap());
@@ -411,10 +413,7 @@ pub(crate) async fn probe(store: &ConfigStore, id: &str) -> Result<()> {
     let result = tokio::time::timeout(Duration::from_secs(20), async {
         let client = config.gateway.client()?;
         let mut request = client
-            .post(crate::proxy::endpoint_url(
-                &provider.base_url,
-                protocol.path(),
-            ))
+            .post(crate::api_sources::endpoint_url(&config, provider, protocol))
             .json(&body)
             .header("accept", "text/event-stream")
             .header("user-agent", "AutoJev/ModelSpeedTest")
@@ -424,9 +423,7 @@ pub(crate) async fn probe(store: &ConfigStore, id: &str) -> Result<()> {
             request = request.header("anthropic-version", "2023-06-01");
         }
         if provider.kind != ProviderKind::Ollama && !crate::subscription::is_subscription_provider(provider) {
-            let key = store
-                .read_secret(&format!("provider:{}", provider.id))
-                .ok_or_else(|| anyhow::anyhow!("Missing API key"))?;
+            let key = generation_key.as_ref().expect("admitted API generation credential");
             request = if protocol == Protocol::Messages {
                 request.header("x-api-key", key)
             } else {
@@ -495,7 +492,7 @@ fn probe_body(protocol: Protocol, target: &str, supports_token_limit: bool) -> s
     body
 }
 
-async fn probe_subscription_gateway(
+async fn probe_fixed_gateway(
     store: &ConfigStore,
     config: &AppConfig,
     model: &Model,
@@ -552,7 +549,7 @@ pub fn due_models(config: &AppConfig, now: i64) -> Vec<String> {
         .filter(|m| m.enabled)
         .filter_map(|m| {
             let p = config.providers.iter().find(|p| p.id == m.provider_id && p.enabled)?;
-            if crate::subscription::is_subscription_provider(p) {
+            if crate::subscription::is_subscription_provider(p) || config.api_sources.contains_key(&p.id) {
                 return None;
             }
             let s = summary(config, m, p, None, now);

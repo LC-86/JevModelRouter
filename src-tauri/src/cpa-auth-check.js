@@ -42,7 +42,7 @@
       await button('重新绑定当前账号',row);
       let c=await wait(async()=>{const c=await view();return c.models[0]?.bound&&c;},'explicit model binding');
       const gateway=await invoke('start_proxy');
-      await invoke('save_provider',{provider:{id:'same-name-paid',name:'Fictional paid API',kind:'openai_compatible',base_url:base,enabled:true,has_api_key:false,preset:'',api_type:'chat_completions',test_model:'same-model'},apiKey:'fictional-paid',creating:true,originalId:null,addTestModel:true});
+      await invoke('save_provider',{provider:{id:'same-name-paid',name:'Fictional paid API',kind:'openai_compatible',base_url:base,enabled:true,has_api_key:false,preset:'',api_type:'chat_completions',test_model:'same-model'},apiKey:'fictional-paid',creating:true,originalId:null,addTestModel:true,source:{kind:'official_api',account_label:null,plan_label:null}});
       const savedModel=(await invoke('get_snapshot')).models.find(m=>m.id===c.models[0].id);
       for(const changedModel of [{...savedModel,provider_id:'same-name-paid',model_id:'other-model'}, {...savedModel,model_id:'other-model'}]) {
         let rejected=false;try {await invoke('save_model',{model:changedModel});}catch {rejected=true;}
@@ -72,6 +72,14 @@
     }
     const metadata=(await invoke('get_snapshot')).models.find(m=>m.id===report.saved.model_id);
     check(!metadata.supports_tools&&!metadata.supports_vision&&!metadata.supports_reasoning&&metadata.context_window===0,'Discovery/edit/reload must keep unverified capabilities unknown');
+    const combined=await invoke('get_snapshot');
+    const api=combined.api_sources['same-name-paid'];
+    const apiModel=combined.models.find(m=>m.provider_id==='same-name-paid'&&m.model_id==='same-model');
+    check(api&&apiModel&&api.kind==='official_api'&&api.endpoint===base&&api.model_bindings[apiModel.id]==='same-model','R2 explicit source and fixed model must coexist with the CPA connection');
+    check(api.connection_instance_id!==combined.cpa_subscriptions[0].connection_instance_id&&api.generation===1&&api.account_state==='unknown'&&api.plan_state==='unknown','CPA switching must not change API identity or invent its account/plan');
+    check(document.querySelector('[data-testid="source-identity-same-name-paid"]'),'The API source stays visible alongside the dedicated CPA panel');
+    report.api_source={provider_id:'same-name-paid',model_id:apiModel.id,connection_instance_id:api.connection_instance_id,generation:api.generation};
+    report.checks.push('R2 explicit API and R3 CPA identities coexist and persist independently');
     const receipts=await post('/__receipts');
     check(receipts.models===0,'No model request may reach CPA or same-name API');
     check(receipts.downloads===0&&receipts.accountQueries===0,'No auth export/account/quota queries');
