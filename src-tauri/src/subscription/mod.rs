@@ -1157,6 +1157,30 @@ pub fn catalog_listed(config: &AppConfig, model: &Model) -> bool {
     crate::subscription_catalog::eligibility(config, &provider.id, &model.model_id).is_eligible()
 }
 
+/// 公共可调用目录只投影当前统一准入能够派发的固定目标。
+/// 订阅模型复用资格、协议能力与额度准入；API 模型复用现有来源绑定、协议及凭据准入。
+/// 目录发现和显示名都不能补造这些证据。
+pub fn callable_catalog_listed(
+    store: &crate::config::ConfigStore,
+    config: &AppConfig,
+    model: &Model,
+) -> bool {
+    if !catalog_listed(config, model) {
+        return false;
+    }
+    let Some(provider) = config.providers.iter().find(|provider| provider.id == model.provider_id) else {
+        return false;
+    };
+    let Ok(protocol) = crate::protocol::Protocol::upstream(model, provider) else {
+        return false;
+    };
+    if is_subscription_provider(provider) {
+        admit_model(config, model, provider, protocol).is_ok()
+    } else {
+        crate::api_sources::admit_generation_target(store, config, provider, model, protocol).is_ok()
+    }
+}
+
 /// 连接级拒绝原因，供界面在服务商行上直接显示。
 pub fn connection_denial(config: &AppConfig, provider: &Provider) -> Option<Denial> {
     if !is_subscription_provider(provider) {

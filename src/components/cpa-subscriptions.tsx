@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { getSnapshot, createCpaSubscription, cpaSubscriptionAction, selectCpaModel, deleteProvider } from '../lib/bridge';
+import { getSnapshot, createCpaSubscription, cpaSubscriptionAction, deleteProvider } from '../lib/bridge';
 import { cpaStageLabel, type CpaView } from '../lib/cpa';
 import type { DashboardSnapshot } from '../types';
 
@@ -31,8 +31,9 @@ export function CpaSubscriptions({connections,onSnapshot,onNotify}: {
       const pending=c.stage==='starting'||c.stage==='waiting'||busy[c.provider_id]==='begin';
       const action=(verb:Parameters<typeof cpaSubscriptionAction>[1])=>void run(c.provider_id,verb,()=>cpaSubscriptionAction(c.provider_id,verb));
       return <article key={c.provider_id} data-cpa-id={c.provider_id} className="cpa-connection">
-        <header><strong>{c.provider} · {c.provider_id}</strong><span data-cpa-stage={c.stage}>{busy[c.provider_id]==='begin' ? '发起授权' : cpaStageLabel[c.stage]}</span></header>
-        <p>账号：{c.account??'未知'} · 套餐：{c.plan??'未知'} · 世代：{c.generation}</p>
+        <header><strong>{c.connection_name} · {c.provider} · {c.provider_id}</strong><span data-cpa-stage={c.stage}>{busy[c.provider_id]==='begin' ? '发起授权' : cpaStageLabel[c.stage]}</span></header>
+        <p>连接实例：{c.connection_instance_id} · 世代：{c.generation}</p>
+        <p>账号：{c.account??'未知'} · 套餐：{c.plan??'未知'}</p>
         <p>{c.catalog_state==='stale'?'历史目录（陈旧）':c.catalog_state==='available'?'目录已发现':'目录未知'}{c.observed_at?` · 最后成功读取 ${c.observed_at}`:''}</p>
         <p>模型资格：未知 · 额度：未知 · 协议能力：未验证</p>
         {!c.service_available && <p role="status">专用 CPA 服务未配置；真实授权未开放。</p>}
@@ -50,9 +51,7 @@ export function CpaSubscriptions({connections,onSnapshot,onNotify}: {
           <button className="button" disabled={!!busy[c.provider_id]||pending||c.stage==='connected'} onClick={()=>void run(c.provider_id,'remove',()=>deleteProvider(c.provider_id))}>删除连接</button>
         </div>
         {c.models.map(m=><div className="cpa-model" key={m.id} data-cpa-model={m.id}>
-          <span>{m.name} · {m.model_id} · {m.bound?'已绑定当前身份':'旧目标/尚未绑定'}</span>
-          <button className="button" disabled={!!busy[c.provider_id]||c.stage!=='connected'||c.catalog_state!=='available'} onClick={()=>void run(c.provider_id,'select',()=>selectCpaModel(c.provider_id,m.id,true))}>{m.bound?(m.selected?'已选模型':'选择模型'):'重新绑定当前账号'}</button>
-          {m.selected&&<button className="button" onClick={()=>void run(c.provider_id,'unselect',()=>selectCpaModel(c.provider_id,m.id,false))}>取消选择</button>}
+          <span>{m.name} · 上游 ID：{m.model_id} · 固定调用 ID：autojev/model/{m.id} · {m.bound?'已绑定当前身份':'旧目标/尚未绑定'} · {m.selected?'已选入模型池':'未选'}</span>
         </div>)}
       </article>;
     })}

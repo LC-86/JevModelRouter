@@ -19,7 +19,9 @@ pub fn build(config: &AppConfig, bindings: &[String]) -> Result<Vec<Entry>> {
         let (id, name) = if let Some(id) = binding.strip_prefix("model/") {
             // 已选、未停用且服务商启用才进入 Agent 可选列表；取消选择与停用都让该绑定不可用。
             let m = config.models.iter().find(|m| m.id == id && m.selected && m.enabled && config.providers.iter().any(|p| p.id == m.provider_id && p.enabled)).ok_or_else(|| anyhow!("Model is unavailable"))?;
-            (format!("{}/{}", m.provider_id, m.model_id), m.name.clone())
+            // Display names and provider labels can change or collide. The local UUID is the
+            // fixed call identity; normalization keeps legacy provider/model aliases working.
+            (format!("autojev/model/{}", m.id), m.name.clone())
         } else {
             let r = config.routes.iter().find(|r| &r.id == binding && r.enabled).ok_or_else(|| anyhow!("Route is unavailable"))?;
             crate::router::validate_available_rule(config, r)?;
@@ -80,11 +82,13 @@ mod tests {
         assert_eq!(catalog.len(), 2);
         assert_eq!(catalog[0].binding, "legacy");
         assert_eq!(catalog[0].id, "autojev/legacy");
-        assert_eq!(catalog[1].id, format!("{}/{}", config.models[0].provider_id, config.models[0].model_id));
+        assert_eq!(catalog[1].id, format!("autojev/model/{}", config.models[0].id));
         for entry in &catalog {
             assert_eq!(crate::router::normalize_requested_model(&config, Some(&entry.id)).unwrap(), Some(format!("autojev/{}",entry.binding)));
         }
         assert_eq!(crate::router::normalize_requested_model(&config, Some("route/legacy")).unwrap(), Some("autojev/legacy".into()));
+        // Existing provider/model references stay valid and resolve to the UUID target.
+        assert_eq!(crate::router::normalize_requested_model(&config, Some(&format!("{}/{}",config.models[0].provider_id,config.models[0].model_id))).unwrap(), Some(format!("autojev/model/{id}")));
         assert_eq!(crate::router::normalize_requested_model(&config, Some(&format!("model/{}",config.models[0].model_id))).unwrap(), Some(format!("autojev/model/{id}")));
         assert!(crate::router::normalize_requested_model(&config, Some("model/not-real")).is_err());
         assert!(crate::router::normalize_requested_model(&config, Some("route/not-real")).is_err());
@@ -101,7 +105,7 @@ mod tests {
         let mut config = AppConfig::default();
         config.models[0].model_id = "vendor/model".into();
         let binding = format!("model/{}", config.models[0].id);
-        let public_id = format!("{}/vendor/model", config.models[0].provider_id);
+        let public_id = format!("autojev/model/{}", config.models[0].id);
         let mut other = config.models[0].clone();
         other.id = "other-model".into();
         other.model_id = public_id.clone();
@@ -123,7 +127,12 @@ mod tests {
         let bindings = vec![format!("model/{}", config.models[0].id), "model/second".into()];
         let catalog = build(&config, &bindings).unwrap();
         assert_ne!(catalog[0].id, catalog[1].id);
-        assert_eq!(catalog[0].id,format!("{}/{}",config.models[0].provider_id,config.models[0].model_id));
+        assert_eq!(catalog[0].id,format!("autojev/model/{}",config.models[0].id));
+        assert_eq!(catalog[1].id,format!("autojev/model/{}",config.models.iter().find(|model| model.id == "second").unwrap().id));
+        assert_eq!(catalog[0].name,catalog[1].name,"display names may collide without merging call identities");
+        let fixed_id = catalog[0].id.clone();
+        config.models[0].name = "Renamed display only".into();
+        assert_eq!(build(&config, &[bindings[0].clone()]).unwrap()[0].id,fixed_id);
         for entry in &catalog {
             assert_eq!(crate::router::normalize_requested_model(&config, Some(&entry.id)).unwrap(), Some(format!("autojev/{}",entry.binding)));
         }

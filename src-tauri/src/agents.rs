@@ -636,7 +636,7 @@ mod catalog_pending_sync_tests {
         let binding = format!("model/{}", model.id);
         let saved = vec![crate::agent_catalog::Entry {
             binding: binding.clone(),
-            id: format!("{}/{}", model.provider_id, model.model_id),
+            id: format!("autojev/model/{}", model.id),
             name: model.name.clone(),
         }];
         // 从未保存过目录：没有可同步的对象。

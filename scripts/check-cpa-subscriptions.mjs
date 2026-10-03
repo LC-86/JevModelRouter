@@ -10,8 +10,9 @@ import {randomUUID} from 'node:crypto';
 const binary=resolve(process.argv[2]||'../build-target/debug/autojev');
 const root=await mkdtemp(join(tmpdir(),'jev-r3-desktop-'));
 console.log(`R3 owned evidence: ${root}`);
-let mode='waiting',account='fictional-a',credential=null,session=0,heldPoll=null;
-const receipts={models:0,downloads:0,accountQueries:0,sessions:[],deleted:[]};
+let mode='waiting',account='fictional-a',credential=null,session=0,heldPoll=null,holdApi=false,releaseApi=null,gatewayOperationId=0;
+const gatewayOperations=new Map();
+const receipts={models:0,apiModels:[],downloads:0,accountQueries:0,sessions:[],deleted:[]};
 const command=async(program,args)=>{const p=spawn(program,args,{env,stdio:'pipe'});let output='';p.stdout.on('data',c=>output+=c);p.stderr.on('data',c=>output+=c);const [code]=await once(p,'exit');assert.equal(code,0,output);return output.trim();};
 const fixture=createServer(async(req,res)=>{
   res.setHeader('access-control-allow-origin','*');res.setHeader('access-control-allow-headers','content-type');
@@ -19,6 +20,32 @@ const fixture=createServer(async(req,res)=>{
   let text='';for await(const chunk of req)text+=chunk;
   const body=JSON.parse(text||'{}'),url=new URL(req.url,'http://127.0.0.1');
   const reply=(value,status=200)=>{res.writeHead(status,{'content-type':'application/json','x-cpa-commit':'e2bff0107bb307337aaa19018ccddd55f64253d5'});res.end(JSON.stringify(value));};
+  if(url.pathname==='/v1/chat/completions'){
+    assert.equal(req.headers.authorization,'Bearer fictional-paid');
+    receipts.apiModels.push(body.model);
+    const completion={id:'fictional-response',choices:[{message:{role:'assistant',content:'fictional loopback response'}}]};
+    if(holdApi){await new Promise(resolve=>{releaseApi=()=>{reply(completion);resolve();};});}
+    else reply(completion);
+    return;
+  }
+  if(url.pathname==='/__hold_api'){holdApi=true;reply({ok:true});return;}
+  if(url.pathname==='/__reset_api'){receipts.apiModels=[];reply({ok:true});return;}
+  if(url.pathname==='/__api_pending'){reply({pending:!!releaseApi});return;}
+  if(url.pathname==='/__release_api'){assert.ok(releaseApi);const release=releaseApi;releaseApi=null;holdApi=false;release();reply({ok:true});return;}
+  if(url.pathname==='/__gateway_start'){
+    assert.ok(Number.isInteger(body.port)&&body.port>0&&![9526,9527,11434].includes(body.port));
+    const operationId=String(++gatewayOperationId),operation={done:false,result:null};gatewayOperations.set(operationId,operation);
+    fetch(`http://127.0.0.1:${body.port}/v1/chat/completions`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({model:body.model,messages:[{role:'user',content:`fictional-inflight-${operationId}`}],max_tokens:4}),signal:AbortSignal.timeout(10000)})
+      .then(async response=>{operation.result={status:response.status,body:await response.json()};operation.done=true;})
+      .catch(error=>{operation.result={status:599,error:String(error)};operation.done=true;});
+    reply({operation_id:operationId});return;
+  }
+  if(url.pathname==='/__gateway_status'){const operation=gatewayOperations.get(String(body.operation_id));assert.ok(operation);reply(operation);return;}
+  if(url.pathname==='/__gateway_models'){
+    assert.ok(Number.isInteger(body.port)&&body.port>0&&![9526,9527,11434].includes(body.port));
+    const response=await fetch(`http://127.0.0.1:${body.port}/v1/models`,{signal:AbortSignal.timeout(5000)});
+    reply({status:response.status,body:await response.json()});return;
+  }
   if(url.pathname==='/__mode'){mode=body.mode;account=body.account||account;reply({ok:true});return;}
   if(url.pathname==='/__poll'){reply({pending:!!heldPoll});return;}
   if(url.pathname==='/__release_poll'){assert.ok(heldPoll);const release=heldPoll;heldPoll=null;receipts.waitingAfterCancel={cancelledSessions:receipts.sessions.length,credentialPresent:!!credential};release();reply({ok:true});return;}
@@ -69,6 +96,7 @@ let log='';vite.stdout.on('data',c=>log+=c);vite.stderr.on('data',c=>log+=c);
 let desktop;
 const terminate=()=>{if(desktop?.pid)try{process.kill(-desktop.pid,'SIGTERM');}catch(error){if(error.code!=='ESRCH')throw error;}};
 const run=async reload=>{
+  await fetch(`${base}/__reset_api`,{method:'POST',headers:{'content-type':'application/json'},body:'{}'});
   const runId=randomUUID();await rm(join(root,'isolation-report.json'),{force:true});
   const args=['--autojev-isolated',root,'--autojev-upstream',base,'--autojev-ui-url',`http://127.0.0.1:${port}`,'--autojev-ui-check',base,'--autojev-cpa-auth-run',runId];
   if(!reload)args.push('--autojev-cpa-auth-check');
