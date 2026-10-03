@@ -1,0 +1,2801 @@
+{
+  "tested_head": "b3a39d549013887adc020579943ca3c1c610db3c",
+  "worktree_clean_at_run": true,
+  "base": "a748034e1de30f0d05c4c96acd01bdb3475e5791",
+  "binary_sha256": "59a98884635e65c5f585789f36f38a6855f8c3c43eb6ec38b38458ca985e2bb8",
+  "source_sha256": {
+    "src-tauri/src/dsh-check.js": "cb20f8bbf3099681657c47c939d92fbf5b9dc0b1809b7c76dab83ef0e4be4d95",
+    "src-tauri/src/dsh_replay_tests.rs": "b039d8d28a6fcb373dea7da8c72ce3e6609aac4e86e93cdddb15712025a456c4",
+    "src-tauri/src/protocol/request.rs": "d705c2d18a42f1381db54919fc2eff6a6bc99ba9a115dfd6e1801af750be8d82",
+    "src-tauri/src/isolation_check.rs": "263900d4b72a165cb9b753e68983b4823ec84d8df7d41aa73d90a41944197bd2",
+    "scripts/check-dsh-desktop.mjs": "90c2069ebca301a2c3704bcc5360ab2a3a7bd7fb03207860d7e860e0741fcb95",
+    "scripts/dsh-upstream-fixture.mjs": "94028fd048212e228a34ccd833cc2f42b1ebd22d7733a7b5b05dc4c865009cdc"
+  },
+  "layer": "native-mac-ui-real-pinned-cpa-fictional-loopback-dsh-shaped-replay",
+  "real_dsh_runtime": false,
+  "real_model_calls": 0,
+  "logins": 0,
+  "account_quota_queries": 0,
+  "first": {
+    "cancellation": {
+      "agent": "Unknown agent",
+      "attempts": [
+        {
+          "duration_ms": 3,
+          "model": "jev-a1/same-model",
+          "provider": "Custom",
+          "status": 200
+        }
+      ],
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 0,
+      "created_at": "2026-10-03T17:53:55.818171+00:00",
+      "duration_ms": 5,
+      "endpoint": "chat/completions",
+      "error": "Client disconnected before completion",
+      "estimated_cost": null,
+      "first_byte_ms": 3,
+      "first_content_ms": 2,
+      "id": "e70a04c6-825c-42f6-8eb0-0aca01aaae07",
+      "input_tokens": null,
+      "model_id": "jev-a1/same-model",
+      "model_name": "jev-a1/same-model",
+      "output_tokens": null,
+      "performance_context_tokens": 17,
+      "performance_fingerprint": "[\"r5-a1\",\"jev-a1/same-model\",\"http://127.0.0.1:65482/v1\",\"chat_completions\",\"chat_completions\"]",
+      "performance_model_id": "cd533ff6-ca5b-4c3e-a86b-39b1d11be9cb",
+      "performance_requires_vision": false,
+      "provider_name": "Custom",
+      "reason": "Kept the model selected for this agent session.",
+      "requested_model": "autojev/model/cd533ff6-ca5b-4c3e-a86b-39b1d11be9cb",
+      "route_id": "",
+      "route_preference": "",
+      "route_strategy": "",
+      "source": "local",
+      "status": "cancelled",
+      "status_code": 200,
+      "streaming": true,
+      "upstream_duration_ms": 5
+    },
+    "checks": [
+      "native source save, snapshot and startup idle generate zero; UUID/source identity persists across restart",
+      "stable UUID maps text and complete multi-turn history to A1; same-name B/A2/paid receive zero",
+      "JSON tool schema/call ID/result/continuation preserved; client supplies result; server tools executed=0",
+      "SSE tool schema/call ID/result/continuation preserved; client supplies result; server tools executed=0",
+      "two concurrent client tool sessions retain distinct call IDs/results and A1/A2 source identities; no B/paid dispatch",
+      "actual incremental A stream survives native pool selection change; same-session next request goes to B; existing stream finishes on A",
+      "401: failed fixed A request; B/A2/paid fallback=0",
+      "429: failed fixed A request; B/A2/paid fallback=0",
+      "500: failed fixed A request; B/A2/paid fallback=0",
+      "502: failed fixed A request; B/A2/paid fallback=0",
+      "503: failed fixed A request; B/A2/paid fallback=0",
+      "partial output failure is terminal error; client abort is cancelled and releases stream; no billing-stop guarantee",
+      "unsupported field, disabled gateway/Debug/provider test/speed test reject before dispatch to every source"
+    ],
+    "completed_stream": {
+      "agent": "Unknown agent",
+      "attempts": [
+        {
+          "duration_ms": 2,
+          "model": "jev-a1/same-model",
+          "provider": "Custom",
+          "status": 200
+        }
+      ],
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 0,
+      "created_at": "2026-10-03T17:53:30.127149+00:00",
+      "duration_ms": 129,
+      "endpoint": "chat/completions",
+      "error": "",
+      "estimated_cost": null,
+      "first_byte_ms": 3,
+      "first_content_ms": 2,
+      "id": "cc54f385-a9af-4017-abbb-fe503d22d69f",
+      "input_tokens": null,
+      "model_id": "jev-a1/same-model",
+      "model_name": "jev-a1/same-model",
+      "output_tokens": null,
+      "performance_context_tokens": 16,
+      "performance_fingerprint": "[\"r5-a1\",\"jev-a1/same-model\",\"http://127.0.0.1:65482/v1\",\"chat_completions\",\"chat_completions\"]",
+      "performance_model_id": "cd533ff6-ca5b-4c3e-a86b-39b1d11be9cb",
+      "performance_requires_vision": false,
+      "provider_name": "Custom",
+      "reason": "Kept the model selected for this agent session.",
+      "requested_model": "autojev/model/cd533ff6-ca5b-4c3e-a86b-39b1d11be9cb",
+      "route_id": "",
+      "route_preference": "",
+      "route_strategy": "",
+      "source": "local",
+      "status": "success",
+      "status_code": 200,
+      "streaming": true,
+      "upstream_duration_ms": 128
+    },
+    "layer": "native-mac-ui-real-cpa-dsh-shaped-replay",
+    "ok": true,
+    "partial_failure": {
+      "body": "data: {\"choices\":[{\"delta\":{\"content\":\"first:a1:\",\"role\":\"assistant\"},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"fictional_r5-partial:23d1efd7-57a2-409d-8431-60c55c475e09:one\",\"model\":\"same-model\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"r5-partial:23d1efd7-57a2-409d-8431-60c55c475e09:one\"},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"fictional_r5-partial:23d1efd7-57a2-409d-8431-60c55c475e09:one\",\"model\":\"same-model\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"error\":{\"code\":\"fixture_partial_failure\",\"message\":\"fictional partial stream failure\",\"type\":\"fixture_error\"}}\n\n",
+      "diagnostic": {
+        "agent": "Unknown agent",
+        "attempts": [
+          {
+            "duration_ms": 3,
+            "model": "jev-a1/same-model",
+            "provider": "Custom",
+            "status": 200
+          }
+        ],
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "created_at": "2026-10-03T17:53:52.139633+00:00",
+        "duration_ms": 3,
+        "endpoint": "chat/completions",
+        "error": "Upstream returned an API error",
+        "estimated_cost": null,
+        "first_byte_ms": 3,
+        "first_content_ms": 2,
+        "id": "bc258514-295f-47b2-9cc2-728394994fef",
+        "input_tokens": null,
+        "model_id": "jev-a1/same-model",
+        "model_name": "jev-a1/same-model",
+        "output_tokens": null,
+        "performance_context_tokens": 17,
+        "performance_fingerprint": "[\"r5-a1\",\"jev-a1/same-model\",\"http://127.0.0.1:65482/v1\",\"chat_completions\",\"chat_completions\"]",
+        "performance_model_id": "cd533ff6-ca5b-4c3e-a86b-39b1d11be9cb",
+        "performance_requires_vision": false,
+        "provider_name": "Custom",
+        "reason": "Kept the model selected for this agent session.",
+        "requested_model": "autojev/model/cd533ff6-ca5b-4c3e-a86b-39b1d11be9cb",
+        "route_id": "",
+        "route_preference": "",
+        "route_strategy": "",
+        "source": "local",
+        "status": "error",
+        "status_code": 200,
+        "streaming": true,
+        "upstream_duration_ms": 2
+      }
+    },
+    "pids": [
+      9028,
+      9029,
+      9053,
+      9056,
+      9059,
+      9093,
+      9094,
+      9095
+    ],
+    "real_dsh_runtime": false,
+    "requests": [
+      {
+        "account": "a1",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-text:23d1efd7-57a2-409d-8431-60c55c475e09:one",
+              "role": "user"
+            }
+          ],
+          "model": "same-model"
+        },
+        "path": "/a1/v1/chat/completions"
+      },
+      {
+        "account": "a1",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-multi:23d1efd7-57a2-409d-8431-60c55c475e09:one",
+              "role": "user"
+            },
+            {
+              "content": "fictional previous answer",
+              "role": "assistant"
+            },
+            {
+              "content": "fictional next question",
+              "role": "user"
+            }
+          ],
+          "model": "same-model"
+        },
+        "path": "/a1/v1/chat/completions"
+      },
+      {
+        "account": "a1",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-tool:23d1efd7-57a2-409d-8431-60c55c475e09:json",
+              "role": "user"
+            }
+          ],
+          "model": "same-model",
+          "stream": false,
+          "tools": [
+            {
+              "function": {
+                "description": "Executed only by the fictional client",
+                "name": "client_echo",
+                "parameters": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "note": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "note"
+                  ],
+                  "type": "object"
+                }
+              },
+              "type": "function"
+            }
+          ]
+        },
+        "path": "/a1/v1/chat/completions"
+      },
+      {
+        "account": "a1",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-tool:23d1efd7-57a2-409d-8431-60c55c475e09:json",
+              "role": "user"
+            },
+            {
+              "content": null,
+              "role": "assistant",
+              "tool_calls": [
+                {
+                  "function": {
+                    "arguments": "{\"note\":\"fictional result\"}",
+                    "name": "client_echo"
+                  },
+                  "id": "call_r5-tool:23d1efd7-57a2-409d-8431-60c55c475e09:json",
+                  "type": "function"
+                }
+              ]
+            },
+            {
+              "content": "client-result:r5-tool:23d1efd7-57a2-409d-8431-60c55c475e09:json",
+              "role": "tool",
+              "tool_call_id": "call_r5-tool:23d1efd7-57a2-409d-8431-60c55c475e09:json"
+            }
+          ],
+          "model": "same-model",
+          "stream": false,
+          "tools": [
+            {
+              "function": {
+                "description": "Executed only by the fictional client",
+                "name": "client_echo",
+                "parameters": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "note": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "note"
+                  ],
+                  "type": "object"
+                }
+              },
+              "type": "function"
+            }
+          ]
+        },
+        "path": "/a1/v1/chat/completions"
+      },
+      {
+        "account": "a1",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-tool:23d1efd7-57a2-409d-8431-60c55c475e09:stream",
+              "role": "user"
+            }
+          ],
+          "model": "same-model",
+          "stream": true,
+          "stream_options": {
+            "include_usage": true
+          },
+          "tools": [
+            {
+              "function": {
+                "description": "Executed only by the fictional client",
+                "name": "client_echo",
+                "parameters": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "note": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "note"
+                  ],
+                  "type": "object"
+                }
+              },
+              "type": "function"
+            }
+          ]
+        },
+        "path": "/a1/v1/chat/completions"
+      },
+      {
+        "account": "a1",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-tool:23d1efd7-57a2-409d-8431-60c55c475e09:stream",
+              "role": "user"
+            },
+            {
+              "content": null,
+              "role": "assistant",
+              "tool_calls": [
+                {
+                  "function": {
+                    "arguments": "{\"note\":\"fictional result\"}",
+                    "name": "client_echo"
+                  },
+                  "id": "call_r5-tool:23d1efd7-57a2-409d-8431-60c55c475e09:stream",
+                  "type": "function"
+                }
+              ]
+            },
+            {
+              "content": "client-result:r5-tool:23d1efd7-57a2-409d-8431-60c55c475e09:stream",
+              "role": "tool",
+              "tool_call_id": "call_r5-tool:23d1efd7-57a2-409d-8431-60c55c475e09:stream"
+            }
+          ],
+          "model": "same-model",
+          "stream": true,
+          "stream_options": {
+            "include_usage": true
+          },
+          "tools": [
+            {
+              "function": {
+                "description": "Executed only by the fictional client",
+                "name": "client_echo",
+                "parameters": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "note": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "note"
+                  ],
+                  "type": "object"
+                }
+              },
+              "type": "function"
+            }
+          ]
+        },
+        "path": "/a1/v1/chat/completions"
+      },
+      {
+        "account": "a1",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-tool:23d1efd7-57a2-409d-8431-60c55c475e09:client-a",
+              "role": "user"
+            }
+          ],
+          "model": "same-model",
+          "tools": [
+            {
+              "function": {
+                "description": "Executed only by the fictional client",
+                "name": "client_echo",
+                "parameters": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "note": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "note"
+                  ],
+                  "type": "object"
+                }
+              },
+              "type": "function"
+            }
+          ]
+        },
+        "path": "/a1/v1/chat/completions"
+      },
+      {
+        "account": "a2",
+        "authorization": "Bearer fictional-a2",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-tool:23d1efd7-57a2-409d-8431-60c55c475e09:client-b",
+              "role": "user"
+            }
+          ],
+          "model": "same-model",
+          "tools": [
+            {
+              "function": {
+                "description": "Executed only by the fictional client",
+                "name": "client_echo",
+                "parameters": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "note": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "note"
+                  ],
+                  "type": "object"
+                }
+              },
+              "type": "function"
+            }
+          ]
+        },
+        "path": "/a2/v1/chat/completions"
+      },
+      {
+        "account": "a2",
+        "authorization": "Bearer fictional-a2",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-tool:23d1efd7-57a2-409d-8431-60c55c475e09:client-b",
+              "role": "user"
+            },
+            {
+              "content": null,
+              "role": "assistant",
+              "tool_calls": [
+                {
+                  "function": {
+                    "arguments": "{\"note\":\"fictional result\"}",
+                    "name": "client_echo"
+                  },
+                  "id": "call_r5-tool:23d1efd7-57a2-409d-8431-60c55c475e09:client-b",
+                  "type": "function"
+                }
+              ]
+            },
+            {
+              "content": "client-result:r5-tool:23d1efd7-57a2-409d-8431-60c55c475e09:client-b",
+              "role": "tool",
+              "tool_call_id": "call_r5-tool:23d1efd7-57a2-409d-8431-60c55c475e09:client-b"
+            }
+          ],
+          "model": "same-model",
+          "tools": [
+            {
+              "function": {
+                "description": "Executed only by the fictional client",
+                "name": "client_echo",
+                "parameters": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "note": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "note"
+                  ],
+                  "type": "object"
+                }
+              },
+              "type": "function"
+            }
+          ]
+        },
+        "path": "/a2/v1/chat/completions"
+      },
+      {
+        "account": "a1",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-tool:23d1efd7-57a2-409d-8431-60c55c475e09:client-a",
+              "role": "user"
+            },
+            {
+              "content": null,
+              "role": "assistant",
+              "tool_calls": [
+                {
+                  "function": {
+                    "arguments": "{\"note\":\"fictional result\"}",
+                    "name": "client_echo"
+                  },
+                  "id": "call_r5-tool:23d1efd7-57a2-409d-8431-60c55c475e09:client-a",
+                  "type": "function"
+                }
+              ]
+            },
+            {
+              "content": "client-result:r5-tool:23d1efd7-57a2-409d-8431-60c55c475e09:client-a",
+              "role": "tool",
+              "tool_call_id": "call_r5-tool:23d1efd7-57a2-409d-8431-60c55c475e09:client-a"
+            }
+          ],
+          "model": "same-model",
+          "tools": [
+            {
+              "function": {
+                "description": "Executed only by the fictional client",
+                "name": "client_echo",
+                "parameters": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "note": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "note"
+                  ],
+                  "type": "object"
+                }
+              },
+              "type": "function"
+            }
+          ]
+        },
+        "path": "/a1/v1/chat/completions"
+      },
+      {
+        "account": "a1",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-hold:23d1efd7-57a2-409d-8431-60c55c475e09:one",
+              "role": "user"
+            }
+          ],
+          "model": "same-model",
+          "stream": true,
+          "stream_options": {
+            "include_usage": true
+          }
+        },
+        "path": "/a1/v1/chat/completions"
+      },
+      {
+        "account": "b1",
+        "authorization": "Bearer fictional-b1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-switched:23d1efd7-57a2-409d-8431-60c55c475e09:one",
+              "role": "user"
+            }
+          ],
+          "model": "same-model"
+        },
+        "path": "/b1/v1/chat/completions"
+      },
+      {
+        "account": "a1",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-failure:23d1efd7-57a2-409d-8431-60c55c475e09:401",
+              "role": "user"
+            }
+          ],
+          "model": "same-model"
+        },
+        "path": "/a1/v1/chat/completions"
+      },
+      {
+        "account": "a1",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-failure:23d1efd7-57a2-409d-8431-60c55c475e09:429",
+              "role": "user"
+            }
+          ],
+          "model": "same-model"
+        },
+        "path": "/a1/v1/chat/completions"
+      },
+      {
+        "account": "a1",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-failure:23d1efd7-57a2-409d-8431-60c55c475e09:500",
+              "role": "user"
+            }
+          ],
+          "model": "same-model"
+        },
+        "path": "/a1/v1/chat/completions"
+      },
+      {
+        "account": "a1",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-failure:23d1efd7-57a2-409d-8431-60c55c475e09:502",
+              "role": "user"
+            }
+          ],
+          "model": "same-model"
+        },
+        "path": "/a1/v1/chat/completions"
+      },
+      {
+        "account": "a1",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-failure:23d1efd7-57a2-409d-8431-60c55c475e09:503",
+              "role": "user"
+            }
+          ],
+          "model": "same-model"
+        },
+        "path": "/a1/v1/chat/completions"
+      },
+      {
+        "account": "a1",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-partial:23d1efd7-57a2-409d-8431-60c55c475e09:one",
+              "role": "user"
+            }
+          ],
+          "model": "same-model",
+          "stream": true,
+          "stream_options": {
+            "include_usage": true
+          }
+        },
+        "path": "/a1/v1/chat/completions"
+      },
+      {
+        "account": "a1",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-cancel:23d1efd7-57a2-409d-8431-60c55c475e09:one",
+              "role": "user"
+            }
+          ],
+          "model": "same-model",
+          "stream": true,
+          "stream_options": {
+            "include_usage": true
+          }
+        },
+        "path": "/a1/v1/chat/completions"
+      }
+    ],
+    "run_id": "23d1efd7-57a2-409d-8431-60c55c475e09",
+    "saved": [
+      {
+        "account": "a1",
+        "endpoint": "http://127.0.0.1:65482/v1",
+        "generation": 1,
+        "instance": "966d3850-0884-4fb4-81c7-762c6844fdf8",
+        "provider_id": "r5-a1",
+        "uuid": "cd533ff6-ca5b-4c3e-a86b-39b1d11be9cb"
+      },
+      {
+        "account": "a2",
+        "endpoint": "http://127.0.0.1:65482/v1",
+        "generation": 1,
+        "instance": "f340d29d-9c44-4f88-b091-5f7e48f7878e",
+        "provider_id": "r5-a2",
+        "uuid": "53ad8a72-ccdb-4a9b-9166-e8aeb0eb4a24"
+      },
+      {
+        "account": "b1",
+        "endpoint": "http://127.0.0.1:65482/v1",
+        "generation": 1,
+        "instance": "883ec213-9e51-4536-8b62-d819be344de3",
+        "provider_id": "r5-b1",
+        "uuid": "378f9b50-cd4d-44b7-9b32-cf09914aaa39"
+      },
+      {
+        "account": "paid",
+        "endpoint": "http://127.0.0.1:65482/v1",
+        "generation": 1,
+        "instance": "24472e76-e75c-42d3-93c9-88d92b113e4f",
+        "provider_id": "r5-paid",
+        "uuid": "70fa75a4-0ba6-47d5-960b-7f96355a0664"
+      }
+    ],
+    "screenshot": {
+      "captured": true,
+      "path": "/var/folders/lb/r7pwx_v1169cry49nqby7pb40000gn/T/jev-r5-desktop-WCWFKx/native-23d1efd7-57a2-409d-8431-60c55c475e09.png",
+      "pid": 9010,
+      "window_id": "129357"
+    },
+    "service": {
+      "artifact": {
+        "binary_sha256": "b92fd27a406361a409c04e2c9e1ac54f864e7ecfd4ac202b48ef164038586809",
+        "build_date": "2026-10-02",
+        "commit": "e2bff0107bb307337aaa19018ccddd55f64253d5",
+        "config_version": 8,
+        "go": "go1.26.0",
+        "license": "MIT",
+        "license_url": "https://github.com/router-for-me/CLIProxyAPI/blob/e2bff0107bb307337aaa19018ccddd55f64253d5/LICENSE",
+        "management_api": "/v8/management/config",
+        "model_api": "/v1/chat/completions",
+        "module": "github.com/router-for-me/CLIProxyAPI/v8",
+        "platform": "darwin/arm64",
+        "repository": "https://github.com/router-for-me/CLIProxyAPI",
+        "source_sha256": "ac4e6e84142973138367efa2e734f08ed2a1b06c75c979e2a8837a09ffb09661",
+        "source_url": "https://codeload.github.com/router-for-me/CLIProxyAPI/tar.gz/e2bff0107bb307337aaa19018ccddd55f64253d5",
+        "toolchain_sha256": "b1640525dfe68f066d56f200bef7bf4dce955a1a893bd061de6754c211431023",
+        "toolchain_url": "https://go.dev/dl/go1.26.0.darwin-arm64.tar.gz",
+        "version": "r1-e2bff010"
+      },
+      "base_url": "http://127.0.0.1:65482",
+      "model_client_key": "fictional-model-client-r1",
+      "pid": 9095,
+      "running": true,
+      "targets": [
+        {
+          "account": "a1",
+          "disabled": false,
+          "model": "same-model",
+          "plan": "fictional-plan-a1",
+          "prefix": "jev-a1",
+          "source": "source-a"
+        },
+        {
+          "account": "a2",
+          "disabled": false,
+          "model": "same-model",
+          "plan": "fictional-plan-a2",
+          "prefix": "jev-a2",
+          "source": "source-a"
+        },
+        {
+          "account": "b1",
+          "disabled": false,
+          "model": "same-model",
+          "plan": "fictional-plan-b1",
+          "prefix": "jev-b1",
+          "source": "source-b1"
+        },
+        {
+          "account": "paid",
+          "disabled": false,
+          "model": "same-model",
+          "plan": "fictional-plan-paid",
+          "prefix": "jev-paid",
+          "source": "source-paid"
+        }
+      ]
+    },
+    "startup": {
+      "account_quota_queries": 0,
+      "generation_requests": 0,
+      "logins": 0
+    },
+    "switch": {
+      "completed": "data: {\"choices\":[{\"delta\":{\"content\":\"first:a1:\",\"role\":\"assistant\"},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"fictional_r5-hold:23d1efd7-57a2-409d-8431-60c55c475e09:one\",\"model\":\"same-model\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"r5-hold:23d1efd7-57a2-409d-8431-60c55c475e09:one\"},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"fictional_r5-hold:23d1efd7-57a2-409d-8431-60c55c475e09:one\",\"model\":\"same-model\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\":last:a1\"},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"fictional_r5-hold:23d1efd7-57a2-409d-8431-60c55c475e09:one\",\"model\":\"same-model\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\",\"index\":0}],\"created\":0,\"id\":\"fictional_r5-hold:23d1efd7-57a2-409d-8431-60c55c475e09:one\",\"model\":\"same-model\",\"object\":\"chat.completion.chunk\"}\n\ndata: [DONE]\n\n",
+      "first": "data: {\"choices\":[{\"delta\":{\"content\":\"first:a1:\",\"role\":\"assistant\"},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"fictional_r5-hold:23d1efd7-57a2-409d-8431-60c55c475e09:one\",\"model\":\"same-model\",\"object\":\"chat.completion.chunk\"}\n\n",
+      "receivers": [
+        "a1",
+        "b1"
+      ],
+      "request_id": "cc54f385-a9af-4017-abbb-fe503d22d69f"
+    }
+  },
+  "reload": {
+    "cancellation": {
+      "agent": "Unknown agent",
+      "attempts": [
+        {
+          "duration_ms": 3,
+          "model": "jev-a1/same-model",
+          "provider": "Custom",
+          "status": 200
+        }
+      ],
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 0,
+      "created_at": "2026-10-03T17:54:29.889664+00:00",
+      "duration_ms": 5,
+      "endpoint": "chat/completions",
+      "error": "Client disconnected before completion",
+      "estimated_cost": null,
+      "first_byte_ms": 3,
+      "first_content_ms": 3,
+      "id": "55507b24-38f7-44b3-b53d-ec4e34179e97",
+      "input_tokens": null,
+      "model_id": "jev-a1/same-model",
+      "model_name": "jev-a1/same-model",
+      "output_tokens": null,
+      "performance_context_tokens": 17,
+      "performance_fingerprint": "[\"r5-a1\",\"jev-a1/same-model\",\"http://127.0.0.1:65482/v1\",\"chat_completions\",\"chat_completions\"]",
+      "performance_model_id": "cd533ff6-ca5b-4c3e-a86b-39b1d11be9cb",
+      "performance_requires_vision": false,
+      "provider_name": "Custom",
+      "reason": "Kept the model selected for this agent session.",
+      "requested_model": "autojev/model/cd533ff6-ca5b-4c3e-a86b-39b1d11be9cb",
+      "route_id": "",
+      "route_preference": "",
+      "route_strategy": "",
+      "source": "local",
+      "status": "cancelled",
+      "status_code": 200,
+      "streaming": true,
+      "upstream_duration_ms": 5
+    },
+    "checks": [
+      "native source save, snapshot and startup idle generate zero; UUID/source identity persists across restart",
+      "stable UUID maps text and complete multi-turn history to A1; same-name B/A2/paid receive zero",
+      "JSON tool schema/call ID/result/continuation preserved; client supplies result; server tools executed=0",
+      "SSE tool schema/call ID/result/continuation preserved; client supplies result; server tools executed=0",
+      "two concurrent client tool sessions retain distinct call IDs/results and A1/A2 source identities; no B/paid dispatch",
+      "actual incremental A stream survives native pool selection change; same-session next request goes to B; existing stream finishes on A",
+      "401: failed fixed A request; B/A2/paid fallback=0",
+      "429: failed fixed A request; B/A2/paid fallback=0",
+      "500: failed fixed A request; B/A2/paid fallback=0",
+      "502: failed fixed A request; B/A2/paid fallback=0",
+      "503: failed fixed A request; B/A2/paid fallback=0",
+      "partial output failure is terminal error; client abort is cancelled and releases stream; no billing-stop guarantee",
+      "unsupported field, disabled gateway/Debug/provider test/speed test reject before dispatch to every source"
+    ],
+    "completed_stream": {
+      "agent": "Unknown agent",
+      "attempts": [
+        {
+          "duration_ms": 3,
+          "model": "jev-a1/same-model",
+          "provider": "Custom",
+          "status": 200
+        }
+      ],
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 0,
+      "created_at": "2026-10-03T17:54:03.867070+00:00",
+      "duration_ms": 128,
+      "endpoint": "chat/completions",
+      "error": "",
+      "estimated_cost": null,
+      "first_byte_ms": 3,
+      "first_content_ms": 2,
+      "id": "357fa05b-e9a1-4bbe-9065-ec0cce4e798f",
+      "input_tokens": null,
+      "model_id": "jev-a1/same-model",
+      "model_name": "jev-a1/same-model",
+      "output_tokens": null,
+      "performance_context_tokens": 16,
+      "performance_fingerprint": "[\"r5-a1\",\"jev-a1/same-model\",\"http://127.0.0.1:65482/v1\",\"chat_completions\",\"chat_completions\"]",
+      "performance_model_id": "cd533ff6-ca5b-4c3e-a86b-39b1d11be9cb",
+      "performance_requires_vision": false,
+      "provider_name": "Custom",
+      "reason": "Kept the model selected for this agent session.",
+      "requested_model": "autojev/model/cd533ff6-ca5b-4c3e-a86b-39b1d11be9cb",
+      "route_id": "",
+      "route_preference": "",
+      "route_strategy": "",
+      "source": "local",
+      "status": "success",
+      "status_code": 200,
+      "streaming": true,
+      "upstream_duration_ms": 127
+    },
+    "layer": "native-mac-ui-real-cpa-dsh-shaped-replay",
+    "ok": true,
+    "partial_failure": {
+      "body": "data: {\"choices\":[{\"delta\":{\"content\":\"first:a1:\",\"role\":\"assistant\"},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"fictional_r5-partial:306e390a-0a1f-4e49-8580-776bc6d45744:one\",\"model\":\"same-model\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"r5-partial:306e390a-0a1f-4e49-8580-776bc6d45744:one\"},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"fictional_r5-partial:306e390a-0a1f-4e49-8580-776bc6d45744:one\",\"model\":\"same-model\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"error\":{\"code\":\"fixture_partial_failure\",\"message\":\"fictional partial stream failure\",\"type\":\"fixture_error\"}}\n\n",
+      "diagnostic": {
+        "agent": "Unknown agent",
+        "attempts": [
+          {
+            "duration_ms": 3,
+            "model": "jev-a1/same-model",
+            "provider": "Custom",
+            "status": 200
+          }
+        ],
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "created_at": "2026-10-03T17:54:26.201992+00:00",
+        "duration_ms": 4,
+        "endpoint": "chat/completions",
+        "error": "Upstream returned an API error",
+        "estimated_cost": null,
+        "first_byte_ms": 3,
+        "first_content_ms": 3,
+        "id": "17f9b76d-2a8b-4405-b837-c59683e581b2",
+        "input_tokens": null,
+        "model_id": "jev-a1/same-model",
+        "model_name": "jev-a1/same-model",
+        "output_tokens": null,
+        "performance_context_tokens": 17,
+        "performance_fingerprint": "[\"r5-a1\",\"jev-a1/same-model\",\"http://127.0.0.1:65482/v1\",\"chat_completions\",\"chat_completions\"]",
+        "performance_model_id": "cd533ff6-ca5b-4c3e-a86b-39b1d11be9cb",
+        "performance_requires_vision": false,
+        "provider_name": "Custom",
+        "reason": "Kept the model selected for this agent session.",
+        "requested_model": "autojev/model/cd533ff6-ca5b-4c3e-a86b-39b1d11be9cb",
+        "route_id": "",
+        "route_preference": "",
+        "route_strategy": "",
+        "source": "local",
+        "status": "error",
+        "status_code": 200,
+        "streaming": true,
+        "upstream_duration_ms": 3
+      }
+    },
+    "pids": [
+      9115,
+      9116,
+      9117,
+      9120,
+      9121,
+      9135,
+      9148,
+      9149
+    ],
+    "real_dsh_runtime": false,
+    "requests": [
+      {
+        "account": "a1",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-text:306e390a-0a1f-4e49-8580-776bc6d45744:one",
+              "role": "user"
+            }
+          ],
+          "model": "same-model"
+        },
+        "path": "/a1/v1/chat/completions"
+      },
+      {
+        "account": "a1",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-multi:306e390a-0a1f-4e49-8580-776bc6d45744:one",
+              "role": "user"
+            },
+            {
+              "content": "fictional previous answer",
+              "role": "assistant"
+            },
+            {
+              "content": "fictional next question",
+              "role": "user"
+            }
+          ],
+          "model": "same-model"
+        },
+        "path": "/a1/v1/chat/completions"
+      },
+      {
+        "account": "a1",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-tool:306e390a-0a1f-4e49-8580-776bc6d45744:json",
+              "role": "user"
+            }
+          ],
+          "model": "same-model",
+          "stream": false,
+          "tools": [
+            {
+              "function": {
+                "description": "Executed only by the fictional client",
+                "name": "client_echo",
+                "parameters": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "note": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "note"
+                  ],
+                  "type": "object"
+                }
+              },
+              "type": "function"
+            }
+          ]
+        },
+        "path": "/a1/v1/chat/completions"
+      },
+      {
+        "account": "a1",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-tool:306e390a-0a1f-4e49-8580-776bc6d45744:json",
+              "role": "user"
+            },
+            {
+              "content": null,
+              "role": "assistant",
+              "tool_calls": [
+                {
+                  "function": {
+                    "arguments": "{\"note\":\"fictional result\"}",
+                    "name": "client_echo"
+                  },
+                  "id": "call_r5-tool:306e390a-0a1f-4e49-8580-776bc6d45744:json",
+                  "type": "function"
+                }
+              ]
+            },
+            {
+              "content": "client-result:r5-tool:306e390a-0a1f-4e49-8580-776bc6d45744:json",
+              "role": "tool",
+              "tool_call_id": "call_r5-tool:306e390a-0a1f-4e49-8580-776bc6d45744:json"
+            }
+          ],
+          "model": "same-model",
+          "stream": false,
+          "tools": [
+            {
+              "function": {
+                "description": "Executed only by the fictional client",
+                "name": "client_echo",
+                "parameters": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "note": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "note"
+                  ],
+                  "type": "object"
+                }
+              },
+              "type": "function"
+            }
+          ]
+        },
+        "path": "/a1/v1/chat/completions"
+      },
+      {
+        "account": "a1",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-tool:306e390a-0a1f-4e49-8580-776bc6d45744:stream",
+              "role": "user"
+            }
+          ],
+          "model": "same-model",
+          "stream": true,
+          "stream_options": {
+            "include_usage": true
+          },
+          "tools": [
+            {
+              "function": {
+                "description": "Executed only by the fictional client",
+                "name": "client_echo",
+                "parameters": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "note": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "note"
+                  ],
+                  "type": "object"
+                }
+              },
+              "type": "function"
+            }
+          ]
+        },
+        "path": "/a1/v1/chat/completions"
+      },
+      {
+        "account": "a1",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-tool:306e390a-0a1f-4e49-8580-776bc6d45744:stream",
+              "role": "user"
+            },
+            {
+              "content": null,
+              "role": "assistant",
+              "tool_calls": [
+                {
+                  "function": {
+                    "arguments": "{\"note\":\"fictional result\"}",
+                    "name": "client_echo"
+                  },
+                  "id": "call_r5-tool:306e390a-0a1f-4e49-8580-776bc6d45744:stream",
+                  "type": "function"
+                }
+              ]
+            },
+            {
+              "content": "client-result:r5-tool:306e390a-0a1f-4e49-8580-776bc6d45744:stream",
+              "role": "tool",
+              "tool_call_id": "call_r5-tool:306e390a-0a1f-4e49-8580-776bc6d45744:stream"
+            }
+          ],
+          "model": "same-model",
+          "stream": true,
+          "stream_options": {
+            "include_usage": true
+          },
+          "tools": [
+            {
+              "function": {
+                "description": "Executed only by the fictional client",
+                "name": "client_echo",
+                "parameters": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "note": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "note"
+                  ],
+                  "type": "object"
+                }
+              },
+              "type": "function"
+            }
+          ]
+        },
+        "path": "/a1/v1/chat/completions"
+      },
+      {
+        "account": "a1",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-tool:306e390a-0a1f-4e49-8580-776bc6d45744:client-a",
+              "role": "user"
+            }
+          ],
+          "model": "same-model",
+          "tools": [
+            {
+              "function": {
+                "description": "Executed only by the fictional client",
+                "name": "client_echo",
+                "parameters": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "note": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "note"
+                  ],
+                  "type": "object"
+                }
+              },
+              "type": "function"
+            }
+          ]
+        },
+        "path": "/a1/v1/chat/completions"
+      },
+      {
+        "account": "a2",
+        "authorization": "Bearer fictional-a2",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-tool:306e390a-0a1f-4e49-8580-776bc6d45744:client-b",
+              "role": "user"
+            }
+          ],
+          "model": "same-model",
+          "tools": [
+            {
+              "function": {
+                "description": "Executed only by the fictional client",
+                "name": "client_echo",
+                "parameters": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "note": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "note"
+                  ],
+                  "type": "object"
+                }
+              },
+              "type": "function"
+            }
+          ]
+        },
+        "path": "/a2/v1/chat/completions"
+      },
+      {
+        "account": "a2",
+        "authorization": "Bearer fictional-a2",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-tool:306e390a-0a1f-4e49-8580-776bc6d45744:client-b",
+              "role": "user"
+            },
+            {
+              "content": null,
+              "role": "assistant",
+              "tool_calls": [
+                {
+                  "function": {
+                    "arguments": "{\"note\":\"fictional result\"}",
+                    "name": "client_echo"
+                  },
+                  "id": "call_r5-tool:306e390a-0a1f-4e49-8580-776bc6d45744:client-b",
+                  "type": "function"
+                }
+              ]
+            },
+            {
+              "content": "client-result:r5-tool:306e390a-0a1f-4e49-8580-776bc6d45744:client-b",
+              "role": "tool",
+              "tool_call_id": "call_r5-tool:306e390a-0a1f-4e49-8580-776bc6d45744:client-b"
+            }
+          ],
+          "model": "same-model",
+          "tools": [
+            {
+              "function": {
+                "description": "Executed only by the fictional client",
+                "name": "client_echo",
+                "parameters": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "note": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "note"
+                  ],
+                  "type": "object"
+                }
+              },
+              "type": "function"
+            }
+          ]
+        },
+        "path": "/a2/v1/chat/completions"
+      },
+      {
+        "account": "a1",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-tool:306e390a-0a1f-4e49-8580-776bc6d45744:client-a",
+              "role": "user"
+            },
+            {
+              "content": null,
+              "role": "assistant",
+              "tool_calls": [
+                {
+                  "function": {
+                    "arguments": "{\"note\":\"fictional result\"}",
+                    "name": "client_echo"
+                  },
+                  "id": "call_r5-tool:306e390a-0a1f-4e49-8580-776bc6d45744:client-a",
+                  "type": "function"
+                }
+              ]
+            },
+            {
+              "content": "client-result:r5-tool:306e390a-0a1f-4e49-8580-776bc6d45744:client-a",
+              "role": "tool",
+              "tool_call_id": "call_r5-tool:306e390a-0a1f-4e49-8580-776bc6d45744:client-a"
+            }
+          ],
+          "model": "same-model",
+          "tools": [
+            {
+              "function": {
+                "description": "Executed only by the fictional client",
+                "name": "client_echo",
+                "parameters": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "note": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "note"
+                  ],
+                  "type": "object"
+                }
+              },
+              "type": "function"
+            }
+          ]
+        },
+        "path": "/a1/v1/chat/completions"
+      },
+      {
+        "account": "a1",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-hold:306e390a-0a1f-4e49-8580-776bc6d45744:one",
+              "role": "user"
+            }
+          ],
+          "model": "same-model",
+          "stream": true,
+          "stream_options": {
+            "include_usage": true
+          }
+        },
+        "path": "/a1/v1/chat/completions"
+      },
+      {
+        "account": "b1",
+        "authorization": "Bearer fictional-b1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-switched:306e390a-0a1f-4e49-8580-776bc6d45744:one",
+              "role": "user"
+            }
+          ],
+          "model": "same-model"
+        },
+        "path": "/b1/v1/chat/completions"
+      },
+      {
+        "account": "a1",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-failure:306e390a-0a1f-4e49-8580-776bc6d45744:401",
+              "role": "user"
+            }
+          ],
+          "model": "same-model"
+        },
+        "path": "/a1/v1/chat/completions"
+      },
+      {
+        "account": "a1",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-failure:306e390a-0a1f-4e49-8580-776bc6d45744:429",
+              "role": "user"
+            }
+          ],
+          "model": "same-model"
+        },
+        "path": "/a1/v1/chat/completions"
+      },
+      {
+        "account": "a1",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-failure:306e390a-0a1f-4e49-8580-776bc6d45744:500",
+              "role": "user"
+            }
+          ],
+          "model": "same-model"
+        },
+        "path": "/a1/v1/chat/completions"
+      },
+      {
+        "account": "a1",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-failure:306e390a-0a1f-4e49-8580-776bc6d45744:502",
+              "role": "user"
+            }
+          ],
+          "model": "same-model"
+        },
+        "path": "/a1/v1/chat/completions"
+      },
+      {
+        "account": "a1",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-failure:306e390a-0a1f-4e49-8580-776bc6d45744:503",
+              "role": "user"
+            }
+          ],
+          "model": "same-model"
+        },
+        "path": "/a1/v1/chat/completions"
+      },
+      {
+        "account": "a1",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-partial:306e390a-0a1f-4e49-8580-776bc6d45744:one",
+              "role": "user"
+            }
+          ],
+          "model": "same-model",
+          "stream": true,
+          "stream_options": {
+            "include_usage": true
+          }
+        },
+        "path": "/a1/v1/chat/completions"
+      },
+      {
+        "account": "a1",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-cancel:306e390a-0a1f-4e49-8580-776bc6d45744:one",
+              "role": "user"
+            }
+          ],
+          "model": "same-model",
+          "stream": true,
+          "stream_options": {
+            "include_usage": true
+          }
+        },
+        "path": "/a1/v1/chat/completions"
+      }
+    ],
+    "run_id": "306e390a-0a1f-4e49-8580-776bc6d45744",
+    "saved": [
+      {
+        "account": "a1",
+        "endpoint": "http://127.0.0.1:65482/v1",
+        "generation": 1,
+        "instance": "966d3850-0884-4fb4-81c7-762c6844fdf8",
+        "provider_id": "r5-a1",
+        "uuid": "cd533ff6-ca5b-4c3e-a86b-39b1d11be9cb"
+      },
+      {
+        "account": "a2",
+        "endpoint": "http://127.0.0.1:65482/v1",
+        "generation": 1,
+        "instance": "f340d29d-9c44-4f88-b091-5f7e48f7878e",
+        "provider_id": "r5-a2",
+        "uuid": "53ad8a72-ccdb-4a9b-9166-e8aeb0eb4a24"
+      },
+      {
+        "account": "b1",
+        "endpoint": "http://127.0.0.1:65482/v1",
+        "generation": 1,
+        "instance": "883ec213-9e51-4536-8b62-d819be344de3",
+        "provider_id": "r5-b1",
+        "uuid": "378f9b50-cd4d-44b7-9b32-cf09914aaa39"
+      },
+      {
+        "account": "paid",
+        "endpoint": "http://127.0.0.1:65482/v1",
+        "generation": 1,
+        "instance": "24472e76-e75c-42d3-93c9-88d92b113e4f",
+        "provider_id": "r5-paid",
+        "uuid": "70fa75a4-0ba6-47d5-960b-7f96355a0664"
+      }
+    ],
+    "screenshot": {
+      "captured": true,
+      "path": "/var/folders/lb/r7pwx_v1169cry49nqby7pb40000gn/T/jev-r5-desktop-WCWFKx/native-306e390a-0a1f-4e49-8580-776bc6d45744.png",
+      "pid": 9110,
+      "window_id": "129378"
+    },
+    "service": {
+      "artifact": {
+        "binary_sha256": "b92fd27a406361a409c04e2c9e1ac54f864e7ecfd4ac202b48ef164038586809",
+        "build_date": "2026-10-02",
+        "commit": "e2bff0107bb307337aaa19018ccddd55f64253d5",
+        "config_version": 8,
+        "go": "go1.26.0",
+        "license": "MIT",
+        "license_url": "https://github.com/router-for-me/CLIProxyAPI/blob/e2bff0107bb307337aaa19018ccddd55f64253d5/LICENSE",
+        "management_api": "/v8/management/config",
+        "model_api": "/v1/chat/completions",
+        "module": "github.com/router-for-me/CLIProxyAPI/v8",
+        "platform": "darwin/arm64",
+        "repository": "https://github.com/router-for-me/CLIProxyAPI",
+        "source_sha256": "ac4e6e84142973138367efa2e734f08ed2a1b06c75c979e2a8837a09ffb09661",
+        "source_url": "https://codeload.github.com/router-for-me/CLIProxyAPI/tar.gz/e2bff0107bb307337aaa19018ccddd55f64253d5",
+        "toolchain_sha256": "b1640525dfe68f066d56f200bef7bf4dce955a1a893bd061de6754c211431023",
+        "toolchain_url": "https://go.dev/dl/go1.26.0.darwin-arm64.tar.gz",
+        "version": "r1-e2bff010"
+      },
+      "base_url": "http://127.0.0.1:65482",
+      "model_client_key": "fictional-model-client-r1",
+      "pid": 9149,
+      "running": true,
+      "targets": [
+        {
+          "account": "a1",
+          "disabled": false,
+          "model": "same-model",
+          "plan": "fictional-plan-a1",
+          "prefix": "jev-a1",
+          "source": "source-a"
+        },
+        {
+          "account": "a2",
+          "disabled": false,
+          "model": "same-model",
+          "plan": "fictional-plan-a2",
+          "prefix": "jev-a2",
+          "source": "source-a"
+        },
+        {
+          "account": "b1",
+          "disabled": false,
+          "model": "same-model",
+          "plan": "fictional-plan-b1",
+          "prefix": "jev-b1",
+          "source": "source-b1"
+        },
+        {
+          "account": "paid",
+          "disabled": false,
+          "model": "same-model",
+          "plan": "fictional-plan-paid",
+          "prefix": "jev-paid",
+          "source": "source-paid"
+        }
+      ]
+    },
+    "startup": {
+      "account_quota_queries": 0,
+      "generation_requests": 0,
+      "logins": 0
+    },
+    "switch": {
+      "completed": "data: {\"choices\":[{\"delta\":{\"content\":\"first:a1:\",\"role\":\"assistant\"},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"fictional_r5-hold:306e390a-0a1f-4e49-8580-776bc6d45744:one\",\"model\":\"same-model\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"r5-hold:306e390a-0a1f-4e49-8580-776bc6d45744:one\"},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"fictional_r5-hold:306e390a-0a1f-4e49-8580-776bc6d45744:one\",\"model\":\"same-model\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\":last:a1\"},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"fictional_r5-hold:306e390a-0a1f-4e49-8580-776bc6d45744:one\",\"model\":\"same-model\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\",\"index\":0}],\"created\":0,\"id\":\"fictional_r5-hold:306e390a-0a1f-4e49-8580-776bc6d45744:one\",\"model\":\"same-model\",\"object\":\"chat.completion.chunk\"}\n\ndata: [DONE]\n\n",
+      "first": "data: {\"choices\":[{\"delta\":{\"content\":\"first:a1:\",\"role\":\"assistant\"},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"fictional_r5-hold:306e390a-0a1f-4e49-8580-776bc6d45744:one\",\"model\":\"same-model\",\"object\":\"chat.completion.chunk\"}\n\n",
+      "receivers": [
+        "a1",
+        "b1"
+      ],
+      "request_id": "357fa05b-e9a1-4bbe-9065-ec0cce4e798f"
+    }
+  },
+  "receivers": {
+    "records": [
+      {
+        "account": "a1",
+        "path": "/a1/v1/chat/completions",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-text:23d1efd7-57a2-409d-8431-60c55c475e09:one",
+              "role": "user"
+            }
+          ],
+          "model": "same-model"
+        }
+      },
+      {
+        "account": "a1",
+        "path": "/a1/v1/chat/completions",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-multi:23d1efd7-57a2-409d-8431-60c55c475e09:one",
+              "role": "user"
+            },
+            {
+              "content": "fictional previous answer",
+              "role": "assistant"
+            },
+            {
+              "content": "fictional next question",
+              "role": "user"
+            }
+          ],
+          "model": "same-model"
+        }
+      },
+      {
+        "account": "a1",
+        "path": "/a1/v1/chat/completions",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-tool:23d1efd7-57a2-409d-8431-60c55c475e09:json",
+              "role": "user"
+            }
+          ],
+          "model": "same-model",
+          "stream": false,
+          "tools": [
+            {
+              "function": {
+                "description": "Executed only by the fictional client",
+                "name": "client_echo",
+                "parameters": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "note": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "note"
+                  ],
+                  "type": "object"
+                }
+              },
+              "type": "function"
+            }
+          ]
+        }
+      },
+      {
+        "account": "a1",
+        "path": "/a1/v1/chat/completions",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-tool:23d1efd7-57a2-409d-8431-60c55c475e09:json",
+              "role": "user"
+            },
+            {
+              "content": null,
+              "role": "assistant",
+              "tool_calls": [
+                {
+                  "function": {
+                    "arguments": "{\"note\":\"fictional result\"}",
+                    "name": "client_echo"
+                  },
+                  "id": "call_r5-tool:23d1efd7-57a2-409d-8431-60c55c475e09:json",
+                  "type": "function"
+                }
+              ]
+            },
+            {
+              "content": "client-result:r5-tool:23d1efd7-57a2-409d-8431-60c55c475e09:json",
+              "role": "tool",
+              "tool_call_id": "call_r5-tool:23d1efd7-57a2-409d-8431-60c55c475e09:json"
+            }
+          ],
+          "model": "same-model",
+          "stream": false,
+          "tools": [
+            {
+              "function": {
+                "description": "Executed only by the fictional client",
+                "name": "client_echo",
+                "parameters": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "note": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "note"
+                  ],
+                  "type": "object"
+                }
+              },
+              "type": "function"
+            }
+          ]
+        }
+      },
+      {
+        "account": "a1",
+        "path": "/a1/v1/chat/completions",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-tool:23d1efd7-57a2-409d-8431-60c55c475e09:stream",
+              "role": "user"
+            }
+          ],
+          "model": "same-model",
+          "stream": true,
+          "stream_options": {
+            "include_usage": true
+          },
+          "tools": [
+            {
+              "function": {
+                "description": "Executed only by the fictional client",
+                "name": "client_echo",
+                "parameters": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "note": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "note"
+                  ],
+                  "type": "object"
+                }
+              },
+              "type": "function"
+            }
+          ]
+        }
+      },
+      {
+        "account": "a1",
+        "path": "/a1/v1/chat/completions",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-tool:23d1efd7-57a2-409d-8431-60c55c475e09:stream",
+              "role": "user"
+            },
+            {
+              "content": null,
+              "role": "assistant",
+              "tool_calls": [
+                {
+                  "function": {
+                    "arguments": "{\"note\":\"fictional result\"}",
+                    "name": "client_echo"
+                  },
+                  "id": "call_r5-tool:23d1efd7-57a2-409d-8431-60c55c475e09:stream",
+                  "type": "function"
+                }
+              ]
+            },
+            {
+              "content": "client-result:r5-tool:23d1efd7-57a2-409d-8431-60c55c475e09:stream",
+              "role": "tool",
+              "tool_call_id": "call_r5-tool:23d1efd7-57a2-409d-8431-60c55c475e09:stream"
+            }
+          ],
+          "model": "same-model",
+          "stream": true,
+          "stream_options": {
+            "include_usage": true
+          },
+          "tools": [
+            {
+              "function": {
+                "description": "Executed only by the fictional client",
+                "name": "client_echo",
+                "parameters": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "note": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "note"
+                  ],
+                  "type": "object"
+                }
+              },
+              "type": "function"
+            }
+          ]
+        }
+      },
+      {
+        "account": "a1",
+        "path": "/a1/v1/chat/completions",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-tool:23d1efd7-57a2-409d-8431-60c55c475e09:client-a",
+              "role": "user"
+            }
+          ],
+          "model": "same-model",
+          "tools": [
+            {
+              "function": {
+                "description": "Executed only by the fictional client",
+                "name": "client_echo",
+                "parameters": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "note": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "note"
+                  ],
+                  "type": "object"
+                }
+              },
+              "type": "function"
+            }
+          ]
+        }
+      },
+      {
+        "account": "a2",
+        "path": "/a2/v1/chat/completions",
+        "authorization": "Bearer fictional-a2",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-tool:23d1efd7-57a2-409d-8431-60c55c475e09:client-b",
+              "role": "user"
+            }
+          ],
+          "model": "same-model",
+          "tools": [
+            {
+              "function": {
+                "description": "Executed only by the fictional client",
+                "name": "client_echo",
+                "parameters": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "note": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "note"
+                  ],
+                  "type": "object"
+                }
+              },
+              "type": "function"
+            }
+          ]
+        }
+      },
+      {
+        "account": "a2",
+        "path": "/a2/v1/chat/completions",
+        "authorization": "Bearer fictional-a2",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-tool:23d1efd7-57a2-409d-8431-60c55c475e09:client-b",
+              "role": "user"
+            },
+            {
+              "content": null,
+              "role": "assistant",
+              "tool_calls": [
+                {
+                  "function": {
+                    "arguments": "{\"note\":\"fictional result\"}",
+                    "name": "client_echo"
+                  },
+                  "id": "call_r5-tool:23d1efd7-57a2-409d-8431-60c55c475e09:client-b",
+                  "type": "function"
+                }
+              ]
+            },
+            {
+              "content": "client-result:r5-tool:23d1efd7-57a2-409d-8431-60c55c475e09:client-b",
+              "role": "tool",
+              "tool_call_id": "call_r5-tool:23d1efd7-57a2-409d-8431-60c55c475e09:client-b"
+            }
+          ],
+          "model": "same-model",
+          "tools": [
+            {
+              "function": {
+                "description": "Executed only by the fictional client",
+                "name": "client_echo",
+                "parameters": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "note": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "note"
+                  ],
+                  "type": "object"
+                }
+              },
+              "type": "function"
+            }
+          ]
+        }
+      },
+      {
+        "account": "a1",
+        "path": "/a1/v1/chat/completions",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-tool:23d1efd7-57a2-409d-8431-60c55c475e09:client-a",
+              "role": "user"
+            },
+            {
+              "content": null,
+              "role": "assistant",
+              "tool_calls": [
+                {
+                  "function": {
+                    "arguments": "{\"note\":\"fictional result\"}",
+                    "name": "client_echo"
+                  },
+                  "id": "call_r5-tool:23d1efd7-57a2-409d-8431-60c55c475e09:client-a",
+                  "type": "function"
+                }
+              ]
+            },
+            {
+              "content": "client-result:r5-tool:23d1efd7-57a2-409d-8431-60c55c475e09:client-a",
+              "role": "tool",
+              "tool_call_id": "call_r5-tool:23d1efd7-57a2-409d-8431-60c55c475e09:client-a"
+            }
+          ],
+          "model": "same-model",
+          "tools": [
+            {
+              "function": {
+                "description": "Executed only by the fictional client",
+                "name": "client_echo",
+                "parameters": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "note": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "note"
+                  ],
+                  "type": "object"
+                }
+              },
+              "type": "function"
+            }
+          ]
+        }
+      },
+      {
+        "account": "a1",
+        "path": "/a1/v1/chat/completions",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-hold:23d1efd7-57a2-409d-8431-60c55c475e09:one",
+              "role": "user"
+            }
+          ],
+          "model": "same-model",
+          "stream": true,
+          "stream_options": {
+            "include_usage": true
+          }
+        }
+      },
+      {
+        "account": "b1",
+        "path": "/b1/v1/chat/completions",
+        "authorization": "Bearer fictional-b1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-switched:23d1efd7-57a2-409d-8431-60c55c475e09:one",
+              "role": "user"
+            }
+          ],
+          "model": "same-model"
+        }
+      },
+      {
+        "account": "a1",
+        "path": "/a1/v1/chat/completions",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-failure:23d1efd7-57a2-409d-8431-60c55c475e09:401",
+              "role": "user"
+            }
+          ],
+          "model": "same-model"
+        }
+      },
+      {
+        "account": "a1",
+        "path": "/a1/v1/chat/completions",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-failure:23d1efd7-57a2-409d-8431-60c55c475e09:429",
+              "role": "user"
+            }
+          ],
+          "model": "same-model"
+        }
+      },
+      {
+        "account": "a1",
+        "path": "/a1/v1/chat/completions",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-failure:23d1efd7-57a2-409d-8431-60c55c475e09:500",
+              "role": "user"
+            }
+          ],
+          "model": "same-model"
+        }
+      },
+      {
+        "account": "a1",
+        "path": "/a1/v1/chat/completions",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-failure:23d1efd7-57a2-409d-8431-60c55c475e09:502",
+              "role": "user"
+            }
+          ],
+          "model": "same-model"
+        }
+      },
+      {
+        "account": "a1",
+        "path": "/a1/v1/chat/completions",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-failure:23d1efd7-57a2-409d-8431-60c55c475e09:503",
+              "role": "user"
+            }
+          ],
+          "model": "same-model"
+        }
+      },
+      {
+        "account": "a1",
+        "path": "/a1/v1/chat/completions",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-partial:23d1efd7-57a2-409d-8431-60c55c475e09:one",
+              "role": "user"
+            }
+          ],
+          "model": "same-model",
+          "stream": true,
+          "stream_options": {
+            "include_usage": true
+          }
+        }
+      },
+      {
+        "account": "a1",
+        "path": "/a1/v1/chat/completions",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-cancel:23d1efd7-57a2-409d-8431-60c55c475e09:one",
+              "role": "user"
+            }
+          ],
+          "model": "same-model",
+          "stream": true,
+          "stream_options": {
+            "include_usage": true
+          }
+        }
+      },
+      {
+        "account": "a1",
+        "path": "/a1/v1/chat/completions",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-text:306e390a-0a1f-4e49-8580-776bc6d45744:one",
+              "role": "user"
+            }
+          ],
+          "model": "same-model"
+        }
+      },
+      {
+        "account": "a1",
+        "path": "/a1/v1/chat/completions",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-multi:306e390a-0a1f-4e49-8580-776bc6d45744:one",
+              "role": "user"
+            },
+            {
+              "content": "fictional previous answer",
+              "role": "assistant"
+            },
+            {
+              "content": "fictional next question",
+              "role": "user"
+            }
+          ],
+          "model": "same-model"
+        }
+      },
+      {
+        "account": "a1",
+        "path": "/a1/v1/chat/completions",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-tool:306e390a-0a1f-4e49-8580-776bc6d45744:json",
+              "role": "user"
+            }
+          ],
+          "model": "same-model",
+          "stream": false,
+          "tools": [
+            {
+              "function": {
+                "description": "Executed only by the fictional client",
+                "name": "client_echo",
+                "parameters": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "note": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "note"
+                  ],
+                  "type": "object"
+                }
+              },
+              "type": "function"
+            }
+          ]
+        }
+      },
+      {
+        "account": "a1",
+        "path": "/a1/v1/chat/completions",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-tool:306e390a-0a1f-4e49-8580-776bc6d45744:json",
+              "role": "user"
+            },
+            {
+              "content": null,
+              "role": "assistant",
+              "tool_calls": [
+                {
+                  "function": {
+                    "arguments": "{\"note\":\"fictional result\"}",
+                    "name": "client_echo"
+                  },
+                  "id": "call_r5-tool:306e390a-0a1f-4e49-8580-776bc6d45744:json",
+                  "type": "function"
+                }
+              ]
+            },
+            {
+              "content": "client-result:r5-tool:306e390a-0a1f-4e49-8580-776bc6d45744:json",
+              "role": "tool",
+              "tool_call_id": "call_r5-tool:306e390a-0a1f-4e49-8580-776bc6d45744:json"
+            }
+          ],
+          "model": "same-model",
+          "stream": false,
+          "tools": [
+            {
+              "function": {
+                "description": "Executed only by the fictional client",
+                "name": "client_echo",
+                "parameters": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "note": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "note"
+                  ],
+                  "type": "object"
+                }
+              },
+              "type": "function"
+            }
+          ]
+        }
+      },
+      {
+        "account": "a1",
+        "path": "/a1/v1/chat/completions",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-tool:306e390a-0a1f-4e49-8580-776bc6d45744:stream",
+              "role": "user"
+            }
+          ],
+          "model": "same-model",
+          "stream": true,
+          "stream_options": {
+            "include_usage": true
+          },
+          "tools": [
+            {
+              "function": {
+                "description": "Executed only by the fictional client",
+                "name": "client_echo",
+                "parameters": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "note": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "note"
+                  ],
+                  "type": "object"
+                }
+              },
+              "type": "function"
+            }
+          ]
+        }
+      },
+      {
+        "account": "a1",
+        "path": "/a1/v1/chat/completions",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-tool:306e390a-0a1f-4e49-8580-776bc6d45744:stream",
+              "role": "user"
+            },
+            {
+              "content": null,
+              "role": "assistant",
+              "tool_calls": [
+                {
+                  "function": {
+                    "arguments": "{\"note\":\"fictional result\"}",
+                    "name": "client_echo"
+                  },
+                  "id": "call_r5-tool:306e390a-0a1f-4e49-8580-776bc6d45744:stream",
+                  "type": "function"
+                }
+              ]
+            },
+            {
+              "content": "client-result:r5-tool:306e390a-0a1f-4e49-8580-776bc6d45744:stream",
+              "role": "tool",
+              "tool_call_id": "call_r5-tool:306e390a-0a1f-4e49-8580-776bc6d45744:stream"
+            }
+          ],
+          "model": "same-model",
+          "stream": true,
+          "stream_options": {
+            "include_usage": true
+          },
+          "tools": [
+            {
+              "function": {
+                "description": "Executed only by the fictional client",
+                "name": "client_echo",
+                "parameters": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "note": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "note"
+                  ],
+                  "type": "object"
+                }
+              },
+              "type": "function"
+            }
+          ]
+        }
+      },
+      {
+        "account": "a1",
+        "path": "/a1/v1/chat/completions",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-tool:306e390a-0a1f-4e49-8580-776bc6d45744:client-a",
+              "role": "user"
+            }
+          ],
+          "model": "same-model",
+          "tools": [
+            {
+              "function": {
+                "description": "Executed only by the fictional client",
+                "name": "client_echo",
+                "parameters": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "note": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "note"
+                  ],
+                  "type": "object"
+                }
+              },
+              "type": "function"
+            }
+          ]
+        }
+      },
+      {
+        "account": "a2",
+        "path": "/a2/v1/chat/completions",
+        "authorization": "Bearer fictional-a2",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-tool:306e390a-0a1f-4e49-8580-776bc6d45744:client-b",
+              "role": "user"
+            }
+          ],
+          "model": "same-model",
+          "tools": [
+            {
+              "function": {
+                "description": "Executed only by the fictional client",
+                "name": "client_echo",
+                "parameters": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "note": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "note"
+                  ],
+                  "type": "object"
+                }
+              },
+              "type": "function"
+            }
+          ]
+        }
+      },
+      {
+        "account": "a2",
+        "path": "/a2/v1/chat/completions",
+        "authorization": "Bearer fictional-a2",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-tool:306e390a-0a1f-4e49-8580-776bc6d45744:client-b",
+              "role": "user"
+            },
+            {
+              "content": null,
+              "role": "assistant",
+              "tool_calls": [
+                {
+                  "function": {
+                    "arguments": "{\"note\":\"fictional result\"}",
+                    "name": "client_echo"
+                  },
+                  "id": "call_r5-tool:306e390a-0a1f-4e49-8580-776bc6d45744:client-b",
+                  "type": "function"
+                }
+              ]
+            },
+            {
+              "content": "client-result:r5-tool:306e390a-0a1f-4e49-8580-776bc6d45744:client-b",
+              "role": "tool",
+              "tool_call_id": "call_r5-tool:306e390a-0a1f-4e49-8580-776bc6d45744:client-b"
+            }
+          ],
+          "model": "same-model",
+          "tools": [
+            {
+              "function": {
+                "description": "Executed only by the fictional client",
+                "name": "client_echo",
+                "parameters": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "note": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "note"
+                  ],
+                  "type": "object"
+                }
+              },
+              "type": "function"
+            }
+          ]
+        }
+      },
+      {
+        "account": "a1",
+        "path": "/a1/v1/chat/completions",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-tool:306e390a-0a1f-4e49-8580-776bc6d45744:client-a",
+              "role": "user"
+            },
+            {
+              "content": null,
+              "role": "assistant",
+              "tool_calls": [
+                {
+                  "function": {
+                    "arguments": "{\"note\":\"fictional result\"}",
+                    "name": "client_echo"
+                  },
+                  "id": "call_r5-tool:306e390a-0a1f-4e49-8580-776bc6d45744:client-a",
+                  "type": "function"
+                }
+              ]
+            },
+            {
+              "content": "client-result:r5-tool:306e390a-0a1f-4e49-8580-776bc6d45744:client-a",
+              "role": "tool",
+              "tool_call_id": "call_r5-tool:306e390a-0a1f-4e49-8580-776bc6d45744:client-a"
+            }
+          ],
+          "model": "same-model",
+          "tools": [
+            {
+              "function": {
+                "description": "Executed only by the fictional client",
+                "name": "client_echo",
+                "parameters": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "note": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "note"
+                  ],
+                  "type": "object"
+                }
+              },
+              "type": "function"
+            }
+          ]
+        }
+      },
+      {
+        "account": "a1",
+        "path": "/a1/v1/chat/completions",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-hold:306e390a-0a1f-4e49-8580-776bc6d45744:one",
+              "role": "user"
+            }
+          ],
+          "model": "same-model",
+          "stream": true,
+          "stream_options": {
+            "include_usage": true
+          }
+        }
+      },
+      {
+        "account": "b1",
+        "path": "/b1/v1/chat/completions",
+        "authorization": "Bearer fictional-b1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-switched:306e390a-0a1f-4e49-8580-776bc6d45744:one",
+              "role": "user"
+            }
+          ],
+          "model": "same-model"
+        }
+      },
+      {
+        "account": "a1",
+        "path": "/a1/v1/chat/completions",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-failure:306e390a-0a1f-4e49-8580-776bc6d45744:401",
+              "role": "user"
+            }
+          ],
+          "model": "same-model"
+        }
+      },
+      {
+        "account": "a1",
+        "path": "/a1/v1/chat/completions",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-failure:306e390a-0a1f-4e49-8580-776bc6d45744:429",
+              "role": "user"
+            }
+          ],
+          "model": "same-model"
+        }
+      },
+      {
+        "account": "a1",
+        "path": "/a1/v1/chat/completions",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-failure:306e390a-0a1f-4e49-8580-776bc6d45744:500",
+              "role": "user"
+            }
+          ],
+          "model": "same-model"
+        }
+      },
+      {
+        "account": "a1",
+        "path": "/a1/v1/chat/completions",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-failure:306e390a-0a1f-4e49-8580-776bc6d45744:502",
+              "role": "user"
+            }
+          ],
+          "model": "same-model"
+        }
+      },
+      {
+        "account": "a1",
+        "path": "/a1/v1/chat/completions",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-failure:306e390a-0a1f-4e49-8580-776bc6d45744:503",
+              "role": "user"
+            }
+          ],
+          "model": "same-model"
+        }
+      },
+      {
+        "account": "a1",
+        "path": "/a1/v1/chat/completions",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-partial:306e390a-0a1f-4e49-8580-776bc6d45744:one",
+              "role": "user"
+            }
+          ],
+          "model": "same-model",
+          "stream": true,
+          "stream_options": {
+            "include_usage": true
+          }
+        }
+      },
+      {
+        "account": "a1",
+        "path": "/a1/v1/chat/completions",
+        "authorization": "Bearer fictional-a1",
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "content": "r5-cancel:306e390a-0a1f-4e49-8580-776bc6d45744:one",
+              "role": "user"
+            }
+          ],
+          "model": "same-model",
+          "stream": true,
+          "stream_options": {
+            "include_usage": true
+          }
+        }
+      }
+    ],
+    "cancelled": [
+      "r5-cancel:23d1efd7-57a2-409d-8431-60c55c475e09:one",
+      "r5-cancel:306e390a-0a1f-4e49-8580-776bc6d45744:one"
+    ]
+  }
+}

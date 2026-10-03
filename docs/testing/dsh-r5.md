@@ -81,3 +81,11 @@ node scripts/check-dsh-desktop.mjs /absolute/owned-target/debug/autojev /absolut
 ```
 
 驱动保留 `first.report.json`、`reload.report.json`、`receivers.json` 和自有 PID 的窗口截图。两份报告均须当前 run ID、`ok:true`、进程退出 0；UUID/来源身份一致，CPA 自有 PID 均已回收，才计通过。缺报告、锁屏、超时或旧 CLI/file-lock 波动不能计通过。截图失败单独记录，不更改权限；只回收本轮启动的进程。
+
+## 本轮留证
+
+代码提交 `b3a39d549013887adc020579943ca3c1c610db3c` 的干净工作区实际运行两次原生进程：[完整报告与接收记录](dsh-r5-evidence.json)、[重启后的自有原生窗口](../screenshots/dsh-r5-native.png)。首轮 run ID `23d1efd7-57a2-409d-8431-60c55c475e09`，重启 `306e390a-0a1f-4e49-8580-776bc6d45744`，均 `ok:true`，共 38 次虚构回环生成请求；两份报告保存完成/失败/取消诊断，UUID、实例、世代和 endpoint 重读一致。记录同时固定桌面二进制与相关源码 SHA-256；后续证据提交只加入报告/截图/本段，最终 head 的完整检查结果写在 PR。
+
+TDD 使用最高层网关接缝：`dsh_unmapped_reasoning_option_is_rejected_before_fixed_source_dispatch` 在修复前实际收到 200（预期 422）而失败，修复后 1/1 通过。两个新增回放测试合计 2/2 通过，订阅状态五种 × 文本/流/tools 共 15 次拒绝，实际付费接收端始终 0。初次 sandbox 禁止 loopback bind 的环境错误没有算作红灯；后续获准的语义失败才作为红灯。
+
+原 task-12 的 206 项 staged WIP 及其它两个原 checkout 均只读。收尾重新核对 HEAD、分支、状态、staged/unstaged diff 与原有修改文件指纹一致；staged diff SHA-256 为 `31e38d65ee094d93f814cf362c2c9440e2fb321c1f7450fa75f6994622f94e36`。
