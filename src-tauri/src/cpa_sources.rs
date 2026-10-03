@@ -7,7 +7,7 @@ use crate::{
 use anyhow::{ensure, Result};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
 };
 
@@ -48,22 +48,32 @@ pub struct Connection {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Binding {
+pub struct IdentityStamp {
     pub provider_id: String,
     pub connection_instance_id: String,
     pub generation: u64,
     pub account: Option<String>,
     pub plan: Option<String>,
-    pub model_id: String,
 }
-impl Binding {
-    fn matches(&self, id: &str, c: &Connection, model: &str) -> bool {
+impl IdentityStamp {
+    fn matches(&self, id: &str, c: &Connection) -> bool {
         self.provider_id == id
             && self.connection_instance_id == c.identity.connection_instance_id
             && self.generation == c.identity.generation
             && self.account == c.identity.identity
             && self.plan == c.plan
-            && self.model_id == model
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Binding {
+    #[serde(flatten)]
+    pub identity: IdentityStamp,
+    pub model_id: String,
+}
+impl Binding {
+    fn matches(&self, id: &str, c: &Connection, model: &str) -> bool {
+        self.identity.matches(id, c) && self.model_id == model
     }
 }
 
@@ -97,15 +107,25 @@ pub struct View {
 
 #[derive(Clone)]
 struct Attempt {
-    stamp: Binding,
-    state: String,
-    url: String,
+    stamp: IdentityStamp,
+    state: Option<String>,
+    url: Option<String>,
+}
+struct CleanupLease<'a> {
+    active: &'a Mutex<HashSet<String>>,
+    id: String,
+}
+impl Drop for CleanupLease<'_> {
+    fn drop(&mut self) {
+        self.active.lock().unwrap().remove(&self.id);
+    }
 }
 #[derive(Default)]
 pub struct Manager {
     // One dedicated service profile per connection. Never scan/adopt a shared CPA.
     clients: Mutex<HashMap<String, Arc<client::Client>>>,
     attempts: Mutex<HashMap<String, Attempt>>,
+    cleaning: Mutex<HashSet<String>>,
     fixture: Option<Arc<client::Client>>,
 }
 
@@ -128,6 +148,48 @@ impl Manager {
                     "CPA service is not provisioned; real authorization is pending R6/R7"
                 )
             })
+    }
+    fn cleanup_lease(&self, id: &str) -> Result<CleanupLease<'_>> {
+        ensure!(
+            self.cleaning.lock().unwrap().insert(id.into()),
+            "Owned CPA cleanup is already in progress"
+        );
+        Ok(CleanupLease {
+            active: &self.cleaning,
+            id: id.into(),
+        })
+    }
+    pub fn cleanup_finished(&self, id: &str) -> bool {
+        !self.attempts.lock().unwrap().contains_key(id)
+            && !self.cleaning.lock().unwrap().contains(id)
+    }
+    pub fn remove(&self, store: &ConfigStore, id: &str) -> Result<()> {
+        let attempts = self.attempts.lock().unwrap();
+        let cleaning = self.cleaning.lock().unwrap();
+        ensure!(
+            !attempts.contains_key(id) && !cleaning.contains(id),
+            "Finish owned CPA cleanup before deleting this connection"
+        );
+        store.update(|config| -> Result<()> {
+            let c = config
+                .cpa_subscriptions
+                .get(id)
+                .ok_or_else(|| anyhow::anyhow!("Unknown CPA connection"))?;
+            ensure!(
+                c.credential_ref.is_none()
+                    && !matches!(c.stage, Stage::Starting | Stage::Waiting | Stage::Connected),
+                "Disconnect and finish owned CPA cleanup before deleting this connection"
+            );
+            config.cpa_subscriptions.remove(id);
+            config
+                .cpa_model_bindings
+                .retain(|_, binding| binding.identity.provider_id != id);
+            config.providers.retain(|provider| provider.id != id);
+            config.models.retain(|model| model.provider_id != id);
+            Ok(())
+        })??;
+        self.clients.lock().unwrap().remove(id);
+        Ok(())
     }
     pub fn create(&self, store: &ConfigStore, provider: &str, name: &str) -> Result<String> {
         ensure!(
@@ -195,8 +257,8 @@ impl Manager {
                 service_available: clients.contains_key(id),
                 authorization_url: attempts
                     .get(id)
-                    .filter(|a| a.stamp.matches(id, c, "") && c.stage == Stage::Waiting)
-                    .map(|a| a.url.clone()),
+                    .filter(|a| a.stamp.matches(id, c) && c.stage == Stage::Waiting)
+                    .and_then(|a| a.url.clone()),
                 qualification: "unknown",
                 quota: "unknown",
                 capability: "unverified",
@@ -223,26 +285,39 @@ impl Manager {
 
     pub async fn begin(&self, store: &ConfigStore, id: &str) -> Result<()> {
         let client = self.client(id)?;
-        ensure!(
-            !self.attempts.lock().unwrap().contains_key(id),
-            "Disconnect the previous owned authorization attempt first"
-        );
-        let stamp = store.update(|config| -> Result<Binding> {
-            let c = config
-                .cpa_subscriptions
-                .get_mut(id)
-                .ok_or_else(|| anyhow::anyhow!("Unknown CPA connection"))?;
+        let stamp = {
+            let mut attempts = self.attempts.lock().unwrap();
+            let cleaning = self.cleaning.lock().unwrap();
             ensure!(
-                !matches!(c.stage, Stage::Starting | Stage::Waiting | Stage::Connected),
-                "Disconnect or cancel this connection first"
+                !attempts.contains_key(id) && !cleaning.contains(id),
+                "Wait for the previous owned authorization/cleanup to finish"
             );
-            ensure!(
-                c.credential_ref.is_none(),
-                "Retry credential cleanup before reconnecting"
+            let stamp = store.update(|config| -> Result<IdentityStamp> {
+                let c = config
+                    .cpa_subscriptions
+                    .get_mut(id)
+                    .ok_or_else(|| anyhow::anyhow!("Unknown CPA connection"))?;
+                ensure!(
+                    !matches!(c.stage, Stage::Starting | Stage::Waiting | Stage::Connected),
+                    "Disconnect or cancel this connection first"
+                );
+                ensure!(
+                    c.credential_ref.is_none(),
+                    "Retry credential cleanup before reconnecting"
+                );
+                advance(c, Stage::Starting)?;
+                Ok(stamp(id, c))
+            })??;
+            attempts.insert(
+                id.into(),
+                Attempt {
+                    stamp: stamp.clone(),
+                    state: None,
+                    url: None,
+                },
             );
-            advance(c, Stage::Starting)?;
-            Ok(stamp(id, c, ""))
-        })??;
+            stamp
+        };
         let result = async {
             ensure!(
                 client.credentials().await?.is_empty(),
@@ -256,7 +331,12 @@ impl Manager {
         let (state, url) = match result {
             Ok(v) => v,
             Err(e) => {
-                fail(store, id, &stamp, &e.to_string())?;
+                let failed = fail(store, id, &stamp, &e.to_string());
+                let mut attempts = self.attempts.lock().unwrap();
+                if attempts.get(id).is_some_and(|a| a.stamp == stamp) {
+                    attempts.remove(id);
+                }
+                failed?;
                 return Err(e);
             }
         };
@@ -269,20 +349,26 @@ impl Manager {
                 c.identity.state = ConnectionState::AuthorizationPending;
                 Ok(())
             })?;
-            if committed.is_ok() {
+            if attempts.get(id).is_some_and(|a| a.stamp == stamp) {
                 attempts.insert(
                     id.into(),
                     Attempt {
                         stamp: stamp.clone(),
-                        state: state.clone(),
-                        url,
+                        state: Some(state),
+                        url: Some(url),
                     },
                 );
             }
             committed
         };
         if committed.is_err() {
-            client.cancel(&state).await?;
+            let _lease = self.cleanup_lease(id)?;
+            let config = store.read();
+            let c = config
+                .cpa_subscriptions
+                .get(id)
+                .ok_or_else(|| anyhow::anyhow!("Connection removed"))?;
+            self.cleanup_owned(store, id, &self::stamp(id, c)).await?;
         }
         committed
     }
@@ -297,7 +383,8 @@ impl Manager {
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("No owned authorization session"))?;
         let result = async {
-            if client.status(&attempt.state).await? == "wait" { return Ok(None); }
+            let session=attempt.state.as_deref().ok_or_else(||anyhow::anyhow!("Authorization request is still starting"))?;
+            if client.status(session).await? == "wait" { return Ok(None); }
             let mut files=client.credentials().await?;
             ensure!(files.len()==1 && files[0].provider==store.read().cpa_subscriptions[id].provider && !files[0].disabled, "Dedicated CPA profile must contain exactly one active credential of the expected provider");
             Ok(Some(files.remove(0)))
@@ -330,39 +417,91 @@ impl Manager {
 
     pub async fn disconnect(&self, store: &ConfigStore, id: &str, cancel: bool) -> Result<()> {
         // Commit the denial before any network wait. Older poll/refresh completions fail their stamp.
-        let (attempt, credential, cleanup_stamp) = {
-            let attempts = self.attempts.lock().unwrap();
-            let (credential, cleanup_stamp) =
-                store.update(|config| -> Result<(Option<String>, Binding)> {
-                    let c = config
-                        .cpa_subscriptions
-                        .get_mut(id)
-                        .ok_or_else(|| anyhow::anyhow!("Unknown CPA connection"))?;
-                    if cancel {
-                        ensure!(
-                            matches!(c.stage, Stage::Starting | Stage::Waiting),
-                            "No pending authorization to cancel"
-                        );
-                    }
-                    let credential = c.credential_ref.clone();
-                    advance(
-                        c,
-                        if cancel {
-                            Stage::Cancelled
-                        } else {
-                            Stage::Disconnected
-                        },
-                    )?;
-                    Ok((credential, stamp(id, c, "")))
-                })??;
-            (attempts.get(id).cloned(), credential, cleanup_stamp)
-        };
+        let _lease = self.cleanup_lease(id)?;
+        let cleanup_stamp = store.update(|config| -> Result<IdentityStamp> {
+            let c = config
+                .cpa_subscriptions
+                .get_mut(id)
+                .ok_or_else(|| anyhow::anyhow!("Unknown CPA connection"))?;
+            if cancel {
+                ensure!(
+                    matches!(c.stage, Stage::Starting | Stage::Waiting),
+                    "No pending authorization to cancel"
+                );
+            }
+            advance(
+                c,
+                if cancel {
+                    Stage::Cancelled
+                } else {
+                    Stage::Disconnected
+                },
+            )?;
+            Ok(stamp(id, c))
+        })??;
+        self.cleanup_owned(store, id, &cleanup_stamp).await
+    }
+
+    async fn cleanup_owned(
+        &self,
+        store: &ConfigStore,
+        id: &str,
+        cleanup_stamp: &IdentityStamp,
+    ) -> Result<()> {
+        let attempt = self.attempts.lock().unwrap().get(id).cloned();
+        if attempt.as_ref().is_some_and(|a| a.state.is_none()) {
+            // The in-flight start remains owned and blocks profile reuse. Its result will
+            // be cancelled/cleaned here when the URL arrives, without restoring identity.
+            return Ok(());
+        }
+        let config = store.read();
+        let c = config
+            .cpa_subscriptions
+            .get(id)
+            .ok_or_else(|| anyhow::anyhow!("Connection removed"))?;
+        ensure!(cleanup_stamp.matches(id, c), "Cleanup identity changed");
+        let credential = c.credential_ref.clone();
         let result = async {
+            let mut credential = credential;
             if let Some(a) = &attempt {
-                self.client(id)?.cancel(&a.state).await?;
+                let client = self.client(id)?;
+                let session = a.state.as_deref().expect("pending start handled above");
+                if !client.cancel(session).await? {
+                    // Fixed CPA returns false after completion. This attempt started with an
+                    // empty, exclusive profile: claim a proven completion for cleanup only.
+                    let files = client.credentials().await?;
+                    if !files.is_empty() {
+                        ensure!(
+                            client.status(session).await? == "ok",
+                            "Owned authorization has not completed"
+                        );
+                        ensure!(
+                            files.len() == 1
+                                && files[0].provider == store.read().cpa_subscriptions[id].provider,
+                            "Completed authorization has ambiguous credential ownership"
+                        );
+                        let name = files[0].name.clone();
+                        store.update(|config| -> Result<()> {
+                            current(config, id, &cleanup_stamp)?.credential_ref =
+                                Some(name.clone());
+                            Ok(())
+                        })??;
+                        credential = Some(name);
+                    }
+                }
             }
             if let Some(name) = &credential {
-                self.client(id)?.delete(name).await?;
+                let client = self.client(id)?;
+                // Repeating a logout after successful remote cleanup is safe, even if
+                // an earlier local write failed; never delete an unrelated reference.
+                if client
+                    .credentials()
+                    .await?
+                    .iter()
+                    .any(|file| &file.name == name)
+                {
+                    client.delete(name).await?;
+                }
             }
             Ok(())
         }
@@ -398,7 +537,7 @@ impl Manager {
             c.stage == Stage::Connected,
             "Connect before reading the directory"
         );
-        let b = stamp(id, c, "");
+        let b = stamp(id, c);
         let name = c
             .credential_ref
             .clone()
@@ -426,7 +565,7 @@ impl Manager {
                 advance(c,Stage::Connected).map_err(|e|e.to_string())?;
                 c.identity.state=ConnectionState::Connected;c.identity.identity=account;c.plan=plan;
             }
-            Ok(stamp(id,c,""))
+            Ok(stamp(id,c))
         }).map_err(anyhow::Error::msg)?;
         let result = client.models(&name).await;
         store
@@ -451,20 +590,26 @@ impl Manager {
                                 .iter()
                                 .any(|m| m.provider_id == id && m.model_id == discovered.model_id)
                             {
-                                let mut model = AppConfig::default().models.remove(0);
-                                model.id = uuid::Uuid::new_v4().to_string();
-                                model.provider_id = id.into();
-                                model.model_id = discovered.model_id.clone();
-                                model.name = discovered.name.clone();
-                                model.selected = false;
-                                model.enabled = true;
-                                model.supports_tools = false;
-                                model.supports_vision = false;
-                                model.supports_reasoning = false;
-                                model.input_price_known = Some(false);
-                                model.output_price_known = Some(false);
-                                model.cache_price_known = Some(false);
-                                config.models.push(model);
+                                config.models.push(Model {
+                                    id: uuid::Uuid::new_v4().to_string(),
+                                    provider_id: id.into(),
+                                    model_id: discovered.model_id.clone(),
+                                    name: discovered.name.clone(),
+                                    api_type: String::new(),
+                                    tier: crate::config::ModelTier::Balanced,
+                                    selected: false,
+                                    enabled: true,
+                                    supports_tools: false,
+                                    supports_vision: false,
+                                    supports_reasoning: false,
+                                    context_window: 0,
+                                    input_cost_per_million: 0.0,
+                                    output_cost_per_million: 0.0,
+                                    cache_cost_per_million: 0.0,
+                                    input_price_known: Some(false),
+                                    output_price_known: Some(false),
+                                    cache_price_known: Some(false),
+                                });
                             }
                         }
                     }
@@ -502,9 +647,13 @@ impl Manager {
                         && c.catalog.iter().any(|m| m.model_id == model.model_id),
                     "Current account, plan and directory are required before binding this model"
                 );
-                config
-                    .cpa_model_bindings
-                    .insert(model.id.clone(), stamp(id, c, &model.model_id));
+                config.cpa_model_bindings.insert(
+                    model.id.clone(),
+                    Binding {
+                        identity: stamp(id, c),
+                        model_id: model.model_id.clone(),
+                    },
+                );
             }
             model.selected = selected;
             Ok(())
@@ -533,6 +682,14 @@ impl Manager {
             failures.is_empty(),
             "CPA owned-session cleanup failed: {}",
             failures.join("; ")
+        );
+        ensure!(
+            self.attempts
+                .lock()
+                .unwrap()
+                .values()
+                .all(|a| a.state.is_some()),
+            "Owned CPA authorization request is still finishing; retry shutdown"
         );
         Ok(())
     }
@@ -605,14 +762,13 @@ fn known(value: Option<String>) -> Option<String> {
         .map(|s| s.trim().to_owned())
         .filter(|s| !s.is_empty() && s.len() <= 200)
 }
-fn stamp(id: &str, c: &Connection, model: &str) -> Binding {
-    Binding {
+fn stamp(id: &str, c: &Connection) -> IdentityStamp {
+    IdentityStamp {
         provider_id: id.into(),
         connection_instance_id: c.identity.connection_instance_id.clone(),
         generation: c.identity.generation,
         account: c.identity.identity.clone(),
         plan: c.plan.clone(),
-        model_id: model.into(),
     }
 }
 fn advance(c: &mut Connection, stage: Stage) -> Result<()> {
@@ -634,18 +790,22 @@ fn advance(c: &mut Connection, stage: Stage) -> Result<()> {
     };
     Ok(())
 }
-fn current<'a>(config: &'a mut AppConfig, id: &str, b: &Binding) -> Result<&'a mut Connection> {
+fn current<'a>(
+    config: &'a mut AppConfig,
+    id: &str,
+    b: &IdentityStamp,
+) -> Result<&'a mut Connection> {
     let c = config
         .cpa_subscriptions
         .get_mut(id)
         .ok_or_else(|| anyhow::anyhow!("Connection removed"))?;
     ensure!(
-        b.matches(id, c, ""),
+        b.matches(id, c),
         "Connection identity changed; late result discarded"
     );
     Ok(c)
 }
-fn fail(store: &ConfigStore, id: &str, b: &Binding, error: &str) -> Result<()> {
+fn fail(store: &ConfigStore, id: &str, b: &IdentityStamp, error: &str) -> Result<()> {
     store.update(|config| -> Result<()> {
         let c = current(config, id, b)?;
         c.stage = Stage::Failed;

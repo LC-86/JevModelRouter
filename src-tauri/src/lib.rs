@@ -729,6 +729,11 @@ async fn delete_provider(
 ) -> Result<DashboardSnapshot, String> {
     if state.store.read().cpa_subscriptions.contains_key(&id) {
         state.store.cpa.disconnect(&state.store,&id,false).await.map_err(|e|e.to_string())?;
+        if !state.store.cpa.cleanup_finished(&id) {
+            return Err("Owned CPA authorization is still finishing; retry deletion".into());
+        }
+        state.store.cpa.remove(&state.store,&id).map_err(|e|e.to_string())?;
+        return Ok(snapshot(&state).await);
     }
     // 删除前释放两套订阅资源：#13 的适配器/内存会话（Codex 等）与本票的 Grok 授权生命周期。
     // 任一失败都中止删除，provider 与连接都保留；非该 kind 的调用按各自实现是空操作。
@@ -784,7 +789,11 @@ async fn delete_route(state: State<'_, AppState>, id: String) -> Result<Dashboar
 
 #[tauri::command]
 async fn save_model(state: State<'_, AppState>, mut model: Model) -> Result<DashboardSnapshot, String> {
-    model.supports_tools = true;
+    if state.store.read().cpa_subscriptions.contains_key(&model.provider_id) {
+        // User configuration and display edits are not verified protocol evidence.
+        model.supports_tools=false; model.supports_vision=false; model.supports_reasoning=false;
+        model.context_window=0; model.api_type.clear();
+    } else { model.supports_tools = true; }
     model.model_id = model.model_id.trim().to_owned();
     state.store.update(|config| -> anyhow::Result<()> {
         validate_model(config, &model)?;
@@ -1371,13 +1380,17 @@ fn validate_model(config: &AppConfig, model: &Model) -> anyhow::Result<()> {
             .subscription_catalogs
             .get(&existing.provider_id)
             .is_some_and(|catalog| catalog.entry(existing.model_id.trim()).is_some());
-        if catalog_entry
+        if (catalog_entry || config.cpa_subscriptions.contains_key(&existing.provider_id))
             && (existing.model_id.trim() != model.model_id.trim() || existing.provider_id != model.provider_id)
         {
             return Err(anyhow!(
                 "A directory-discovered model keeps its provider and upstream model ID; a different upstream ID is a new model."
             ));
         }
+    }
+    if config.cpa_model_bindings.get(&model.id).is_some_and(|binding|
+        binding.identity.provider_id != model.provider_id || binding.model_id != model.model_id) {
+        return Err(anyhow!("A CPA fixed target cannot be reassigned; create a new model reference"));
     }
     if [model.input_cost_per_million, model.output_cost_per_million, model.cache_cost_per_million].iter().any(|cost| !cost.is_finite() || *cost < 0.0) {
         return Err(anyhow!("Model pricing cannot be negative"));

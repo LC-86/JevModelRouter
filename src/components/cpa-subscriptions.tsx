@@ -50,7 +50,7 @@ export function CpaSubscriptions({connections,onSnapshot,onNotify}: {
         </div>
         {c.models.map(m=><div className="cpa-model" key={m.id} data-cpa-model={m.id}>
           <span>{m.name} · {m.model_id} · {m.bound?'已绑定当前身份':'旧目标/尚未绑定'}</span>
-          <button className="button" disabled={!!busy[c.provider_id]||c.stage!=='connected'||c.catalog_state!=='available'} onClick={()=>void run(c.provider_id,'select',()=>selectCpaModel(c.provider_id,m.id,true))}>{m.bound?'已选模型':'重新绑定当前账号'}</button>
+          <button className="button" disabled={!!busy[c.provider_id]||c.stage!=='connected'||c.catalog_state!=='available'} onClick={()=>void run(c.provider_id,'select',()=>selectCpaModel(c.provider_id,m.id,true))}>{m.bound?(m.selected?'已选模型':'选择模型'):'重新绑定当前账号'}</button>
           {m.selected&&<button className="button" onClick={()=>void run(c.provider_id,'unselect',()=>selectCpaModel(c.provider_id,m.id,false))}>取消选择</button>}
         </div>)}
       </article>;

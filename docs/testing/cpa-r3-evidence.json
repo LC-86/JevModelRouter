@@ -3,6 +3,7 @@
     "checks": [
       "begin/wait/cancel public desktop loop",
       "failure/disconnect public desktop loop",
+      "public model edits retain the CPA fixed target and unknown capabilities",
       "connection/directory/selection/listening gateway rejection; no same-name API fallback",
       "stale directory retained; switch disables old target; explicit rebind"
     ],
@@ -20,11 +21,11 @@
         "fictional-2"
       ]
     },
-    "run_id": "af937f04-587e-4f7c-b990-9050f5424383",
+    "run_id": "7ee62055-8915-400f-909b-eba53a381246",
     "saved": {
       "generation": 8,
-      "model_id": "a2937f1f-8633-48e9-b645-2231a2dbf982",
-      "provider_id": "cpa-768876fe-f135-4f5d-8389-867024ab770c"
+      "model_id": "aad561dd-c6e4-4854-ac0b-38f6f3ec2ffd",
+      "provider_id": "cpa-9bf5999f-4ef5-436a-b29c-cfddb32882cd"
     }
   },
   "reload.report": {
@@ -45,11 +46,11 @@
         "fictional-2"
       ]
     },
-    "run_id": "a31dff76-a73b-4f61-a667-7c9776aca1da",
+    "run_id": "71635154-76ed-494c-9833-ecf80fc45a57",
     "saved": {
       "generation": 8,
-      "model_id": "a2937f1f-8633-48e9-b645-2231a2dbf982",
-      "provider_id": "cpa-768876fe-f135-4f5d-8389-867024ab770c"
+      "model_id": "aad561dd-c6e4-4854-ac0b-38f6f3ec2ffd",
+      "provider_id": "cpa-9bf5999f-4ef5-436a-b29c-cfddb32882cd"
     }
   },
   "receiver-records": {
@@ -63,5 +64,15 @@
     "deleted": [
       "fictional-fictional-a.json"
     ]
+  },
+  "before-fixed-target-edit": {
+    "checks": [
+      "begin/wait/cancel public desktop loop",
+      "failure/disconnect public desktop loop"
+    ],
+    "error": "Error: A CPA fixed UUID must reject provider/upstream reassignment through public model editing",
+    "layer": "native-desktop-fictional-cpa",
+    "ok": false,
+    "run_id": "a1ea957b-4afc-474a-ad7b-7d6d9dec317d"
   }
 }

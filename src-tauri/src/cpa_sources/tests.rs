@@ -13,6 +13,9 @@ struct AccountFixture {
     entered: Arc<tokio::sync::Notify>,
     release: Arc<tokio::sync::Notify>,
     delayed: Arc<std::sync::atomic::AtomicBool>,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+    cleanup_fail: Arc<std::sync::atomic::AtomicBool>,
+    auth_delayed: Arc<std::sync::atomic::AtomicBool>,
     server: tokio::task::JoinHandle<()>,
 }
 impl AccountFixture {
@@ -21,6 +24,10 @@ impl AccountFixture {
         let active = account.clone();
         let signed_in = account.clone();
         let deleted = account.clone();
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let cancellation = cancelled.clone();
+        let cleanup_fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cleanup_failed = cleanup_fail.clone();
         let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let failed = fail.clone();
         let entered = Arc::new(tokio::sync::Notify::new());
@@ -29,11 +36,15 @@ impl AccountFixture {
         let unblock = release.clone();
         let delayed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let delay = delayed.clone();
+        let auth_delayed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let auth_delay = auth_delayed.clone();
+        let auth_entered = entered.clone();
+        let auth_release = release.clone();
         let router=Router::new()
-            .route("/v8/management/oauth/auth-url",get(||async {Json(json!({"state":"fictional-session","url":"https://auth.example.invalid/authorize"}))}))
+            .route("/v8/management/oauth/auth-url",get(move || {let delay=auth_delay.clone();let entered=auth_entered.clone();let release=auth_release.clone();async move {if delay.load(std::sync::atomic::Ordering::SeqCst) {entered.notify_one();release.notified().await;} Json(json!({"state":"fictional-session","url":"https://auth.example.invalid/authorize"}))}}))
             .route("/v8/management/oauth/status",get(move || {let active=signed_in.clone();async move {*active.lock().unwrap()=Some("account-a");Json(json!({"status":"ok"}))}}))
-            .route("/v8/management/credentials",get(move || {let active=active.clone();async move {Json(json!({"files":active.lock().unwrap().map(|account|json!({"name":"owned.json","provider":"codex","id_token":{"chatgpt_account_id":account,"plan_type":"plan-a"}})).into_iter().collect::<Vec<_>>()}))}}).delete(move ||{let deleted=deleted.clone();async move {*deleted.lock().unwrap()=None;Json(json!({"status":"ok"}))}}))
-            .route("/v8/management/oauth/session",delete(||async {Json(json!({"status":"ok","cancelled":true}))}))
+            .route("/v8/management/credentials",get(move || {let active=active.clone();async move {Json(json!({"files":active.lock().unwrap().map(|account|json!({"name":"owned.json","provider":"codex","id_token":{"chatgpt_account_id":account,"plan_type":"plan-a"}})).into_iter().collect::<Vec<_>>()}))}}).delete(move ||{let deleted=deleted.clone();let failed=cleanup_failed.clone();async move {if failed.load(std::sync::atomic::Ordering::SeqCst) {return (axum::http::StatusCode::BAD_GATEWAY,Json(json!({})));} *deleted.lock().unwrap()=None;(axum::http::StatusCode::OK,Json(json!({"status":"ok"})))}}))
+            .route("/v8/management/oauth/session",delete(move ||{let cancelled=cancellation.clone();async move {Json(json!({"status":"ok","cancelled":cancelled.load(std::sync::atomic::Ordering::SeqCst)}))}}))
             .route("/v8/management/credentials/models",get(move || {let failed=failed.clone();let delay=delay.clone();let arrival=arrival.clone();let unblock=unblock.clone();async move {
                 if failed.load(std::sync::atomic::Ordering::SeqCst) {return (axum::http::StatusCode::BAD_GATEWAY,Json(json!({})));}
                 if delay.load(std::sync::atomic::Ordering::SeqCst) {arrival.notify_one();unblock.notified().await;}
@@ -52,6 +63,9 @@ impl AccountFixture {
             entered,
             release,
             delayed,
+            cancelled,
+            cleanup_fail,
+            auth_delayed,
             server,
         }
     }
@@ -76,6 +90,20 @@ async fn failed_reads_keep_history_but_changed_accounts_require_explicit_rebindi
     manager.poll(&store, &id).await.unwrap();
     manager.refresh(&store, &id).await.unwrap();
     let model_id = manager.views(&store.read())[0].models[0].id.clone();
+    let discovered = store
+        .read()
+        .models
+        .into_iter()
+        .find(|m| m.id == model_id)
+        .unwrap();
+    assert_eq!(
+        discovered.context_window, 0,
+        "Discovery must not invent a context limit"
+    );
+    assert_eq!(discovered.input_cost_per_million, 0.0);
+    assert!(
+        !discovered.supports_tools && !discovered.supports_vision && !discovered.supports_reasoning
+    );
     manager.select(&store, &id, &model_id, true).unwrap();
     fixture
         .fail
@@ -105,12 +133,132 @@ async fn failed_reads_keep_history_but_changed_accounts_require_explicit_rebindi
         "cpa_target_identity_changed"
     );
     let reopened = ConfigStore::load(path).unwrap();
+    assert!(
+        !reopened
+            .read()
+            .models
+            .iter()
+            .find(|m| m.id == model_id)
+            .unwrap()
+            .supports_tools,
+        "Reload must not invent a CPA protocol capability"
+    );
     assert_eq!(
         Manager::default().views(&reopened.read())[0].models[0].id,
         model_id
     );
     manager.select(&store, &id, &model_id, true).unwrap();
     assert!(manager.views(&store.read())[0].models[0].bound);
+}
+
+#[tokio::test]
+async fn completed_authorization_cancel_can_retry_only_its_owned_cleanup() {
+    let fixture = AccountFixture::start().await;
+    let temp = tempfile::tempdir().unwrap();
+    let store = ConfigStore::load(temp.path().join("completed-cancel.db")).unwrap();
+    let manager = Manager::owned_fixture(fixture.base.clone()).unwrap();
+    let id = manager
+        .create(&store, "codex", "Completed cancellation")
+        .unwrap();
+    manager.begin(&store, &id).await.unwrap();
+    // CPA completed and stored this dedicated flow before the desktop polled it.
+    *fixture.account.lock().unwrap() = Some("account-a");
+    fixture
+        .cancelled
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    fixture
+        .cleanup_fail
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(manager.disconnect(&store, &id, true).await.is_err());
+    let view = manager.views(&store.read()).remove(0);
+    assert_eq!(view.stage, Stage::Cancelled);
+    assert!(view.account.is_none() && view.authorization_url.is_none());
+    assert_eq!(
+        store.read().cpa_subscriptions[&id]
+            .credential_ref
+            .as_deref(),
+        Some("owned.json")
+    );
+    assert!(manager.begin(&store, &id).await.is_err());
+    fixture
+        .cleanup_fail
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    manager.disconnect(&store, &id, false).await.unwrap();
+    assert!(fixture.account.lock().unwrap().is_none());
+    manager.begin(&store, &id).await.unwrap();
+    assert_eq!(manager.views(&store.read())[0].stage, Stage::Waiting);
+    assert!(
+        manager.remove(&store, &id).is_err(),
+        "Pending owned tasks must block connection deletion"
+    );
+    manager.disconnect(&store, &id, true).await.unwrap();
+    manager.remove(&store, &id).unwrap();
+    assert!(manager.views(&store.read()).is_empty());
+    assert!(!store
+        .read()
+        .providers
+        .iter()
+        .any(|provider| provider.id == id));
+    let replacement = manager
+        .create(&store, "codex", "Replacement connection")
+        .unwrap();
+    assert!(
+        manager
+            .views(&store.read())
+            .iter()
+            .find(|c| c.provider_id == replacement)
+            .unwrap()
+            .service_available
+    );
+}
+
+#[tokio::test]
+async fn cancelling_a_delayed_start_blocks_reuse_until_owned_cleanup_finishes() {
+    let fixture = AccountFixture::start().await;
+    let temp = tempfile::tempdir().unwrap();
+    let store = Arc::new(ConfigStore::load(temp.path().join("delayed-start.db")).unwrap());
+    let manager = Arc::new(Manager::owned_fixture(fixture.base.clone()).unwrap());
+    let id = manager.create(&store, "codex", "Delayed start").unwrap();
+    fixture
+        .auth_delayed
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let starting = {
+        let manager = manager.clone();
+        let store = store.clone();
+        let id = id.clone();
+        tokio::spawn(async move { manager.begin(&store, &id).await })
+    };
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        fixture.entered.notified(),
+    )
+    .await
+    .unwrap();
+    manager.disconnect(&store, &id, true).await.unwrap();
+    let blocked = tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        manager.begin(&store, &id),
+    )
+    .await;
+    assert!(
+        matches!(blocked, Ok(Err(_))),
+        "A pending owned auth-url request must block another start immediately"
+    );
+    *fixture.account.lock().unwrap() = Some("account-a");
+    fixture
+        .cancelled
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    fixture
+        .auth_delayed
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    fixture.release.notify_one();
+    assert!(starting.await.unwrap().is_err());
+    assert!(
+        fixture.account.lock().unwrap().is_none(),
+        "The superseded completed flow must clean only its own profile credential"
+    );
+    assert_eq!(manager.views(&store.read())[0].stage, Stage::Cancelled);
+    manager.begin(&store, &id).await.unwrap();
 }
 
 #[tokio::test]

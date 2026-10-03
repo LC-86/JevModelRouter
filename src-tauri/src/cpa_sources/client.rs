@@ -159,14 +159,21 @@ impl Client {
             _ => anyhow::bail!("CPA authorization failed or expired"),
         }
     }
-    pub async fn cancel(&self, state: &str) -> Result<()> {
-        self.request(
-            reqwest::Method::DELETE,
-            "oauth/session",
-            &[("state", state)],
-        )
-        .await?;
-        Ok(())
+    pub async fn cancel(&self, state: &str) -> Result<bool> {
+        let result = self
+            .request(
+                reqwest::Method::DELETE,
+                "oauth/session",
+                &[("state", state)],
+            )
+            .await?;
+        ensure!(
+            result["status"] == "ok",
+            "CPA did not acknowledge cancellation"
+        );
+        result["cancelled"]
+            .as_bool()
+            .ok_or_else(|| anyhow::anyhow!("CPA returned an unknown cancellation result"))
     }
     pub async fn delete(&self, name: &str) -> Result<()> {
         self.request(reqwest::Method::DELETE, "credentials", &[("name", name)])

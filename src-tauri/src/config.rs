@@ -378,8 +378,10 @@ impl ConfigStore {
             value.performance_settings = Default::default();
             transaction.execute("UPDATE app_meta SET value = ?1 WHERE key = 'config'", [serde_json::to_string(&value)?])?;
         }
-        if value.models.iter().any(|model| !model.supports_tools) {
-            for model in &mut value.models { model.supports_tools = true; }
+        if value.models.iter().any(|model| !model.supports_tools && !value.cpa_subscriptions.contains_key(&model.provider_id)) {
+            for model in &mut value.models {
+                if !value.cpa_subscriptions.contains_key(&model.provider_id) {model.supports_tools = true;}
+            }
             transaction.execute("UPDATE app_meta SET value = ?1 WHERE key = 'config'", [serde_json::to_string(&value)?])?;
         }
         // Import previously retained route events once; their token usage remains unknown.

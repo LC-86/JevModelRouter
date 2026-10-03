@@ -43,6 +43,14 @@
       let c=await wait(async()=>{const c=await view();return c.models[0]?.bound&&c;},'explicit model binding');
       const gateway=await invoke('start_proxy');
       await invoke('save_provider',{provider:{id:'same-name-paid',name:'Fictional paid API',kind:'openai_compatible',base_url:base,enabled:true,has_api_key:false,preset:'',api_type:'chat_completions',test_model:'same-model'},apiKey:'fictional-paid',creating:true,originalId:null,addTestModel:true});
+      const savedModel=(await invoke('get_snapshot')).models.find(m=>m.id===c.models[0].id);
+      for(const changedModel of [{...savedModel,provider_id:'same-name-paid',model_id:'other-model'}, {...savedModel,model_id:'other-model'}]) {
+        let rejected=false;try {await invoke('save_model',{model:changedModel});}catch {rejected=true;}
+        check(rejected,'A CPA fixed UUID must reject provider/upstream reassignment through public model editing');
+      }
+      await invoke('save_model',{model:{...savedModel,name:'用户显示名'}});
+      check(!(await invoke('get_snapshot')).models.find(m=>m.id===savedModel.id).supports_tools,'Display edits must not invent CPA tools support');
+      report.checks.push('public model edits retain the CPA fixed target and unknown capabilities');
       const reply=await post('/__gateway',{port:gateway.proxy.port,model:`autojev/model/${c.models[0].id}`,run_id});
       check(reply.status===429&&reply.body.error.code==='cpa_qualification_unknown','Login/directory must not authorize generation');
       report.checks.push('connection/directory/selection/listening gateway rejection; no same-name API fallback');
@@ -62,6 +70,8 @@
       report.saved={provider_id:c.provider_id,model_id:c.models[0].id,generation:c.generation};
       report.checks.push('stale directory retained; switch disables old target; explicit rebind');
     }
+    const metadata=(await invoke('get_snapshot')).models.find(m=>m.id===report.saved.model_id);
+    check(!metadata.supports_tools&&!metadata.supports_vision&&!metadata.supports_reasoning&&metadata.context_window===0,'Discovery/edit/reload must keep unverified capabilities unknown');
     const receipts=await post('/__receipts');
     check(receipts.models===0,'No model request may reach CPA or same-name API');
     check(receipts.downloads===0&&receipts.accountQueries===0,'No auth export/account/quota queries');
