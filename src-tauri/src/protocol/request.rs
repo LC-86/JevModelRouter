@@ -382,7 +382,9 @@ pub fn convert_request(
     {
         return Err(unsupported("Messages structured output constraints"));
     }
-    for key in ["background", "audio", "prediction"] {
+    // A reasoning setting has provider-specific semantics; this portable subset
+    // cannot silently replace it with an ordinary text request.
+    for key in ["background", "audio", "prediction", "reasoning_effort"] {
         if !body[key].is_null() && body[key] != false {
             return Err(unsupported(key));
         }

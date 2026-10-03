@@ -32,6 +32,8 @@ mod cpa_validation;
 mod isolation_check;
 #[cfg(test)]
 mod dispatch_tests;
+#[cfg(test)]
+mod dsh_replay_tests;
 
 use std::sync::Arc;
 

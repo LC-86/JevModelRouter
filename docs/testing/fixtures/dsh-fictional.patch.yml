@@ -1,0 +1,36 @@
+# Copyable configuration fragment for a separate, fictional DSH composition.
+# These UUIDs and port are examples. Replace them with the isolated Jev pool IDs.
+# Never paste this into a daily profile; no login or model call is required to inspect it.
+- name: '@deepseek-ai/dsh-llm-pi-ai'
+  config:
+    providers:
+      jev-local:
+        displayName: Jev fictional loopback
+        api: openai-completions
+        baseURL: http://127.0.0.1:19527/v1
+        apiKeyEnv: JEV_FICTIONAL_KEY
+        retryPolicy:
+          mode: normal
+          maxRetries: 0
+        compat:
+          supportsStore: false
+          supportsReasoningEffort: false
+          supportsUsageInStreaming: true
+          maxTokensField: max_tokens
+        models:
+          - id: autojev/model/11111111-1111-4111-8111-111111111111
+            name: Source A / fictional account A1
+            contextWindow: 4096
+            maxTokens: 64
+            input: [text]
+            reasoningEfforts: false
+          - id: autojev/model/22222222-2222-4222-8222-222222222222
+            name: Source B / fictional account B1
+            contextWindow: 4096
+            maxTokens: 64
+            input: [text]
+            reasoningEfforts: false
+- name: '@deepseek-ai/dsh-agent-default-model'
+  config:
+    provider: jev-local
+    model: autojev/model/11111111-1111-4111-8111-111111111111
