@@ -21,7 +21,7 @@ export function CpaSubscriptions({connections,onSnapshot,onNotify}: {
     <div className="cpa-subscriptions-intro">
       <strong>CPA 订阅连接</strong>
       <p>目录和登录不授予生成资格。账号、套餐、能力与整次调用仅用订阅内权益的证据需分别验证。</p>
-      <p>真实调用：待 R7 验证。当前仅接入 Codex 的隔离授权替身；真实 CPA 服务交付待 R6。</p>
+      <p>真实调用：待 R7 验证。开发服务只接虚构回环来源；真实 CPA 授权与能力仍未开放。</p>
       <form onSubmit={e=> {e.preventDefault();void run('new','create',()=>createCpaSubscription(name));}}>
         <input aria-label="CPA 连接名称" value={name} maxLength={100} onChange={e=>setName(e.target.value)} />
         <button className="button" type="submit" disabled={!name.trim() || !!busy.new}>添加 CPA 连接</button>

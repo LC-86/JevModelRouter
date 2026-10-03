@@ -1575,8 +1575,8 @@ pub fn run() {
         })
         .invoke_handler(|invoke: tauri::ipc::Invoke<tauri::Wry>| {
             #[cfg(feature = "isolation-check")]
-            if matches!(invoke.message.command(), "start_cpa_validation" | "reload_cpa_validation" | "stop_cpa_validation") {
-                let handler: fn(tauri::ipc::Invoke<tauri::Wry>) -> bool = tauri::generate_handler![cpa_validation::start_cpa_validation, cpa_validation::reload_cpa_validation, cpa_validation::stop_cpa_validation];
+            if matches!(invoke.message.command(), "start_cpa_validation" | "reload_cpa_validation" | "stop_cpa_validation" | "get_cpa_development_service" | "start_cpa_development_service") {
+                let handler: fn(tauri::ipc::Invoke<tauri::Wry>) -> bool = tauri::generate_handler![cpa_validation::start_cpa_validation, cpa_validation::reload_cpa_validation, cpa_validation::stop_cpa_validation, cpa_validation::get_cpa_development_service, cpa_validation::start_cpa_development_service];
                 return handler(invoke);
             }
             #[cfg(feature = "isolation-check")]

@@ -6,7 +6,7 @@ import { once } from 'node:events';
 import { createServer } from 'node:http';
 import { mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join, resolve, extname, sep } from 'node:path';
 import { randomUUID, createHash } from 'node:crypto';
 import { dshFixture } from './dsh-upstream-fixture.mjs';
 
@@ -14,12 +14,13 @@ const binary = resolve(process.argv[2]);
 const cpa = resolve(process.argv[3]);
 const artifact = JSON.parse(await readFile(new URL('./cpa-artifact.json', import.meta.url), 'utf8'));
 assert.equal(createHash('sha256').update(await readFile(cpa)).digest('hex'), artifact.binary_sha256);
-const root = await mkdtemp(join(tmpdir(), 'jev-r5-desktop-'));
+const root = await mkdtemp(join(tmpdir(), process.argv.includes('--service-check') ? 'jev-r6-desktop-' : 'jev-r5-desktop-'));
 const execFileAsync = promisify(execFile);
-console.log(`Owned R5 fixture: ${root}`);
+console.log(`Owned desktop fixture: ${root}`);
 const records = [], cancelled = [], held = new Map(), modes = new Map(), streams = new Map();
 const upstream = dshFixture(records, cancelled, held, modes);
 let activeRun, gatewayPort;
+const ownedCpa = new Set();
 const fixture = createServer(async (req, res) => {
   res.setHeader('access-control-allow-origin', '*');
   res.setHeader('access-control-allow-headers', 'content-type');
@@ -31,12 +32,15 @@ const fixture = createServer(async (req, res) => {
     if (!req.url.startsWith('/__')) { await upstream(req, res, body); return; }
     assert.equal(body.run_id, activeRun, 'Control belongs to the current native process');
     if (req.url === '/__progress') { console.log(body.message); reply({ ok: true }); return; }
+    if (req.url === '/__own_cpa') { assert.ok(Number.isInteger(body.pid) && body.pid > 1); ownedCpa.add(body.pid); reply({ ok: true }); return; }
+    if (req.url === '/__exit_cpa') { assert.ok(ownedCpa.has(body.pid), 'Only a CPA returned by this native run may be stopped'); process.kill(body.pid, 'SIGTERM'); reply({ ok: true }); return; }
     if (req.url === '/__capture') {
       if (!process.argv.includes('--capture')) { reply({ captured: false, reason: 'not requested' }); return; }
       try {
-        const { stdout } = await execFileAsync('/usr/bin/swift', ['-module-cache-path',join(root,'swift-cache'),resolve('scripts/cpa-owned-window.swift'),String(desktop.pid)], { timeout: 20000 });
+        const { stdout } = await execFileAsync('/usr/bin/swift', ['-module-cache-path',join(root,'swift-cache'),new URL('./cpa-owned-window.swift', import.meta.url).pathname,String(desktop.pid)], { timeout: 20000 });
         const windowId = stdout.trim(); assert.match(windowId, /^\d+$/);
-        const path = join(root, `native-${activeRun}.png`);
+        assert.ok(!body.label || body.label === 'service');
+        const path = join(root, `native-${activeRun}${body.label ? '-service' : ''}.png`);
         await execFileAsync('/usr/sbin/screencapture', ['-x',`-l${windowId}`,path], { timeout: 10000 });
         reply({ captured: true, path, pid: desktop.pid, window_id: windowId });
       } catch (error) { reply({ captured: false, reason: String(error) }); }
@@ -72,37 +76,67 @@ const base = `http://127.0.0.1:${fixture.address().port}`;
 const reservation = createServer(); reservation.listen(0, '127.0.0.1'); await once(reservation, 'listening');
 const uiPort = reservation.address().port; await new Promise(r => reservation.close(r));
 const env = Object.fromEntries(['PATH','TMPDIR','LANG','LC_ALL'].filter(k => process.env[k]).map(k => [k, process.env[k]]));
-const vite = spawn(process.execPath, [resolve('node_modules/vite/bin/vite.js'), '--host','127.0.0.1','--port',String(uiPort),'--strictPort'], { env, stdio: 'pipe' });
-let viteLog = ''; vite.stdout.on('data', b => viteLog += b); vite.stderr.on('data', b => viteLog += b);
+const webIndex = process.argv.indexOf('--web-root');
+let vite, web, viteLog = '';
+if (webIndex >= 0) {
+  const webRoot = resolve(process.argv[webIndex + 1]);
+  web = createServer(async (req, res) => {
+    try {
+      const pathname = decodeURIComponent(new URL(req.url, 'http://localhost').pathname);
+      const path = resolve(webRoot, `.${pathname === '/' ? '/index.html' : pathname}`);
+      assert.ok(path.startsWith(`${webRoot}${sep}`));
+      const mime = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.woff2': 'font/woff2', '.svg': 'image/svg+xml', '.png': 'image/png' };
+      const contents = await readFile(path);
+      res.writeHead(200, { 'content-type': mime[extname(path)] || 'application/octet-stream' }); res.end(contents);
+    } catch { res.writeHead(404); res.end(); }
+  });
+  web.listen(uiPort, '127.0.0.1'); await once(web, 'listening');
+} else {
+  vite = spawn(process.execPath, [resolve('node_modules/vite/bin/vite.js'), '--host','127.0.0.1','--port',String(uiPort),'--strictPort'], { env, stdio: 'pipe' });
+  vite.stdout.on('data', b => viteLog += b); vite.stderr.on('data', b => viteLog += b);
+}
 let desktop;
+const unrelated = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { env, stdio: 'ignore' });
 const terminate = () => { if (desktop?.pid && desktop.exitCode === null) try { process.kill(-desktop.pid, 'SIGTERM'); } catch (e) { if (e.code !== 'ESRCH') throw e; } };
+process.on('SIGINT', terminate); process.on('SIGTERM', terminate);
 async function run(reload) {
-  modes.clear(); activeRun = randomUUID(); gatewayPort = null;
+  modes.clear(); ownedCpa.clear(); activeRun = randomUUID(); gatewayPort = null;
   await rm(join(root, 'isolation-report.json'), { force: true });
-  const args = ['--autojev-isolated',root,'--autojev-upstream',base,'--autojev-ui-url',`http://127.0.0.1:${uiPort}`,'--autojev-ui-check',base,'--autojev-dsh-check',cpa,'--autojev-cpa-run',activeRun];
+  const args = ['--autojev-isolated',root,'--autojev-upstream',base,'--autojev-ui-url',`http://127.0.0.1:${uiPort}`];
+  const manual = process.argv.includes('--manual');
+  if (!manual) args.push('--autojev-ui-check',base,'--autojev-dsh-check',cpa,'--autojev-cpa-run',activeRun);
   if (reload) args.push('--autojev-check-reload');
+  if (process.argv.includes('--service-check') || manual) args.push('--autojev-cpa-service-check', '--autojev-cpa-service', cpa);
   desktop = spawn(binary, args, { env, stdio: 'pipe', detached: true });
   let log = ''; desktop.stdout.on('data', b => log += b); desktop.stderr.on('data', b => log += b);
-  const timer = setTimeout(terminate, 180000);
-  const [code] = await once(desktop, 'exit'); clearTimeout(timer);
+  const timer = manual ? null : setTimeout(terminate, 180000);
+  const [code] = await once(desktop, 'exit'); if (timer) clearTimeout(timer);
   const label = reload ? 'reload' : 'first';
   await writeFile(join(root, `${label}.desktop.log`), log);
+  if (manual) return { ok: code === 0, manual: true };
   const report = JSON.parse(await readFile(join(root, 'isolation-report.json'), 'utf8'));
   await writeFile(join(root, `${label}.report.json`), JSON.stringify(report, null, 2));
   assert.equal(report.run_id, activeRun); assert.equal(code, 0, report.error || log); assert.equal(report.ok, true, report.error);
+  assert.equal(unrelated.exitCode, null, 'An unrelated process must remain alive');
   for (const pid of report.pids) { let alive = true; try { process.kill(pid, 0); } catch (e) { if (e.code === 'ESRCH') alive = false; else throw e; } assert.equal(alive, false, `Owned CPA ${pid} must be reaped`); }
   return report;
 }
 try {
   const deadline = Date.now() + 20000;
   while (true) { try { if ((await fetch(`http://127.0.0.1:${uiPort}`)).ok) break; } catch {} assert.ok(Date.now() < deadline, viteLog); await new Promise(r => setTimeout(r, 100)); }
-  const first = await run(false), reload = await run(true);
-  assert.deepEqual(first.saved, reload.saved, 'Native restart preserves UUID and immutable source identity');
+  const first = await run(false);
+  if (!process.argv.includes('--manual')) {
+    const reload = await run(true);
+    assert.deepEqual(first.saved, reload.saved, 'Native restart preserves UUID and immutable source identity');
+  }
   await writeFile(join(root, 'receivers.json'), JSON.stringify({ records, cancelled }, null, 2));
   console.log(JSON.stringify({ ok: true, root, layers: ['native-mac-ui', 'real-pinned-cpa-loopback', 'dsh-shaped-http-replay'], requests: records.length, real_dsh_runtime: false, real_model_calls: 0, logins: 0, account_quota_queries: 0 }));
 } finally {
   terminate(); for (const s of streams.values()) { s.abort.abort(); await s.reader.cancel().catch(() => {}); }
-  vite.kill('SIGTERM'); fixture.closeAllConnections(); await new Promise(r => fixture.close(r));
+  unrelated.kill('SIGTERM'); await once(unrelated, 'exit');
+  vite?.kill('SIGTERM');
+  if (web) { web.closeAllConnections(); await new Promise(r => web.close(r)); }
+  fixture.closeAllConnections(); await new Promise(r => fixture.close(r));
   await writeFile(join(root, 'receivers.json'), JSON.stringify({ records, cancelled }, null, 2));
   console.log(`Retained fictional reports: ${root}`);
 }

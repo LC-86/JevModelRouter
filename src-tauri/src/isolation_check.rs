@@ -198,7 +198,7 @@ pub fn script() -> anyhow::Result<Option<String>> {
     if let Some(index) = args.iter().position(|s| s == "--autojev-dsh-check") {
         let binary = args.get(index + 1).context("Missing pinned CPA binary path")?;
         let run_id = args.iter().position(|s| s == "--autojev-cpa-run").and_then(|i|args.get(i + 1)).context("Missing DSH replay run ID")?;
-        let config = serde_json::json!({"base":url.to_string().trim_end_matches('/'),"binary":binary,"run_id":run_id,"reload":args.iter().any(|s|s == "--autojev-check-reload")});
+        let config = serde_json::json!({"base":url.to_string().trim_end_matches('/'),"binary":binary,"run_id":run_id,"reload":args.iter().any(|s|s == "--autojev-check-reload"),"service_check":args.iter().any(|s|s == "--autojev-cpa-service-check")});
         return Ok(Some(format!("window.__DSH_CHECK__ = {config};\n{}", include_str!("dsh-check.js"))));
     }
     if let Some(cpa_index) = args.iter().position(|s| s == "--autojev-cpa-check") {

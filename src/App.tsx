@@ -62,6 +62,7 @@ import { SettingsDialog, type SettingsSection } from './components/settings-dial
 import { SubscriptionAuthDialog } from './components/subscription-auth-dialog';
 import { GrokReadOnlyStatus } from './components/grok-readonly-status';
 import { CpaSubscriptions } from './components/cpa-subscriptions';
+import { CpaDevelopmentService } from './components/cpa-development-service';
 import { usePreferences } from './lib/preferences-context';
 import { SearchSelect } from './components/search-select';
 import { BrandMark } from './components/brand-mark';
@@ -694,6 +695,7 @@ function ProvidersPage({ snapshot, onAdd, onEdit, onDelete, onTest, onImport, on
     <div className="stack lg">
       <PageIntro title={t("Providers")} body={t("Keys are stored in the local database.")} action={<div className="provider-actions"><ProviderImport onImport={onImport} /><button className="button primary" onClick={onAdd}><Plus size={16} /> {t("Add provider")}</button></div>} />
       <GrokReadOnlyStatus t={t} />
+      <CpaDevelopmentService />
       <CpaSubscriptions connections={snapshot.cpa_subscriptions??[]} onSnapshot={onSnapshot} onNotify={onNotify} />
       <div className="table-panel provider-table-panel">
         <table className="provider-table">

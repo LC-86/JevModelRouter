@@ -25,6 +25,7 @@ R1 是选型验证门，不是已完成的服务接入。唯一 prefix 的静态
 ## 理由、历史与待验
 
 - [R1 实际 CPA 验证与复现](../testing/cpa-r1.md)：制品追溯、普通 HTTP 实证和原生验收状态。
+- [R6 Mac 开发产物与服务恢复](../testing/mac-service-r6.md)：固定 artifact/source/checksum/许可及隔离复现；[逐来源 HAND_RUN](../testing/relay-hand-run.md) 和[结果模板](../testing/relay-hand-run-result.md)统一移交 #58。
 - [R5 DSH 固定目标与工具链](../testing/dsh-r5.md)：只读接口 pin、虚构配置、协议回放和原生 CPA 证据边界。
 - [复用接口、许可和维护边界](../research/local-relay-reuse.md)：固定 CPA/CPAMP 源码与定向能力限制。
 - [独立服务 ADR](../adr/0007-independent-local-relay.md)：复用职责和替换旧 CLI 首选路线的理由。
