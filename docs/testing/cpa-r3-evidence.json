@@ -730,7 +730,7 @@
         "seam": "public Manager operations, temporary SQLite and pinned fictional management HTTP"
       },
       "after": {
-        "result": "passed in all 9 CPA lifecycle tests and full 534-test Rust run",
+        "result": "passed in all 13 CPA lifecycle tests and full 538-test Rust run",
         "observations": [
           "cleanup unfinished while the poll is pending",
           "begin/remove blocked until completion",
@@ -759,19 +759,28 @@
     },
     "first.report": {
       "api_source": {
-        "connection_instance_id": "4d193adc-c162-418f-9a78-800810726213",
+        "connection_instance_id": "e70dd804-501b-4846-b75a-8071e38bc85a",
         "generation": 1,
-        "model_id": "31f795ec-8942-437d-9931-9b78d63b3bfb",
+        "model_id": "73303e7a-013a-4d36-b709-ded406df3d10",
         "provider_id": "same-name-paid"
       },
       "bound_rediscovery": {
         "bound": true,
-        "deleted_id": "b99a203a-b031-4832-bfed-3ab5476c05e3",
-        "restored_id": "b99a203a-b031-4832-bfed-3ab5476c05e3",
+        "deleted_id": "8dedb686-093a-4e0f-858d-7ec7d7868175",
+        "restored_id": "8dedb686-093a-4e0f-858d-7ec7d7868175",
         "selected": false
+      },
+      "cancel_waiting": {
+        "account": null,
+        "generation": 3,
+        "plan": null,
+        "retry_stage": "waiting",
+        "service_available": true,
+        "stage": "cancelled"
       },
       "checks": [
         "begin/wait/cancel public desktop loop",
+        "cancel with an in-flight Waiting poll preserves the profile and retries authorization",
         "failure/disconnect public desktop loop",
         "public delete_model and directory rediscovery preserve an unselected fixed UUID",
         "public delete_model preserves an existing binding UUID; reselection stays explicit",
@@ -792,25 +801,29 @@
         "sessions": [
           "fictional-1",
           "fictional-2"
-        ]
+        ],
+        "waitingAfterCancel": {
+          "cancelledSessions": 1,
+          "credentialPresent": false
+        }
       },
       "rediscovery": {
-        "deleted_id": "b99a203a-b031-4832-bfed-3ab5476c05e3",
-        "restored_id": "b99a203a-b031-4832-bfed-3ab5476c05e3",
+        "deleted_id": "8dedb686-093a-4e0f-858d-7ec7d7868175",
+        "restored_id": "8dedb686-093a-4e0f-858d-7ec7d7868175",
         "selected": false
       },
-      "run_id": "22c9edae-b564-41a2-a81d-90e75fb95076",
+      "run_id": "866470dc-1c49-4236-9bf7-c5585f080fee",
       "saved": {
         "generation": 8,
-        "model_id": "b99a203a-b031-4832-bfed-3ab5476c05e3",
-        "provider_id": "cpa-fba7b879-d085-40fa-9d62-9f8de9e36c59"
+        "model_id": "8dedb686-093a-4e0f-858d-7ec7d7868175",
+        "provider_id": "cpa-57fefe6d-f7b5-4aa8-9800-a8ee83e41d3c"
       }
     },
     "reload.report": {
       "api_source": {
-        "connection_instance_id": "4d193adc-c162-418f-9a78-800810726213",
+        "connection_instance_id": "e70dd804-501b-4846-b75a-8071e38bc85a",
         "generation": 1,
-        "model_id": "31f795ec-8942-437d-9931-9b78d63b3bfb",
+        "model_id": "73303e7a-013a-4d36-b709-ded406df3d10",
         "provider_id": "same-name-paid"
       },
       "checks": [
@@ -829,13 +842,17 @@
         "sessions": [
           "fictional-1",
           "fictional-2"
-        ]
+        ],
+        "waitingAfterCancel": {
+          "cancelledSessions": 1,
+          "credentialPresent": false
+        }
       },
-      "run_id": "8577d543-435a-4fdd-8c1f-00e52b9fc706",
+      "run_id": "c13fc7b8-07f9-4469-bb8d-abf21352438a",
       "saved": {
         "generation": 8,
-        "model_id": "b99a203a-b031-4832-bfed-3ab5476c05e3",
-        "provider_id": "cpa-fba7b879-d085-40fa-9d62-9f8de9e36c59"
+        "model_id": "8dedb686-093a-4e0f-858d-7ec7d7868175",
+        "provider_id": "cpa-57fefe6d-f7b5-4aa8-9800-a8ee83e41d3c"
       }
     },
     "receiver-records": {
@@ -848,10 +865,14 @@
       ],
       "deleted": [
         "fictional-fictional-a.json"
-      ]
+      ],
+      "waitingAfterCancel": {
+        "cancelledSessions": 1,
+        "credentialPresent": false
+      }
     },
     "validation": {
-      "rust": "534 passed; 0 failed",
+      "rust": "538 passed; 0 failed",
       "frontend": "96 passed in 16 files",
       "build": "passed",
       "release_check": "passed",
@@ -862,6 +883,31 @@
       "oauth_login": 0,
       "account_quota_queries": 0,
       "model_calls": 0
+    },
+    "cancel-waiting": {
+      "review_head": "6094b395038a3b186208d242739a5e07a85480a1",
+      "review_id": 5400982533,
+      "discussion_id": 4173333931,
+      "test": "cpa_sources::tests::successful_cancel_with_a_late_waiting_poll_keeps_the_profile_retryable",
+      "before": {
+        "exit_code": 101,
+        "failed_assertion": "Successful cancellation and late Waiting must preserve an empty profile"
+      },
+      "after": {
+        "cpa_tests": 13,
+        "rust_tests": 538,
+        "branches": [
+          "cancel acknowledged before late Waiting, empty profile: retryable",
+          "late Waiting before cancellation acknowledgement: ownership retained until acknowledgement, then retryable",
+          "cancellation HTTP failure plus late Waiting: owned cleanup retained, explicit retry succeeds",
+          "late Waiting plus cancelled:false: old profile isolated",
+          "late Waiting plus residual credential: old profile isolated; credential untouched",
+          "late Waiting plus unreadable credential metadata: old profile isolated",
+          "late completed poll plus cancelled:true or false: old profile isolated",
+          "late expired authorization status: old profile isolated"
+        ]
+      },
+      "review_scope": "No further review rounds or low-impact refactoring, as directed by the parent."
     }
   }
 }

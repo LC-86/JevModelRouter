@@ -10,7 +10,7 @@ import {randomUUID} from 'node:crypto';
 const binary=resolve(process.argv[2]||'../build-target/debug/autojev');
 const root=await mkdtemp(join(tmpdir(),'jev-r3-desktop-'));
 console.log(`R3 owned evidence: ${root}`);
-let mode='waiting',account='fictional-a',credential=null,session=0;
+let mode='waiting',account='fictional-a',credential=null,session=0,heldPoll=null;
 const receipts={models:0,downloads:0,accountQueries:0,sessions:[],deleted:[]};
 const command=async(program,args)=>{const p=spawn(program,args,{env,stdio:'pipe'});let output='';p.stdout.on('data',c=>output+=c);p.stderr.on('data',c=>output+=c);const [code]=await once(p,'exit');assert.equal(code,0,output);return output.trim();};
 const fixture=createServer(async(req,res)=>{
@@ -20,6 +20,8 @@ const fixture=createServer(async(req,res)=>{
   const body=JSON.parse(text||'{}'),url=new URL(req.url,'http://127.0.0.1');
   const reply=(value,status=200)=>{res.writeHead(status,{'content-type':'application/json','x-cpa-commit':'e2bff0107bb307337aaa19018ccddd55f64253d5'});res.end(JSON.stringify(value));};
   if(url.pathname==='/__mode'){mode=body.mode;account=body.account||account;reply({ok:true});return;}
+  if(url.pathname==='/__poll'){reply({pending:!!heldPoll});return;}
+  if(url.pathname==='/__release_poll'){assert.ok(heldPoll);const release=heldPoll;heldPoll=null;receipts.waitingAfterCancel={cancelledSessions:receipts.sessions.length,credentialPresent:!!credential};release();reply({ok:true});return;}
   if(url.pathname==='/__receipts'){reply(receipts);return;}
   if(url.pathname==='/__capture'){
     if(process.argv.includes('--capture')){
@@ -40,6 +42,7 @@ const fixture=createServer(async(req,res)=>{
   if(url.pathname.startsWith('/v8/management/'))assert.equal(req.headers.authorization,'Bearer fictional-management-r3');
   if(url.pathname==='/v8/management/oauth/auth-url'){session++;reply({status:'ok',state:`fictional-${session}`,url:'https://auth.example.invalid/authorize'});return;}
   if(url.pathname==='/v8/management/oauth/status'){
+    if(mode==='delayed-waiting'){assert.equal(heldPoll,null);heldPoll=()=>reply({status:'wait'});return;}
     if(mode==='failed'){reply({status:'error',error:'fictional auth rejection'});return;}
     if(mode==='waiting'){reply({status:'wait'});return;}
     credential={name:`fictional-${account}.json`,provider:'codex',account,id_token:{chatgpt_account_id:account,plan_type:'fictional-plan'},access_token:'fictional-never-project'};reply({status:'ok'});return;

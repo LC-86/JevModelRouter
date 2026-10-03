@@ -118,6 +118,8 @@ struct Attempt {
     stamp: IdentityStamp,
     state: Option<String>,
     url: Option<String>,
+    cancelled: Option<bool>,
+    poll_waiting: bool,
 }
 struct CleanupLease<'a> {
     active: &'a Mutex<HashSet<String>>,
@@ -339,6 +341,8 @@ impl Manager {
                     stamp: stamp.clone(),
                     state: None,
                     url: None,
+                    cancelled: None,
+                    poll_waiting: false,
                 },
             );
             stamp
@@ -381,6 +385,8 @@ impl Manager {
                         stamp: stamp.clone(),
                         state: Some(state),
                         url: Some(url),
+                        cancelled: None,
+                        poll_waiting: false,
                     },
                 );
             }
@@ -428,11 +434,12 @@ impl Manager {
                 },
             )
         };
+        let mut waiting = false;
         let outcome = async {
             let result = async {
                 let session=attempt.state.as_deref().ok_or_else(||anyhow::anyhow!("Authorization request is still starting"))?;
                 match client.status(session).await? {
-                    client::SessionStatus::Waiting => return Ok(None),
+                    client::SessionStatus::Waiting => { waiting = true; return Ok(None); },
                     client::SessionStatus::Complete => {},
                     client::SessionStatus::Expired => anyhow::bail!("CPA authorization record expired; disconnect to isolate the old service profile"),
                 }
@@ -465,26 +472,50 @@ impl Manager {
             }
             Ok(())
         }.await;
-        // A cancelled poll still owns its late service result. Block reuse/removal
-        // until it settles, then isolate that profile without adopting its credentials.
-        let mut attempts = self.attempts.lock().unwrap();
+        // The last of poll/cancel to settle completes ownership. A Waiting result
+        // is retryable only after successful cancellation and a proven empty profile.
         let config = store.read();
         if !config.cpa_subscriptions.get(id).is_some_and(|c| {
             c.identity.connection_instance_id == attempt.stamp.connection_instance_id
                 && c.identity.generation == attempt.stamp.generation
         }) {
-            self.retire_profile(id, &client);
-            store.update(|config| {
-                if let Some(c) = config.cpa_subscriptions.get_mut(id) {
-                    c.credential_ref = None;
-                    c.error = Some("Cancelled authorization poll settled; old service profile isolated. 迟到授权结果已隔离；请删除旧连接并配置新的专用服务。未认领凭据不会删除。".into());
+            let settled = {
+                let mut attempts = self.attempts.lock().unwrap();
+                let a = attempts.get_mut(id).filter(|a| a.stamp == attempt.stamp);
+                if let Some(a) = a {
+                    a.poll_waiting = waiting;
+                    a.clone()
+                } else {
+                    Attempt { poll_waiting: waiting, ..attempt.clone() }
                 }
-            })?;
-            if attempts.get(id).is_some_and(|a| a.stamp == attempt.stamp) {
-                attempts.remove(id);
+            };
+            if !waiting || settled.cancelled.is_some() {
+                self.settle_cancelled_poll(store, id, &client, &settled).await?;
             }
         }
         outcome
+    }
+
+    async fn settle_cancelled_poll(
+        &self, store: &ConfigStore, id: &str,
+        client: &Arc<client::Client>, attempt: &Attempt,
+    ) -> Result<()> {
+        let retryable = attempt.poll_waiting && attempt.cancelled == Some(true)
+            && matches!(client.credentials().await, Ok(files) if files.is_empty());
+        if !retryable {
+            self.retire_profile(id, client);
+            store.update(|config| {
+                if let Some(c) = config.cpa_subscriptions.get_mut(id) {
+                    c.credential_ref = None;
+                    c.error = Some("Cancelled authorization poll settled; old service profile isolated. 迟到完成或残留状态不明，旧服务配置已隔离；请删除旧连接并配置新的专用服务。未认领凭据不会删除。".into());
+                }
+            })?;
+        }
+        let mut attempts = self.attempts.lock().unwrap();
+        if attempts.get(id).is_some_and(|a| a.stamp == attempt.stamp) {
+            attempts.remove(id);
+        }
+        Ok(())
     }
 
     pub async fn disconnect(&self, store: &ConfigStore, id: &str, cancel: bool) -> Result<()> {
@@ -539,9 +570,22 @@ impl Manager {
                 let client = self.client(id)?;
                 let session = a.state.as_deref().expect("pending start handled above");
                 let cancelled = client.cancel(session).await?;
+                let settled = {
+                    let mut attempts = self.attempts.lock().unwrap();
+                    if let Some(owned) = attempts.get_mut(id).filter(|owned| owned.stamp == a.stamp) {
+                        owned.cancelled = Some(cancelled);
+                        owned.clone()
+                    } else {
+                        a.clone()
+                    }
+                };
                 if self.polling.lock().unwrap().contains(id)
                     || !self.clients.lock().unwrap().contains_key(id) {
-                    // The poll retains this attempt and isolates its profile when it settles.
+                    // The poll retains this attempt and finishes ownership when it settles.
+                    return Ok(());
+                }
+                if settled.poll_waiting {
+                    self.settle_cancelled_poll(store, id, &client, &settled).await?;
                     return Ok(());
                 }
                 if !cancelled && credential.is_none() {

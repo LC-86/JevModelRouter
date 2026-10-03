@@ -17,9 +17,23 @@ struct AccountFixture {
     cleanup_fail: Arc<std::sync::atomic::AtomicBool>,
     auth_delayed: Arc<std::sync::atomic::AtomicBool>,
     status_failed: Arc<std::sync::atomic::AtomicBool>,
+    status_waiting: Arc<std::sync::atomic::AtomicBool>,
+    status_delayed: Arc<std::sync::atomic::AtomicBool>,
+    credentials_failed: Arc<std::sync::atomic::AtomicBool>,
+    cancel_failed: Arc<std::sync::atomic::AtomicBool>,
+    cancel_delayed: Arc<std::sync::atomic::AtomicBool>,
+    cancel_entered: Arc<tokio::sync::Notify>,
+    cancel_release: Arc<tokio::sync::Notify>,
     server: tokio::task::JoinHandle<()>,
 }
 impl AccountFixture {
+    async fn paused_poll(&self, store: Arc<ConfigStore>, manager: Arc<Manager>, id: String)
+        -> tokio::task::JoinHandle<Result<()>> {
+        self.status_delayed.store(true, std::sync::atomic::Ordering::SeqCst);
+        let operation = tokio::spawn(async move { manager.poll(&store, &id).await });
+        tokio::time::timeout(std::time::Duration::from_secs(2), self.entered.notified()).await.unwrap();
+        operation
+    }
     async fn start() -> Self {
         let account = Arc::new(std::sync::Mutex::new(None));
         let active = account.clone();
@@ -43,11 +57,27 @@ impl AccountFixture {
         let auth_delay = auth_delayed.clone();
         let auth_entered = entered.clone();
         let auth_release = release.clone();
+        let status_waiting = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let waiting = status_waiting.clone();
+        let status_delayed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let status_delay = status_delayed.clone();
+        let status_entered = entered.clone();
+        let status_release = release.clone();
+        let credentials_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let credentials_error = credentials_failed.clone();
+        let cancel_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel_error = cancel_failed.clone();
+        let cancel_delayed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel_delay = cancel_delayed.clone();
+        let cancel_entered = Arc::new(tokio::sync::Notify::new());
+        let cancel_arrived = cancel_entered.clone();
+        let cancel_release = Arc::new(tokio::sync::Notify::new());
+        let cancel_unblock = cancel_release.clone();
         let router=Router::new()
             .route("/v8/management/oauth/auth-url",get(move || {let delay=auth_delay.clone();let entered=auth_entered.clone();let release=auth_release.clone();async move {if delay.load(std::sync::atomic::Ordering::SeqCst) {entered.notify_one();release.notified().await;} Json(json!({"state":"fictional-session","url":"https://auth.example.invalid/authorize"}))}}))
-            .route("/v8/management/oauth/status",get(move || {let active=signed_in.clone();let expired=expired.clone();async move {if expired.load(std::sync::atomic::Ordering::SeqCst) {return Json(json!({"status":"error","error":"unknown or expired state"}));} *active.lock().unwrap()=Some("account-a");Json(json!({"status":"ok"}))}}))
-            .route("/v8/management/credentials",get(move || {let active=active.clone();async move {Json(json!({"files":active.lock().unwrap().map(|account|json!({"name":"owned.json","provider":"codex","id_token":{"chatgpt_account_id":account,"plan_type":"plan-a"}})).into_iter().collect::<Vec<_>>()}))}}).delete(move ||{let deleted=deleted.clone();let failed=cleanup_failed.clone();async move {if failed.load(std::sync::atomic::Ordering::SeqCst) {return (axum::http::StatusCode::BAD_GATEWAY,Json(json!({})));} *deleted.lock().unwrap()=None;(axum::http::StatusCode::OK,Json(json!({"status":"ok"})))}}))
-            .route("/v8/management/oauth/session",delete(move ||{let cancelled=cancellation.clone();async move {Json(json!({"status":"ok","cancelled":cancelled.load(std::sync::atomic::Ordering::SeqCst)}))}}))
+            .route("/v8/management/oauth/status",get(move || {let active=signed_in.clone();let expired=expired.clone();let waiting=waiting.clone();let delay=status_delay.clone();let entered=status_entered.clone();let release=status_release.clone();async move {if delay.load(std::sync::atomic::Ordering::SeqCst) {entered.notify_one();release.notified().await;} if waiting.load(std::sync::atomic::Ordering::SeqCst) {return Json(json!({"status":"wait"}));} if expired.load(std::sync::atomic::Ordering::SeqCst) {return Json(json!({"status":"error","error":"unknown or expired state"}));} *active.lock().unwrap()=Some("account-a");Json(json!({"status":"ok"}))}}))
+            .route("/v8/management/credentials",get(move || {let active=active.clone();let failed=credentials_error.clone();async move {if failed.load(std::sync::atomic::Ordering::SeqCst) {return (axum::http::StatusCode::BAD_GATEWAY,Json(json!({})));} (axum::http::StatusCode::OK,Json(json!({"files":active.lock().unwrap().map(|account|json!({"name":"owned.json","provider":"codex","id_token":{"chatgpt_account_id":account,"plan_type":"plan-a"}})).into_iter().collect::<Vec<_>>()})))}}).delete(move ||{let deleted=deleted.clone();let failed=cleanup_failed.clone();async move {if failed.load(std::sync::atomic::Ordering::SeqCst) {return (axum::http::StatusCode::BAD_GATEWAY,Json(json!({})));} *deleted.lock().unwrap()=None;(axum::http::StatusCode::OK,Json(json!({"status":"ok"})))}}))
+            .route("/v8/management/oauth/session",delete(move ||{let cancelled=cancellation.clone();let failed=cancel_error.clone();let delay=cancel_delay.clone();let entered=cancel_arrived.clone();let release=cancel_unblock.clone();async move {if delay.load(std::sync::atomic::Ordering::SeqCst) {entered.notify_one();release.notified().await;} if failed.load(std::sync::atomic::Ordering::SeqCst) {return (axum::http::StatusCode::BAD_GATEWAY,Json(json!({})));} (axum::http::StatusCode::OK,Json(json!({"status":"ok","cancelled":cancelled.load(std::sync::atomic::Ordering::SeqCst)})))}}))
             .route("/v8/management/credentials/models",get(move || {let failed=failed.clone();let delay=delay.clone();let arrival=arrival.clone();let unblock=unblock.clone();async move {
                 if failed.load(std::sync::atomic::Ordering::SeqCst) {return (axum::http::StatusCode::BAD_GATEWAY,Json(json!({})));}
                 if delay.load(std::sync::atomic::Ordering::SeqCst) {arrival.notify_one();unblock.notified().await;}
@@ -70,6 +100,13 @@ impl AccountFixture {
             cleanup_fail,
             auth_delayed,
             status_failed,
+            status_waiting,
+            status_delayed,
+            credentials_failed,
+            cancel_failed,
+            cancel_delayed,
+            cancel_entered,
+            cancel_release,
             server,
         }
     }
@@ -537,4 +574,119 @@ async fn cancel_discards_a_late_success_and_only_cancels_its_owned_session() {
     assert!(!manager.views(&store.read())[0].service_available);
     assert!(manager.begin(&store, &replacement).await.is_err());
     server.abort();
+}
+
+#[tokio::test]
+async fn successful_cancel_with_a_late_waiting_poll_keeps_the_profile_retryable() {
+    let fixture = AccountFixture::start().await;
+    fixture.status_waiting.store(true, std::sync::atomic::Ordering::SeqCst);
+    fixture.status_delayed.store(true, std::sync::atomic::Ordering::SeqCst);
+    let temp = tempfile::tempdir().unwrap();
+    let store = Arc::new(ConfigStore::load(temp.path().join("late-wait.db")).unwrap());
+    let manager = Arc::new(Manager::owned_fixture(fixture.base.clone()).unwrap());
+    let id = manager.create(&store, "codex", "Retryable cancellation").unwrap();
+    manager.begin(&store, &id).await.unwrap();
+    let operation = fixture.paused_poll(store.clone(), manager.clone(), id.clone()).await;
+    manager.disconnect(&store, &id, true).await.unwrap();
+    assert!(!manager.cleanup_finished(&id));
+    assert!(manager.begin(&store, &id).await.is_err());
+    assert!(manager.remove(&store, &id).is_err());
+    fixture.release.notify_one();
+    operation.await.unwrap().unwrap();
+    let view = manager.views(&store.read()).remove(0);
+    assert_eq!(view.stage, Stage::Cancelled);
+    assert!(view.account.is_none() && view.plan.is_none() && view.authorization_url.is_none());
+    assert!(view.service_available, "Successful cancellation and late Waiting must preserve an empty profile");
+    assert!(manager.cleanup_finished(&id));
+    manager.begin(&store, &id).await.unwrap();
+    assert_eq!(manager.views(&store.read())[0].stage, Stage::Waiting);
+    manager.disconnect(&store, &id, true).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_cancelled_poll_with_completion_or_unproven_residue_isolates_the_profile() {
+    for case in ["not_cancelled", "residue", "expired", "complete", "unreadable"] {
+        let fixture = AccountFixture::start().await;
+        fixture.status_waiting.store(!matches!(case, "expired" | "complete"), std::sync::atomic::Ordering::SeqCst);
+        fixture.status_failed.store(case == "expired", std::sync::atomic::Ordering::SeqCst);
+        fixture.cancelled.store(!matches!(case, "not_cancelled" | "complete"), std::sync::atomic::Ordering::SeqCst);
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(ConfigStore::load(temp.path().join("uncertain.db")).unwrap());
+        let manager = Arc::new(Manager::owned_fixture(fixture.base.clone()).unwrap());
+        let id = manager.create(&store, "codex", "Uncertain cancellation").unwrap();
+        manager.begin(&store, &id).await.unwrap();
+        let operation = fixture.paused_poll(store.clone(), manager.clone(), id.clone()).await;
+        manager.disconnect(&store, &id, true).await.unwrap();
+        if case == "residue" { *fixture.account.lock().unwrap() = Some("unclaimed"); }
+        fixture.credentials_failed.store(case == "unreadable", std::sync::atomic::Ordering::SeqCst);
+        fixture.release.notify_one();
+        assert_eq!(operation.await.unwrap().is_err(), matches!(case, "expired" | "complete"), "{case}");
+        let view = manager.views(&store.read()).remove(0);
+        assert_eq!(view.stage, Stage::Cancelled, "{case}");
+        assert!(view.account.is_none() && view.plan.is_none() && !view.service_available, "{case}");
+        assert!(manager.cleanup_finished(&id), "{case}");
+        assert!(manager.begin(&store, &id).await.is_err(), "{case}");
+        if case == "residue" { assert_eq!(*fixture.account.lock().unwrap(), Some("unclaimed")); }
+        manager.remove(&store, &id).unwrap();
+        let new_id = manager.create(&store, "codex", "Replacement").unwrap();
+        assert!(manager.begin(&store, &new_id).await.is_err(), "{case}");
+    }
+}
+
+#[tokio::test]
+async fn a_waiting_poll_that_settles_before_cancel_ack_keeps_ownership_until_ack() {
+    let fixture = AccountFixture::start().await;
+    fixture.status_waiting.store(true, std::sync::atomic::Ordering::SeqCst);
+    fixture.cancel_delayed.store(true, std::sync::atomic::Ordering::SeqCst);
+    let temp = tempfile::tempdir().unwrap();
+    let store = Arc::new(ConfigStore::load(temp.path().join("cancel-later.db")).unwrap());
+    let manager = Arc::new(Manager::owned_fixture(fixture.base.clone()).unwrap());
+    let id = manager.create(&store, "codex", "Cancel response later").unwrap();
+    manager.begin(&store, &id).await.unwrap();
+    let operation = fixture.paused_poll(store.clone(), manager.clone(), id.clone()).await;
+    let cancellation = {
+        let store = store.clone(); let manager = manager.clone(); let id = id.clone();
+        tokio::spawn(async move { manager.disconnect(&store, &id, true).await })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(2), fixture.cancel_entered.notified()).await.unwrap();
+    fixture.release.notify_one();
+    operation.await.unwrap().unwrap();
+    assert!(manager.views(&store.read())[0].service_available);
+    assert!(!manager.cleanup_finished(&id));
+    assert!(manager.begin(&store, &id).await.is_err());
+    assert!(manager.remove(&store, &id).is_err());
+    fixture.cancel_release.notify_one();
+    cancellation.await.unwrap().unwrap();
+    assert!(manager.cleanup_finished(&id));
+    assert!(manager.views(&store.read())[0].service_available);
+    manager.begin(&store, &id).await.unwrap();
+    fixture.cancel_delayed.store(false, std::sync::atomic::Ordering::SeqCst);
+    manager.disconnect(&store, &id, true).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_failed_cancel_keeps_a_late_waiting_poll_owned_for_explicit_retry() {
+    let fixture = AccountFixture::start().await;
+    fixture.status_waiting.store(true, std::sync::atomic::Ordering::SeqCst);
+    fixture.cancel_failed.store(true, std::sync::atomic::Ordering::SeqCst);
+    let temp = tempfile::tempdir().unwrap();
+    let store = Arc::new(ConfigStore::load(temp.path().join("cancel-failed.db")).unwrap());
+    let manager = Arc::new(Manager::owned_fixture(fixture.base.clone()).unwrap());
+    let id = manager.create(&store, "codex", "Cancellation retry").unwrap();
+    manager.begin(&store, &id).await.unwrap();
+    let operation = fixture.paused_poll(store.clone(), manager.clone(), id.clone()).await;
+    assert!(manager.disconnect(&store, &id, true).await.is_err());
+    fixture.release.notify_one();
+    operation.await.unwrap().unwrap();
+    let view = manager.views(&store.read()).remove(0);
+    assert_eq!(view.stage, Stage::Cancelled);
+    assert!(view.account.is_none() && view.plan.is_none() && view.service_available);
+    assert!(!manager.cleanup_finished(&id));
+    assert!(manager.begin(&store, &id).await.is_err());
+    assert!(manager.remove(&store, &id).is_err());
+    fixture.cancel_failed.store(false, std::sync::atomic::Ordering::SeqCst);
+    manager.disconnect(&store, &id, false).await.unwrap();
+    assert!(manager.cleanup_finished(&id));
+    manager.begin(&store, &id).await.unwrap();
+    manager.disconnect(&store, &id, true).await.unwrap();
 }
