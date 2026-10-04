@@ -10,6 +10,26 @@ use axum::{
 use serde_json::json;
 use std::sync::{Arc, Mutex};
 
+pub(crate) fn finite_tool_response(mode: &str) -> axum::response::Response {
+    let mut call=json!({"index":0,"id":"call_echo","type":"function","function":{"name":"echo","arguments":"{}"}});
+    match mode {
+        "invalid-single"|"invalid-split"=>call["function"]["arguments"]="{".into(),
+        "missing-id"=>{call.as_object_mut().unwrap().remove("id");},
+        "missing-name"=>{call["function"].as_object_mut().unwrap().remove("name");},
+        "invalid-type"=>call["type"]="custom".into(),
+        "valid-single"=>{},
+        "valid-split"=>{call["id"]="call_".into();call["function"]["name"]="ec".into();call["function"]["arguments"]="{\"n\":".into();},
+        _=>panic!("Unknown fictional response mode"),
+    }
+    let mut text=format!("data: {}\n\n",json!({"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[call]},"finish_reason":null}]}));
+    if mode=="valid-split" {text+=&format!("data: {}\n\n",json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"echo","function":{"name":"ho","arguments":"1}"}}]},"finish_reason":null}]}));}
+    text+=&format!("data: {}\n\ndata: [DONE]\n\n",json!({"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}));
+    let size=if mode.ends_with("split"){17}else{text.len()};
+    let chunks:std::collections::VecDeque<_>=text.as_bytes().chunks(size).map(axum::body::Bytes::copy_from_slice).collect();
+    let stream=futures_util::stream::unfold(chunks,|mut chunks|async move {let chunk=chunks.pop_front()?;tokio::time::sleep(std::time::Duration::from_millis(2)).await;Some((Ok::<_,std::io::Error>(chunk),chunks))});
+    ([("content-type","text/event-stream")],axum::body::Body::from_stream(stream)).into_response()
+}
+
 fn review_response_event(kind: &str, mut value: serde_json::Value) -> String {
     value["type"] = kind.into();
     format!("event: {kind}\ndata: {value}\n\n")
@@ -268,6 +288,9 @@ async fn source_fixture() -> (
                     });
                     return axum::response::Response::builder().header("content-type", "text/event-stream")
                         .header("x-request-id", key).body(axum::body::Body::from_stream(stream)).unwrap();
+                }
+                if let Some(mode)=body.pointer("/messages/0/content").and_then(|v|v.as_str()).and_then(|v|v.strip_prefix("finite-tool-")) {
+                    return finite_tool_response(mode);
                 }
                 if let Some(mode)=body.pointer("/messages/0/content").and_then(|v|v.as_str()).and_then(|v|v.strip_prefix("plan-stream-")) {
                     let mode=mode.to_owned();
@@ -1453,6 +1476,7 @@ async fn coding_plan_evidence_failures_restart_and_first_http_failure_stay_locke
     let req=json!({"model":"autojev/model/uuid-coding","messages":[{"role":"user","content":"fail-429"}],"max_tokens":16});
     let reply=crate::dispatch::local_gateway_request(gateway.port,crate::protocol::Protocol::Chat,&req).unwrap().send().await.unwrap();
     assert_eq!(reply.status(),429);let text=reply.text().await.unwrap();assert!(!text.contains("fictional-coding"));
+    assert!(text.contains("Bearer [REDACTED]"),"locked plan must retain the safe upstream failure reason: {text}");
     assert!(store.read().api_sources["coding"].hand_run_ledger[&proof.plan_id].stopped);
     assert!(crate::coding_hand_run::enable(&store,"coding",proof.clone()).is_err());
     let reopened=ConfigStore::load(root.path().join("sources.db")).unwrap();
@@ -1476,6 +1500,41 @@ async fn coding_plan_public_stream_cancel_and_missing_terminal_lock_only_the_ori
         else {assert!(!store.read().api_sources["coding"].hand_run_ledger[&proof.plan_id].stopped);}
         assert_eq!(received.lock().unwrap().len(),1);gateway.stop().await;upstream.abort();
     }
+}
+
+#[tokio::test]
+async fn finite_coding_plan_streamed_tools_fail_closed_or_complete() {
+    for mode in ["invalid-single","invalid-split","missing-id","missing-name","invalid-type","valid-split"] {
+        let (_root,store,received,upstream)=source_fixture().await;
+        store.update(|c|c.api_sources.get_mut("coding").unwrap().kind=crate::api_sources::SourceKind::CodingPlan).unwrap();
+        let mut proof=coding_proof(&store);proof.policy.streaming=true;proof.policy.function_tools=true;proof.policy.max_requests=2;
+        crate::coding_hand_run::enable(&store,"coding",proof.clone()).unwrap();let gateway=crate::proxy::start(store.clone()).await.unwrap();
+        let request=json!({"model":"autojev/model/uuid-coding","messages":[{"role":"user","content":format!("finite-tool-{mode}")}],"max_tokens":16,"stream":true});
+        let valid=mode=="valid-split";
+        let first=crate::dispatch::local_gateway_request(gateway.port,crate::protocol::Protocol::Chat,&request).unwrap().send().await;
+        if valid {assert!(first.unwrap().text().await.unwrap().contains("[DONE]"));}
+        else if let Ok(first)=first {assert!(first.text().await.is_err(),"invalid assembled tool must fail: {mode}");}
+        let second=crate::dispatch::local_gateway_request(gateway.port,crate::protocol::Protocol::Chat,&request).unwrap().send().await;
+        assert_eq!(received.lock().unwrap().len(),if valid {2}else{1},"fixed source dispatch count: {mode}");
+        if valid {assert!(second.unwrap().text().await.unwrap().contains("[DONE]"));}
+        else {assert!(!second.unwrap().status().is_success());assert!(crate::coding_hand_run::enable(&store,"coding",proof).is_err());}
+        gateway.stop().await;upstream.abort();
+    }
+}
+
+#[tokio::test]
+async fn finite_coding_plan_outer_parser_failure_locks_before_a_second_dispatch() {
+    let (_root,store,received,upstream)=source_fixture().await;
+    store.update(|c|c.api_sources.get_mut("coding").unwrap().kind=crate::api_sources::SourceKind::CodingPlan).unwrap();
+    let mut proof=coding_proof(&store);proof.policy.streaming=true;proof.policy.function_tools=true;proof.policy.max_requests=2;
+    crate::coding_hand_run::enable(&store,"coding",proof.clone()).unwrap();let gateway=crate::proxy::start(store.clone()).await.unwrap();
+    let request=json!({"model":"autojev/model/uuid-coding","messages":[{"role":"user","content":"finite-tool-valid-single"}],"max_tokens":16,"stream":false});
+    let first=crate::dispatch::local_gateway_request(gateway.port,crate::protocol::Protocol::Chat,&request).unwrap().send().await.unwrap();
+    assert_eq!(first.status(),StatusCode::BAD_GATEWAY);assert!(first.text().await.unwrap().contains("invalid JSON"));
+    let second=crate::dispatch::local_gateway_request(gateway.port,crate::protocol::Protocol::Chat,&request).unwrap().send().await;
+    assert_eq!(received.lock().unwrap().len(),1,"outer parser failure must never dispatch again");
+    assert!(!second.unwrap().status().is_success());assert!(crate::coding_hand_run::enable(&store,"coding",proof).is_err());
+    gateway.stop().await;upstream.abort();
 }
 
 #[tokio::test]

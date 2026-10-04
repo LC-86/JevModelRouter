@@ -667,8 +667,9 @@ async fn forward_attempt(context: ProxyContext, headers: HeaderMap, body: Value,
     }
     let redaction_key = cpa_target.as_ref().map(|t|t.key.clone()).or_else(||config.api_sources.contains_key(&resolved.provider.id).then(|| generation_key.clone()).flatten());
     let event_stream=response_headers.get(header::CONTENT_TYPE).and_then(|v|v.to_str().ok()).is_some_and(crate::protocol::is_event_stream);
-    let stream:std::pin::Pin<Box<dyn futures_util::Stream<Item=Result<axum::body::Bytes,reqwest::Error>>+Send>> = if let Some(lease)=cpa_target.as_mut().and_then(|t|t.lease.take()).or_else(||coding_lease.take()){Box::pin(crate::cpa_sources::response::guarded(upstream.bytes_stream(),lease,event_stream))}else{Box::pin(upstream.bytes_stream())};
-    let upstream_stream = crate::api_sources::redacted_stream(stream,redaction_key.clone(),event_stream);
+    let response_failure=cpa_target.as_ref().and_then(|t|t.lease.as_ref()).or(coding_lease.as_ref()).map(|lease|lease.on_failure());
+    let redacted = crate::api_sources::redacted_stream(upstream.bytes_stream(),redaction_key.clone(),event_stream);
+    let upstream_stream:std::pin::Pin<Box<dyn futures_util::Stream<Item=Result<axum::body::Bytes,std::io::Error>>+Send>> = if let Some(lease)=cpa_target.as_mut().and_then(|t|t.lease.take()).or_else(||coding_lease.take()){Box::pin(crate::cpa_sources::response::guarded(redacted,lease,event_stream))}else{Box::pin(redacted)};
     let success = status.is_success();
     capture.lock().unwrap().upstream(target, response_headers.get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok()).is_some_and(crate::protocol::is_event_stream),
@@ -710,17 +711,18 @@ async fn forward_attempt(context: ProxyContext, headers: HeaderMap, body: Value,
             let is_sse = response_headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok())
                 .is_some_and(crate::protocol::is_event_stream);
             if !is_sse {
+                if let Some(fail)=&response_failure {fail();}
                 return (StatusCode::BAD_GATEWAY, Json(source.error("Upstream did not return the requested event stream"))).into_response();
             }
             return builder.header(header::CONTENT_TYPE, "text/event-stream")
                 .header(header::CACHE_CONTROL, "no-cache")
-                .body(Body::from_stream(protocol::converted_stream_observed(crate::traffic::observe(timed_stream(upstream_stream, config.gateway.stream_idle_seconds), capture.clone()), target, source, resolved.model.model_id, tool_map, { let capture = capture.clone(); move || capture.lock().unwrap().log.error = "Response conversion failed".into() },
+                .body(Body::from_stream(protocol::converted_stream_observed(crate::traffic::observe(timed_stream(upstream_stream, config.gateway.stream_idle_seconds), capture.clone()), target, source, resolved.model.model_id, tool_map, { let capture = capture.clone(); move || {if let Some(fail)=&response_failure {fail();}capture.lock().unwrap().log.error = "Response conversion failed".into();} },
                 ))).unwrap();
         }
         let converted = match read_upstream_json(upstream_stream, capture.clone(), config.gateway.stream_idle_seconds).await.and_then(|body|
             protocol::convert_response(&body, target, source, &resolved.model.model_id, &tool_map)) {
             Ok(body) => body,
-            Err(error) => return (StatusCode::BAD_GATEWAY, Json(source.error(&error.to_string()))).into_response(),
+            Err(error) => {if let Some(fail)=&response_failure {fail();}return (StatusCode::BAD_GATEWAY, Json(source.error(&error.to_string()))).into_response();},
         };
         return builder.header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(converted.to_string())).unwrap();
@@ -734,10 +736,13 @@ async fn forward_attempt(context: ProxyContext, headers: HeaderMap, body: Value,
                 }
                 builder.header(header::CONTENT_TYPE,"application/json").body(Body::from(body.to_string())).unwrap()
             }
-            Err(_)=>error_response(StatusCode::BAD_GATEWAY,"Upstream returned invalid JSON or the response body timed out"),
+            Err(_)=>{if let Some(fail)=&response_failure {fail();}error_response(StatusCode::BAD_GATEWAY,"Upstream returned invalid JSON or the response body timed out")},
         };
     }
-    let stream = crate::traffic::observe(timed_stream(upstream_stream, config.gateway.stream_idle_seconds), capture).map(|chunk| chunk.map_err(std::io::Error::other));
+    let stream = crate::traffic::observe(timed_stream(upstream_stream, config.gateway.stream_idle_seconds), capture).map(move |chunk| {
+        if chunk.is_err() {if let Some(fail)=&response_failure {fail();}}
+        chunk.map_err(std::io::Error::other)
+    });
     builder.body(Body::from_stream(stream)).unwrap_or_else(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "Could not construct upstream response"))
 }
 

@@ -57,21 +57,17 @@ pub(crate) struct ResponseLease {
     store: Arc<ConfigStore>,
     id: String,
     complete: bool,
-    terminal: bool,
     errored: bool,
-    coding_plan: Option<String>,
+    plan: String,
+    coding: bool,
     function_tools: bool,
 }
 impl Drop for ResponseLease {
     fn drop(&mut self) {
         if !self.complete {
-            if let Some(plan) = &self.coding_plan {
-                let _ = crate::coding_hand_run::fail_plan(&self.store, &self.id, plan);
-            } else {
-                let _ = self.store.cpa.fail_hand_run(&self.store, &self.id);
-            }
+            self.on_failure()();
         }
-        if self.coding_plan.is_none() {
+        if !self.coding {
             self.store.cpa.finish_transport(&self.id);
         }
     }
@@ -79,11 +75,23 @@ impl Drop for ResponseLease {
 impl ResponseLease {
     pub(crate) fn reject(&mut self) {
         self.errored = true;
-        if let Some(plan) = &self.coding_plan {
-            let _ = crate::coding_hand_run::fail_plan(&self.store, &self.id, plan);
-        } else {
-            let _ = self.store.cpa.fail_hand_run(&self.store, &self.id);
-        }
+        self.on_failure()();
+    }
+    /// Outer parsers can fail after a valid upstream terminal; bind the original plan.
+    pub(crate) fn on_failure(&self) -> Arc<dyn Fn() + Send + Sync> {
+        let (store, id, plan, coding) = (
+            self.store.clone(),
+            self.id.clone(),
+            self.plan.clone(),
+            self.coding,
+        );
+        Arc::new(move || {
+            if coding {
+                let _ = crate::coding_hand_run::fail_plan(&store, &id, &plan);
+            } else {
+                let _ = store.cpa.fail_plan(&store, &id, &plan);
+            }
+        })
     }
     pub(crate) fn coding(
         store: Arc<ConfigStore>,
@@ -92,24 +100,26 @@ impl ResponseLease {
         function_tools: bool,
     ) -> Self {
         let mut lease = Self::new(store, id);
-        lease.coding_plan = Some(plan);
+        lease.plan = plan;
+        lease.coding = true;
         lease.function_tools = function_tools;
         lease
     }
     pub(crate) fn new(store: Arc<ConfigStore>, id: String) -> Self {
-        let function_tools = store
+        let (plan, function_tools) = store
             .read()
             .cpa_subscriptions
             .get(&id)
             .and_then(|c| c.permit.as_ref())
-            .is_some_and(|p| p.proof.policy.function_tools);
+            .map(|p| (p.proof.plan_id.clone(), p.proof.policy.function_tools))
+            .unwrap_or_default();
         Self {
             store,
             id,
             complete: false,
-            terminal: false,
             errored: false,
-            coding_plan: None,
+            plan,
+            coding: false,
             function_tools,
         }
     }
@@ -118,14 +128,17 @@ pub(crate) fn guarded<S>(
     stream: S,
     lease: ResponseLease,
     sse: bool,
-) -> impl Stream<Item = Result<axum::body::Bytes, reqwest::Error>>
+) -> impl Stream<Item = Result<axum::body::Bytes, std::io::Error>>
 where
-    S: Stream<Item = Result<axum::body::Bytes, reqwest::Error>> + Send + 'static,
+    S: Stream<Item = Result<axum::body::Bytes, std::io::Error>> + Send + 'static,
 {
     let stream: Pin<Box<S>> = Box::pin(stream);
     futures_util::stream::unfold(
-        (stream, lease, Vec::new()),
-        move |(mut stream, mut lease, mut data)| async move {
+        (stream, lease, Vec::new(), false),
+        move |(mut stream, mut lease, mut data, ended)| async move {
+            if ended {
+                return None;
+            }
             match stream.next().await {
                 Some(Ok(bytes)) => {
                     if data.len() + bytes.len() <= 65536 {
@@ -133,34 +146,23 @@ where
                     } else {
                         lease.reject();
                     }
-                    if sse {
-                        for line in data.split(|b| *b == b'\n') {
-                            if let Some(json) = line.strip_prefix(b"data: ") {
-                                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(json) {
-                                    lease.errored |= v.get("error").is_some();
-                                    lease.errored |= !lease.function_tools
-                                        && v["choices"].as_array().is_some_and(|c| {
-                                            c.iter().any(|c| has_tool_call(&c["delta"]))
-                                        });
-                                    lease.terminal |= v["choices"].as_array().is_some_and(|c| {
-                                        c.iter().any(|c| {
-                                            c["finish_reason"] == "stop"
-                                                || (lease.function_tools
-                                                    && c["finish_reason"] == "tool_calls")
-                                        })
-                                    });
-                                }
+                    if sse && !lease.errored {
+                        match sse_complete(&data, lease.function_tools) {
+                            Ok(complete) => lease.complete = complete && !lease.errored,
+                            Err(()) => {
+                                lease.reject();
+                                return Some((
+                                    Err(std::io::Error::other("Invalid upstream finite response")),
+                                    (stream, lease, data, true),
+                                ));
                             }
                         }
-                        lease.complete = lease.terminal
-                            && !lease.errored
-                            && data.windows(12).any(|w| w == b"data: [DONE]");
                     }
-                    Some((Ok(bytes), (stream, lease, data)))
+                    Some((Ok(bytes), (stream, lease, data, false)))
                 }
                 Some(Err(error)) => {
                     lease.reject();
-                    Some((Err(error), (stream, lease, data)))
+                    Some((Err(error), (stream, lease, data, true)))
                 }
                 None => {
                     if !sse {
@@ -174,6 +176,115 @@ where
             }
         },
     )
+}
+
+/// Validate the assembled choices, never just a terminal marker in raw bytes.
+fn sse_complete(bytes: &[u8], tools: bool) -> Result<bool, ()> {
+    use serde_json::{json, Value};
+    use std::collections::BTreeMap;
+    let mut parser = crate::protocol::SseParser::default();
+    let frames = parser.push(bytes).map_err(|_| ())?;
+    let mut choices: BTreeMap<u64, Value> = BTreeMap::new();
+    let mut calls: BTreeMap<(u64, u64), Value> = BTreeMap::new();
+    let mut done = false;
+    for (_, data) in frames {
+        if done {
+            return Err(());
+        }
+        if data == "[DONE]" {
+            done = true;
+            continue;
+        }
+        let value: Value = serde_json::from_str(&data).map_err(|_| ())?;
+        if value.get("error").is_some() {
+            return Err(());
+        }
+        let Some(items) = value["choices"].as_array() else {
+            continue;
+        };
+        for item in items {
+            let index = match item.get("index") {
+                Some(v) => v.as_u64().ok_or(())?,
+                None => 0,
+            };
+            let choice = choices.entry(index).or_insert_with(
+                || json!({"message":{"role":"assistant","content":""},"finish_reason":null}),
+            );
+            let delta = &item["delta"];
+            if !choice["finish_reason"].is_null()
+                && delta.as_object().is_some_and(|d| !d.is_empty())
+            {
+                return Err(());
+            }
+            if let Some(role) = delta.get("role") {
+                if role != "assistant" {
+                    return Err(());
+                }
+            }
+            append_delta(&mut choice["message"], delta, "content")?;
+            if delta.get("function_call").is_some_and(|v| !v.is_null()) {
+                return Err(());
+            }
+            if has_tool_call(delta) && !tools {
+                return Err(());
+            }
+            if let Some(tool_delta) = delta.get("tool_calls").filter(|v| !v.is_null()) {
+                for tool in tool_delta.as_array().ok_or(())? {
+                    let tool_index = tool["index"].as_u64().ok_or(())?;
+                    let call = calls
+                        .entry((index, tool_index))
+                        .or_insert_with(|| json!({"function":{}}));
+                    append_delta(call, tool, "id")?;
+                    if let Some(kind) = tool.get("type") {
+                        if kind != "function" {
+                            return Err(());
+                        }
+                        call["type"] = kind.clone();
+                    }
+                    for field in ["name", "arguments"] {
+                        append_delta(&mut call["function"], &tool["function"], field)?;
+                    }
+                }
+            }
+            if let Some(reason) = item.get("finish_reason").filter(|r| !r.is_null()) {
+                choice["finish_reason"] = reason.clone();
+            }
+        }
+    }
+    if !done {
+        return Ok(false);
+    }
+    if !parser.clean_eof() {
+        return Err(());
+    }
+    for ((index, _), call) in calls {
+        let message = &mut choices.get_mut(&index).ok_or(())?["message"];
+        if message["tool_calls"].is_null() {
+            message["tool_calls"] = json!([]);
+        }
+        message["tool_calls"].as_array_mut().ok_or(())?.push(call);
+    }
+    if !json_complete(
+        &json!({"choices":choices.into_values().collect::<Vec<_>>()}),
+        tools,
+    ) {
+        return Err(());
+    }
+    Ok(true)
+}
+
+fn append_delta(
+    target: &mut serde_json::Value,
+    delta: &serde_json::Value,
+    field: &str,
+) -> Result<(), ()> {
+    if let Some(value) = delta.get(field).filter(|v| !v.is_null()) {
+        let fragment = value.as_str().ok_or(())?;
+        let mut assembled = target[field].as_str().unwrap_or_default().to_owned();
+        assembled.push_str(fragment);
+        target[field] = assembled.into();
+    }
+    Ok(())
 }
 
 fn json_complete(v: &serde_json::Value, tools: bool) -> bool {
@@ -195,8 +306,10 @@ fn choice_complete(c: &serde_json::Value, tools: bool) -> bool {
                     !t.is_empty()
                         && t.iter().all(|t| {
                             t["type"] == "function"
-                                && t["id"].is_string()
-                                && t["function"]["name"].is_string()
+                                && t["id"].as_str().is_some_and(|s| !s.is_empty())
+                                && t["function"]["name"]
+                                    .as_str()
+                                    .is_some_and(|s| !s.is_empty())
                                 && t["function"]["arguments"].as_str().is_some_and(|a| {
                                     serde_json::from_str::<serde_json::Value>(a).is_ok()
                                 })

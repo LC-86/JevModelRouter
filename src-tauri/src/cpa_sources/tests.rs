@@ -165,6 +165,7 @@ impl AccountFixture {
             .route("/v1/chat/completions",post(|Json(body):Json<serde_json::Value>|async move {
                 use axum::response::IntoResponse;
                 let tag=body["messages"][0]["content"].as_str().unwrap_or("");
+                if let Some(mode)=tag.strip_prefix("finite-tool-") {return crate::api_source_tests::finite_tool_response(mode);}
                 if tag=="fictional-error" {return (axum::http::StatusCode::TOO_MANY_REQUESTS,Json(json!({"error":{"message":"fictional exhausted"}}))).into_response();}
                 if tag=="fictional-json-unknown" {return Json(json!({"choices":[{"message":{"role":"assistant","content":"fictional"},"finish_reason":null}]})).into_response();}
                 if tag=="fictional-json-empty" {return Json(json!({"choices":[{}]})).into_response();}
@@ -1067,8 +1068,8 @@ async fn cpa_stream_failure_or_cancel_stops_the_plan_without_fallback_or_budget_
         let model=store.read().models.last().unwrap().clone();store.cpa.select(&store,&id,&model.id,true).unwrap();let proof=reviewed_fixture_proof(&store,&id,&model);store.cpa.enable_hand_run(&store,&id,proof.clone()).unwrap();
         store.update(|c|{c.port=0;c.gateway.proxy_mode="direct".into();}).unwrap();let gateway=crate::proxy::start(store.clone()).await.unwrap();
         let body=json!({"model":format!("autojev/model/{}",model.id),"messages":[{"role":"user","content":tag}],"max_tokens":32,"stream":!matches!(tag,"fictional-error"|"fictional-json-unknown"|"fictional-json-empty")});
-        let mut response=crate::dispatch::local_gateway_request(gateway.port,crate::protocol::Protocol::Chat,&body).unwrap().send().await.unwrap();
-        if tag=="fictional-cancel" {assert!(response.chunk().await.unwrap().is_some());drop(response);}else{let _=response.text().await;}
+        let response=crate::dispatch::local_gateway_request(gateway.port,crate::protocol::Protocol::Chat,&body).unwrap().send().await;
+        if tag=="fictional-cancel" {let mut response=response.unwrap();assert!(response.chunk().await.unwrap().is_some());drop(response);}else if let Ok(response)=response {let _=response.text().await;}
         tokio::time::timeout(std::time::Duration::from_secs(3),async{loop{if store.read().cpa_subscriptions[&id].permit.as_ref().unwrap().stopped{break;}tokio::time::sleep(std::time::Duration::from_millis(10)).await;}}).await.unwrap();
         assert!(store.cpa.enable_hand_run(&store,&id,proof).is_err());
         let response=crate::dispatch::local_gateway_request(gateway.port,crate::protocol::Protocol::Chat,&body).unwrap().send().await.unwrap();assert!(!response.status().is_success());
@@ -1092,4 +1093,29 @@ async fn finite_cpa_tool_round_uses_the_same_fixed_target_and_client_call_id() {
     let response=crate::dispatch::local_gateway_request(gateway.port,crate::protocol::Protocol::Chat,&second).unwrap().send().await.unwrap();assert_eq!(response.status(),200);let _=response.text().await.unwrap();
     let ledger=store.read().cpa_subscriptions[&id].hand_run_ledger.values().next().unwrap().clone();assert_eq!((ledger.used,ledger.auxiliary_used,ledger.tool_rounds_used),(2,2,1));
     assert_eq!(fixture.requests.lock().unwrap().iter().filter(|(_,p)|p=="/v1/chat/completions").count(),2);gateway.stop().await;
+}
+
+#[tokio::test]
+async fn finite_cpa_streamed_tools_fail_closed_or_complete() {
+    for mode in ["invalid-single","invalid-split","missing-id","missing-name","invalid-type","valid-split","valid-single"] {
+    let fixture=AccountFixture::start().await;let root=tempfile::tempdir().unwrap();
+    let mut store=ConfigStore::load(root.path().join("stream-tools.db")).unwrap();
+    store.cpa=Arc::new(Manager::owned_fixture(fixture.base.clone()).unwrap());let store=Arc::new(store);
+    let id=store.cpa.create(&store,"codex","Stream tools").unwrap();
+    store.cpa.begin(&store,&id).await.unwrap();store.cpa.poll(&store,&id).await.unwrap();store.cpa.refresh(&store,&id).await.unwrap();
+    let model=store.read().models.last().unwrap().clone();store.cpa.select(&store,&id,&model.id,true).unwrap();
+    let proof=reviewed_fixture_proof(&store,&id,&model);store.cpa.enable_hand_run(&store,&id,proof.clone()).unwrap();
+    store.update(|c|{c.port=0;c.gateway.proxy_mode="direct".into();}).unwrap();let gateway=crate::proxy::start(store.clone()).await.unwrap();
+    let request=json!({"model":format!("autojev/model/{}",model.id),"messages":[{"role":"user","content":format!("finite-tool-{mode}")}],"max_tokens":16,"stream":mode!="valid-single"});
+    let first=crate::dispatch::local_gateway_request(gateway.port,crate::protocol::Protocol::Chat,&request).unwrap().send().await;
+    let valid=mode=="valid-split";
+    if valid {let body=first.unwrap().text().await.unwrap();assert!(body.contains("[DONE]"));}
+    else if mode=="valid-single" {let first=first.unwrap();assert_eq!(first.status(),502);assert!(first.text().await.unwrap().contains("invalid JSON"));}
+    else if let Ok(first)=first {assert!(first.text().await.is_err(),"invalid assembled tool must fail: {mode}");}
+    let second=crate::dispatch::local_gateway_request(gateway.port,crate::protocol::Protocol::Chat,&request).unwrap().send().await;
+    assert_eq!(fixture.requests.lock().unwrap().iter().filter(|(_,p)|p=="/v1/chat/completions").count(),if valid {2}else{1},"fixed source dispatch count: {mode}");
+    if valid {assert!(second.unwrap().text().await.unwrap().contains("[DONE]"));}
+    else {assert!(!second.unwrap().status().is_success());assert!(store.cpa.enable_hand_run(&store,&id,proof).is_err(),"same plan cannot resume");}
+    gateway.stop().await;
+    }
 }
