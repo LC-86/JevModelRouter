@@ -1068,8 +1068,8 @@ async fn cpa_stream_failure_or_cancel_stops_the_plan_without_fallback_or_budget_
         let model=store.read().models.last().unwrap().clone();store.cpa.select(&store,&id,&model.id,true).unwrap();let proof=reviewed_fixture_proof(&store,&id,&model);store.cpa.enable_hand_run(&store,&id,proof.clone()).unwrap();
         store.update(|c|{c.port=0;c.gateway.proxy_mode="direct".into();}).unwrap();let gateway=crate::proxy::start(store.clone()).await.unwrap();
         let body=json!({"model":format!("autojev/model/{}",model.id),"messages":[{"role":"user","content":tag}],"max_tokens":32,"stream":!matches!(tag,"fictional-error"|"fictional-json-unknown"|"fictional-json-empty")});
-        let mut response=crate::dispatch::local_gateway_request(gateway.port,crate::protocol::Protocol::Chat,&body).unwrap().send().await.unwrap();
-        if tag=="fictional-cancel" {assert!(response.chunk().await.unwrap().is_some());drop(response);}else{let _=response.text().await;}
+        let response=crate::dispatch::local_gateway_request(gateway.port,crate::protocol::Protocol::Chat,&body).unwrap().send().await;
+        if tag=="fictional-cancel" {let mut response=response.unwrap();assert!(response.chunk().await.unwrap().is_some());drop(response);}else if let Ok(response)=response {let _=response.text().await;}
         tokio::time::timeout(std::time::Duration::from_secs(3),async{loop{if store.read().cpa_subscriptions[&id].permit.as_ref().unwrap().stopped{break;}tokio::time::sleep(std::time::Duration::from_millis(10)).await;}}).await.unwrap();
         assert!(store.cpa.enable_hand_run(&store,&id,proof).is_err());
         let response=crate::dispatch::local_gateway_request(gateway.port,crate::protocol::Protocol::Chat,&body).unwrap().send().await.unwrap();assert!(!response.status().is_success());
