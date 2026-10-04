@@ -288,7 +288,7 @@ pub fn reserve(
     protocol: Protocol,
     body: &serde_json::Value,
 ) -> Result<crate::cpa_sources::response::ResponseLease> {
-    let plan = store.update(|config| -> Result<String> {
+    let plan = store.update(|config| -> Result<(String, bool)> {
         admit(config, provider, model, protocol)?;
         let source = config.api_sources.get_mut(&provider.id).unwrap();
         let permit = source.hand_run.as_mut().unwrap();
@@ -309,13 +309,17 @@ pub fn reserve(
             ledger.tool_rounds_used += 1;
         }
         permit.used = ledger.used;
-        Ok(permit.proof.plan_id.clone())
+        Ok((
+            permit.proof.plan_id.clone(),
+            permit.proof.policy.function_tools,
+        ))
     })?;
     match plan {
-        Ok(plan) => Ok(crate::cpa_sources::response::ResponseLease::coding(
+        Ok((plan, function_tools)) => Ok(crate::cpa_sources::response::ResponseLease::coding(
             store.clone(),
             provider.id.clone(),
             plan,
+            function_tools,
         )),
         Err(e) => {
             if let Some(p) = store

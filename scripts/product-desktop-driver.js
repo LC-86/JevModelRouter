@@ -37,8 +37,8 @@
   }
   step='Coding Plan entry';
   if(!test.reopened){
-   await invoke('save_provider',{provider:{id:'fictional-plan',name:'Fictional Coding Plan',kind:'openai_compatible',base_url:'http://127.0.0.1:1/coding/v4',api_type:'chat',enabled:true,has_api_key:false},apiKey:'fictional-plan-key',creating:true,source:{kind:'coding_plan',account_label:'fictional-account',plan_label:'fictional-plan'}});
-   await invoke('save_model',{model:{...initial.models[0],id:'fictional-plan-model',model_id:'fictional-plan-model',name:'Fictional Plan Model',provider_id:'fictional-plan',api_type:'chat',enabled:true,selected:true}});
+   await invoke('save_provider',{provider:{id:'fictional-plan',name:'Fictional Coding Plan',kind:'openai_compatible',base_url:'http://127.0.0.1:1/coding/v4',api_type:'chat_completions',enabled:true,has_api_key:false},apiKey:'fictional-plan-key',creating:true,source:{kind:'coding_plan',account_label:'fictional-account',plan_label:'fictional-plan'}});
+   await invoke('save_model',{model:{...initial.models[0],id:'fictional-plan-model',model_id:'fictional-plan-model',name:'Fictional Plan Model',provider_id:'fictional-plan',api_type:'chat_completions',enabled:true,selected:true}});
   }
   document.querySelector('[data-nav-page="providers"]').click();
   const pane=await wait(()=>document.querySelector('[data-coding-plan-id="fictional-plan"]'));

@@ -199,6 +199,15 @@ impl Manager {
         outcome
     }
 
+    pub fn fail_plan(&self,store:&ConfigStore,id:&str,plan:&str)->Result<()> {
+        store.update(|config| {
+            if let Some(c)=config.cpa_subscriptions.get_mut(id) {
+                if let Some(l)=c.hand_run_ledger.get_mut(plan){l.stopped=true;}
+                if let Some(p)=c.permit.as_mut().filter(|p|p.proof.plan_id==plan){p.enabled=false;p.stopped=true;}
+            }
+        })?;
+        Ok(())
+    }
     pub fn enable_hand_run(&self, store:&ConfigStore,id:&str,proof:HandRunProof)->Result<()> {
         ensure!(!self.cleaning.lock().unwrap().contains(id),"Finish this owned request before enabling another plan");
         self.ensure_owned_running(id)?;

@@ -166,6 +166,8 @@ impl AccountFixture {
                 use axum::response::IntoResponse;
                 let tag=body["messages"][0]["content"].as_str().unwrap_or("");
                 if tag=="fictional-error" {return (axum::http::StatusCode::TOO_MANY_REQUESTS,Json(json!({"error":{"message":"fictional exhausted"}}))).into_response();}
+                if tag=="fictional-json-unknown" {return Json(json!({"choices":[{"message":{"role":"assistant","content":"fictional"},"finish_reason":null}]})).into_response();}
+                if tag=="fictional-json-empty" {return Json(json!({"choices":[{}]})).into_response();}
                 if tag=="fictional-tool" {
                     let result=body["messages"].as_array().unwrap().iter().find(|m|m["role"]=="tool");
                     if let Some(result)=result {
@@ -1057,13 +1059,13 @@ fn grok_cpa_connections_are_explicit_and_unknown_plan_cannot_enable_generation()
 
 #[tokio::test]
 async fn cpa_stream_failure_or_cancel_stops_the_plan_without_fallback_or_budget_reset() {
-    for tag in ["fictional-error","fictional-missing-terminal","fictional-cancel","fictional-empty-done","fictional-stream-error"] {
+    for tag in ["fictional-error","fictional-missing-terminal","fictional-cancel","fictional-empty-done","fictional-stream-error","fictional-json-unknown","fictional-json-empty"] {
         let fixture=AccountFixture::start().await;let root=tempfile::tempdir().unwrap();
         let mut store=ConfigStore::load(root.path().join("stop.db")).unwrap();store.cpa=Arc::new(Manager::owned_fixture(fixture.base.clone()).unwrap());let store=Arc::new(store);
         let id=store.cpa.create(&store,"codex","Stop on failure").unwrap();store.cpa.begin(&store,&id).await.unwrap();store.cpa.poll(&store,&id).await.unwrap();store.cpa.refresh(&store,&id).await.unwrap();
         let model=store.read().models.last().unwrap().clone();store.cpa.select(&store,&id,&model.id,true).unwrap();let proof=reviewed_fixture_proof(&store,&id,&model);store.cpa.enable_hand_run(&store,&id,proof.clone()).unwrap();
         store.update(|c|{c.port=0;c.gateway.proxy_mode="direct".into();}).unwrap();let gateway=crate::proxy::start(store.clone()).await.unwrap();
-        let body=json!({"model":format!("autojev/model/{}",model.id),"messages":[{"role":"user","content":tag}],"max_tokens":32,"stream":tag!="fictional-error"});
+        let body=json!({"model":format!("autojev/model/{}",model.id),"messages":[{"role":"user","content":tag}],"max_tokens":32,"stream":!matches!(tag,"fictional-error"|"fictional-json-unknown"|"fictional-json-empty")});
         let mut response=crate::dispatch::local_gateway_request(gateway.port,crate::protocol::Protocol::Chat,&body).unwrap().send().await.unwrap();
         if tag=="fictional-cancel" {assert!(response.chunk().await.unwrap().is_some());drop(response);}else{let _=response.text().await;}
         tokio::time::timeout(std::time::Duration::from_secs(3),async{loop{if store.read().cpa_subscriptions[&id].permit.as_ref().unwrap().stopped{break;}tokio::time::sleep(std::time::Duration::from_millis(10)).await;}}).await.unwrap();

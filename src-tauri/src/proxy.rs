@@ -398,21 +398,24 @@ async fn forward_attempt(context: ProxyContext, headers: HeaderMap, body: Value,
         Err(error) => return error_response(StatusCode::UNPROCESSABLE_ENTITY, &error.to_string()),
     };
     // 固定目标（原 ID 直调）先给出订阅准入的精确原因，而不是被候选过滤成笼统错误。
+    let mut admission_guard=input.requested_model.as_deref().and_then(|id|id.strip_prefix("autojev/model/")).and_then(|id|crate::cpa_sources::response::AdmissionGuard::fixed(&context.store,id));
     if let Some(pinned) = input.requested_model.as_deref().and_then(|id| id.strip_prefix("autojev/model/")).map(str::to_owned) {
         let stored = context.store.read();
         if let Some(model) = stored.models.iter().find(|model| model.id == pinned) {
             if let Some(provider) = stored.providers.iter().find(|provider| provider.id == model.provider_id) {
                 if let Ok(protocol) = Protocol::parse(endpoint) {
                     if let Err(denial) = crate::subscription::admit_model(&stored, model, provider, protocol) {
+                        let _=crate::coding_hand_run::fail_active(&context.store,&provider.id);
                         if stored.cpa_subscriptions.contains_key(&provider.id){let _=context.store.cpa.fail_hand_run(&context.store,&provider.id);}
                         return subscription_denial(denial, protocol);
                     }
                     if stored.api_sources.contains_key(&provider.id) {
                         let upstream = match Protocol::upstream(model, provider) {
                             Ok(upstream) => upstream,
-                            Err(error) => return protocol_error_response(StatusCode::UNPROCESSABLE_ENTITY, protocol, &error.to_string()),
+                            Err(error) => {let _=crate::coding_hand_run::fail_active(&context.store,&provider.id);return protocol_error_response(StatusCode::UNPROCESSABLE_ENTITY, protocol, &error.to_string());},
                         };
                         if let Err(error) = crate::api_sources::admit_generation_target(&context.store, &stored, provider, model, upstream) {
+                            let _=crate::coding_hand_run::fail_active(&context.store,&provider.id);
                             return protocol_error_response(StatusCode::PRECONDITION_REQUIRED, protocol, &error.to_string());
                         }
                     }
@@ -526,6 +529,7 @@ async fn forward_attempt(context: ProxyContext, headers: HeaderMap, body: Value,
             && body.get("tools").and_then(Value::as_array).is_some_and(|tools| !tools.is_empty())
             && !resolved.model.supports_tools
         {
+            if config.cpa_subscriptions.contains_key(&resolved.provider.id){let _=context.store.cpa.fail_hand_run(&context.store,&resolved.provider.id);}
             return protocol_error_response(StatusCode::FORBIDDEN, source, "Codex client function tools have not been verified for this model; tool calls remain unavailable.");
         }
     }
@@ -552,6 +556,7 @@ async fn forward_attempt(context: ProxyContext, headers: HeaderMap, body: Value,
     let mut coding_lease=if config.api_sources.get(&resolved.provider.id).is_some_and(|s|s.kind==crate::api_sources::SourceKind::CodingPlan) {
         match crate::coding_hand_run::reserve(&context.store,&resolved.provider,&resolved.model,source,&body){Ok(lease)=>Some(lease),Err(error)=>return protocol_error_response(StatusCode::PRECONDITION_REQUIRED,source,&error.to_string())}
     }else{None};
+    if cpa_target.is_some() || coding_lease.is_some() {if let Some(guard)=admission_guard.as_mut(){guard.disarm();}}
     *lease = context.health.acquire(&model_health_id(&config, &resolved.model));
     if lease.is_none() {return error_response(StatusCode::SERVICE_UNAVAILABLE, "Candidate is being probed by another request. Retry shortly.");}
     tried.insert(resolved.model.id.clone());

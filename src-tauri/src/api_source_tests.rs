@@ -1477,3 +1477,17 @@ async fn coding_plan_public_stream_cancel_and_missing_terminal_lock_only_the_ori
         assert_eq!(received.lock().unwrap().len(),1);gateway.stop().await;upstream.abort();
     }
 }
+
+#[tokio::test]
+async fn coding_plan_first_fixed_admission_failure_cannot_resume_the_plan() {
+    let (_root,store,received,upstream)=source_fixture().await;
+    store.update(|c|c.api_sources.get_mut("coding").unwrap().kind=crate::api_sources::SourceKind::CodingPlan).unwrap();
+    let proof=coding_proof(&store);crate::coding_hand_run::enable(&store,"coding",proof.clone()).unwrap();
+    store.update(|c|c.models.iter_mut().find(|m|m.id=="uuid-coding").unwrap().enabled=false).unwrap();
+    let gateway=crate::proxy::start(store.clone()).await.unwrap();
+    let req=json!({"model":"autojev/model/uuid-coding","messages":[{"role":"user","content":"fictional plan"}],"max_tokens":16});
+    let reply=crate::dispatch::local_gateway_request(gateway.port,crate::protocol::Protocol::Chat,&req).unwrap().send().await.unwrap();assert!(!reply.status().is_success());
+    store.update(|c|c.models.iter_mut().find(|m|m.id=="uuid-coding").unwrap().enabled=true).unwrap();
+    assert!(crate::coding_hand_run::enable(&store,"coding",proof).is_err(),"first fixed-target refusal must stop its finite plan");
+    assert!(received.lock().unwrap().is_empty());gateway.stop().await;upstream.abort();
+}
