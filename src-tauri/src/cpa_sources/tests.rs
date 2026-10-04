@@ -189,7 +189,7 @@ impl AccountFixture {
                     }
                     return ([("content-type","text/event-stream")],format!("{chunk}{}",if tag=="fictional-missing-terminal"{""}else{terminal})).into_response();
                 }
-                Json(json!({"id":"fictional-cpa","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"owned CPA fictional reply"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}})).into_response()
+                Json(json!({"id":"fictional-cpa","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"owned CPA fictional reply","tool_calls":null,"function_call":null},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}})).into_response()
             }))
             .route("/v8/management/oauth/auth-url",get(move || {let delay=auth_delay.clone();let entered=auth_entered.clone();let release=auth_release.clone();async move {if delay.load(std::sync::atomic::Ordering::SeqCst) {entered.notify_one();release.notified().await;} Json(json!({"state":"fictional-session","url":auth_url}))}}))
             .route("/v8/management/oauth/status",get(move || {let active=signed_in.clone();let expired=expired.clone();let waiting=waiting.clone();let delay=status_delay.clone();let entered=status_entered.clone();let release=status_release.clone();async move {if delay.load(std::sync::atomic::Ordering::SeqCst) {entered.notify_one();release.notified().await;} if waiting.load(std::sync::atomic::Ordering::SeqCst) {return Json(json!({"status":"wait"}));} if expired.load(std::sync::atomic::Ordering::SeqCst) {return Json(json!({"status":"error","error":"unknown or expired state"}));} *active.lock().unwrap()=Some("account-a");Json(json!({"status":"ok"}))}}))
@@ -1009,6 +1009,7 @@ async fn gateway_uses_the_owned_cpa_http_path_after_complete_finite_admission() 
     assert_eq!(response.status(),200);
     assert_eq!(response.json::<serde_json::Value>().await.unwrap()["choices"][0]["message"]["content"],"owned CPA fictional reply");
     assert_eq!(fixture.requests.lock().unwrap().iter().filter(|(_,path)|path=="/v1/chat/completions").count(),1);
+    assert!(!store.read().cpa_subscriptions[&id].permit.as_ref().unwrap().stopped,"legal nullable tool fields must preserve the remaining finite plan");
     gateway.stop().await;
 }
 

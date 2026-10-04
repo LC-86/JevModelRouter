@@ -140,10 +140,7 @@ where
                                     lease.errored |= v.get("error").is_some();
                                     lease.errored |= !lease.function_tools
                                         && v["choices"].as_array().is_some_and(|c| {
-                                            c.iter().any(|c| {
-                                                c["delta"].get("tool_calls").is_some()
-                                                    || c["delta"].get("function_call").is_some()
-                                            })
+                                            c.iter().any(|c| has_tool_call(&c["delta"]))
                                         });
                                     lease.terminal |= v["choices"].as_array().is_some_and(|c| {
                                         c.iter().any(|c| {
@@ -191,11 +188,7 @@ fn choice_complete(c: &serde_json::Value, tools: bool) -> bool {
         return false;
     }
     match c["finish_reason"].as_str() {
-        Some("stop") => {
-            m["content"].is_string()
-                && m.get("tool_calls").is_none()
-                && m.get("function_call").is_none()
-        }
+        Some("stop") => m["content"].is_string() && !has_tool_call(m),
         Some("tool_calls") => {
             tools
                 && m["tool_calls"].as_array().is_some_and(|t| {
@@ -212,4 +205,10 @@ fn choice_complete(c: &serde_json::Value, tools: bool) -> bool {
         }
         _ => false,
     }
+}
+
+fn has_tool_call(v: &serde_json::Value) -> bool {
+    v.get("tool_calls")
+        .is_some_and(|v| !v.is_null() && !v.as_array().is_some_and(|a| a.is_empty()))
+        || v.get("function_call").is_some_and(|v| !v.is_null())
 }
