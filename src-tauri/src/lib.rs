@@ -24,6 +24,8 @@ mod api_source_tests;
 mod subscription;
 mod subscription_catalog;
 mod cpa_sources;
+mod hand_run_policy;
+mod coding_hand_run;
 mod codex_helper;
 mod runtime;
 #[cfg(feature = "isolation-check")]
@@ -69,6 +71,7 @@ struct ProxyStatus {
 
 #[derive(Serialize)]
 struct DashboardSnapshot {
+    coding_hand_runs: Vec<coding_hand_run::View>,
     cpa_subscriptions: Vec<cpa_sources::View>,
     recovery_notice: Option<String>,
     gateway: resilience::Settings,
@@ -90,6 +93,7 @@ struct DashboardSnapshot {
 }
 
 async fn snapshot(state: &AppState) -> DashboardSnapshot {
+    let _=state.store.cpa.reconcile_owned(&state.store);
     let (mut config, decision_key) = state.store.read_with_decision_key();
     for provider in &mut config.providers {
         provider.has_api_key = (provider.kind == ProviderKind::Ollama
@@ -127,6 +131,7 @@ async fn snapshot(state: &AppState) -> DashboardSnapshot {
     };
     let subscription_auth = subscription::auth::views(&config, &*state.store.auth);
     DashboardSnapshot {
+        coding_hand_runs: coding_hand_run::views(&state.store,&config),
         cpa_subscriptions: state.store.cpa.views(&config),
         recovery_notice: lifecycle::notice(config.port),
         gateway: config.gateway.clone(),
@@ -1463,14 +1468,17 @@ fn request_safe_exit(app:tauri::AppHandle){
         }
     });
 }
+#[tauri::command]
+fn quit_app(app: tauri::AppHandle) { request_safe_exit(app); }
 pub fn run() {
     if let Err(error) = runtime::init() { eprintln!("AutoJev isolation: {error}"); std::process::exit(2); }
     if lifecycle::watchdog_entry(){return;}
     let mut context = tauri::generate_context!();
-    if runtime::isolated() {
-        context.config_mut().identifier = "ai.autojev.client.isolated".into();
+    if runtime::dedicated() {
+        context.config_mut().identifier = if runtime::isolated() { "ai.autojev.client.isolated" } else { "ai.autojev.client.profile" }.into();
         let args: Vec<_> = std::env::args().collect();
         if let Some(index) = args.iter().position(|s| s == "--autojev-ui-url") {
+            assert!(cfg!(debug_assertions), "External UI is available only in development");
             let url = args.get(index + 1).and_then(|s| reqwest::Url::parse(s).ok())
                 .filter(|url| dispatch::ensure_loopback(url).is_ok()).expect("Isolation UI URL must be literal loopback HTTP");
             context.config_mut().build.dev_url = Some(url);
@@ -1481,7 +1489,7 @@ pub fn run() {
         }
     }
     let builder = tauri::Builder::default();
-    let builder = if runtime::isolated() { builder } else { builder.plugin(tauri_plugin_updater::Builder::new().build()) };
+    let builder = if runtime::dedicated() { builder } else { builder.plugin(tauri_plugin_updater::Builder::new().build()) };
     builder
         .on_page_load(|_window, _payload| {
             #[cfg(feature = "isolation-check")]
@@ -1525,10 +1533,10 @@ pub fn run() {
             // 挂起登录只存在于内存：上次进程退出时留下的 authorization_pending 无法继续，
             // 启动时归位成未连接，否则界面只允许取消、而取消又无会话可 settle。
             subscription::reconcile_orphaned_pending(&store).map_err(|error| anyhow!(error))?;
-            let port = if runtime::isolated() { 0 } else if app.config().identifier.ends_with(".dev") { config::DEV_PORT } else { config::DEFAULT_PORT };
+            let port = if runtime::dedicated() { 0 } else if app.config().identifier.ends_with(".dev") { config::DEV_PORT } else { config::DEFAULT_PORT };
             app.manage(lifecycle::lock(port)?);
-            if !runtime::isolated() { lifecycle::spawn_watchdog(port)?; }
-            let port = if runtime::isolated() { 0 } else { port };
+            if !runtime::dedicated() { lifecycle::spawn_watchdog(port)?; }
+            let port = if runtime::dedicated() { 0 } else { port };
             if store.read().port != port { store.update(|config| config.port = port)?; }
             let state = AppState {
                 #[cfg(feature = "isolation-check")]
@@ -1538,14 +1546,14 @@ pub fn run() {
                 proxy: Arc::new(Mutex::new(None)),
                 sessions: Arc::new(Mutex::new(subscription::SessionState::default())),
             };
-            if runtime::isolated() {
+            if runtime::dedicated() {
                 store.update(|c| c.performance_settings.enabled = false)?;
             } else {
                 tauri::async_runtime::spawn(performance::schedule(state.store.clone(),state.performance.clone()));
             }
             let proxy_state = state.clone();
             let startup_app = app.handle().clone();
-            if !runtime::isolated() { tauri::async_runtime::spawn(async move {
+            if !runtime::dedicated() { tauri::async_runtime::spawn(async move {
                 let mut service=proxy_state.proxy.lock().await;
                 if service.is_some(){return;}
                 match proxy::start(store).await {
@@ -1575,8 +1583,8 @@ pub fn run() {
         })
         .invoke_handler(|invoke: tauri::ipc::Invoke<tauri::Wry>| {
             #[cfg(feature = "isolation-check")]
-            if matches!(invoke.message.command(), "start_cpa_validation" | "reload_cpa_validation" | "stop_cpa_validation") {
-                let handler: fn(tauri::ipc::Invoke<tauri::Wry>) -> bool = tauri::generate_handler![cpa_validation::start_cpa_validation, cpa_validation::reload_cpa_validation, cpa_validation::stop_cpa_validation];
+            if matches!(invoke.message.command(), "start_cpa_validation" | "reload_cpa_validation" | "stop_cpa_validation" | "get_cpa_development_service" | "start_cpa_development_service") {
+                let handler: fn(tauri::ipc::Invoke<tauri::Wry>) -> bool = tauri::generate_handler![cpa_validation::start_cpa_validation, cpa_validation::reload_cpa_validation, cpa_validation::stop_cpa_validation, cpa_validation::get_cpa_development_service, cpa_validation::start_cpa_development_service];
                 return handler(invoke);
             }
             #[cfg(feature = "isolation-check")]
@@ -1588,9 +1596,15 @@ pub fn run() {
             }
             let handler: fn(tauri::ipc::Invoke<tauri::Wry>) -> bool = tauri::generate_handler![
             get_snapshot,
+            quit_app,
             cpa_sources::create_cpa_subscription,
             cpa_sources::cpa_subscription_action,
             cpa_sources::select_cpa_model,
+            cpa_sources::configure_cpa_service,
+            cpa_sources::stop_cpa_service,
+            cpa_sources::set_cpa_hand_run,
+            coding_hand_run::set_coding_plan_hand_run,
+            cpa_sources::open_cpa_authorization,
             refresh_subscription,
             grok_readonly_status,
             set_codex_real_generation_enabled,

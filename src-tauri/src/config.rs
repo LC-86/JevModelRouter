@@ -319,11 +319,17 @@ pub struct ConfigStore {
 }
 
 impl ConfigStore {
+    pub(crate) fn hand_run_root(&self) -> PathBuf {
+        self.path.parent().expect("Config database has a parent").join("hand-runs")
+    }
+    pub(crate) fn cpa_profile_root(&self) -> PathBuf {
+        self.path.parent().expect("Config database has a parent").join("cpa-services")
+    }
     pub fn load(path: PathBuf) -> Result<Self> {
         Self::load_with_dispatcher(
             path,
             std::sync::Arc::new(crate::dispatch::ApiDispatcher {
-                loopback_only: crate::runtime::isolated(),
+                loopback_only: crate::runtime::loopback_only(),
             }),
         )
     }

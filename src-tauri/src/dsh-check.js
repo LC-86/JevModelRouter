@@ -2,7 +2,7 @@
 (async () => {
   if (window.__DSH_CHECK_RUNNING__) return;
   window.__DSH_CHECK_RUNNING__ = true;
-  const { base, binary, run_id, reload } = window.__DSH_CHECK__;
+  const { base, binary, run_id, reload, service_check } = window.__DSH_CHECK__;
   const report = { ok: false, run_id, layer: 'native-mac-ui-real-cpa-dsh-shaped-replay', real_dsh_runtime: false, checks: [] };
   const invoke = window.__TAURI_INTERNALS__.invoke;
   const check = (ok, message) => { if (!ok) throw new Error(message); };
@@ -18,12 +18,42 @@
   const channel = (() => { const id = window.__TAURI_INTERNALS__.transformCallback(() => {}, false); const serialize = () => `__CHANNEL__:${id}`; return { __TAURI_TO_IPC_KEY__: serialize, toJSON: serialize }; })();
   try {
     const beforeStartup = (await records()).length;
+    if (service_check) {
+      const status = await invoke('get_cpa_development_service');
+      check(status.state === 'stopped' && status.real_generation_enabled === false, 'Development service defaults stopped with real generation disabled');
+    }
     const accounts = ['a1', 'a2', 'b1', 'paid'];
     const initial = await invoke('get_snapshot');
     const savedProvider = initial.providers.find(p => p.id === 'r5-a1');
     const profile = { upstream: base, port: reload ? Number(new URL(savedProvider.base_url).port) : 0, targets: accounts.map(account => ({ prefix: `jev-${account}`, source: account.startsWith('a') ? 'source-a' : `source-${account}`, account, plan: `fictional-plan-${account}`, model: 'same-model', aliases: ['same-model'], keys: [`fictional-${account}`], disabled: false })) };
-    const start = async () => { report.service = await invoke('start_cpa_validation', { binary, profile }); profile.port = Number(new URL(report.service.base_url).port); report.pids = [...(report.pids || []), report.service.pid]; };
-    await start();
+    const remember = service => { report.service = service; profile.port = Number(new URL(service.base_url).port); report.pids = [...(report.pids || []), service.pid]; };
+    const start = async () => remember(await invoke('start_cpa_validation', { binary, profile }));
+    const uiStart = async () => {
+      await click('[data-testid="cpa-service-start"]');
+      const status = await wait(async () => { const s = await invoke('get_cpa_development_service'); return s.state === 'ready' && s; }, 'owned service ready');
+      remember(status.service);
+    };
+    if (service_check) {
+      (await wait(() => document.querySelectorAll('nav .nav-item')[1], 'providers page')).click();
+      await wait(() => document.querySelector('[data-testid="cpa-development-service"]'), 'development service controls');
+      for (const [path, reason] of [[`${binary}-missing`, 'executable is missing'], ['/bin/echo', 'version/checksum']]) {
+        await set('[data-testid="cpa-service-binary"]', path); await click('[data-testid="cpa-service-start"]');
+        await wait(() => document.querySelector('[data-testid="cpa-service-error"]')?.textContent.includes(reason), reason);
+      }
+      await set('[data-testid="cpa-service-binary"]', binary);
+      if (!reload) {
+        await set('[data-testid="cpa-service-port"]', new URL(base).port); await click('[data-testid="cpa-service-start"]');
+        await wait(() => document.querySelector('[data-testid="cpa-service-error"]')?.textContent.includes('port is already occupied'), 'occupied port recovery message');
+      }
+      await set('[data-testid="cpa-service-port"]', String(profile.port));
+      await uiStart();
+      await control('/__own_cpa', { pid: report.service.pid });
+      await control('/__exit_cpa', { pid: report.service.pid });
+      await wait(() => document.querySelector('[data-testid="cpa-service-state"]')?.textContent.includes('服务已退出'), 'owned exit appears in native UI');
+      await uiStart();
+      report.checks.push('native controls reject missing/incompatible artifact and occupied port; observe owned exit and explicitly recover; real generation remains disabled');
+      report.service_screenshot = await control('/__capture', { label: 'service' });
+    } else await start();
     await progress('R5 pinned CPA ready; configure sources through native forms');
     (await wait(() => document.querySelectorAll('nav .nav-item')[1], 'providers page')).click();
     if (!reload) for (const account of accounts) {
@@ -55,6 +85,20 @@
     const restart = async () => { await invoke('stop_cpa_validation'); await start(); await invoke('reset_gateway_health', { modelId: null }); };
     const logFor = id => wait(async () => (await invoke('get_request_logs', { since: '2026-01-01T00:00:00Z' })).find(l => l.id === id), `terminal diagnostic ${id}`);
     let offset = (await records()).length;
+    if (service_check) {
+      await control('/__own_cpa', { pid: report.service.pid }); await control('/__exit_cpa', { pid: report.service.pid });
+      await wait(async () => (await invoke('get_cpa_development_service')).state === 'exited', 'owned child exit status');
+      const failed = await call(request('a1', tag('service-exit')));
+      check(failed.status >= 400, 'Exited service must reject a fixed target'); await only(offset, 'a1', 0);
+      await set('[data-testid="cpa-service-port"]', '0'); await click('[data-testid="cpa-service-start"]');
+      const recovered = await invoke('get_cpa_development_service');
+      check(recovered.state === 'exited', 'Changing the recovery port must not strand saved fixed targets');
+      await wait(() => document.querySelector('[data-testid="cpa-service-error"]')?.textContent.includes('saved port'), 'saved port recovery guidance');
+      await set('[data-testid="cpa-service-port"]', String(profile.port));
+      await uiStart();
+      check(report.service.base_url === snapshot.providers.find(p => p.id === 'r5-a1').base_url.replace(/\/v1$/, ''), 'Recovery preserves the saved endpoint and target bindings');
+      report.checks.push('service-exit fixed request fails with zero upstream dispatch; recovery rejects port changes and preserves source/model binding');
+    }
     const text = await call(request('a1', tag('text'))); check(text.status === 200 && text.body.includes('a1:'), 'Plain fixed text'); await only(offset, 'a1', 1);
     offset = (await records()).length;
     const history = [{ role: 'user', content: tag('multi') }, { role: 'assistant', content: 'fictional previous answer' }, { role: 'user', content: 'fictional next question' }];

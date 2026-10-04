@@ -4,6 +4,7 @@
   "source_url": "https://codeload.github.com/router-for-me/CLIProxyAPI/tar.gz/e2bff0107bb307337aaa19018ccddd55f64253d5",
   "source_sha256": "ac4e6e84142973138367efa2e734f08ed2a1b06c75c979e2a8837a09ffb09661",
   "license": "MIT",
+  "license_sha256": "879792e89cf1bdd6a8d446033ec87e30496f97dcafc4656dc53f641509b346a6",
   "license_url": "https://github.com/router-for-me/CLIProxyAPI/blob/e2bff0107bb307337aaa19018ccddd55f64253d5/LICENSE",
   "module": "github.com/router-for-me/CLIProxyAPI/v8",
   "go": "go1.26.0",

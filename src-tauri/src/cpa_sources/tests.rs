@@ -6,6 +6,76 @@ use axum::{
 use serde_json::json;
 use std::sync::Arc;
 
+#[tokio::test]
+async fn production_service_rejects_a_missing_artifact_without_enabling_authorization() {
+    let root = tempfile::tempdir().unwrap();
+    let store = ConfigStore::load(root.path().join("owned-service.db")).unwrap();
+    let id = store.cpa.create(&store, "codex", "Owned service").unwrap();
+    let error = store.cpa.provision_owned(&store, &id, root.path().join("missing-cpa").to_string_lossy().into_owned(), 0).await.err().unwrap();
+    assert!(error.to_string().contains("artifact"));
+    let view = store.cpa.views(&store.read()).remove(0);
+    assert!(!view.service_available && view.authorization_url.is_none());
+}
+
+#[tokio::test]
+async fn production_management_client_connects_a_dedicated_profile_without_granting_generation() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let router = Router::new()
+        .route("/v8/management/credentials", get(|| async { Json(json!({"files":[]})) }))
+        .route("/v8/management/oauth/auth-url", get(|| async { Json(json!({"state":"fictional-oauth-session","url":"https://auth.openai.com/oauth/authorize?state=fictional-oauth-session"})) }))
+        .layer(axum::middleware::from_fn(|req: axum::extract::Request, next: axum::middleware::Next| async move {
+            assert_eq!(req.headers()["authorization"], "Bearer fictional-owned-management");
+            let mut response = next.run(req).await;
+            response.headers_mut().insert("x-cpa-commit", "e2bff0107bb307337aaa19018ccddd55f64253d5".parse().unwrap());
+            response
+        }));
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let root = tempfile::tempdir().unwrap();
+    let store = ConfigStore::load(root.path().join("production-client.db")).unwrap();
+    let manager = Manager::default();
+    let id = manager.create(&store, "codex", "Dedicated production connection").unwrap();
+    manager.configure_owned_client(&id, base, "fictional-owned-management".into()).unwrap();
+    manager.begin(&store, &id).await.unwrap();
+    let view = manager.views(&store.read()).remove(0);
+    assert!(view.service_available);
+    assert_eq!(view.stage, Stage::Waiting);
+    assert_eq!(view.authorization_url.as_deref(), Some("https://auth.openai.com/oauth/authorize?state=fictional-oauth-session"));
+    let config = store.read();
+    let provider = config.providers.iter().find(|p| p.id == id).unwrap();
+    assert_eq!(denial(&config, provider, None).unwrap().code, "cpa_not_connected");
+    server.abort();
+}
+
+#[tokio::test]
+async fn finite_cpa_hand_run_requires_all_evidence_and_does_not_reset_its_budget() {
+    let fixture = AccountFixture::start().await;
+    let root = tempfile::tempdir().unwrap();
+    let store = ConfigStore::load(root.path().join("finite-cpa.db")).unwrap();
+    let manager = Manager::owned_fixture(fixture.base.clone()).unwrap();
+    let id = manager.create(&store, "codex", "Finite source").unwrap();
+    manager.begin(&store, &id).await.unwrap();
+    manager.poll(&store, &id).await.unwrap();
+    manager.refresh(&store, &id).await.unwrap();
+    let model = store.read().models.last().unwrap().clone();
+    manager.select(&store, &id, &model.id, true).unwrap();
+    let proof = reviewed_fixture_proof(&store, &id, &model);
+    let mut unknown = proof.clone(); unknown.policy.evidence[5].state=EvidenceState::Unknown;
+    assert!(manager.enable_hand_run(&store, &id, unknown).is_err());
+    let config=store.read();let provider=config.providers.iter().find(|p|p.id==id).unwrap();
+    assert_eq!(denial(&config,provider,Some(&model)).unwrap().code,"cpa_qualification_unknown");
+    manager.enable_hand_run(&store, &id, proof.clone()).unwrap();
+    let body=json!({"messages":[{"role":"user","content":"fictional"}],"max_tokens":32});
+    manager.reserve_hand_run(&store, &id, &model, crate::protocol::Protocol::Chat, &body).unwrap();
+    manager.disable_hand_run(&store, &id).unwrap();
+    manager.enable_hand_run(&store, &id, proof).unwrap();
+    manager.reserve_hand_run(&store, &id, &model, crate::protocol::Protocol::Chat, &body).unwrap();
+    assert!(manager.reserve_hand_run(&store, &id, &model, crate::protocol::Protocol::Chat, &body).is_err());
+    let reloaded=ConfigStore::load(root.path().join("finite-cpa.db")).unwrap();
+    let config=reloaded.read();let provider=config.providers.iter().find(|p|p.id==id).unwrap();
+    assert!(denial(&config,provider,Some(&model)).is_some(),"reopening never restores a volatile grant");
+}
+
 #[test]
 fn cpa_view_projects_saved_connection_name_without_changing_fixed_identity() {
     let temp = tempfile::tempdir().unwrap();
@@ -51,7 +121,8 @@ impl AccountFixture {
         tokio::time::timeout(std::time::Duration::from_secs(2), self.entered.notified()).await.unwrap();
         operation
     }
-    async fn start() -> Self {
+    async fn start() -> Self {Self::with_contract("https://auth.example.invalid/authorize","same-model").await}
+    async fn with_contract(auth_url:&'static str,model_id:&'static str) -> Self {
         let account = Arc::new(std::sync::Mutex::new(None));
         let active = account.clone();
         let signed_in = account.clone();
@@ -91,14 +162,43 @@ impl AccountFixture {
         let cancel_release = Arc::new(tokio::sync::Notify::new());
         let cancel_unblock = cancel_release.clone();
         let router=Router::new()
-            .route("/v8/management/oauth/auth-url",get(move || {let delay=auth_delay.clone();let entered=auth_entered.clone();let release=auth_release.clone();async move {if delay.load(std::sync::atomic::Ordering::SeqCst) {entered.notify_one();release.notified().await;} Json(json!({"state":"fictional-session","url":"https://auth.example.invalid/authorize"}))}}))
+            .route("/v1/chat/completions",post(|Json(body):Json<serde_json::Value>|async move {
+                use axum::response::IntoResponse;
+                let tag=body["messages"][0]["content"].as_str().unwrap_or("");
+                if tag=="fictional-error" {return (axum::http::StatusCode::TOO_MANY_REQUESTS,Json(json!({"error":{"message":"fictional exhausted"}}))).into_response();}
+                if tag=="fictional-json-unknown" {return Json(json!({"choices":[{"message":{"role":"assistant","content":"fictional"},"finish_reason":null}]})).into_response();}
+                if tag=="fictional-json-empty" {return Json(json!({"choices":[{}]})).into_response();}
+                if tag=="fictional-tool" {
+                    let result=body["messages"].as_array().unwrap().iter().find(|m|m["role"]=="tool");
+                    if let Some(result)=result {
+                        assert_eq!(result["tool_call_id"],"call_cpa_echo");assert_eq!(result["content"],"fixture-value");
+                        assert_eq!(body["messages"][1]["tool_calls"][0]["id"],"call_cpa_echo");
+                    } else {
+                        return Json(json!({"choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_cpa_echo","type":"function","function":{"name":"client_echo","arguments":"{}"}}]},"finish_reason":"tool_calls"}]})).into_response();
+                    }
+                }
+                if body["stream"]==true {
+                    if tag=="fictional-empty-done" {return ([("content-type","text/event-stream")],"data: [DONE]\n\n").into_response();}
+                    if tag=="fictional-stream-error" {return ([("content-type","text/event-stream")],"data: {\"error\":{\"message\":\"fixture error\"}}\n\ndata: [DONE]\n\n").into_response();}
+                    let chunk="data: {\"id\":\"fictional-stream\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"fictional\"},\"finish_reason\":null}]}\n\n";
+                    let terminal="data: {\"id\":\"fictional-stream\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+                    if tag=="fictional-cancel" {
+                        let initial=futures_util::stream::iter(vec![Ok::<_,std::io::Error>(axum::body::Bytes::from(format!("{chunk}{chunk}")))]);
+                        let held=futures_util::StreamExt::chain(initial,futures_util::stream::pending());
+                        return ([("content-type","text/event-stream")],axum::body::Body::from_stream(held)).into_response();
+                    }
+                    return ([("content-type","text/event-stream")],format!("{chunk}{}",if tag=="fictional-missing-terminal"{""}else{terminal})).into_response();
+                }
+                Json(json!({"id":"fictional-cpa","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"owned CPA fictional reply","tool_calls":null,"function_call":null},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}})).into_response()
+            }))
+            .route("/v8/management/oauth/auth-url",get(move || {let delay=auth_delay.clone();let entered=auth_entered.clone();let release=auth_release.clone();async move {if delay.load(std::sync::atomic::Ordering::SeqCst) {entered.notify_one();release.notified().await;} Json(json!({"state":"fictional-session","url":auth_url}))}}))
             .route("/v8/management/oauth/status",get(move || {let active=signed_in.clone();let expired=expired.clone();let waiting=waiting.clone();let delay=status_delay.clone();let entered=status_entered.clone();let release=status_release.clone();async move {if delay.load(std::sync::atomic::Ordering::SeqCst) {entered.notify_one();release.notified().await;} if waiting.load(std::sync::atomic::Ordering::SeqCst) {return Json(json!({"status":"wait"}));} if expired.load(std::sync::atomic::Ordering::SeqCst) {return Json(json!({"status":"error","error":"unknown or expired state"}));} *active.lock().unwrap()=Some("account-a");Json(json!({"status":"ok"}))}}))
             .route("/v8/management/credentials",get(move || {let active=active.clone();let failed=credentials_error.clone();async move {if failed.load(std::sync::atomic::Ordering::SeqCst) {return (axum::http::StatusCode::BAD_GATEWAY,Json(json!({})));} (axum::http::StatusCode::OK,Json(json!({"files":active.lock().unwrap().map(|account|json!({"name":"owned.json","provider":"codex","id_token":{"chatgpt_account_id":account,"plan_type":"plan-a"}})).into_iter().collect::<Vec<_>>()})))}}).delete(move ||{let deleted=deleted.clone();let failed=cleanup_failed.clone();async move {if failed.load(std::sync::atomic::Ordering::SeqCst) {return (axum::http::StatusCode::BAD_GATEWAY,Json(json!({})));} *deleted.lock().unwrap()=None;(axum::http::StatusCode::OK,Json(json!({"status":"ok"})))}}))
             .route("/v8/management/oauth/session",delete(move ||{let cancelled=cancellation.clone();let failed=cancel_error.clone();let delay=cancel_delay.clone();let entered=cancel_arrived.clone();let release=cancel_unblock.clone();async move {if delay.load(std::sync::atomic::Ordering::SeqCst) {entered.notify_one();release.notified().await;} if failed.load(std::sync::atomic::Ordering::SeqCst) {return (axum::http::StatusCode::BAD_GATEWAY,Json(json!({})));} (axum::http::StatusCode::OK,Json(json!({"status":"ok","cancelled":cancelled.load(std::sync::atomic::Ordering::SeqCst)})))}}))
             .route("/v8/management/credentials/models",get(move || {let failed=failed.clone();let delay=delay.clone();let arrival=arrival.clone();let unblock=unblock.clone();async move {
                 if failed.load(std::sync::atomic::Ordering::SeqCst) {return (axum::http::StatusCode::BAD_GATEWAY,Json(json!({})));}
                 if delay.load(std::sync::atomic::Ordering::SeqCst) {arrival.notify_one();unblock.notified().await;}
-                (axum::http::StatusCode::OK,Json(json!({"models":[{"id":"same-model"}]})))
+                (axum::http::StatusCode::OK,Json(json!({"models":[{"id":model_id}]})))
             }}))
             .layer(axum::middleware::from_fn(|req,next:axum::middleware::Next|async move {let mut response=next.run(req).await;response.headers_mut().insert("x-cpa-commit","e2bff0107bb307337aaa19018ccddd55f64253d5".parse().unwrap());response}));
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -875,4 +975,121 @@ async fn preflight_http_failure_keeps_the_profile_available_for_explicit_retry()
     assert_eq!(requests.iter().filter(|(method, path)| method == "GET" && path.ends_with("/oauth/auth-url")).count(), 2);
     assert!(!requests.iter().any(|(method, path)| method == "DELETE" && path.ends_with("/credentials")));
     assert!(fixture.account.lock().unwrap().is_none());
+}
+
+fn reviewed_fixture_proof(store:&ConfigStore,id:&str,model:&Model)->HandRunProof {
+    use crate::subscription::{QuotaEvidence,QuotaBucket,QuotaWindow,QuotaCredits,QuotaPermission,QuotaView};
+    use super::hand_run::{EvidenceKind,ReviewedEvidence};
+    let now=chrono::Utc::now();
+    let authority="https://chatgpt.com/fictional-proof";
+    HandRunProof {
+        plan_id: "04ba9e63-a733-4e20-bc86-83b2d460f738".into(),
+        binding:store.read().cpa_model_bindings[&model.id].clone(),
+        jev_artifact_sha256:crate::runtime::artifact_sha().unwrap(),artifact_sha256:service::artifact_sha(),credential_ref:store.read().cpa_subscriptions[id].credential_ref.clone().unwrap(),
+        policy:super::hand_run::Policy{evidence:[EvidenceKind::Identity,EvidenceKind::Plan,EvidenceKind::Eligibility,EvidenceKind::Protocol,EvidenceKind::Quota,EvidenceKind::WholeCallCost].into_iter().map(|kind|ReviewedEvidence{kind,state:EvidenceState::Available,authority:authority.into(),observed_at:now.timestamp(),valid_until:now.timestamp()+300,receipt_sha256:"a".repeat(64),reviewed:true}).collect(),
+        quota:QuotaEvidence{state:EvidenceState::Available,source:Some(authority.into()),observed_at:Some(now.to_rfc3339()),view:QuotaView::RateLimits,buckets:vec![QuotaBucket{limit_id:"fictional-included".into(),permission:QuotaPermission::Allowed,windows:vec![QuotaWindow{label:"fictional".into(),used_percent:Some(1.0),resets_at:Some(now.timestamp()+300),..Default::default()}],credits:Some(QuotaCredits{permission:QuotaPermission::Denied,..Default::default()}),..Default::default()}],..Default::default()},
+        subscription_only:true,streaming:true,function_tools:true,max_requests:2,max_input_bytes:2048,max_output_tokens:64,max_auxiliary_requests:2,max_tool_rounds:1},
+    }
+}
+
+#[tokio::test]
+async fn gateway_uses_the_owned_cpa_http_path_after_complete_finite_admission() {
+    let fixture=AccountFixture::start().await;
+    let root=tempfile::tempdir().unwrap();
+    let mut store=ConfigStore::load(root.path().join("cpa-dispatch.db")).unwrap();
+    store.cpa=Arc::new(Manager::owned_fixture(fixture.base.clone()).unwrap());
+    let store=Arc::new(store);
+    let id=store.cpa.create(&store,"codex","Finite CPA target").unwrap();
+    store.cpa.begin(&store,&id).await.unwrap();store.cpa.poll(&store,&id).await.unwrap();store.cpa.refresh(&store,&id).await.unwrap();
+    let model=store.read().models.last().unwrap().clone();store.cpa.select(&store,&id,&model.id,true).unwrap();
+    let proof=reviewed_fixture_proof(&store,&id,&model);store.cpa.enable_hand_run(&store,&id,proof).unwrap();
+    store.update(|c|{c.port=0;c.gateway.proxy_mode="direct".into();}).unwrap();
+    let gateway=crate::proxy::start(store.clone()).await.unwrap();
+    let response=crate::dispatch::local_gateway_request(gateway.port,crate::protocol::Protocol::Chat,&json!({"model":format!("autojev/model/{}",model.id),"messages":[{"role":"user","content":"fictional"}],"max_tokens":32})).unwrap().send().await.unwrap();
+    assert_eq!(response.status(),200);
+    assert_eq!(response.json::<serde_json::Value>().await.unwrap()["choices"][0]["message"]["content"],"owned CPA fictional reply");
+    assert_eq!(fixture.requests.lock().unwrap().iter().filter(|(_,path)|path=="/v1/chat/completions").count(),1);
+    assert!(!store.read().cpa_subscriptions[&id].permit.as_ref().unwrap().stopped,"legal nullable tool fields must preserve the remaining finite plan");
+    gateway.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "Requires the explicitly pinned local CPA artifact; all upstreams are sandboxed loopback"]
+async fn product_owned_cpa_process_reaches_a_fictional_upstream_and_recovers_without_a_grant() {
+    let binary=std::env::var("AUTOJEV_CPA_ARTIFACT").expect("Pass the pinned local CPA artifact");
+    let received=Arc::new(std::sync::Mutex::new(Vec::new()));let hits=received.clone();
+    let app=Router::new().route("/v1/chat/completions",post(move |Json(body):Json<serde_json::Value>|{let hits=hits.clone();async move{hits.lock().unwrap().push(body);Json(json!({"id":"actual-cpa-fictional","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"actual CPA fictional upstream"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}))}}));
+    let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let upstream=format!("http://{}/v1",listener.local_addr().unwrap());
+    let server=tokio::spawn(async move{axum::serve(listener,app).await.unwrap()});
+    let root=tempfile::tempdir().unwrap();let store=Arc::new(ConfigStore::load(root.path().join("ordinary-product.db")).unwrap());
+    let id=store.cpa.create(&store,"codex","Actual CPA / fictional OAuth metadata").unwrap();
+    let view=store.cpa.provision_owned(&store,&id,binary.clone(),0).await.unwrap();
+    let instance=store.read().cpa_subscriptions[&id].identity.connection_instance_id.clone();
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let config_file=store.cpa_profile_root().join(&instance).join("config.json");
+    let mut c:serde_json::Value=serde_json::from_slice(&std::fs::read(&config_file).unwrap()).unwrap();
+    // External CPA boundary is fictional API-key-backed compatibility, not OAuth proof.
+    c["api-keys"]=json!({"openai-compatibility":[{"name":"fictional","prefix":"fictional","base-url":upstream,"request-retry":0,"keys":[{"api-key":"fictional-upstream-only"}],"models":[{"name":"same-model","alias":"same-model"}]}]});
+    std::fs::write(&config_file,serde_json::to_vec(&c).unwrap()).unwrap();
+    let oauth=AccountFixture::with_contract("https://auth.openai.com/fictional-authorize","fictional/same-model").await;
+    store.cpa.configure_owned_client(&id,oauth.base.clone(),"fictional-owned-management".into()).unwrap();
+    store.cpa.begin(&store,&id).await.unwrap();store.cpa.poll(&store,&id).await.unwrap();store.cpa.refresh(&store,&id).await.unwrap();
+    let model=store.read().models.last().unwrap().clone();store.cpa.select(&store,&id,&model.id,true).unwrap();
+    let proof=reviewed_fixture_proof(&store,&id,&model);store.cpa.enable_hand_run(&store,&id,proof).unwrap();
+    store.update(|c|{c.port=0;c.gateway.proxy_mode="direct".into();}).unwrap();
+    let gateway=crate::proxy::start(store.clone()).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    let response=crate::dispatch::local_gateway_request(gateway.port,crate::protocol::Protocol::Chat,&json!({"model":format!("autojev/model/{}",model.id),"messages":[{"role":"user","content":"fictional-only"}],"max_tokens":32})).unwrap().send().await.unwrap();
+    let status=response.status();let body=response.text().await.unwrap();assert_eq!(status,200,"{body}");
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["choices"][0]["message"]["content"],"actual CPA fictional upstream");
+    assert_eq!(received.lock().unwrap().len(),1);
+    store.cpa.disable_hand_run(&store,&id).unwrap();store.cpa.stop_owned(&id).unwrap();
+    let recovered=store.cpa.provision_owned(&store,&id,binary,view.port).await.unwrap();assert_eq!(recovered.port,view.port);
+    let config=store.read();let provider=config.providers.iter().find(|p|p.id==id).unwrap();assert!(denial(&config,provider,Some(&model)).is_some());
+    gateway.stop().await;store.cpa.stop_owned(&id).unwrap();server.abort();
+}
+
+#[test]
+fn grok_cpa_connections_are_explicit_and_unknown_plan_cannot_enable_generation() {
+    let root=tempfile::tempdir().unwrap();let store=ConfigStore::load(root.path().join("xai.db")).unwrap();
+    let id=store.cpa.create(&store,"xai","Grok CPA").unwrap();let view=store.cpa.views(&store.read()).remove(0);
+    assert_eq!(view.provider,"xai");assert!(view.account.is_none() && view.plan.is_none());
+    let config=store.read();let p=config.providers.iter().find(|p|p.id==id).unwrap();
+    assert_eq!(p.kind,ProviderKind::GrokSubscription);assert!(denial(&config,p,None).is_some());
+}
+
+#[tokio::test]
+async fn cpa_stream_failure_or_cancel_stops_the_plan_without_fallback_or_budget_reset() {
+    for tag in ["fictional-error","fictional-missing-terminal","fictional-cancel","fictional-empty-done","fictional-stream-error","fictional-json-unknown","fictional-json-empty"] {
+        let fixture=AccountFixture::start().await;let root=tempfile::tempdir().unwrap();
+        let mut store=ConfigStore::load(root.path().join("stop.db")).unwrap();store.cpa=Arc::new(Manager::owned_fixture(fixture.base.clone()).unwrap());let store=Arc::new(store);
+        let id=store.cpa.create(&store,"codex","Stop on failure").unwrap();store.cpa.begin(&store,&id).await.unwrap();store.cpa.poll(&store,&id).await.unwrap();store.cpa.refresh(&store,&id).await.unwrap();
+        let model=store.read().models.last().unwrap().clone();store.cpa.select(&store,&id,&model.id,true).unwrap();let proof=reviewed_fixture_proof(&store,&id,&model);store.cpa.enable_hand_run(&store,&id,proof.clone()).unwrap();
+        store.update(|c|{c.port=0;c.gateway.proxy_mode="direct".into();}).unwrap();let gateway=crate::proxy::start(store.clone()).await.unwrap();
+        let body=json!({"model":format!("autojev/model/{}",model.id),"messages":[{"role":"user","content":tag}],"max_tokens":32,"stream":!matches!(tag,"fictional-error"|"fictional-json-unknown"|"fictional-json-empty")});
+        let mut response=crate::dispatch::local_gateway_request(gateway.port,crate::protocol::Protocol::Chat,&body).unwrap().send().await.unwrap();
+        if tag=="fictional-cancel" {assert!(response.chunk().await.unwrap().is_some());drop(response);}else{let _=response.text().await;}
+        tokio::time::timeout(std::time::Duration::from_secs(3),async{loop{if store.read().cpa_subscriptions[&id].permit.as_ref().unwrap().stopped{break;}tokio::time::sleep(std::time::Duration::from_millis(10)).await;}}).await.unwrap();
+        assert!(store.cpa.enable_hand_run(&store,&id,proof).is_err());
+        let response=crate::dispatch::local_gateway_request(gateway.port,crate::protocol::Protocol::Chat,&body).unwrap().send().await.unwrap();assert!(!response.status().is_success());
+        assert_eq!(fixture.requests.lock().unwrap().iter().filter(|(_,p)|p=="/v1/chat/completions").count(),1,"never retry a failed fixed target");
+        gateway.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn finite_cpa_tool_round_uses_the_same_fixed_target_and_client_call_id() {
+    let fixture=AccountFixture::start().await;let root=tempfile::tempdir().unwrap();
+    let mut store=ConfigStore::load(root.path().join("tools.db")).unwrap();store.cpa=Arc::new(Manager::owned_fixture(fixture.base.clone()).unwrap());let store=Arc::new(store);
+    let id=store.cpa.create(&store,"codex","Client tools").unwrap();store.cpa.begin(&store,&id).await.unwrap();store.cpa.poll(&store,&id).await.unwrap();store.cpa.refresh(&store,&id).await.unwrap();
+    let model=store.read().models.last().unwrap().clone();store.cpa.select(&store,&id,&model.id,true).unwrap();store.cpa.enable_hand_run(&store,&id,reviewed_fixture_proof(&store,&id,&model)).unwrap();
+    store.update(|c|{c.port=0;c.gateway.proxy_mode="direct".into();}).unwrap();let gateway=crate::proxy::start(store.clone()).await.unwrap();
+    let tools=json!([{"type":"function","function":{"name":"client_echo","parameters":{"type":"object","properties":{}}}}]);
+    let first=json!({"model":format!("autojev/model/{}",model.id),"messages":[{"role":"user","content":"fictional-tool"}],"tools":tools,"max_tokens":32});
+    let response=crate::dispatch::local_gateway_request(gateway.port,crate::protocol::Protocol::Chat,&first).unwrap().send().await.unwrap();assert_eq!(response.status(),200);
+    let body=response.json::<serde_json::Value>().await.unwrap();let assistant=body["choices"][0]["message"].clone();assert_eq!(assistant["tool_calls"][0]["id"],"call_cpa_echo");
+    let second=json!({"model":first["model"],"messages":[first["messages"][0],assistant,{"role":"tool","tool_call_id":"call_cpa_echo","content":"fixture-value"}],"tools":tools,"max_tokens":32});
+    let response=crate::dispatch::local_gateway_request(gateway.port,crate::protocol::Protocol::Chat,&second).unwrap().send().await.unwrap();assert_eq!(response.status(),200);let _=response.text().await.unwrap();
+    let ledger=store.read().cpa_subscriptions[&id].hand_run_ledger.values().next().unwrap().clone();assert_eq!((ledger.used,ledger.auxiliary_used,ledger.tool_rounds_used),(2,2,1));
+    assert_eq!(fixture.requests.lock().unwrap().iter().filter(|(_,p)|p=="/v1/chat/completions").count(),2);gateway.stop().await;
 }

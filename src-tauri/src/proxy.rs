@@ -106,6 +106,7 @@ async fn pause_requests(State(paused): State<Arc<std::sync::atomic::AtomicBool>>
 }
 
 async fn health(State(context): State<ProxyContext>) -> impl IntoResponse {
+    let _=context.store.cpa.reconcile_owned(&context.store);
     let config = context.store.read();
     Json(json!({
         "status": "ok",
@@ -397,20 +398,24 @@ async fn forward_attempt(context: ProxyContext, headers: HeaderMap, body: Value,
         Err(error) => return error_response(StatusCode::UNPROCESSABLE_ENTITY, &error.to_string()),
     };
     // 固定目标（原 ID 直调）先给出订阅准入的精确原因，而不是被候选过滤成笼统错误。
+    let mut admission_guard=input.requested_model.as_deref().and_then(|id|id.strip_prefix("autojev/model/")).and_then(|id|crate::cpa_sources::response::AdmissionGuard::fixed(&context.store,id));
     if let Some(pinned) = input.requested_model.as_deref().and_then(|id| id.strip_prefix("autojev/model/")).map(str::to_owned) {
         let stored = context.store.read();
         if let Some(model) = stored.models.iter().find(|model| model.id == pinned) {
             if let Some(provider) = stored.providers.iter().find(|provider| provider.id == model.provider_id) {
                 if let Ok(protocol) = Protocol::parse(endpoint) {
                     if let Err(denial) = crate::subscription::admit_model(&stored, model, provider, protocol) {
+                        let _=crate::coding_hand_run::fail_active(&context.store,&provider.id);
+                        if stored.cpa_subscriptions.contains_key(&provider.id){let _=context.store.cpa.fail_hand_run(&context.store,&provider.id);}
                         return subscription_denial(denial, protocol);
                     }
                     if stored.api_sources.contains_key(&provider.id) {
                         let upstream = match Protocol::upstream(model, provider) {
                             Ok(upstream) => upstream,
-                            Err(error) => return protocol_error_response(StatusCode::UNPROCESSABLE_ENTITY, protocol, &error.to_string()),
+                            Err(error) => {let _=crate::coding_hand_run::fail_active(&context.store,&provider.id);return protocol_error_response(StatusCode::UNPROCESSABLE_ENTITY, protocol, &error.to_string());},
                         };
                         if let Err(error) = crate::api_sources::admit_generation_target(&context.store, &stored, provider, model, upstream) {
+                            let _=crate::coding_hand_run::fail_active(&context.store,&provider.id);
                             return protocol_error_response(StatusCode::PRECONDITION_REQUIRED, protocol, &error.to_string());
                         }
                     }
@@ -524,21 +529,34 @@ async fn forward_attempt(context: ProxyContext, headers: HeaderMap, body: Value,
             && body.get("tools").and_then(Value::as_array).is_some_and(|tools| !tools.is_empty())
             && !resolved.model.supports_tools
         {
+            if config.cpa_subscriptions.contains_key(&resolved.provider.id){let _=context.store.cpa.fail_hand_run(&context.store,&resolved.provider.id);}
             return protocol_error_response(StatusCode::FORBIDDEN, source, "Codex client function tools have not been verified for this model; tool calls remain unavailable.");
         }
     }
     if let Err(denial) = crate::subscription::admit_model(&config, &resolved.model, &resolved.provider, source) {
+        if config.cpa_subscriptions.contains_key(&resolved.provider.id){let _=context.store.cpa.fail_hand_run(&context.store,&resolved.provider.id);}
         return subscription_denial(denial, source);
     }
+    let mut cpa_target = if config.cpa_subscriptions.contains_key(&resolved.provider.id) {
+        *allow_retry=false;
+        match context.store.cpa.generation_target(&context.store,&resolved.provider.id,&resolved.model,source,&body).await {
+            Ok(target)=>Some(target),
+            Err(error)=>return protocol_error_response(StatusCode::PRECONDITION_REQUIRED,source,&error.to_string()),
+        }
+    } else {None};
     let target_protocol = match Protocol::upstream(&resolved.model, &resolved.provider) {
         Ok(protocol) => protocol,
-        Err(error) => return protocol_error_response(StatusCode::UNPROCESSABLE_ENTITY, source, &error.to_string()),
+        Err(error) => {let _=crate::coding_hand_run::fail_active(&context.store,&resolved.provider.id);return protocol_error_response(StatusCode::UNPROCESSABLE_ENTITY, source, &error.to_string());},
     };
     let generation_key = match crate::api_sources::admit_generation_target(&context.store, &config, &resolved.provider, &resolved.model, target_protocol) {
         Ok(key) => key,
-        Err(error) => return protocol_error_response(StatusCode::PRECONDITION_REQUIRED, source, &error.to_string()),
+        Err(error) => {let _=crate::coding_hand_run::fail_active(&context.store,&resolved.provider.id);return protocol_error_response(StatusCode::PRECONDITION_REQUIRED, source, &error.to_string());},
     };
 
+    let mut coding_lease=if config.api_sources.get(&resolved.provider.id).is_some_and(|s|s.kind==crate::api_sources::SourceKind::CodingPlan) {
+        match crate::coding_hand_run::reserve(&context.store,&resolved.provider,&resolved.model,source,&body){Ok(lease)=>Some(lease),Err(error)=>return protocol_error_response(StatusCode::PRECONDITION_REQUIRED,source,&error.to_string())}
+    }else{None};
+    if cpa_target.is_some() || coding_lease.is_some() {if let Some(guard)=admission_guard.as_mut(){guard.disarm();}}
     *lease = context.health.acquire(&model_health_id(&config, &resolved.model));
     if lease.is_none() {return error_response(StatusCode::SERVICE_UNAVAILABLE, "Candidate is being probed by another request. Retry shortly.");}
     tried.insert(resolved.model.id.clone());
@@ -548,7 +566,7 @@ async fn forward_attempt(context: ProxyContext, headers: HeaderMap, body: Value,
         Err(error) => return error_response(StatusCode::BAD_REQUEST, &error.to_string()),
     };
     let streaming = body["stream"].as_bool().unwrap_or(false);
-    if crate::subscription::is_subscription_provider(&resolved.provider) {
+    if cpa_target.is_none() && crate::subscription::is_subscription_provider(&resolved.provider) {
         if !matches!(resolved.provider.kind, ProviderKind::CodexSubscription | ProviderKind::GrokSubscription) {
             return protocol_error_response(StatusCode::NOT_IMPLEMENTED, source,
                 "Generation through this subscription provider is not implemented.");
@@ -608,13 +626,14 @@ async fn forward_attempt(context: ProxyContext, headers: HeaderMap, body: Value,
         if !body["stream_options"].is_object() { body["stream_options"] = json!({}); }
         body["stream_options"]["include_usage"] = json!(true);
     }
-    let url = crate::api_sources::endpoint_url(&config, &resolved.provider, target);
+    let url = cpa_target.as_ref().map(|t|format!("{}{}",t.base,target.path())).unwrap_or_else(||crate::api_sources::endpoint_url(&config, &resolved.provider, target));
     let mut request = context.client.post(url).json(&body)
         .header(header::ACCEPT, if streaming { "text/event-stream" } else { "application/json" });
     if target == Protocol::Messages {
         request = request.header("anthropic-version", "2023-06-01");
     }
-    if resolved.provider.kind != ProviderKind::Ollama && !crate::subscription::is_subscription_provider(&resolved.provider) {
+    if let Some(cpa)=&cpa_target { request=request.bearer_auth(&cpa.key); }
+    else if resolved.provider.kind != ProviderKind::Ollama && !crate::subscription::is_subscription_provider(&resolved.provider) {
         let key = generation_key.as_ref().expect("admitted API generation credential");
         request = if target == Protocol::Messages { request.header("x-api-key", key) } else { request.bearer_auth(key) };
     }
@@ -635,15 +654,21 @@ async fn forward_attempt(context: ProxyContext, headers: HeaderMap, body: Value,
         provider: &resolved.provider, model_id: &resolved.model.model_id, protocol: target }, request),
     ).await {
         Ok(Ok(response)) => response,
-        Err(_) => return error_response(StatusCode::GATEWAY_TIMEOUT, "Upstream response timed out"),
-        Ok(Err(error)) => return error_response(
+        Err(_) => {if cpa_target.is_some(){let _=context.store.cpa.fail_hand_run(&context.store,&resolved.provider.id);}return error_response(StatusCode::GATEWAY_TIMEOUT, "Upstream response timed out");},
+        Ok(Err(error)) => {if cpa_target.is_some(){let _=context.store.cpa.fail_hand_run(&context.store,&resolved.provider.id);}return error_response(
                 StatusCode::BAD_GATEWAY,
-                &format!("Could not reach {}: {error}", resolved.provider.name)),
+                &format!("Could not reach {}: {error}", resolved.provider.name));},
     };
     let status = upstream.status();
     let response_headers = upstream.headers().clone();
-    let redaction_key = config.api_sources.contains_key(&resolved.provider.id).then(|| generation_key.clone()).flatten();
-    let upstream_stream = crate::api_sources::redacted_stream(upstream.bytes_stream(), redaction_key.clone(), response_headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(crate::protocol::is_event_stream));
+    if !status.is_success() {
+        if let Some(lease)=cpa_target.as_mut().and_then(|t|t.lease.as_mut()){lease.reject();}
+        if let Some(lease)=coding_lease.as_mut(){lease.reject();}
+    }
+    let redaction_key = cpa_target.as_ref().map(|t|t.key.clone()).or_else(||config.api_sources.contains_key(&resolved.provider.id).then(|| generation_key.clone()).flatten());
+    let event_stream=response_headers.get(header::CONTENT_TYPE).and_then(|v|v.to_str().ok()).is_some_and(crate::protocol::is_event_stream);
+    let stream:std::pin::Pin<Box<dyn futures_util::Stream<Item=Result<axum::body::Bytes,reqwest::Error>>+Send>> = if let Some(lease)=cpa_target.as_mut().and_then(|t|t.lease.take()).or_else(||coding_lease.take()){Box::pin(crate::cpa_sources::response::guarded(upstream.bytes_stream(),lease,event_stream))}else{Box::pin(upstream.bytes_stream())};
+    let upstream_stream = crate::api_sources::redacted_stream(stream,redaction_key.clone(),event_stream);
     let success = status.is_success();
     capture.lock().unwrap().upstream(target, response_headers.get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok()).is_some_and(crate::protocol::is_event_stream),
@@ -2410,6 +2435,7 @@ fn observe_health(
 }
 
 async fn model_catalog(State(context):State<ProxyContext>,headers:HeaderMap)->Response {
+    let _=context.store.cpa.reconcile_owned(&context.store);
     let config=context.store.read();
     if let Some(agent)=headers.get("x-autojev-agent").and_then(|v|v.to_str().ok()) {
         // Agent 保存目录按保存内容原样返回：它是注入清单，不是准入依据，外部待同步不在此判定。

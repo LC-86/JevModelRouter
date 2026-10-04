@@ -7,6 +7,8 @@ use std::{
 };
 
 static ISOLATION_ROOT: OnceLock<PathBuf> = OnceLock::new();
+static PROFILE_ROOT: OnceLock<PathBuf> = OnceLock::new();
+static OFFLINE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static UPSTREAM: OnceLock<reqwest::Url> = OnceLock::new();
 static GATEWAY_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
 #[cfg(feature = "isolation-check")]
@@ -30,6 +32,27 @@ static GROK_HELPER_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 
 pub fn init() -> Result<()> {
     let args: Vec<_> = std::env::args_os().collect();
+    ensure!(
+        option_env!("AUTOJEV_DEVELOPMENT_ISOLATION") != Some("1") || args.iter().any(|arg| arg == "--autojev-isolated"),
+        "This Mac development artifact requires the isolated runner"
+    );
+    if let Some(index) = args.iter().position(|arg| arg == "--autojev-profile") {
+        ensure!(!args.iter().any(|arg|arg == "--autojev-isolated"), "Choose one dedicated profile mode");
+        let root = PathBuf::from(args.get(index+1).context("--autojev-profile requires an absolute directory")?);
+        ensure!(root.is_absolute() && root.is_dir(), "Create an absolute dedicated profile directory first");
+        ensure!(!fs::symlink_metadata(&root)?.file_type().is_symlink(), "Dedicated profile cannot be a symlink");
+        let root = root.canonicalize()?;
+        let marker = root.join(".autojev-profile");
+        if marker.exists() {
+            ensure!(fs::read_to_string(&marker)? == "AutoJev dedicated profile v1\n", "Unrecognized dedicated profile");
+            reject_symlinks(&root)?;
+        } else {
+            ensure!(fs::read_dir(&root)?.next().is_none(), "First dedicated startup requires an empty directory");
+            fs::write(marker, "AutoJev dedicated profile v1\n")?;
+        }
+        #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?; }
+        PROFILE_ROOT.set(root).map_err(|_|anyhow::anyhow!("Profile already initialized"))?;
+    }
     if let Some(index) = args.iter().position(|arg| arg == "--autojev-isolated") {
         ensure!(
             cfg!(debug_assertions),
@@ -56,6 +79,10 @@ pub fn init() -> Result<()> {
         ISOLATION_ROOT
             .set(root)
             .map_err(|_| anyhow::anyhow!("Isolation already initialized"))?;
+    }
+    if args.iter().any(|arg|arg == "--autojev-offline") {
+        ensure!(dedicated(), "Offline startup requires a dedicated profile");
+        OFFLINE.store(true, std::sync::atomic::Ordering::SeqCst);
     }
     #[cfg(feature = "isolation-check")]
     if let Some(index) = args.iter().position(|arg| arg == "--autojev-helper") {
@@ -158,6 +185,8 @@ fn reject_symlinks(root: &Path) -> Result<()> {
 pub fn isolated() -> bool {
     ISOLATION_ROOT.get().is_some()
 }
+pub fn dedicated() -> bool { isolated() || PROFILE_ROOT.get().is_some() }
+pub fn loopback_only() -> bool { isolated() || OFFLINE.load(std::sync::atomic::Ordering::SeqCst) }
 /// 隔离验收显式指定的辅助进程可执行文件；生产构建里这个入口不存在。
 #[cfg(feature = "isolation-check")]
 pub fn helper_override() -> Option<&'static Path> {
@@ -177,7 +206,7 @@ pub fn grok_helper_override() -> Option<&'static Path> {
     None
 }
 pub fn home_dir() -> Option<PathBuf> {
-    ISOLATION_ROOT.get().cloned().or_else(dirs::home_dir)
+    ISOLATION_ROOT.get().cloned().or_else(|| PROFILE_ROOT.get().cloned()).or_else(dirs::home_dir)
 }
 
 pub fn gateway_port(port: u16) {
@@ -201,7 +230,7 @@ pub fn check_url(url: &reqwest::Url) -> Result<()> {
 
 pub fn external_action() -> Result<()> {
     ensure!(
-        !isolated(),
+        !loopback_only(),
         "External application actions are disabled in isolated validation"
     );
     Ok(())
@@ -240,4 +269,12 @@ mod tests {
         std::fs::write(root.path().join("fixture.db"), "fixture").unwrap();
         assert!(super::prepare_root(root.path()).is_ok());
     }
+}
+
+static ARTIFACT_SHA:OnceLock<String>=OnceLock::new();
+pub fn artifact_sha()->Result<String> {
+    use sha2::{Digest,Sha256};
+    if let Some(value)=ARTIFACT_SHA.get(){return Ok(value.clone());}
+    let value=format!("{:x}",Sha256::digest(fs::read(std::env::current_exe()?)?));
+    let _=ARTIFACT_SHA.set(value.clone());Ok(value)
 }
