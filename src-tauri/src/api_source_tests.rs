@@ -1476,6 +1476,7 @@ async fn coding_plan_evidence_failures_restart_and_first_http_failure_stay_locke
     let req=json!({"model":"autojev/model/uuid-coding","messages":[{"role":"user","content":"fail-429"}],"max_tokens":16});
     let reply=crate::dispatch::local_gateway_request(gateway.port,crate::protocol::Protocol::Chat,&req).unwrap().send().await.unwrap();
     assert_eq!(reply.status(),429);let text=reply.text().await.unwrap();assert!(!text.contains("fictional-coding"));
+    assert!(text.contains("Bearer [REDACTED]"),"locked plan must retain the safe upstream failure reason: {text}");
     assert!(store.read().api_sources["coding"].hand_run_ledger[&proof.plan_id].stopped);
     assert!(crate::coding_hand_run::enable(&store,"coding",proof.clone()).is_err());
     let reopened=ConfigStore::load(root.path().join("sources.db")).unwrap();

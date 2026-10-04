@@ -134,9 +134,9 @@ where
 {
     let stream: Pin<Box<S>> = Box::pin(stream);
     futures_util::stream::unfold(
-        (stream, lease, Vec::new()),
-        move |(mut stream, mut lease, mut data)| async move {
-            if lease.errored {
+        (stream, lease, Vec::new(), false),
+        move |(mut stream, mut lease, mut data, ended)| async move {
+            if ended {
                 return None;
             }
             match stream.next().await {
@@ -146,23 +146,23 @@ where
                     } else {
                         lease.reject();
                     }
-                    if sse {
+                    if sse && !lease.errored {
                         match sse_complete(&data, lease.function_tools) {
                             Ok(complete) => lease.complete = complete && !lease.errored,
                             Err(()) => {
                                 lease.reject();
                                 return Some((
                                     Err(std::io::Error::other("Invalid upstream finite response")),
-                                    (stream, lease, data),
+                                    (stream, lease, data, true),
                                 ));
                             }
                         }
                     }
-                    Some((Ok(bytes), (stream, lease, data)))
+                    Some((Ok(bytes), (stream, lease, data, false)))
                 }
                 Some(Err(error)) => {
                     lease.reject();
-                    Some((Err(error), (stream, lease, data)))
+                    Some((Err(error), (stream, lease, data, true)))
                 }
                 None => {
                     if !sse {
