@@ -50,6 +50,10 @@ pub struct Connection {
     pub account_state: IdentityState,
     #[serde(default)]
     pub plan_state: IdentityState,
+    #[serde(skip)]
+    pub hand_run:Option<crate::coding_hand_run::Permit>,
+    #[serde(default)]
+    pub hand_run_ledger:std::collections::HashMap<String,crate::hand_run_policy::Ledger>,
 }
 
 impl Connection {
@@ -144,6 +148,7 @@ pub fn apply_edit(
                 },
                 account_label,
                 plan_label,
+                hand_run:None,hand_run_ledger:Default::default(),
             },
         );
     }
@@ -288,6 +293,7 @@ pub fn admit_generation_target(
         "source_model_invalid: This fixed model is no longer available"
     );
     if let Some(source) = config.api_sources.get(&provider.id) {
+        if source.kind==SourceKind::CodingPlan {crate::coding_hand_run::admit(config,provider,model,protocol)?;}
         ensure!(
             !source.retired
                 && !source.connection_instance_id.is_empty()

@@ -269,6 +269,16 @@ async fn source_fixture() -> (
                     return axum::response::Response::builder().header("content-type", "text/event-stream")
                         .header("x-request-id", key).body(axum::body::Body::from_stream(stream)).unwrap();
                 }
+                if let Some(mode)=body.pointer("/messages/0/content").and_then(|v|v.as_str()).and_then(|v|v.strip_prefix("plan-stream-")) {
+                    let mode=mode.to_owned();
+                    let stream=futures_util::stream::unfold((mode,0),|(mode,n)|async move {
+                        if n==0 {return Some((Ok::<_,std::io::Error>(axum::body::Bytes::from("data: {\"choices\":[{\"delta\":{\"content\":\"fictional\"}}]}\n\n")),(mode,1)));}
+                        if mode=="cancel" {tokio::time::sleep(std::time::Duration::from_secs(3)).await;}
+                        if n==1 && mode=="done" {return Some((Ok(axum::body::Bytes::from("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")),(mode,2)));}
+                        None
+                    });
+                    return axum::response::Response::builder().header("content-type","text/event-stream").body(axum::body::Body::from_stream(stream)).unwrap();
+                }
                 if let Some(status) = body.pointer("/messages/0/content").and_then(|v|v.as_str()).and_then(|v| v.strip_prefix("fail-")).and_then(|v| v.parse::<u16>().ok()) {
                     return (StatusCode::from_u16(status).unwrap(), Json(json!({"error":{"message":headers["authorization"].to_str().unwrap()}}))).into_response();
                 }
@@ -359,7 +369,9 @@ async fn source_fixture() -> (
         config.gateway.proxy_mode = "direct".into();
         config.gateway.failure_threshold = 20;
         config.policy.use_jev_when_ambiguous = true;
-        for (id, kind, endpoint) in [("official","official_api","/official/v1"),("third","third_party_api","/third/api/v1"),("coding","coding_plan","/coding/v4")] {
+        // The coding-labelled fixture now tests compatibility/secret handling only;
+        // actual Coding Plan admission has a separate fail-closed test below.
+        for (id, kind, endpoint) in [("official","official_api","/official/v1"),("third","third_party_api","/third/api/v1"),("coding","third_party_api","/coding/v4")] {
             let mut provider = original_provider.clone();
             provider.id = id.into(); provider.name = id.into(); provider.base_url = format!("http://{address}{endpoint}"); provider.api_type = "chat_completions".into();
             let mut model = original_model.clone(); model.id = format!("uuid-{id}"); model.provider_id = id.into(); model.model_id = "same-model".into();
@@ -1377,4 +1389,91 @@ async fn api_sources_background_schedule_never_generates_or_speed_tests() {
     assert!(received.lock().unwrap().is_empty());
     task.abort();
     upstream.abort();
+}
+
+#[tokio::test]
+async fn unreviewed_coding_plan_keeps_its_fixed_target_but_never_dispatches() {
+    let (_root,store,received,upstream)=source_fixture().await;
+    store.update(|c|c.api_sources.get_mut("coding").unwrap().kind=crate::api_sources::SourceKind::CodingPlan).unwrap();
+    let gateway=crate::proxy::start(store.clone()).await.unwrap();
+    for model in ["coding/same-model","autojev/model/uuid-coding"] {
+        let reply=reqwest::Client::builder().no_proxy().build().unwrap().post(format!("http://127.0.0.1:{}/v1/chat/completions",gateway.port)).json(&json!({"model":model,"messages":[{"role":"user","content":"fictional coding plan request"}],"max_tokens":32})).send().await.unwrap();
+        assert!(!reply.status().is_success());assert!(reply.text().await.unwrap().contains("coding_plan_unverified"));
+    }
+    assert!(received.lock().unwrap().is_empty());assert_eq!(store.read().api_sources["coding"].endpoint.ends_with("/coding/v4"),true);
+    gateway.stop().await;upstream.abort();
+}
+
+fn coding_proof(store:&ConfigStore)->crate::coding_hand_run::Proof {
+    use crate::hand_run_policy::{EvidenceKind,ReviewedEvidence,Policy};
+    use crate::subscription::{EvidenceState,QuotaEvidence,QuotaView,QuotaBucket,QuotaWindow,QuotaCredits,QuotaPermission};
+    let c=store.read();let source=&c.api_sources["coding"];let now=chrono::Utc::now();let authority="https://127.0.0.1/fictional-plan-receipt";
+    crate::coding_hand_run::Proof{plan_id:"5872ea21-53ba-45c4-a427-01a4190833e9".into(),binding:crate::coding_hand_run::Binding{provider_id:"coding".into(),connection_instance_id:source.connection_instance_id.clone(),generation:source.generation,endpoint:source.endpoint.clone(),credential_reference:source.credential_reference.clone(),model_id:"same-model".into(),model_uuid:"uuid-coding".into(),account:"fictional-plan-account".into(),plan:"fictional-plan".into()},jev_artifact_sha256:crate::runtime::artifact_sha().unwrap(),policy:Policy{
+        evidence:[EvidenceKind::Identity,EvidenceKind::Plan,EvidenceKind::Eligibility,EvidenceKind::Protocol,EvidenceKind::Quota,EvidenceKind::WholeCallCost].into_iter().map(|kind|ReviewedEvidence{kind,state:EvidenceState::Available,authority:authority.into(),observed_at:now.timestamp(),valid_until:now.timestamp()+300,receipt_sha256:"b".repeat(64),reviewed:true}).collect(),
+        quota:QuotaEvidence{state:EvidenceState::Available,source:Some(authority.into()),observed_at:Some(now.to_rfc3339()),view:QuotaView::RateLimits,buckets:vec![QuotaBucket{limit_id:"fictional-plan-quota".into(),permission:QuotaPermission::Allowed,windows:vec![QuotaWindow{label:"fictional".into(),used_percent:Some(1.0),resets_at:Some(now.timestamp()+300),..Default::default()}],credits:Some(QuotaCredits{permission:QuotaPermission::Denied,..Default::default()}),..Default::default()}],..Default::default()},subscription_only:true,streaming:false,function_tools:false,max_requests:1,max_input_bytes:2048,max_output_tokens:32,max_auxiliary_requests:0,max_tool_rounds:0}}
+}
+
+#[tokio::test]
+async fn reviewed_coding_plan_uses_its_plan_endpoint_with_a_finite_independent_budget() {
+    let (_root,store,received,upstream)=source_fixture().await;
+    store.update(|c|c.api_sources.get_mut("coding").unwrap().kind=crate::api_sources::SourceKind::CodingPlan).unwrap();
+    let proof=coding_proof(&store);
+    crate::coding_hand_run::enable(&store,"coding",proof.clone()).unwrap();let gateway=crate::proxy::start(store.clone()).await.unwrap();
+    let request=json!({"model":"autojev/model/uuid-coding","messages":[{"role":"user","content":"fictional plan"}],"max_tokens":16});
+    let reply=crate::dispatch::local_gateway_request(gateway.port,crate::protocol::Protocol::Chat,&request).unwrap().send().await.unwrap();assert_eq!(reply.status(),200);assert_eq!(reply.json::<serde_json::Value>().await.unwrap()["choices"][0]["message"]["content"],"/coding/v4/chat/completions");
+    assert_eq!(received.lock().unwrap().len(),1);
+    crate::coding_hand_run::disable(&store,"coding").unwrap();crate::coding_hand_run::enable(&store,"coding",proof).unwrap();
+    let reply=crate::dispatch::local_gateway_request(gateway.port,crate::protocol::Protocol::Chat,&request).unwrap().send().await.unwrap();assert!(!reply.status().is_success());assert_eq!(received.lock().unwrap().len(),1);
+    gateway.stop().await;upstream.abort();
+}
+
+#[tokio::test]
+async fn coding_plan_evidence_failures_restart_and_first_http_failure_stay_locked() {
+    let (root,store,received,upstream)=source_fixture().await;
+    store.update(|c|c.api_sources.get_mut("coding").unwrap().kind=crate::api_sources::SourceKind::CodingPlan).unwrap();
+    let proof=coding_proof(&store);
+    for bad in 0..6 {
+        let mut p=proof.clone();
+        match bad {
+            0=>p.policy.subscription_only=false,
+            1=>p.binding.endpoint.push_str("/other"),
+            2=>p.policy.evidence[0].valid_until=chrono::Utc::now().timestamp()-1,
+            3=>p.policy.evidence[5].state=crate::subscription::EvidenceState::Unknown,
+            4=>p.policy.quota.buckets[0].windows[0].used_percent=Some(100.0),
+            _=>p.jev_artifact_sha256="0".repeat(64),
+        }
+        assert!(crate::coding_hand_run::enable(&store,"coding",p).is_err());
+    }
+    assert!(received.lock().unwrap().is_empty());
+    let mut proof=proof;proof.policy.max_requests=2;
+    crate::coding_hand_run::enable(&store,"coding",proof.clone()).unwrap();
+    let mut expanded=proof.clone();expanded.policy.max_output_tokens+=1;
+    assert!(crate::coding_hand_run::enable(&store,"coding",expanded).is_err(),"same plan cannot expand another budget");
+    let gateway=crate::proxy::start(store.clone()).await.unwrap();
+    let req=json!({"model":"autojev/model/uuid-coding","messages":[{"role":"user","content":"fail-429"}],"max_tokens":16});
+    let reply=crate::dispatch::local_gateway_request(gateway.port,crate::protocol::Protocol::Chat,&req).unwrap().send().await.unwrap();
+    assert_eq!(reply.status(),429);let text=reply.text().await.unwrap();assert!(!text.contains("fictional-coding"));
+    assert!(store.read().api_sources["coding"].hand_run_ledger[&proof.plan_id].stopped);
+    assert!(crate::coding_hand_run::enable(&store,"coding",proof.clone()).is_err());
+    let reopened=ConfigStore::load(root.path().join("sources.db")).unwrap();
+    assert!(reopened.read().api_sources["coding"].hand_run.is_none());
+    assert!(crate::coding_hand_run::enable(&reopened,"coding",proof).is_err());
+    assert_eq!(received.lock().unwrap().len(),1);gateway.stop().await;upstream.abort();
+}
+
+#[tokio::test]
+async fn coding_plan_public_stream_cancel_and_missing_terminal_lock_only_the_original_plan() {
+    for mode in ["done","cancel","missing"] {
+        let (_root,store,received,upstream)=source_fixture().await;
+        store.update(|c|c.api_sources.get_mut("coding").unwrap().kind=crate::api_sources::SourceKind::CodingPlan).unwrap();
+        let mut proof=coding_proof(&store);proof.policy.streaming=true;proof.policy.max_requests=2;
+        crate::coding_hand_run::enable(&store,"coding",proof.clone()).unwrap();
+        let gateway=crate::proxy::start(store.clone()).await.unwrap();
+        let req=json!({"model":"autojev/model/uuid-coding","messages":[{"role":"user","content":format!("plan-stream-{mode}")}],"max_tokens":16,"stream":true});
+        let mut reply=crate::dispatch::local_gateway_request(gateway.port,crate::protocol::Protocol::Chat,&req).unwrap().send().await.unwrap();assert_eq!(reply.status(),200);
+        if mode=="cancel" {assert!(reply.chunk().await.unwrap().is_some());drop(reply);}else{let _=reply.text().await;}
+        if mode!="done" {tokio::time::timeout(std::time::Duration::from_secs(5),async{while !store.read().api_sources["coding"].hand_run_ledger[&proof.plan_id].stopped{tokio::time::sleep(std::time::Duration::from_millis(10)).await;}}).await.unwrap();assert!(crate::coding_hand_run::enable(&store,"coding",proof.clone()).is_err());}
+        else {assert!(!store.read().api_sources["coding"].hand_run_ledger[&proof.plan_id].stopped);}
+        assert_eq!(received.lock().unwrap().len(),1);gateway.stop().await;upstream.abort();
+    }
 }

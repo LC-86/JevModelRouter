@@ -9,8 +9,8 @@
 | 来源 | 账号 / 套餐 | 版本与路径范围 | 模型 / 协议 / 工具轮次 | 可能费用 | 当前允许步骤 / 状态 |
 | --- | --- | --- | --- | --- | --- |
 | CPA Codex 订阅 | Unknown / Unknown | Jev 完整 SHA + artifact manifest；CPA `r1-e2bff010` / v8，独立专用 profile；DSH `0.1.7-rc.1` / pi-ai `0.85.1` 接口 pin | 上游 ID 与稳定 UUID 待填；Chat Completions 待真人验证；工具 0 | Unknown；整次调用仅订阅内权益保证未成立 | 仅阅读本包；凭据/登录/额度/生成预算均 0；未测、禁用 |
-| CPA Grok 订阅 | Unknown / Unknown | 相同 Jev/CPA pin；本版本普通 OAuth 固定账号与 Grok 接入契约未建立 | Unknown / 未验证；工具 0 | Unknown；Extra Usage 保证未成立 | 仅阅读；真实服务接入不支持/未验证，不尝试登录；预算 0 |
-| Coding Plan | Unknown / Unknown，必须写具体产品 | Jev manifest；实际 Key 与套餐专用 endpoint 待填；若用 CPA 则记录其 pin、单凭据 namespace | 上游 ID + UUID 待填；Chat Completions 待验；工具 0 | Unknown；不能改用同品牌普通 API endpoint | 仅阅读；配置/查询/生成预算 0；未测、禁用 |
+| CPA Grok 订阅 | Unknown / Unknown | 相同 Jev/CPA pin；普通桌面可管理 xAI 专用服务并调用固定 v8 device-flow；真实授权、套餐/费用和普通 OAuth 生成均未验 | Unknown / 未验证；工具 0 | Unknown；Extra Usage 保证未成立 | 仅阅读；套餐/费用依据未知，生成禁用，不尝试登录；预算 0 |
+| Coding Plan | Unknown / Unknown，必须写具体产品 | Jev manifest；实际 Key 与套餐专用 endpoint 待填；若用 CPA 则记录其 pin、单凭据 namespace | 上游 ID + UUID 待填；Chat Completions 待验；工具 0 | Unknown；不能改用同品牌普通 API endpoint | 仅阅读；配置/查询/生成预算 0；未测、禁用；工程入口已交付；真实事实未知 |
 | 官方 API | Unknown / Unknown | Jev manifest；具体官方 endpoint、API 版本待填；使用既有 API 派发路径 | 上游 ID + UUID 待填；Chat Completions 待验；工具 0 | Unknown；须具体费用上限及依据 | 仅阅读；配置/生成预算 0；未测 |
 | OpenRouter 第三方 API | Unknown / Unknown | Jev manifest；实际入口、账户及计费范围待填；生成来源与决策供应商分开 | 实际上游 ID + UUID 待填；Chat Completions 待验；工具 0 | Unknown；须具体费用上限及依据 | 仅阅读；配置/生成预算 0；未测 |
 | ZenMux 第三方 API | Unknown / Unknown | Jev manifest；实际入口、账户及计费范围待填；生成来源与决策供应商分开 | 实际上游 ID + UUID 待填；Chat Completions 待验；工具 0 | Unknown；须具体费用上限及依据 | 仅阅读；配置/生成预算 0；未测 |
@@ -19,13 +19,23 @@
 
 ## 条件成立后才可使用的有限步骤
 
-1. 核对 [Mac 开发产物](mac-service-r6.md) manifest 与服务状态。隔离回环产物只含虚构来源，不接真实账号；生产 CPA 授权当前未配置。#58 解阻必须有实际专用服务与账号定向契约，不能把隔离开关或替身改成真实入口。
+1. 核对 [Mac 开发产物](mac-service-r6.md) manifest 与服务状态。使用 ordinary `--product` 产物与 `launch-product.mjs /absolute/dedicated-profile`；隔离回环产物只供离线验收，不接真实账号。没有真实动作许可时仅阅读或加 `--offline` 检查自有服务。
 2. 逐项核实身份、套餐、资格、协议、额度/费用。只读步骤也需在计划中分别批准和计数。服务启动/恢复、保存来源和模型选择本身不得触发登录、额度或生成。
-3. 官方 API/第三方来源使用既有来源表单，填准确 endpoint、计费身份和模型；Coding Plan 只填套餐专用 endpoint。选择模型池行的稳定 `autojev/model/<UUID>`，在独立虚构 DSH composition 中使用 R5 [配置片段](fixtures/dsh-fictional.patch.yml)，`maxRetries: 0`。不写日常 DSH 配置、不启用自动测速/智能路由。
-4. 来源、模型启用是用户配置，不能使未知身份/世代、失去绑定、资格/协议未验证或订阅费用依据缺失变成有效。CPA 订阅生产入口仍不可配置，等待 #58 的适用证据和受控接入；不修改数据库或源码来解除门禁。
+3. 官方 API/第三方来源使用既有来源表单，填准确 endpoint、计费身份和模型；Coding Plan 使用套餐专用 endpoint；未经独立审查保持 `coding_plan_unverified`。Providers 的 Coding Plan 区显示本来源证据文件；参考 `fixtures/coding-plan-hand-run.reviewed.template.json`，完整审阅后点击有限 HAND_RUN。不修改数据库放行。选择模型池行的稳定 `autojev/model/<UUID>`，在独立虚构 DSH composition 中使用 R5 [配置片段](fixtures/dsh-fictional.patch.yml)，`maxRetries: 0`。不写日常 DSH 配置、不启用自动测速/智能路由。
+4. 来源、模型启用是用户配置，不能使未知身份/世代、失去绑定、资格/协议未验证或订阅费用依据缺失变成有效。CPA 用下述已审证据文件与显式有限开关，所有门禁仍校验；不修改数据库、源码或旧 CLI 许可来解除门禁。
 5. 恢复服务只恢复自有进程及已保存 endpoint，不授予真实能力。换号/套餐变化后旧证据和引用失效；重新验证并明确绑定后才讨论受控启用。取消选择不等于撤销；停用后旧 UUID 直调仍须拒绝。
 
 当前上述真实执行步骤均为**未允许**。将来批准范围只作用于该来源/账号/套餐/世代/模型/协议/artifact，不自动扩到其它行。
+
+## 普通 CPA 的启用与恢复入口
+
+真实动作获单来源计划许可后：Providers → CPA → 选择 Codex 或 Grok/xAI → 添加具名连接 → 指定随附 pinned `bin/cpa` → 启动专用服务 → 发起授权 → 打开 CPA 返回的当前会话页面 → 明确检查授权结果 → 读取目录 → 在模型页手选并绑定具体 UUID。每步实际次数单列；服务、连接与目录均不能创造资格。Grok 无当前套餐和费用证据时不可绑定为可调用目标。
+
+将独立审阅的脱敏依据填入 [证据模板](fixtures/cpa-hand-run.reviewed.template.json)，文件保存到面板显示的自有 `hand-run.reviewed.json` 路径。模板所有状态默认为 Unknown、未审阅，不是许可。每项必须来自适用权威源且在15分钟内有效：身份、套餐、模型资格、Chat 协议/SSE/客户端工具、可用额度、整次禁止额外消费；各自记录 receipt SHA、来源和时间。绑定当前实例/世代/账号/套餐、唯一凭据引用、模型、CPA artifact。额度桶必须明确允许包含用量、未耗尽有效窗口、全部禁止额外 credits，usage 不能代替这些依据。未知或缺项后端拒绝。
+
+填写唯一 plan UUID、1–7 总网关派发、完整输入最多2048 UTF-8字节、显式输出最多64 tokens、最多7次许可内辅助管理请求、最多2个工具结果续答轮次，且使用本文更严格的单轮候选计划。每个派发前核对唯一凭据消耗1次辅助预算；授权/目录的事前管理请求和外部权威查询另外事前限定及记录。点击“为此来源启用有限 HAND_RUN”；该开关不接受前端证据布尔值，后端重读自有已审文件并执行全部门禁。
+
+关闭不删除已有用量；首失败/取消/不完整终态会持久锁停该 plan。应用重开、自有 CPA 恢复后临时许可消失，原plan用量/stop不会重置。失败后不新建plan重试、不改文件扩大次数，不换来源。未来独立新计划仍须另行人工许可。其它协议、compact/WebSocket/媒体/服务层切换未验证则拒绝。真实凭据、授权和费用事实只有真人能够建立，本轮均未执行。
 
 ## 单来源候选调用矩阵
 
@@ -54,3 +64,5 @@
 - [R5 DSH 接口与回放](dsh-r5.md)：复用固定接口 pin、虚构配置、UUID 选择、JSON/SSE 工具 ID/结果与取消检查。实际 DSH composition/选择器和真实来源均仍未验。
 
 #25/#26 仍保持真人未完成事实。仅在 #58 相应真实必需项通过后，由父线程将该来源的结果链接回旧票；一项来源通过不覆盖其它来源。
+
+Coding Plan 证据采用独立模板和文件（桌面显示路径），与 CPA OAuth 证据分开。六项事实全部未知时模板不能启用；真人审阅后补入 15 分钟内主来源、脱敏回执 SHA、绑定和 Jev artifact SHA。此路径仅 Chat 文本/已审 client function；没有辅助查询路径，预算固定 0。同一 plan UUID 的完整证据与所有预算不可更改；失败锁定和次数跨重开保留，许可跨重开不保留。HTTP 错误、取消和非法终止均停止该计划，不能重试、扩量或换来源。

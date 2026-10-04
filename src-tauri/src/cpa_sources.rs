@@ -4,7 +4,7 @@ use crate::{
     config::{AppConfig, ConfigStore, Model, Provider, ProviderKind},
     subscription::{Connection as Identity, ConnectionState, Denial, DenialFamily, EvidenceState},
 };
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
@@ -12,6 +12,10 @@ use std::{
 };
 
 mod client;
+mod service;
+mod hand_run;
+pub mod response;
+pub use hand_run::HandRunProof;
 #[cfg(test)]
 mod tests;
 
@@ -47,6 +51,12 @@ pub struct Connection {
     pub catalog_state: EvidenceState,
     pub observed_at: Option<String>,
     pub error: Option<String>,
+    #[serde(default)]
+    pub owned_profile: Option<service::View>,
+    #[serde(skip)]
+    pub permit: Option<hand_run::Permit>,
+    #[serde(default)]
+    pub hand_run_ledger: HashMap<String,hand_run::Ledger>,
 }
 
 impl Connection {
@@ -103,6 +113,7 @@ pub struct View {
     pub generation: u64,
     pub account: Option<String>,
     pub plan: Option<String>,
+    pub credential_reference:Option<String>,
     pub catalog_state: EvidenceState,
     pub observed_at: Option<String>,
     pub models: Vec<ModelView>,
@@ -112,6 +123,8 @@ pub struct View {
     pub qualification: &'static str,
     pub quota: &'static str,
     pub capability: &'static str,
+    pub owned_service: Option<service::View>,
+    pub hand_run: Option<serde_json::Value>,
 }
 
 #[derive(Clone)]
@@ -125,10 +138,11 @@ struct Attempt {
 struct CleanupLease<'a> {
     active: &'a Mutex<HashSet<String>>,
     id: String,
+    held:bool,
 }
 impl Drop for CleanupLease<'_> {
     fn drop(&mut self) {
-        self.active.lock().unwrap().remove(&self.id);
+        if self.held {self.active.lock().unwrap().remove(&self.id);}
     }
 }
 #[derive(Default)]
@@ -139,9 +153,143 @@ pub struct Manager {
     cleaning: Mutex<HashSet<String>>,
     polling: Mutex<HashSet<String>>,
     fixture: Mutex<Option<Arc<client::Client>>>,
+    services: Mutex<HashMap<String, service::Service>>,
 }
 
+pub struct GenerationTarget {pub base:String,pub key:String,pub(crate) lease:Option<response::ResponseLease>}
+
 impl Manager {
+    pub fn reconcile_owned(&self,store:&ConfigStore)->Result<()> {
+        let dead:Vec<_>=self.services.lock().unwrap().iter_mut().filter_map(|(id,s)|(!s.running().unwrap_or(false)).then(||id.clone())).collect();
+        let config=store.read();
+        for id in dead {if config.cpa_subscriptions.get(&id).and_then(|c|c.permit.as_ref()).is_some_and(|p|p.enabled || !p.stopped){self.fail_hand_run(store,&id)?;}}
+        Ok(())
+    }
+    pub(crate) fn finish_transport(&self,id:&str){self.cleaning.lock().unwrap().remove(id);}
+    pub async fn generation_target(&self,store:&Arc<ConfigStore>,id:&str,model:&Model,protocol:crate::protocol::Protocol,body:&serde_json::Value)->Result<GenerationTarget> {
+        let mut ownership=self.cleanup_lease(id)?;
+        let outcome=async {
+            self.ensure_owned_running(id)?;
+            let snapshot=store.read();let c=snapshot.cpa_subscriptions.get(id).context("Unknown CPA connection")?;
+            let identity=stamp(id,c);
+            admit_model(&snapshot,snapshot.providers.iter().find(|p|p.id==id).context("Unknown provider")?,Some(model),protocol)?;
+            c.permit.as_ref().context("CPA permission missing")?.validate_request(protocol,body)?;
+            store.update(|config|->Result<()> {
+                let c=config.cpa_subscriptions.get_mut(id).context("Connection removed")?;
+                ensure!(identity.matches(id,c),"Identity changed before management read");
+                let p=c.permit.as_ref().context("CPA permission missing")?;
+                let ledger=c.hand_run_ledger.get_mut(&p.proof.plan_id).context("Missing plan ledger")?;
+                ensure!(!ledger.stopped && ledger.auxiliary_used<p.proof.policy.max_auxiliary_requests,"Finite auxiliary request budget exhausted");
+                ledger.auxiliary_used+=1;Ok(())
+            })??;
+            let files=self.client(id)?.credentials().await?;
+            ensure!(files.len()==1 && files[0].provider==c.provider && !files[0].disabled && Some(&files[0].name)==c.credential_ref.as_ref(),"Owned credential became missing or ambiguous");
+            ensure!(known(files[0].identity())==identity.account && known(files[0].id_token.plan_type.clone())==identity.plan,"Owned account or plan changed before dispatch");
+            ensure!(identity.matches(id,store.read().cpa_subscriptions.get(id).context("Connection removed")?),"Connection changed during admission");
+            let owned=self.services.lock().unwrap().get(id).map(|s|GenerationTarget{base:s.base(),key:s.model_key(),lease:None});
+            #[cfg(test)]
+            let owned=owned.or_else(||self.fixture.lock().unwrap().as_ref().map(|c|GenerationTarget{base:c.model_base(),key:"fictional-cpa-generation".into(),lease:None}));
+            let mut target=owned.context("Owned CPA transport is unavailable")?;
+            self.reserve_hand_run(store,id,model,protocol,body)?;
+            target.lease=Some(response::ResponseLease::new(store.clone(),id.into()));
+            ownership.held=false;
+            Ok(target)
+        }.await;
+        if outcome.is_err(){self.fail_hand_run(store,id)?;}
+        outcome
+    }
+
+    pub fn enable_hand_run(&self, store:&ConfigStore,id:&str,proof:HandRunProof)->Result<()> {
+        ensure!(!self.cleaning.lock().unwrap().contains(id),"Finish this owned request before enabling another plan");
+        self.ensure_owned_running(id)?;
+        store.update(|config|->Result<()> {
+            let c=config.cpa_subscriptions.get(id).context("Unknown CPA connection")?;
+            ensure!(c.stage==Stage::Connected && c.catalog_state==EvidenceState::Available,"Connect and refresh this source before HAND_RUN");
+            proof.validate(id,c)?;
+            ensure!(c.catalog.iter().any(|m|m.model_id==proof.binding.model_id) && config.models.iter().any(|m|m.provider_id==id && m.model_id==proof.binding.model_id && m.selected && m.enabled && config.cpa_model_bindings.get(&m.id)==Some(&proof.binding)),"Select a current model bound to this identity first");
+            let c=config.cpa_subscriptions.get_mut(id).unwrap();
+            ensure!(c.hand_run_ledger.len()<100 || c.hand_run_ledger.contains_key(&proof.plan_id),"HAND_RUN plan limit reached");
+            let ledger=c.hand_run_ledger.entry(proof.plan_id.clone()).or_insert(hand_run::Ledger{proof_sha256:crate::hand_run_policy::proof_sha256(&proof)?,used:0,max_requests:proof.policy.max_requests,stopped:false,auxiliary_used:0,tool_rounds_used:0});
+            ensure!(!ledger.stopped && proof.policy.max_requests==ledger.max_requests && ledger.proof_sha256==crate::hand_run_policy::proof_sha256(&proof)?,"A stopped plan cannot resume or expand its budget");
+            let expires_at=proof.policy.evidence.iter().map(|e|e.valid_until).min().unwrap();
+            let tools=proof.policy.function_tools;let upstream_model=proof.binding.model_id.clone();
+            c.permit=Some(hand_run::Permit{proof,enabled:true,used:ledger.used,expires_at,stopped:false});
+            for m in config.models.iter_mut().filter(|m|m.provider_id==id && m.model_id==upstream_model){m.supports_tools=tools;}
+            Ok(())
+        })??;
+        Ok(())
+    }
+    pub fn disable_hand_run(&self,store:&ConfigStore,id:&str)->Result<()> {
+        store.update(|config| {if let Some(p)=config.cpa_subscriptions.get_mut(id).and_then(|c|c.permit.as_mut()){p.enabled=false;}})?;
+        Ok(())
+    }
+    pub fn fail_hand_run(&self,store:&ConfigStore,id:&str)->Result<()> {
+        store.update(|config| {if let Some(c)=config.cpa_subscriptions.get_mut(id){if let Some(p)=c.permit.as_mut(){p.enabled=false;p.stopped=true;if let Some(l)=c.hand_run_ledger.get_mut(&p.proof.plan_id){l.stopped=true;}}}})?;
+        Ok(())
+    }
+    fn ensure_owned_running(&self,id:&str)->Result<()> {
+        let live=self.services.lock().unwrap().get_mut(id).map(|s|s.running()).transpose()?;
+        ensure!(live==Some(true) || (cfg!(test) && self.fixture.lock().unwrap().is_some()),"Owned CPA service is unavailable; recover explicitly");
+        ensure!(self.clients.lock().unwrap().contains_key(id),"Dedicated management client is unavailable");
+        Ok(())
+    }
+    pub fn reserve_hand_run(&self,store:&ConfigStore,id:&str,model:&Model,protocol:crate::protocol::Protocol,body:&serde_json::Value)->Result<()> {
+        if let Err(error)=self.ensure_owned_running(id){self.fail_hand_run(store,id)?;return Err(error);}
+        let result=store.update(|config|->Result<()> {
+            let provider=config.providers.iter().find(|p|p.id==id).context("Unknown provider")?;
+            admit_model(config,provider,Some(model),protocol)?;
+            let c=config.cpa_subscriptions.get_mut(id).unwrap();
+            let permit=c.permit.as_ref().context("CPA generation remains disabled")?;
+            permit.validate_request(protocol,body)?;
+            let plan=permit.proof.plan_id.clone();
+            let ledger=c.hand_run_ledger.get_mut(&plan).context("HAND_RUN ledger is unavailable")?;
+            ensure!(!ledger.stopped && ledger.used<ledger.max_requests,"HAND_RUN finite budget is exhausted or stopped");
+            let tool_round=body["messages"].as_array().is_some_and(|m|m.iter().any(|m|m["role"]=="tool"));
+            ensure!(!tool_round || ledger.tool_rounds_used<permit.proof.policy.max_tool_rounds,"Finite client tool round budget exhausted");
+            if tool_round {ledger.tool_rounds_used+=1;}
+            ledger.used+=1;c.permit.as_mut().unwrap().used=ledger.used;
+            Ok(())
+        })?;
+        if result.is_err(){self.fail_hand_run(store,id)?;}
+        result
+    }
+
+    pub async fn provision_owned(&self, store: &ConfigStore, id: &str, binary: String, port: u16) -> Result<service::View> {
+        let _lease = self.cleanup_lease(id)?;
+        ensure!(!self.attempts.lock().unwrap().contains_key(id), "Finish owned authorization before changing its service");
+        {
+            let mut services = self.services.lock().unwrap();
+            if let Some(service) = services.get_mut(id) {
+                ensure!(!service.running()?, "Stop the owned service before restarting it");
+            }
+            services.remove(id);
+        }
+        self.clients.lock().unwrap().remove(id);
+        self.disable_hand_run(store,id)?;
+        let connection = store.read().cpa_subscriptions.get(id).cloned().context("Unknown CPA connection")?;
+        let mut owned = service::Service::start(store.cpa_profile_root(), &connection.identity.connection_instance_id, binary, port).await?;
+        self.configure_owned_client(id, owned.base(), owned.management_key())?;
+        let view = owned.view()?;
+        store.update(|config| {
+            if let Some(c) = config.cpa_subscriptions.get_mut(id) { c.owned_profile = Some(view.clone()); }
+        })?;
+        self.services.lock().unwrap().insert(id.into(), owned);
+        Ok(view)
+    }
+    pub fn stop_owned(&self, id: &str) -> Result<()> {
+        let _lease = self.cleanup_lease(id)?;
+        ensure!(!self.attempts.lock().unwrap().contains_key(id), "Cancel authorization before stopping its service");
+        let owned=self.services.lock().unwrap().remove(id);
+        if let Some(mut service) = owned { service.stop()?; }
+        self.clients.lock().unwrap().remove(id);
+        Ok(())
+    }
+    // Called only after the process owner has provisioned this connection's profile.
+    pub(crate) fn configure_owned_client(&self, id: &str, base: String, key: String) -> Result<()> {
+        let client = Arc::new(client::Client::owned_service(base, key)?);
+        self.clients.lock().unwrap().insert(id.into(), client);
+        Ok(())
+    }
     #[cfg(any(test, feature = "isolation-check"))]
     pub fn owned_fixture(base: String) -> Result<Self> {
         Ok(Self {
@@ -169,6 +317,7 @@ impl Manager {
         Ok(CleanupLease {
             active: &self.cleaning,
             id: id.into(),
+            held:true,
         })
     }
     fn retire_profile(&self, id: &str, client: &Arc<client::Client>) {
@@ -195,6 +344,14 @@ impl Manager {
                 && !self.polling.lock().unwrap().contains(id),
             "Finish owned CPA cleanup before deleting this connection"
         );
+        // Remove only this process handle. A failed stop retains its recovery entry.
+        let owned = self.services.lock().unwrap().remove(id);
+        if let Some(mut service) = owned {
+            if let Err(error) = service.stop() {
+                self.services.lock().unwrap().insert(id.into(), service);
+                return Err(error);
+            }
+        }
         store.update(|config| -> Result<()> {
             let c = config
                 .cpa_subscriptions
@@ -218,8 +375,8 @@ impl Manager {
     }
     pub fn create(&self, store: &ConfigStore, provider: &str, name: &str) -> Result<String> {
         ensure!(
-            provider == "codex",
-            "This R3 integration currently supports the Codex management contract only"
+            matches!(provider,"codex"|"xai"),
+            "Only the pinned Codex and xAI management contracts are available"
         );
         ensure!(
             !name.trim().is_empty() && name.len() <= 100,
@@ -231,7 +388,7 @@ impl Manager {
             config.providers.push(Provider {
                 id: id.clone(),
                 name: name.trim().into(),
-                kind: ProviderKind::CodexSubscription,
+                kind: if provider=="codex"{ProviderKind::CodexSubscription}else{ProviderKind::GrokSubscription},
                 base_url: String::new(),
                 enabled: true,
                 preset: String::new(),
@@ -252,6 +409,9 @@ impl Manager {
                     catalog_state: EvidenceState::Unknown,
                     observed_at: None,
                     error: None,
+                    owned_profile: None,
+                    permit: None,
+                    hand_run_ledger: HashMap::new(),
                 },
             );
         })?;
@@ -283,17 +443,21 @@ impl Manager {
                 generation: c.identity.generation,
                 account: c.identity.identity.clone(),
                 plan: c.plan.clone(),
+                credential_reference:c.credential_ref.clone(),
                 catalog_state: c.catalog_state,
                 observed_at: c.observed_at.clone(),
                 error: c.error.clone(),
-                service_available: clients.contains_key(id),
+                service_available: clients.contains_key(id) && self.services.lock().unwrap().get_mut(id).is_none_or(|s| s.running().unwrap_or(false)),
                 authorization_url: attempts
                     .get(id)
                     .filter(|a| a.stamp.matches(id, c) && c.stage == Stage::Waiting)
                     .and_then(|a| a.url.clone()),
-                qualification: "unknown",
-                quota: "unknown",
-                capability: "unverified",
+                hand_run:c.permit.as_ref().map(|p|serde_json::json!({"enabled":p.ready(id,c,&p.proof.binding.model_id),"stopped":p.stopped,"used":p.used,"max_requests":p.proof.policy.max_requests,"expires_at":p.expires_at,"model_id":p.proof.binding.model_id})),
+                qualification: if c.permit.as_ref().is_some_and(|p|p.ready(id,c,&p.proof.binding.model_id)){"reviewed_available"}else{"unknown"},
+                quota: if c.permit.as_ref().is_some_and(|p|p.ready(id,c,&p.proof.binding.model_id)){"reviewed_available"}else{"unknown"},
+                capability: if c.permit.as_ref().is_some_and(|p|p.ready(id,c,&p.proof.binding.model_id)){"reviewed_chat"}else{"unverified"},
+                owned_service: self.services.lock().unwrap().get_mut(id).and_then(|service| service.view().ok())
+                    .or_else(|| c.owned_profile.clone().map(|mut view| {view.running=false;view.pid=0;view})),
                 models: config
                     .models
                     .iter()
@@ -440,6 +604,7 @@ impl Manager {
                 CleanupLease {
                     active: &self.polling,
                     id: id.into(),
+                    held:true,
                 },
             )
         };
@@ -469,7 +634,7 @@ impl Manager {
                 let c = current(config, id, &attempt.stamp)?;
                 ensure!(c.stage == Stage::Waiting, "Authorization was superseded");
                 c.identity.state = ConnectionState::Connected;
-                c.identity.identity = known(credential.id_token.chatgpt_account_id);
+                c.identity.identity = known(credential.identity());
                 c.plan = known(credential.id_token.plan_type);
                 c.credential_ref = Some(credential.name);
                 c.stage = Stage::Connected;
@@ -703,7 +868,7 @@ impl Manager {
                 c.error=Some("Owned CPA credential disappeared, was disabled, or became ambiguous; connection disabled".into());
                 return Err(c.error.clone().unwrap());
             };
-            let account=known(file.id_token.chatgpt_account_id.clone());
+            let account=known(file.identity());
             let plan=known(file.id_token.plan_type.clone());
             if account!=c.identity.identity||plan!=c.plan {
                 advance(c,Stage::Connected).map_err(|e|e.to_string())?;
@@ -842,6 +1007,11 @@ impl Manager {
                 .all(|a| a.state.is_some()),
             "Owned CPA authorization request is still finishing; retry shutdown"
         );
+        let mut services = std::mem::take(&mut *self.services.lock().unwrap());
+        let owned_ids:Vec<_>=services.keys().cloned().collect();
+        for service in services.values_mut() { service.stop()?; }
+        let mut clients=self.clients.lock().unwrap();
+        for id in owned_ids {clients.remove(&id);}
         Ok(())
     }
 }
@@ -880,6 +1050,8 @@ pub fn denial(config: &AppConfig, provider: &Provider, model: Option<&Model>) ->
             DenialFamily::NotEligible,
             "This fixed target is not bound to the current account, plan and connection generation",
         )
+    } else if model.is_some_and(|m| c.permit.as_ref().is_some_and(|p| p.ready(&provider.id,c,&m.model_id))) {
+        return None;
     } else {
         ("cpa_qualification_unknown",DenialFamily::Quota,"CPA login and directory do not prove model eligibility, protocol capability or whole-call subscription-only consumption")
     };
@@ -928,6 +1100,7 @@ fn advance(c: &mut Connection, stage: Stage) -> Result<()> {
         .generation
         .checked_add(1)
         .ok_or_else(|| anyhow::anyhow!("Connection generation exhausted"))?;
+    c.permit = None;
     c.identity.state = ConnectionState::NotConnected;
     c.identity.identity = None;
     c.identity.evidence = None;
@@ -960,13 +1133,25 @@ fn fail(store: &ConfigStore, id: &str, b: &IdentityStamp, error: &str) -> Result
     store.update(|config| -> Result<()> {
         let c = current(config, id, b)?;
         c.stage = Stage::Failed;
-        c.identity.state = ConnectionState::NotConnected;
+        c.permit = None;
+    c.identity.state = ConnectionState::NotConnected;
         c.error = Some(error.into());
         Ok(())
     })??;
     Ok(())
 }
 
+#[tauri::command]
+pub async fn configure_cpa_service(state: tauri::State<'_, crate::AppState>, provider_id: String, binary: String, port: u16) -> std::result::Result<crate::DashboardSnapshot, String> {
+    state.store.cpa.provision_owned(&state.store, &provider_id, binary, port).await.map_err(|e|format!("{e:#}"))?;
+    Ok(crate::snapshot(&state).await)
+}
+#[tauri::command]
+pub async fn stop_cpa_service(state: tauri::State<'_, crate::AppState>, provider_id: String) -> std::result::Result<crate::DashboardSnapshot, String> {
+    state.store.cpa.disable_hand_run(&state.store,&provider_id).map_err(|e|e.to_string())?;
+    state.store.cpa.stop_owned(&provider_id).map_err(|e|format!("{e:#}"))?;
+    Ok(crate::snapshot(&state).await)
+}
 #[tauri::command]
 pub async fn create_cpa_subscription(
     state: tauri::State<'_, crate::AppState>,
@@ -1015,4 +1200,38 @@ pub async fn select_cpa_model(
         .select(&state.store, &provider_id, &model_id, selected)
         .map_err(|e| e.to_string())?;
     Ok(crate::snapshot(&state).await)
+}
+
+pub fn admit_model(config:&AppConfig,provider:&Provider,model:Option<&Model>,protocol:crate::protocol::Protocol)->Result<()> {
+    if let Some(denial)=denial(config,provider,model){anyhow::bail!("{}: {}",denial.code,denial.message);}
+    let c=config.cpa_subscriptions.get(&provider.id).context("Unknown CPA connection")?;
+    let model=model.context("Select a stable bound CPA model")?;
+    ensure!(c.catalog_state==EvidenceState::Available && c.catalog.iter().any(|m|m.model_id==model.model_id),"CPA model eligibility is stale or removed");
+    let permit=c.permit.as_ref().context("CPA generation remains disabled")?;
+    ensure!(permit.ready(&provider.id,c,&model.model_id),"CPA finite permission is unavailable");
+    ensure!(protocol==crate::protocol::Protocol::Chat,"CPA protocol capability is unverified");
+    permit.proof.validate(&provider.id,c)
+}
+
+#[tauri::command]
+pub async fn set_cpa_hand_run(state:tauri::State<'_,crate::AppState>,provider_id:String,enabled:bool)->std::result::Result<crate::DashboardSnapshot,String> {
+    let manager=&state.store.cpa;
+    if enabled {
+        let config=state.store.read();let c=config.cpa_subscriptions.get(&provider_id).ok_or("Unknown CPA connection")?;
+        let path=state.store.cpa_profile_root().join(&c.identity.connection_instance_id).join("hand-run.reviewed.json");
+        let metadata=std::fs::symlink_metadata(&path).map_err(|_|format!("Put independently reviewed source evidence at {}",path.display()))?;
+        if !metadata.is_file() || metadata.len()>65536 {return Err("Use a regular owned evidence file up to 64 KiB".into());}
+        let proof:HandRunProof=serde_json::from_slice(&std::fs::read(path).map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
+        manager.enable_hand_run(&state.store,&provider_id,proof).map_err(|e|e.to_string())?;
+    }else{manager.disable_hand_run(&state.store,&provider_id).map_err(|e|e.to_string())?;}
+    Ok(crate::snapshot(&state).await)
+}
+
+#[tauri::command]
+pub fn open_cpa_authorization(state:tauri::State<'_,crate::AppState>,app:tauri::AppHandle,provider_id:String)->std::result::Result<(),String> {
+    use tauri_plugin_opener::OpenerExt;
+    crate::runtime::external_action().map_err(|e|e.to_string())?;
+    let config=state.store.read();
+    let url=state.store.cpa.views(&config).into_iter().find(|c|c.provider_id==provider_id).and_then(|c|c.authorization_url).ok_or("No current owned authorization URL")?;
+    app.opener().open_url(url,None::<&str>).map_err(|e|e.to_string())
 }

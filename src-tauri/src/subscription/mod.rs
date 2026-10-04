@@ -589,7 +589,7 @@ fn quota_admission_denial(provider: &Provider, state: EvidenceState) -> Option<D
     Some(quota_denial(provider, code, rejected_state))
 }
 
-fn admission_denial(provider: &Provider, quota: &QuotaEvidence) -> Option<Denial> {
+pub(crate) fn admission_denial(provider: &Provider, quota: &QuotaEvidence) -> Option<Denial> {
     quota_admission_denial(provider, admission_quota_state(quota))
         .or_else(|| extra_usage_denial(provider, extra_usage_permission(quota)))
 }
@@ -1026,6 +1026,12 @@ fn evaluate(
     if let Some(denial) = crate::cpa_sources::denial(config, provider, model) {
         return Err(denial);
     }
+    if config.cpa_subscriptions.contains_key(&provider.id) {
+        // CPA evidence is independently bound and reviewed. Never use a CLI grant here.
+        return crate::cpa_sources::admit_model(config, provider, model, protocol)
+            .map_err(|error| Denial::new("cpa_evidence_denied", DenialFamily::Quota,
+                error.to_string(), "Stop HAND_RUN and review this fixed source's current evidence.".into()));
+    }
     if !is_subscription_provider(provider) {
         return Ok(());
     }
@@ -1150,6 +1156,9 @@ pub fn catalog_listed(config: &AppConfig, model: &Model) -> bool {
     };
     if !provider.enabled {
         return false;
+    }
+    if config.cpa_subscriptions.contains_key(&provider.id) {
+        return crate::cpa_sources::admit_model(config,provider,Some(model),Protocol::Chat).is_ok();
     }
     if !is_subscription_provider(provider) {
         return true;

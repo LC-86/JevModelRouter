@@ -15,6 +15,7 @@ pub struct Client {
     base: reqwest::Url,
     key: String,
     http: reqwest::Client,
+    fictional_authorization: bool,
 }
 #[derive(Deserialize)]
 pub struct Credential {
@@ -24,6 +25,10 @@ pub struct Credential {
     pub disabled: bool,
     #[serde(default)]
     pub id_token: Claims,
+    #[serde(default)]
+    pub account_type: Option<String>,
+    #[serde(default)]
+    pub account: Option<String>,
 }
 #[derive(Default, Deserialize)]
 pub struct Claims {
@@ -47,7 +52,26 @@ struct DirectoryModel {
     display_name: Option<String>,
 }
 
+impl Credential {
+    pub fn identity(&self)->Option<String> {
+        if self.provider=="codex" {return self.id_token.chatgpt_account_id.clone();}
+        if self.provider=="xai" && self.account_type.as_deref()==Some("oauth") {return self.account.clone();}
+        None // In particular, never project an api_key account value.
+    }
+}
 impl Client {
+    #[cfg(test)]
+    pub fn model_base(&self)->String {self.base.as_str().trim_end_matches('/').into()}
+    pub fn owned_service(base: String, key: String) -> Result<Self> {
+        let base = reqwest::Url::parse(&base)?;
+        crate::dispatch::ensure_loopback(&base)?;
+        ensure!(base.path() == "/" && base.query().is_none() && base.fragment().is_none()
+            && base.username().is_empty() && base.password().is_none(), "Use a dedicated owned service origin");
+        ensure!(!key.trim().is_empty(), "Owned management authentication is missing");
+        Ok(Self { base, key, fictional_authorization: false,
+            http: reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none())
+                .timeout(std::time::Duration::from_secs(3)).build()? })
+    }
     #[cfg(any(test, feature = "isolation-check"))]
     pub fn owned_fixture(base: String) -> Result<Self> {
         let base = reqwest::Url::parse(&base)?;
@@ -63,6 +87,7 @@ impl Client {
         Ok(Self {
             base,
             key: "fictional-management-r3".into(),
+            fictional_authorization: true,
             http: reqwest::Client::builder()
                 .no_proxy()
                 .redirect(reqwest::redirect::Policy::none())
@@ -131,7 +156,7 @@ impl Client {
             .request(
                 reqwest::Method::GET,
                 "oauth/auth-url",
-                &[("provider", provider)],
+                &[("provider", provider), ("is_webui", "true")],
             )
             .await?;
         let state = value["state"]
@@ -144,14 +169,19 @@ impl Client {
             .ok_or_else(|| anyhow::anyhow!("CPA did not return an authorization URL"))?;
         let parsed =
             reqwest::Url::parse(url).map_err(|_| anyhow::anyhow!("Invalid authorization URL"))?;
+        let accepted_host = parsed.host_str().is_some_and(|host| {
+            if self.fictional_authorization { return host.ends_with(".example.invalid"); }
+            match provider {
+                "codex" => host == "auth.openai.com",
+                "xai" => matches!(host, "auth.x.ai" | "accounts.x.ai"),
+                _ => false,
+            }
+        });
         ensure!(
-            parsed.scheme() == "https"
-                && parsed
-                    .host_str()
-                    .is_some_and(|s| s.ends_with(".example.invalid"))
+            parsed.scheme() == "https" && accepted_host
                 && parsed.username().is_empty()
                 && parsed.password().is_none(),
-            "R3 fixture permits fictional authorization URLs only"
+            "CPA returned an authorization URL outside this provider's contract"
         );
         Ok((state, url.into()))
     }

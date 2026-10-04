@@ -129,9 +129,15 @@ async function invoke<T>(command: string, args?: Record<string, unknown>): Promi
   return tauriInvoke<T>(command, args);
 }
 
-export async function createCpaSubscription(name:string):Promise<DashboardSnapshot> {
+export async function createCpaSubscription(name:string,provider:'codex'|'xai'='codex'):Promise<DashboardSnapshot> {
   if (!isTauri()) throw new Error('CPA 连接需要桌面应用；服务交付待 R6');
-  return invoke('create_cpa_subscription',{provider:'codex',name});
+  return invoke('create_cpa_subscription',{provider,name});
+}
+export async function configureCpaService(providerId:string,binary:string,port:number):Promise<DashboardSnapshot> {
+  return invoke('configure_cpa_service',{providerId,binary,port});
+}
+export async function stopCpaService(providerId:string):Promise<DashboardSnapshot> {
+  return invoke('stop_cpa_service',{providerId});
 }
 export async function cpaSubscriptionAction(providerId:string,action:'begin'|'poll'|'refresh'|'cancel'|'disconnect'|'switch'):Promise<DashboardSnapshot> {
   if (!isTauri()) throw new Error('CPA 连接需要桌面应用');
@@ -491,3 +497,8 @@ export async function openAgentConfig(id: string, index: number): Promise<void> 
   if (!isTauri()) throw new Error('Opening configuration files requires the desktop app');
   return invoke('open_agent_config', { id, index });
 }
+
+export async function setCpaHandRun(providerId:string,enabled:boolean):Promise<DashboardSnapshot> {return invoke('set_cpa_hand_run',{providerId,enabled});}
+export async function setCodingPlanHandRun(providerId:string,enabled:boolean):Promise<DashboardSnapshot> {return invoke('set_coding_plan_hand_run',{providerId,enabled});}
+
+export async function openCpaAuthorization(providerId:string):Promise<void> {return invoke('open_cpa_authorization',{providerId});}

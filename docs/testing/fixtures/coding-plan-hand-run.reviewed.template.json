@@ -1,0 +1,87 @@
+{
+  "plan_id": "REPLACE_WITH_APPROVED_PLAN_UUID",
+  "binding": {
+    "provider_id": "FROM_CURRENT_SOURCE",
+    "connection_instance_id": "FROM_CURRENT_SOURCE",
+    "generation": 0,
+    "endpoint": "EXACT_PLAN_ENDPOINT",
+    "credential_reference": "FROM_CURRENT_SOURCE",
+    "model_id": "EXACT_UPSTREAM_MODEL",
+    "model_uuid": "EXACT_FIXED_MODEL_UUID",
+    "account": "UNKNOWN",
+    "plan": "UNKNOWN"
+  },
+  "evidence": [
+    {
+      "kind": "identity",
+      "state": "unknown",
+      "authority": "UNKNOWN",
+      "observed_at": 0,
+      "valid_until": 0,
+      "receipt_sha256": "UNKNOWN",
+      "reviewed": false
+    },
+    {
+      "kind": "plan",
+      "state": "unknown",
+      "authority": "UNKNOWN",
+      "observed_at": 0,
+      "valid_until": 0,
+      "receipt_sha256": "UNKNOWN",
+      "reviewed": false
+    },
+    {
+      "kind": "eligibility",
+      "state": "unknown",
+      "authority": "UNKNOWN",
+      "observed_at": 0,
+      "valid_until": 0,
+      "receipt_sha256": "UNKNOWN",
+      "reviewed": false
+    },
+    {
+      "kind": "protocol",
+      "state": "unknown",
+      "authority": "UNKNOWN",
+      "observed_at": 0,
+      "valid_until": 0,
+      "receipt_sha256": "UNKNOWN",
+      "reviewed": false
+    },
+    {
+      "kind": "quota",
+      "state": "unknown",
+      "authority": "UNKNOWN",
+      "observed_at": 0,
+      "valid_until": 0,
+      "receipt_sha256": "UNKNOWN",
+      "reviewed": false
+    },
+    {
+      "kind": "whole_call_cost",
+      "state": "unknown",
+      "authority": "UNKNOWN",
+      "observed_at": 0,
+      "valid_until": 0,
+      "receipt_sha256": "UNKNOWN",
+      "reviewed": false
+    }
+  ],
+  "quota": {
+    "state": "unknown",
+    "source": null,
+    "observed_at": null,
+    "view": "unknown",
+    "buckets": [],
+    "history": false
+  },
+  "subscription_only": false,
+  "streaming": false,
+  "function_tools": false,
+  "max_requests": 1,
+  "max_input_bytes": 2048,
+  "max_output_tokens": 64,
+  "max_auxiliary_requests": 0,
+  "max_tool_rounds": 0,
+  "jev_artifact_sha256": "FROM_CURRENT_PRODUCT_MANIFEST"
+}

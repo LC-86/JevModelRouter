@@ -62,6 +62,7 @@ import { SettingsDialog, type SettingsSection } from './components/settings-dial
 import { SubscriptionAuthDialog } from './components/subscription-auth-dialog';
 import { GrokReadOnlyStatus } from './components/grok-readonly-status';
 import { CpaSubscriptions } from './components/cpa-subscriptions';
+import { CodingPlanHandRuns } from './components/coding-plan-hand-runs';
 import { CpaDevelopmentService } from './components/cpa-development-service';
 import { usePreferences } from './lib/preferences-context';
 import { SearchSelect } from './components/search-select';
@@ -697,6 +698,7 @@ function ProvidersPage({ snapshot, onAdd, onEdit, onDelete, onTest, onImport, on
       <GrokReadOnlyStatus t={t} />
       <CpaDevelopmentService />
       <CpaSubscriptions connections={snapshot.cpa_subscriptions??[]} onSnapshot={onSnapshot} onNotify={onNotify} />
+      <CodingPlanHandRuns connections={snapshot.coding_hand_runs??[]} onSnapshot={onSnapshot} onNotify={onNotify} />
       <div className="table-panel provider-table-panel">
         <table className="provider-table">
           <thead><tr><th>{t('Provider')}</th><th>{t('Base URL')}</th><th>{t('Enabled status')}</th><th>{t('Subscription')}</th><th>{t('API key')}</th><th className="provider-actions-heading">{t('Actions')}</th></tr></thead>
@@ -744,7 +746,7 @@ function ProvidersPage({ snapshot, onAdd, onEdit, onDelete, onTest, onImport, on
             ); })}
           </tbody>
         </table>
-        {snapshot.providers.filter((provider) => provider.kind === 'codex_subscription').map((provider) => {
+        {snapshot.providers.filter((provider) => provider.kind === 'codex_subscription' && !snapshot.cpa_subscriptions?.some(c=>c.provider_id===provider.id)).map((provider) => {
           const view = subscriptionView(snapshot, provider.id);
           const enabled = view?.real_generation_enabled === true;
           const canArm = provider.enabled && view?.state === 'connected' && Boolean(view.identity?.trim());
@@ -788,7 +790,7 @@ function ProvidersPage({ snapshot, onAdd, onEdit, onDelete, onTest, onImport, on
             <p className="provider-subscription-generation-note">{t('This volatile control does not verify identity, models, protocols, quota, or credits. Every existing admission check remains mandatory. The per-connection request count survives disarm/re-arm and resets after restart, sign-out, or account switch.')}</p>
           </section>;
         })}
-        {snapshot.providers.filter((provider) => provider.kind === 'grok_subscription').map((provider) => {
+        {snapshot.providers.filter((provider) => provider.kind === 'grok_subscription' && !snapshot.cpa_subscriptions?.some(c=>c.provider_id===provider.id)).map((provider) => {
           const view = subscriptionView(snapshot, provider.id);
           const enabled = view?.real_generation_enabled === true;
           const loginSupported = subscriptionAuthView(snapshot, provider.id)?.helper?.login_supported === true;

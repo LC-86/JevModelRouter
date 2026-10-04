@@ -4,8 +4,9 @@
 
 ## 产物与职责
 
-这是 macOS arm64 的 unsigned development folder，包含 Jev `isolation-check` 原生开发二进制、构建后的前端、独立固定 CPA、源码归档、随附许可和依赖通知、虚构运行入口和 HAND_RUN。不把 CPA 链接进 Jev，不重写 OAuth、刷新或协议内核。只有显式隔离 debug profile 的 Providers 页显示开发服务控制；普通构建没有这些 IPC，真实 CPA 授权仍未配置。
+同时交付两种 macOS arm64 unsigned development folder。`--product` 构建普通原生二进制与持久专用 profile 入口：没有 `isolation-check`、没有强制隔离、没有内置虚构授权或 driver。默认构建保留隔离验收产物，用于已合入 R5 的虚构 DSH 全链路回归。两种产物独立 manifest/source/checksum/许可，不共用通过结论。
 
+普通 Providers 页可创建 Codex 或 Grok/xAI CPA 连接，指定固定 artifact，启动/停止/恢复各连接自己的 CPA 子进程与私有配置。CPA 承担 OAuth 与刷新；Jev 只保存凭据引用和非秘密身份、模型绑定。真实生成默认关闭，只有完整、独立审阅且新鲜的证据及有限计划才能进入普通 CPA 模型 HTTP；不会使用旧 CLI helper 许可或管理 token 派发。Grok 套餐/费用依据缺失会阻止调用。Coding Plan 通过独立证据入口启用绑定套餐端点的有限计划；未知事实继续拒绝。
 | 产物 | source / version | checksum / 许可 |
 | --- | --- | --- |
 | Jev | `0.1.2`；完整构建 commit 写入产物 `manifest.json`，并随附 `jev-source.tar` | `bin/jev`、所有 frontend/driver/docs/source 文件 SHA-256 写入 manifest；`JEV.LICENSE` AGPL-3.0-only 与 `NOTICE` 随附 |
@@ -20,19 +21,26 @@
 先有已验证的 CPA 文件和 `<CPA>.LICENSE`、现成 Node 22+/pnpm 10+/Rust/Tauri 工具链及本项目依赖。使用自有 source、Cargo cache/target；锁文件不变，不下载系统软件。将 CPA 放在本任务拥有目录，不能把前序 checkout/target 作为输出目录。
 
 ```sh
-CARGO_HOME=/absolute/owned-cargo-cache node scripts/build-mac-development.mjs /absolute/pinned-cpa /absolute/new-development-folder /absolute/owned-target /absolute/verified-cpa-module-cache /absolute/verified-go/LICENSE
+CARGO_HOME=/absolute/owned-cargo-cache node scripts/build-mac-development.mjs /absolute/pinned-cpa /absolute/new-development-folder /absolute/owned-target /absolute/verified-cpa-module-cache /absolute/verified-go/LICENSE --product
 ```
 
-构建脚本要求干净、已提交 source，设置编译期 `AUTOJEV_DEVELOPMENT_ISOLATION=1`（普通构建不变），执行 `pnpm build` 和 locked/offline 原生 build，核对 source 未改变、两份 Mach-O arm64 文件及 CPA/许可 pin，保留 Node（含 React、字体 OFL）、locked Rust、固定 CPA 模块缓存与 Go 的许可通知，再生成新目录与逐文件 SHA manifest。依赖通知包含构建依赖，不改变 Jev/CPA 自身许可。已存在目录不会覆盖。产物有源码归档与构建命令，可重建/重新验契约；不修改 AGENTS、全局技能或系统配置。
+构建脚本要求干净、已提交 source。`--product` 不设置强制隔离变量、不编译隔离 feature；不传此选项才设置 `AUTOJEV_DEVELOPMENT_ISOLATION=1` 并编译隔离 feature。执行 `pnpm build` 和 locked/offline 原生 build，核对 source 未改变、两份 Mach-O arm64 文件及 CPA/许可 pin，保留 Node（含 React、字体 OFL）、locked Rust、固定 CPA 模块缓存与 Go 的许可通知，再生成新目录与逐文件 SHA manifest。依赖通知包含构建依赖，不改变 Jev/CPA 自身许可。已存在目录不会覆盖。产物有源码归档与构建命令，可重建/重新验契约；不修改 AGENTS、全局技能或系统配置。
 
-从任意目录运行产物的隔离验收，前端静态资源随附，不依赖开发服务器/node_modules：
+普通桌面使用明确选择的新空目录，或本应用已标记的专用目录。前端静态资源随附，运行无需 node_modules：
 
 ```sh
-node /absolute/folder/scripts/check-dsh-desktop.mjs /absolute/folder/bin/jev /absolute/folder/bin/cpa --web-root /absolute/folder/web --service-check --capture
+node /absolute/product/scripts/launch-product.mjs /absolute/dedicated-profile
 ```
 
-用 `--manual` 替代 `--service-check --capture` 可打开没有自动生成的隔离桌面：Providers → 隔离 CPA 开发服务 → 启动自有服务；仅接 `a1/a2/b1/paid` 四个虚构 namespace，每个一个虚构凭据，全部上游被 macOS 沙箱限定回环。新临时 home 与 fixture 地址会打印；安全退出用托盘 Quit 或运行器 Ctrl-C。**产物编译时强制隔离；直接运行 `bin/jev` 会在读取普通 profile 前退出。** 手动模式本轮未执行，不冒充桌面自动验收结果。
+添加 `--offline` 则应用外部操作禁用、传输只准回环，CPA 子进程另受 macOS 回环网络沙箱限制。真人计划另行批准后，才在普通入口 Providers → CPA 创建对应连接，指定 `/absolute/product/bin/cpa` 并启动；授权页面由 CPA 返回，Jev 仅打开当前自有会话 URL，不自行实现 OAuth。绝不在日常 profile 或 DSH 配置中验收。
 
+普通公开操作的离线验收运行器（外部注入驱动，不编译进产品）使用新临时目录，验证错误 artifact、端口占用、停止/恢复、自有进程退出及同 profile 应用重开：
+
+```sh
+node /absolute/product/scripts/check-product-desktop.mjs /absolute/product/bin/jev /absolute/product/web /absolute/product/bin/cpa
+```
+
+原隔离 DSH 全链路产物另用 `check-dsh-desktop.mjs ... --web-root ... --service-check --capture`。只有该隔离产物强制拒绝裸启动；不能将此限制或其 API-key-backed 虚构结果描述为普通 OAuth 产品成功。
 保存与状态轮询只读自有 child handle，不自动登录、读账号额度或生成。服务管理 key 只留后端，前端/DSH 不得到管理认证或 auth-file。重开后显式启动，保留已存端口、来源身份绑定与稳定模型 UUID；不自动接管端口上的外部服务。
 
 ## 故障与恢复
@@ -45,12 +53,12 @@ node /absolute/folder/scripts/check-dsh-desktop.mjs /absolute/folder/bin/jev /ab
 | 安全退出 / 重开应用 | 回收并 wait 自有 CPA；重开显式启动保存端口 | 稳定 UUID、连接实例/世代与 namespace 绑定保留；不自动登录/查询/生成 |
 | 身份、模型、协议或费用依据不成立 | 保持拒绝；按 [逐来源 HAND_RUN](relay-hand-run.md)记录未测/禁用与缺失依据 | 不能靠服务恢复、模型选择、provider enabled 或 Debug/测速旁路 |
 
-服务状态是自有进程状态，不能代替来源连接、模型目录、隔离链路或真实验收。API/第三方/Coding Plan 沿用已合入派发及明确 endpoint/身份，既有用户配置不迁移、不扩大。新 CPA 开发服务只允许声明的虚构凭据；真实订阅/Coding Plan 的整次调用费用门禁和身份/模型/协议门禁没有解除。
+服务状态是自有进程状态，不能代替来源连接、模型目录、隔离链路或真实验收。官方/第三方 API 保留已有明确 endpoint、Key 和固定模型路径。Coding Plan 使用独立 `coding-plan.reviewed.json` 入口和校验器；无证据时 shared admission 返回 `coding_plan_unverified`。有限许可绑定来源实例/世代、准确端点、Key 引用、账号、套餐、模型和 Jev artifact；不会借用 CPA OAuth 许可。既有用户配置不迁移。CPA 恢复后许可关闭；旧计划的已用次数与失败锁停保留，不因重开或关闭/开启重置。
 
 ## 验证范围与移交
 
-TDD 使用 #51 已确认的原生桌面公开操作与最高层网关接缝。自有 CPA 退出后的显式恢复原先报 `Stop the owned CPA before starting another profile`，修复后两次原生进程与 38 次虚构回环请求通过；服务状态入口原先报 `Command get_cpa_development_service not found`，新增面板后覆盖缺文件、错误 checksum/版本、占用端口、退出、恢复与固定请求零派发。普通前端类型构建已通过。最终 SHA 的完整检查、产物与截图证据在交付记录中单独列出，不将中间构建当作最终检查。
+TDD 使用 #51 既定桌面公开操作和最高层网关接缝。普通入口与自有 pinned CPA 生命周期、有限许可/费用未知零派发、实际 CPA 普通 HTTP 接虚构上游、SSE/429/取消失败锁停分别测试。实际 CPA 模型 fixture 是单 Key compatibility；OAuth 管理元数据是替身，不能证明 OAuth 普通生成或真实套餐权益。最终 SHA 的完整检查、manifest、截图/接收端记录在交付证据单独列出。
 
-复用 R5 的实际固定 CPA 与 DSH 形状文本/多轮/JSON/SSE 工具/取消、固定失败和禁用准入证据；每次 receiver 记录属于当前 run ID。旧 CLI 证据不移作 CPA 成功。实际 DSH 运行、真实身份/资格/协议、OAuth 普通生成固定账号、额度与整次调用费用限制全部未验，统一由 [#58](https://github.com/LC-86/JevModelRouter/issues/58)逐来源回填；[#25](https://github.com/LC-86/JevModelRouter/issues/25)/[#26](https://github.com/LC-86/JevModelRouter/issues/26)仍保留真人未完成事实。
+旧隔离产物的 38 次虚构请求、R5 DSH 文本/多轮/JSON/SSE 工具往返及定向 receiver 记录保持原作用域。真实凭据、OAuth、额度/费用和实际 DSH 均未测、0 次，结果仅回填 [#58](https://github.com/LC-86/JevModelRouter/issues/58)。Coding Plan 的证据输入、校验、有限启用/关闭和固定端点派发属于 #57 工程交付。Grok 套餐/费用、Coding Plan 真实权益及真实协议结果留在 #58；未支持的协议仍明确拒绝。[#25](https://github.com/LC-86/JevModelRouter/issues/25)/[#26](https://github.com/LC-86/JevModelRouter/issues/26)的旧 CLI 证据不移作 CPA 成功。
 
-真人事前计划、有限次数/工具/输入输出上限、可能费用、失败即停和脱敏结果格式见 [HAND_RUN](relay-hand-run.md) 与[结果模板](relay-hand-run-result.md)。服务能启动不等于真实来源可调用；本票只交付隔离开发产物和移交入口。
+逐来源计划、有限请求/工具/辅助预算、费用 Unknown 和失败即停要求见 [HAND_RUN](relay-hand-run.md)。来源连接、目录可见、隔离通过、真实通过分别表达；本票与 R7 均不自动关闭。
